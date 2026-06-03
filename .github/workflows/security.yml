@@ -555,8 +555,20 @@ jobs:
       - name: Build A
         run: |
           set -euo pipefail
-          nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
-            --no-link --print-out-paths > /tmp/bvm-path-a.txt
+          # Plan 115 / ADR-065: the flake reads MVM_HOST_BIN_DIR under --impure
+          # to inject mvm-host-vm-init + mvm-egress-proxy via extraFiles. This
+          # lane tests the *nix build's* determinism, not the host binaries, so
+          # use deterministic placeholder bytes (same approach as ci-full.yml's
+          # builder-vm smoke). A fixed path + empty files are byte-identical
+          # across Build A and Build B, isolating the determinism under test.
+          HOST_BIN_DIR="$RUNNER_TEMP/mvm-host-bins"
+          mkdir -p "$HOST_BIN_DIR"
+          : > "$HOST_BIN_DIR/mvm-host-vm-init"
+          : > "$HOST_BIN_DIR/mvm-egress-proxy"
+          chmod 0755 "$HOST_BIN_DIR"/mvm-*
+          MVM_HOST_BIN_DIR="$HOST_BIN_DIR" \
+            nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
+              --impure --no-link --print-out-paths > /tmp/bvm-path-a.txt
           out=$(head -1 /tmp/bvm-path-a.txt)
           # Hash the four outputs the flake commits to under stable
           # relative names so the store-path component (input-hash, not
@@ -567,8 +579,15 @@ jobs:
       - name: Build B (force rebuild)
         run: |
           set -euo pipefail
-          nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
-            --rebuild --no-link --print-out-paths > /tmp/bvm-path-b.txt
+          # Same deterministic placeholder host bins as Build A (see note there).
+          HOST_BIN_DIR="$RUNNER_TEMP/mvm-host-bins"
+          mkdir -p "$HOST_BIN_DIR"
+          : > "$HOST_BIN_DIR/mvm-host-vm-init"
+          : > "$HOST_BIN_DIR/mvm-egress-proxy"
+          chmod 0755 "$HOST_BIN_DIR"/mvm-*
+          MVM_HOST_BIN_DIR="$HOST_BIN_DIR" \
+            nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
+              --rebuild --impure --no-link --print-out-paths > /tmp/bvm-path-b.txt
           out=$(head -1 /tmp/bvm-path-b.txt)
           ( cd "$out" && sha256sum vmlinux rootfs.ext4 cmdline.txt manifest.json ) > /tmp/bvm-hash-b.txt
           cat /tmp/bvm-hash-b.txt
