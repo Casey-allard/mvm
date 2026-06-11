@@ -5,8 +5,9 @@
 //!
 //! - **Firecracker** (`backend::FirecrackerBackend`) + the `AnyBackend`
 //!   dispatch enum + `FirecrackerConfig` — the production Tier 1 path.
-//! - **Apple Container** (`apple_container::AppleContainerBackend`) —
-//!   macOS 26+ Apple Virtualization.framework.
+//! - **Vz** (`vz::VzBackend`) — Apple Virtualization.framework via the
+//!   per-VM Rust supervisor; the macOS-26 default (the in-process Apple
+//!   Container backend converged onto it).
 //! - **libkrun** (`libkrun::LibkrunBackend`) — raw libkrun shim
 //!   (Linux KVM / macOS HVF).
 //!
@@ -28,7 +29,6 @@
 //!                     mvm-cli
 //!                     (consumes us directly)
 
-pub mod apple_container;
 pub mod artifacts;
 pub mod audit_substrate;
 pub mod backend;
@@ -58,11 +58,12 @@ pub mod netinit_audit;
 pub mod network;
 /// `NetworkProvider` impl over the bridge+TAP path.
 pub mod network_provider;
-/// Apple Container / Apple Virtualization.framework runtime interface
-/// (objc2 + Swift bridge, process spawn + verity wiring) — folded in
-/// from the former `mvm-providers` crate. The
-/// `apple_container` backend dispatch (`AppleContainerBackend`) stays in
-/// `apple_container.rs`; this is the lower-level interface it drives.
+/// Apple Virtualization.framework in-process runtime interface (objc2,
+/// process spawn + verity wiring) — folded in from the former
+/// `mvm-providers` crate. The workload backend that drove it converged
+/// onto `vz` (the per-VM supervisor); this remains for the macOS-26 dev
+/// environment (`mvmctl dev`) and the codesigning helpers until that
+/// path moves onto the supervisor too.
 pub mod providers;
 /// QEMU workload runtime backend (dev/test).
 pub mod qemu;
@@ -72,15 +73,13 @@ pub mod standby_pool;
 /// Shared per-VM substitution-endpoint spawn/reap helpers used by the
 /// QEMU + Firecracker launch paths (one impl, no drift).
 pub(crate) mod substitution_spawn;
-// Vz (Apple Virtualization.framework) backend. Currently a skeleton:
-// trait surface + capabilities + security profile + availability
-// probe; lifecycle methods land in a follow-up slice.
+// Vz (Apple Virtualization.framework) backend — full lifecycle via the
+// per-VM Rust supervisor (boot/stop/pause/resume/snapshot/console).
 pub mod vz;
 // Rust client for the Vz supervisor's control socket
 // (PAUSE / RESUME / BALLOON / SAVE). Used by VzBackend.
 pub mod vz_control;
 
-pub use apple_container::AppleContainerBackend;
 pub use backend::{AnyBackend, FirecrackerBackend, FirecrackerConfig};
 pub use libkrun::LibkrunBackend;
 pub use mock::MockBackend;
