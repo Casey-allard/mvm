@@ -942,11 +942,10 @@ pub fn restore_from_template_snapshot(
         dir = abs_dir,
     ))?;
 
-    // Create config and secrets drives in the new VM directory with fresh runtime data
-    ui::info("Creating config drive...");
-    let config_drive = create_dev_config_drive(&abs_dir, config)?;
-    ui::info("Creating secrets drive...");
-    let secrets_drive = create_dev_secrets_drive(&abs_dir, &config.secret_files)?;
+    // Build config + secrets drives concurrently in the new VM directory
+    // with fresh runtime data.
+    ui::info("Creating config + secrets drives...");
+    let (config_drive, secrets_drive) = create_dev_drives_parallel(&abs_dir, config)?;
 
     // The snapshot expects drives at the template runtime directory.
     // Create per-instance symlinks from template runtime paths to the instance drives.
@@ -1679,6 +1678,27 @@ fn drive_file_inject_commands(files: &[DriveFile]) -> String {
     cmds
 }
 
+/// Build the config + secrets drives concurrently, returning
+/// `(config_drive_path, secrets_drive_path)`.
+///
+/// Each is an independent host-side `mkfs.ext4 -d` (~170 ms) with no data
+/// dependency on the other, so running them on two scoped threads halves
+/// the drive-prep stretch of the boot leg. The cheap, ordered Firecracker
+/// API attach calls that consume the paths stay sequential at the call site.
+fn create_dev_drives_parallel(abs_dir: &str, config: &FlakeRunConfig) -> Result<(String, String)> {
+    std::thread::scope(|s| {
+        let cfg = s.spawn(|| create_dev_config_drive(abs_dir, config));
+        let sec = s.spawn(|| create_dev_secrets_drive(abs_dir, &config.secret_files));
+        let config_drive = cfg
+            .join()
+            .map_err(|_| anyhow::anyhow!("config-drive build thread panicked"))??;
+        let secrets_drive = sec
+            .join()
+            .map_err(|_| anyhow::anyhow!("secrets-drive build thread panicked"))??;
+        Ok((config_drive, secrets_drive))
+    })
+}
+
 /// Create a config drive (mvm-config label) with config.json and role-specific toml.
 pub fn create_dev_config_drive(abs_dir: &str, config: &FlakeRunConfig) -> Result<String> {
     let path = format!("{}/config.ext4", abs_dir);
@@ -2055,9 +2075,11 @@ pub fn configure_flake_microvm_with_drives_dir(
         )?;
     }
 
-    // Create and attach mvm-config drive (config.json + role.toml)
-    ui::info("Creating config drive...");
-    let config_drive = create_dev_config_drive(drives_dir, config)?;
+    // Build both drives concurrently, then attach them via the (cheap,
+    // ordered) Firecracker API — config.json + role.toml on mvm-config,
+    // stub secrets.json + extra secret files on mvm-secrets.
+    ui::info("Creating config + secrets drives...");
+    let (config_drive, secrets_drive) = create_dev_drives_parallel(drives_dir, config)?;
     api_put_socket(
         socket,
         "/drives/config",
@@ -2066,10 +2088,6 @@ pub fn configure_flake_microvm_with_drives_dir(
             path = config_drive,
         ),
     )?;
-
-    // Create and attach mvm-secrets drive (stub secrets.json + extra secret files)
-    ui::info("Creating secrets drive...");
-    let secrets_drive = create_dev_secrets_drive(drives_dir, &config.secret_files)?;
     api_put_socket(
         socket,
         "/drives/secrets",
