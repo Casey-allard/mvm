@@ -139,6 +139,18 @@ e2fsprogs ≥ 1.43): stage the tiny files (config.json + role stub; empty
 it. Removes the loop-mount round-trip and the `sudo` from the hot path. Each drive
 drops from ~0.6 s toward ~0.15 s.
 
+**Tertiary lever — build the two drives in parallel.** The config and secrets
+drives are independent `mkfs.ext4 -d` ops with no data dependency, so
+`create_dev_drives_parallel` runs them on two scoped threads and joins before the
+(cheap, ordered) Firecracker API attach calls. On a quiet multicore host the two
+overlap for up to ~166 ms of savings; under CPU/disk contention the benefit
+shrinks (the two `mkfs` contend), so it is a strict win on an idle host and
+neutral under load — never a regression (correctness is unaffected; it's two
+independent host-side ops). Applies to both the flake-boot and snapshot-restore
+paths. Measured drive span on the (contended) x86_64 box: ~284 ms for both in
+parallel; a clean before/after was obscured by box load (a runaway `passt`
+pegging a core swung warm-`up` totals 0.98 s↔1.8 s independent of this change).
+
 ## Tasks
 
 - [x] Add `workload_build_fingerprint(user_flake, profile, mode, mvm_workspace)`
@@ -158,6 +170,8 @@ drops from ~0.6 s toward ~0.15 s.
 - [x] Drive creation: `mkfs.ext4 -d` populate-at-format for config + secrets
       drives; labels + permissions preserved (firecracker runs as root, so file
       ownership matches the old `sudo tee` path).
+- [x] Build the two drives in parallel (`create_dev_drives_parallel`, scoped
+      threads) on both the flake-boot and snapshot-restore paths.
 - [x] Box validation (x86_64 KVM): cold `up` records the fingerprint; warm `up`
       short-circuits with **no builder VM in the log** at **1.01 s**; a flake edit
       busts the cache and the next `up` rebuilds (32 s). See Status table above.
