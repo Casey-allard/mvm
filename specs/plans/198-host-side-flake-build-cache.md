@@ -176,6 +176,26 @@ pegging a core swung warm-`up` totals 0.98 s↔1.8 s independent of this change)
       short-circuits with **no builder VM in the log** at **1.01 s**; a flake edit
       busts the cache and the next `up` rebuilds (32 s). See Status table above.
 
+## Further boot-leg levers (deferred — diminishing returns)
+
+Warm `up` is already sub-second on a quiet host; these are ranked by
+value/risk if more margin is ever wanted (each isolated from the build leg):
+
+- [ ] **Skip the secrets drive when there are no secrets (~150 ms).** A
+      no-secrets workload still pays a full `mkfs` for an empty `{}` drive.
+      Highest remaining single win, but needs the guest-side contract checked
+      (does `/init` tolerate the absent drive, or mount it conditionally?).
+- [ ] **Overlap drive build with network provision (~110 ms).** The
+      bridge/TAP/egress provision and the drive `mkfs` are both host-side and
+      independent, but sit in different functions (provision in the `run` path,
+      drives in `configure_flake_microvm`). Threading the drive build to start
+      at provision time would overlap them. Moderate risk (TapGuard lifecycle).
+- [ ] **Shrink the drives 4M → 1M (~10–30 ms).** Trivial; the content is <4 KB.
+- [ ] **Investigate the ~110 ms post-`running` finalize span** (readiness record
+      / audit emit / name-registry write) — may be necessary work; measure first.
+- [ ] **Parallelize the fingerprint file-hash (~50 ms).** Rules out under the
+      "limit dependencies" rule unless done without adding `rayon`.
+
 ## Non-goals
 
 - Snapshot / live-memory warmstart (Plan 140 / Plan 175) — a different, faster
