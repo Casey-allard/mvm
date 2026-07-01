@@ -17,7 +17,7 @@
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::HvfError;
@@ -80,6 +80,10 @@ pub struct KernelBootResult {
     /// port (the transient run-to-exit signal). `None` for a run that ended by
     /// timeout/stop without a workload-exit report.
     pub workload_exit_code: Option<i32>,
+    /// Egress targets the vsock gateway refused (claim-10 default-deny, ADR-100).
+    pub egress_denied: Vec<String>,
+    /// Egress targets the vsock gateway admitted + connected (ADR-100).
+    pub egress_allowed: Vec<String>,
 }
 
 /// Boot `image` (an arm64 `Image`) under HVF, optionally with an `initramfs`
@@ -92,13 +96,22 @@ pub fn boot_kernel(
     timeout: Duration,
 ) -> Result<KernelBootResult, HvfError> {
     static NEVER_STOP: AtomicBool = AtomicBool::new(false);
-    boot_kernel_impl(image, initramfs, disk, vsock, timeout, &NEVER_STOP)
+    boot_kernel_impl(
+        image,
+        initramfs,
+        disk,
+        vsock,
+        timeout,
+        &NEVER_STOP,
+        egress_gate_from_env(),
+    )
 }
 
-/// Like [`boot_kernel`], but also stops as soon as `stop` is set — a
-/// persistent-until-stop VM. The supervisor sets `stop` from a SIGTERM handler so
-/// `HvfBackend::stop` ends the guest cleanly (console flushed) instead of a
-/// timeout. `timeout` still caps the run as a backstop.
+/// Like [`boot_kernel`], but stops as soon as `stop` is set — a
+/// persistent-until-stop VM — and drives egress through the caller-supplied
+/// `egress` gateway (the supervisor builds it from the admitted plan's network
+/// policy; ADR-100). The supervisor sets `stop` from a SIGTERM handler so
+/// `HvfBackend::stop` ends the guest cleanly. `timeout` still caps the run.
 pub fn boot_kernel_until(
     image: &[u8],
     initramfs: Option<&[u8]>,
@@ -106,8 +119,9 @@ pub fn boot_kernel_until(
     vsock: bool,
     timeout: Duration,
     stop: &'static AtomicBool,
+    egress: crate::vmm::egress_gate::EgressGate,
 ) -> Result<KernelBootResult, HvfError> {
-    boot_kernel_impl(image, initramfs, disk, vsock, timeout, stop)
+    boot_kernel_impl(image, initramfs, disk, vsock, timeout, stop, egress)
 }
 
 fn boot_kernel_impl(
@@ -117,6 +131,7 @@ fn boot_kernel_impl(
     vsock: bool,
     timeout: Duration,
     stop: &'static AtomicBool,
+    egress: crate::vmm::egress_gate::EgressGate,
 ) -> Result<KernelBootResult, HvfError> {
     // Validate it's an arm64 Image; we load at the fixed boot-protocol offset.
     let _hdr = kernel_image::parse(image).map_err(|_| HvfError::BadKernel)?;
@@ -192,7 +207,18 @@ fn boot_kernel_impl(
             dealloc(ram, layout);
             return Err(HvfError::VmCreate(rc));
         }
-        let r = run(ram, entry, dtb_addr, disk, vsock, timeout, stop);
+        let r = run(
+            ram,
+            entry,
+            dtb_addr,
+            RunInputs {
+                disk,
+                vsock,
+                timeout,
+                egress,
+            },
+            stop,
+        );
         hv_vm_destroy();
         r
     };
@@ -201,18 +227,61 @@ fn boot_kernel_impl(
     result
 }
 
+/// Build the egress gateway policy. Until the admitted plan's network policy is
+/// threaded through (the productionized path), a dev hook
+/// `MVM_HVF_EGRESS_ALLOW=<ip>:<port>` admits one TCP destination; otherwise the
+/// gate is claim-10 default-deny (ADR-100).
+fn egress_gate_from_env() -> crate::vmm::egress_gate::EgressGate {
+    use crate::vmm::egress_gate::EgressGate;
+    use mvm_core::policy::projection::{CanonicalEgress, CanonicalRule, Proto};
+
+    let Ok(spec) = std::env::var("MVM_HVF_EGRESS_ALLOW") else {
+        return EgressGate::default_deny();
+    };
+    match spec.parse::<std::net::SocketAddr>() {
+        Ok(addr) => {
+            let cidr = if addr.is_ipv4() {
+                format!("{}/32", addr.ip())
+            } else {
+                format!("{}/128", addr.ip())
+            };
+            let rule = CanonicalRule {
+                proto: Proto::Tcp,
+                net: cidr.parse().expect("host cidr"),
+                port_lo: addr.port(),
+                port_hi: addr.port(),
+            };
+            EgressGate::new(CanonicalEgress::Rules(vec![rule]))
+        }
+        Err(_) => EgressGate::default_deny(),
+    }
+}
+
 /// # Safety
 /// Between `hv_vm_create`/`hv_vm_destroy`; `ram` holds RAM_SIZE bytes with the
 /// kernel + DTB loaded.
+/// Device + run inputs for [`run`], bundled to keep its argument count sane.
+struct RunInputs<'a> {
+    disk: Option<&'a [u8]>,
+    vsock: bool,
+    timeout: Duration,
+    /// Host egress gateway policy (ADR-100).
+    egress: crate::vmm::egress_gate::EgressGate,
+}
+
 unsafe fn run(
     ram: *mut u8,
     entry: u64,
     dtb_addr: u64,
-    disk: Option<&[u8]>,
-    vsock: bool,
-    timeout: Duration,
+    inputs: RunInputs,
     stop: &'static AtomicBool,
 ) -> Result<KernelBootResult, HvfError> {
+    let RunInputs {
+        disk,
+        vsock,
+        timeout,
+        egress,
+    } = inputs;
     unsafe {
         // In-kernel GICv3 — created after the VM, before any vCPU. Base
         // addresses must match the DTB's intc node, or the kernel's IRQ/timer
@@ -265,26 +334,44 @@ unsafe fn run(
             return Err(e);
         }
 
-        // Watchdog: a booting kernel never exits on its own, so force the vCPU out
-        // after `timeout`, or as soon as `stop` is set (graceful stop), via the
-        // seam's cross-thread cancel.
+        // Watchdog + heartbeat: a booting kernel never exits on its own, so force
+        // the vCPU out after `timeout` or as soon as `stop` is set (graceful stop).
+        // Between those, a periodic force-exit acts as a heartbeat: it breaks the
+        // guest out of WFI so the run loop can poll host-side async work (drain an
+        // egress socket into a guest blocked in `recv` — ADR-100). The run loop
+        // treats a forced exit as a stop only when `stop` is set, so a heartbeat
+        // wake just polls and continues. On timeout we set `stop` first so the run
+        // loop ends.
         let done = Arc::new(AtomicBool::new(false));
         let done_w = done.clone();
+        // Open-egress-connection count, shared with the vsock device. The heartbeat
+        // only fires while this is non-zero — a guest with no open egress socket has
+        // no host push to wait for, so the host can idle instead of waking 200×/s.
+        let egress_active = Arc::new(AtomicUsize::new(0));
+        let egress_active_w = egress_active.clone();
         let handle = vcpu.exit_token();
         let watchdog = std::thread::spawn(move || {
-            let step = Duration::from_millis(50);
+            let step = Duration::from_millis(5);
             let mut waited = Duration::ZERO;
-            while waited < timeout {
+            loop {
+                std::thread::sleep(step);
                 if done_w.load(Ordering::Relaxed) {
-                    return;
+                    return; // run already ended; don't poke a finishing vCPU
                 }
                 if stop.load(Ordering::Relaxed) {
-                    break; // requested stop → force-exit below
+                    break; // requested stop / workload-exit → final force-exit below
                 }
-                std::thread::sleep(step);
                 waited += step;
+                if waited >= timeout {
+                    stop.store(true, Ordering::Relaxed); // timeout → end the run
+                    break;
+                }
+                // Heartbeat only when there's host→guest egress to deliver.
+                if egress_active_w.load(Ordering::Relaxed) > 0 {
+                    HvfHandle::force_exit(&[handle]); // wake the run loop to drain
+                }
             }
-            HvfHandle::force_exit(&[handle]);
+            HvfHandle::force_exit(&[handle]); // final wake → loop sees stop, returns
         });
 
         let mut uart = Pl011::new(UART_BASE);
@@ -301,9 +388,12 @@ unsafe fn run(
         let mut vsock_dev =
             vsock.then(|| VirtioVsock::new(VSOCK_MMIO_BASE, VSOCK_IRQ, ram, RAM_BASE, RAM_SIZE));
         // Transient run-to-exit: a guest write of the exit code to the workload
-        // exit port stops the run (and is captured below).
+        // exit port stops the run (and is captured below). Egress over vsock is
+        // claim-10 default-deny until the plan's policy is threaded in (ADR-100).
         if let Some(v) = vsock_dev.as_mut() {
             v.capture_workload_exit(stop);
+            v.set_egress_gate(egress);
+            v.set_egress_activity(egress_active.clone());
         }
 
         // Diagnostics gathered by the exception hook (HVC/PSCI + other traps).
@@ -331,32 +421,41 @@ unsafe fn run(
                     Err(HvfError::GicCreate(0))
                 }
             };
-            run::run(&vcpu, set_irq, &mut devices, |vc: &HvfVcpu, esr, _phys| {
-                if esr_ec(esr) == EC_HVC_AARCH64 {
-                    hvc_calls += 1;
-                    let fn_id = vc.get_core(CoreReg::X(0))?;
-                    if psci_fns.len() < 16 && !psci_fns.contains(&fn_id) {
-                        psci_fns.push(fn_id);
+            run::run(
+                &vcpu,
+                set_irq,
+                &mut devices,
+                |vc: &HvfVcpu, esr, _phys| {
+                    if esr_ec(esr) == EC_HVC_AARCH64 {
+                        hvc_calls += 1;
+                        let fn_id = vc.get_core(CoreReg::X(0))?;
+                        if psci_fns.len() < 16 && !psci_fns.contains(&fn_id) {
+                            psci_fns.push(fn_id);
+                        }
+                        match fn_id {
+                            PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => return Ok(RunControl::Stop),
+                            PSCI_VERSION_FN => vc.set_core(CoreReg::X(0), 0x1_0000)?, // PSCI v1.0
+                            _ => vc.set_core(CoreReg::X(0), PSCI_NOT_SUPPORTED)?,
+                        }
+                        // HVC is completed: HVF already advanced PC. Do NOT advance.
+                        Ok(RunControl::Continue)
+                    } else {
+                        let ec = esr_ec(esr);
+                        other_exceptions += 1;
+                        if other_ecs.len() < 16 && !other_ecs.contains(&ec) {
+                            other_ecs.push(ec);
+                        }
+                        // Advance past the faulting instruction and keep going.
+                        let pc = vc.get_core(CoreReg::Pc)?;
+                        vc.set_core(CoreReg::Pc, pc + 4)?;
+                        Ok(RunControl::Continue)
                     }
-                    match fn_id {
-                        PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => return Ok(RunControl::Stop),
-                        PSCI_VERSION_FN => vc.set_core(CoreReg::X(0), 0x1_0000)?, // PSCI v1.0
-                        _ => vc.set_core(CoreReg::X(0), PSCI_NOT_SUPPORTED)?,
-                    }
-                    // HVC is completed: HVF already advanced PC. Do NOT advance.
-                    Ok(RunControl::Continue)
-                } else {
-                    let ec = esr_ec(esr);
-                    other_exceptions += 1;
-                    if other_ecs.len() < 16 && !other_ecs.contains(&ec) {
-                        other_ecs.push(ec);
-                    }
-                    // Advance past the faulting instruction and keep going.
-                    let pc = vc.get_core(CoreReg::Pc)?;
-                    vc.set_core(CoreReg::Pc, pc + 4)?;
-                    Ok(RunControl::Continue)
-                }
-            })?
+                },
+                // A forced exit is a real stop only when `stop` is set (timeout or
+                // graceful); otherwise it's a heartbeat wake so the run loop can drain
+                // egress sockets into a guest blocked in WFI (ADR-100 async proxy).
+                move || stop.load(Ordering::Relaxed),
+            )?
         };
 
         done.store(true, Ordering::Relaxed);
@@ -381,6 +480,8 @@ unsafe fn run(
         if let Some(vs) = &vsock_dev {
             r.vsock_received = vs.received.clone();
             r.workload_exit_code = vs.workload_exit_code;
+            r.egress_denied = vs.egress_denied.clone();
+            r.egress_allowed = vs.egress_allowed.clone();
         }
         Ok(r)
     }

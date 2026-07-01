@@ -111,6 +111,32 @@ The guest therefore has exactly one device class for talking to anything: vsock.
    so a regression that re-adds a guest NIC fails closed — the machine-checked
    form of this invariant.
 
+## Status (HVF reference, live-proven on Apple silicon)
+
+Step 1 is realized on HVF:
+
+- ✅ No guest NIC; the guest's only off-guest channels are vsock (control, the
+  transient workload-exit signal, and egress).
+- ✅ Egress **deny by default** — a NIC-less guest's connect request over vsock is
+  refused unless policy admits it (`vmm::egress_gate` reuses the claim-10
+  `CanonicalEgress`).
+- ✅ Egress **allow + TCP proxy** when admitted — the host opens the socket and
+  proxies bytes; an echo round-trips guest → vsock → host TCP → guest.
+- ✅ The gate is built from the **admitted plan's `NetworkPolicy`**, with the
+  supervisor **resolving host-allowlist DNS pins** at startup; fails closed.
+- ✅ **Async bidirectional streaming** — replies / server-push reach a guest
+  blocked in `recv` (WFI), not just inline request/response. The run loop takes a
+  `should_stop` predicate so a forced exit (`Canceled`) polls host-side I/O before
+  ending; the HVF watchdog doubles as a ~5 ms heartbeat that `force_exit`s the
+  vCPU to break WFI, so `drain_egress` runs and the vsock rx IRQ wakes the guest.
+  (Root cause: `hv_vcpu_run` sleeps on WFI, so the loop otherwise never returns to
+  drain the socket — confirmed by tracing.)
+- ✅ **CI guard** (`xtask check-vsock-only-egress`) keeps the vmm/HVF path NIC-free.
+
+Step 1 (HVF reference) is complete. Step 2 — converge Firecracker/libkrun/vz off
+their NICs onto this gateway, then widen the CI guard to them — remains; it is a
+larger, per-backend change to the production workload paths.
+
 ## Alternatives considered
 
 - **Keep per-backend NICs with host-enforced default-deny (today's posture).**
