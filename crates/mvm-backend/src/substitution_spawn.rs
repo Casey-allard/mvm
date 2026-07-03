@@ -256,10 +256,17 @@ pub fn spawn_substitution_endpoint(params: SubstitutionSpawnParams<'_>) -> Resul
 
     let bin = resolve_substitution_endpoint_path()?;
 
+    // Capture the endpoint's stderr to a per-VM log so a failed startup
+    // (config parse, listener bind, signer error) is diagnosable rather than
+    // swallowed behind the opaque "closed stdout without a ready handshake".
+    let stderr_log = state_dir.join("substitution-endpoint.stderr.log");
+    let stderr_sink = std::fs::File::create(&stderr_log)
+        .map_err(|e| anyhow!("create {}: {e}", stderr_log.display()))?;
+
     let mut cmd = Command::new(&bin);
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::from(stderr_sink));
     // Detach into its own session so it survives this `mvmctl` process.
     unsafe {
         use std::os::unix::process::CommandExt;
