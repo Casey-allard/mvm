@@ -562,9 +562,14 @@ impl AnyBackend {
             return Self::Firecracker(FirecrackerBackend);
         }
 
-        // 2. macOS 26+ → Apple Virtualization.framework via the vz supervisor.
+        // 2. macOS 26+ Apple Silicon → the in-house VMM driven through the
+        //    WorkloadRunner (the destination macOS backend). Vz stays reachable
+        //    via `--hypervisor vz` until it is removed.
         if plat.is_vz_default_tier() {
-            return Self::Vz(VzBackend);
+            return Self::InHouse(WorkloadRunner::new(
+                InHouseDriver::new(),
+                RealEndpointSpawner,
+            ));
         }
 
         // 3. libkrun installed → use the raw libkrun shim.
@@ -1165,7 +1170,9 @@ mod tests {
         let name = backend.name();
         assert!(
             // The full set of legitimate auto_select returns is:
-            matches!(name, "firecracker" | "vz" | "libkrun"),
+            // in-house (macOS 26+ AS, reports "hvf"), firecracker (Linux KVM),
+            // libkrun (macOS 13-25).
+            matches!(name, "firecracker" | "hvf" | "libkrun"),
             "auto_select returned unexpected backend: {name}"
         );
     }
