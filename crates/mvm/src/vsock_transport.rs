@@ -268,17 +268,23 @@ impl VsockTransport for NestingHopTransport {
 /// `connect()`. This matches the legacy ladder it replaces, which
 /// already did one throwaway probe before the real call.
 pub fn for_vm(vm_name: &str) -> Result<Box<dyn VsockTransport>> {
+    // In-house runner: the agent is a standing `<state_dir>/agent.sock` host
+    // socket bridged to the guest agent. Select it by socket EXISTENCE, never a
+    // connect-probe: on the in-house VMM every host connect is a real guest
+    // `OP_REQUEST` the agent must accept, so a per-poll throwaway probe (this
+    // fn is re-called each `wait_for_agent` iteration) floods the guest's
+    // single-threaded accept loop and it RSTs. Existence-select is free and
+    // unambiguous — the agent-port socket layout is in-house-specific.
+    let inhouse = DevConsoleTransport::for_vm(vm_name);
+    if inhouse
+        .socket_path(mvm_guest::vsock::GUEST_AGENT_PORT)
+        .exists()
+    {
+        return Ok(Box::new(inhouse));
+    }
     let libkrun = LibkrunTransport::for_vm(vm_name);
     if libkrun.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
         return Ok(Box::new(libkrun));
-    }
-    // In-house runner: the agent is exposed as a standing `<state_dir>/agent.sock`
-    // host socket (distinct from libkrun/vz's per-port layout). DevConsoleTransport
-    // routes the agent port to that socket, so it is the in-house agent reachability
-    // path — without this probe, exec/wait_for_agent can't reach an in-house guest.
-    let inhouse = DevConsoleTransport::for_vm(vm_name);
-    if inhouse.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
-        return Ok(Box::new(inhouse));
     }
     let vz = VzTransport::for_vm(vm_name);
     if vz.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
