@@ -1226,13 +1226,20 @@ pub fn wait_for_agent(vm_name: &str, timeout_secs: u64) -> bool {
         // that is *not* "reachable" from the caller's perspective.
         if let Ok(transport) = vsock_transport::for_vm(vm_name)
             && let Ok(mut stream) = transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT)
-            && mvm_guest::vsock::negotiate_protocol(
+        {
+            // A probe transport may connect to the host bridge socket before the
+            // bridge relays to the guest agent (the in-house agent.sock accepts
+            // immediately). Bound the hello read so a not-yet-ready agent fails
+            // fast and the loop retries, instead of blocking forever on read.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            if mvm_guest::vsock::negotiate_protocol(
                 &mut stream,
                 vec![mvm_guest::vsock::GuestCapability::Ping],
             )
             .is_ok()
-        {
-            return true;
+            {
+                return true;
+            }
         }
         // Tight poll: the guest agent comes up within ~1s, so a coarse
         // cadence would round readiness up to the next tick and add hundreds

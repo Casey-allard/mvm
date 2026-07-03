@@ -272,6 +272,14 @@ pub fn for_vm(vm_name: &str) -> Result<Box<dyn VsockTransport>> {
     if libkrun.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
         return Ok(Box::new(libkrun));
     }
+    // In-house runner: the agent is exposed as a standing `<state_dir>/agent.sock`
+    // host socket (distinct from libkrun/vz's per-port layout). DevConsoleTransport
+    // routes the agent port to that socket, so it is the in-house agent reachability
+    // path — without this probe, exec/wait_for_agent can't reach an in-house guest.
+    let inhouse = DevConsoleTransport::for_vm(vm_name);
+    if inhouse.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
+        return Ok(Box::new(inhouse));
+    }
     let vz = VzTransport::for_vm(vm_name);
     if vz.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
         return Ok(Box::new(vz));
