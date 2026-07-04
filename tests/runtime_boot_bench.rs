@@ -24,7 +24,6 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use mvm::vsock_transport::VsockTransport as _;
 use mvm_backend::backend::AnyBackend;
 use mvm_core::vm_backend::VmStartConfig;
 use mvm_guest::vsock::{GuestRequest, GuestResponse};
@@ -269,9 +268,6 @@ fn wait_until_ready(spec: &BenchSpec, name: &str) -> Result<()> {
 }
 
 fn wait_for_guest_agent(backend: &str, name: &str) -> Result<()> {
-    if backend == "vz" {
-        return wait_for_vz_guest_agent(name);
-    }
     let uds_path = guest_agent_socket_path(backend, name)?;
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut last_err = None;
@@ -290,48 +286,6 @@ fn wait_for_guest_agent(backend: &str, name: &str) -> Result<()> {
             uds_path.display(),
             READY_TIMEOUT
         )
-    }))
-}
-
-fn wait_for_vz_guest_agent(name: &str) -> Result<()> {
-    let transport = mvm::vsock_transport::VzTransport::for_vm(name);
-    let deadline = Instant::now() + READY_TIMEOUT;
-    let mut last_err = None;
-
-    while Instant::now() < deadline {
-        match transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT) {
-            Ok(mut stream) => {
-                // ADR-053 / plan 74 W1: hard cutover requires hello
-                // before any operational request, so a raw `Ping`
-                // probe no longer works. Treat a successful hello
-                // negotiation (with the `Ping` capability acknowledged)
-                // as the readiness signal.
-                match mvm_guest::vsock::negotiate_protocol(
-                    &mut stream,
-                    vec![mvm_guest::vsock::GuestCapability::Ping],
-                ) {
-                    Ok(negotiated)
-                        if negotiated
-                            .capabilities
-                            .contains(&mvm_guest::vsock::GuestCapability::Ping) =>
-                    {
-                        return Ok(());
-                    }
-                    Ok(_) => {
-                        last_err = Some(anyhow::anyhow!(
-                            "guest agent did not advertise the Ping capability"
-                        ))
-                    }
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            Err(e) => last_err = Some(e),
-        }
-        std::thread::sleep(READY_POLL);
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        anyhow::anyhow!("Apple Container guest agent did not become ready within {READY_TIMEOUT:?}")
     }))
 }
 

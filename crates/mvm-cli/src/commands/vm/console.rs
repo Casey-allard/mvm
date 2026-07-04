@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 
 use mvm::vsock_transport::{
-    DevConsoleTransport, FirecrackerTransport, LibkrunTransport, VsockTransport, VzTransport,
+    DevConsoleTransport, FirecrackerTransport, LibkrunTransport, VsockTransport,
 };
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
@@ -18,18 +18,16 @@ use super::shared::{IN_CONSOLE_MODE, clap_vm_name};
 use crate::ui;
 
 /// Pick the right vsock transport for `name`. Priority:
-/// 1. The dev VM's Vz guest-agent socket, when this is the dev VM and
+/// 1. The dev VM's builder guest-agent socket, when this is the dev VM and
 ///    its socket is present (the dev VM lives in the builder cache, a
-///    different path than `VzTransport::for_vm` resolves).
+///    different path than the data-dir per-VM dir resolves).
 /// 2. libkrun per-port Unix socket.
 /// 3. In-house runner (`WorkloadRunner` / HVF): selected when a pre-opened
 ///    console data socket (`<vm_state_dir>/vsock/vsock-<port>.sock`) exists —
 ///    which happens only when `dev_console` was set at boot (an unsealed
 ///    interactive run; a sealed prod rootfs never has one, upholding claim 15).
 ///    Agent RPC then dials `<vm_state_dir>/agent.sock`.
-/// 4. Vz per-port Unix socket (`<vm_state_dir>/vsock/vsock-<port>.sock`) —
-///    the macOS AVF path.
-/// 5. Firecracker UDS multiplexer (fleet/production path).
+/// 4. Firecracker UDS multiplexer (fleet/production path).
 ///
 /// Each probe consumes one stream and drops it; the returned
 /// `Arc<dyn VsockTransport>` is then used for every real connection
@@ -37,9 +35,10 @@ use crate::ui;
 /// thread reuse the same dispatch.
 fn pick_console_transport(name: &str) -> Result<Arc<dyn VsockTransport>> {
     // The dev VM's guest-agent socket sits in the builder cache, not the
-    // data-dir path `VzTransport::for_vm` resolves. The Vz supervisor
-    // exposes it as a direct per-port socket (no proxy port prefix), so
-    // dial it through `VzTransport` rooted at the socket's parent dir.
+    // data-dir per-VM dir. The builder Vz supervisor exposes it as a direct
+    // per-port socket (`<dir>/vsock-<port>.sock`, no proxy port prefix), the
+    // same layout `LibkrunTransport::new` dials, so root it at the socket's
+    // parent dir.
     //
     // Gate this on the requested name being the dev VM. The dev socket is
     // present whenever the persistent dev/builder VM is up (e.g. after an
@@ -52,7 +51,7 @@ fn pick_console_transport(name: &str) -> Result<Arc<dyn VsockTransport>> {
         if dev_sock.exists()
             && let Some(dir) = dev_sock.parent()
         {
-            return Ok(Arc::new(VzTransport::new(dir)));
+            return Ok(Arc::new(LibkrunTransport::new(dir)));
         }
     }
     let libkrun = LibkrunTransport::for_vm(name);
@@ -82,13 +81,6 @@ fn pick_console_transport(name: &str) -> Result<Arc<dyn VsockTransport>> {
         });
     if inhouse_agent_sock.exists() || inhouse_console_sock.is_some_and(|sock| sock.exists()) {
         return Ok(Arc::new(DevConsoleTransport::for_vm(name)));
-    }
-    // Vz workloads expose the agent at `<vm_state_dir>/vsock/vsock-<port>.sock`
-    // (one subdir deeper than libkrun); without this probe `console` fell
-    // through to the firecracker fallback and mis-resolved to `mvm-dev`.
-    let vz = VzTransport::for_vm(name);
-    if vz.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
-        return Ok(Arc::new(vz));
     }
     Ok(Arc::new(FirecrackerTransport::for_vm(name)?))
 }
@@ -564,29 +556,6 @@ mod accessible_gate_tests {
         env.set("HOME", tmp.path());
         env.set("MVM_DATA_DIR", tmp.path().join(".mvm"));
         f(tmp.path());
-    }
-
-    #[test]
-    fn pick_console_transport_selects_vz_when_only_vz_socket_present() {
-        use std::os::unix::net::UnixListener;
-        // Regression for the "console can't reach a Vz workload" gap: with a
-        // Vz workload's vsock socket present (and no dev-proxy / libkrun /
-        // firecracker surface), the picker must select the Vz
-        // transport instead of erroring out on the firecracker fallback.
-        let mut env = mvm_core::util::test_env::TestEnv::new();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        env.set("MVM_DATA_DIR", tmp.path());
-
-        let name = "vz-console-probe";
-        let sock =
-            mvm_core::config::vm_vz_vsock_port_socket(name, mvm_guest::vsock::GUEST_AGENT_PORT);
-        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
-        let _listener = UnixListener::bind(&sock).unwrap();
-
-        let transport = pick_console_transport(name).expect("picker should find the vz transport");
-        transport
-            .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
-            .expect("selected transport should connect to the vz socket");
     }
 
     // The dev VM's vsock socket is present whenever the persistent

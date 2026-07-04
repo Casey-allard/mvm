@@ -107,42 +107,6 @@ impl VsockTransport for LibkrunTransport {
     }
 }
 
-/// Connects through the Vz supervisor's per-port vsock listener.
-///
-/// `VzBackend` starts the Swift supervisor with a `VsockProxy` that
-/// listens under `<vm_state_dir>/vsock/` and forwards each connection to
-/// the guest's vsock port, so a host client connects directly with no
-/// port handshake — the libkrun shape, one subdir deeper. The path is the
-/// single-source-of-truth [`mvm_core::config::vm_vz_vsock_port_socket`].
-pub struct VzTransport {
-    socket_dir: PathBuf,
-}
-
-impl VzTransport {
-    pub fn new(socket_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            socket_dir: socket_dir.into(),
-        }
-    }
-
-    pub fn for_vm(vm_name: &str) -> Self {
-        Self::new(mvm_core::config::vm_vz_vsock_dir(vm_name))
-    }
-
-    fn socket_path(&self, port: u32) -> PathBuf {
-        self.socket_dir
-            .join(mvm_core::config::vsock_socket_filename(port))
-    }
-}
-
-impl VsockTransport for VzTransport {
-    fn connect(&self, port: u32) -> Result<UnixStream> {
-        let path = self.socket_path(port);
-        UnixStream::connect(&path)
-            .with_context(|| format!("Failed to connect to Vz vsock at {}", path.display()))
-    }
-}
-
 /// Connects to an in-house (`WorkloadRunner` / HVF) VM's vsock channels.
 ///
 /// The in-house runner binds two distinct socket layouts under the per-VM
@@ -258,10 +222,9 @@ impl VsockTransport for NestingHopTransport {
 
 /// Pick a transport for a VM by name.
 ///
-/// Probes libkrun's per-port Unix socket first, then the vz supervisor's
-/// per-port socket, then Firecracker by resolving the running VM's
-/// instance directory — the cheapest probe that doesn't require the
-/// caller to know the backend ahead of time.
+/// Probes libkrun's per-port Unix socket first, then Firecracker by
+/// resolving the running VM's instance directory — the cheapest probe
+/// that doesn't require the caller to know the backend ahead of time.
 ///
 /// Note: the probe consumes one stream and immediately drops it;
 /// callers get a *fresh* stream from the returned transport's
@@ -285,10 +248,6 @@ pub fn for_vm(vm_name: &str) -> Result<Box<dyn VsockTransport>> {
     let libkrun = LibkrunTransport::for_vm(vm_name);
     if libkrun.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
         return Ok(Box::new(libkrun));
-    }
-    let vz = VzTransport::for_vm(vm_name);
-    if vz.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
-        return Ok(Box::new(vz));
     }
     let fc = FirecrackerTransport::for_vm(vm_name)
         .with_context(|| format!("no vsock transport found for VM {:?}", vm_name))?;
@@ -325,61 +284,6 @@ mod tests {
             msg.contains("/tmp/no-such-libkrun-vm"),
             "error didn't mention socket dir: {msg}"
         );
-    }
-
-    #[test]
-    fn vz_transport_connects_to_socket_in_its_dir() {
-        use std::os::unix::net::UnixListener;
-        // Vz's supervisor listens on `<vsock_dir>/vsock-<port>.sock`; a host
-        // client connects directly (no port handshake), same shape as libkrun.
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir
-            .path()
-            .join(mvm_core::config::vsock_socket_filename(5252));
-        let _listener = UnixListener::bind(&sock).unwrap();
-        let t = VzTransport::new(dir.path());
-        t.connect(5252).expect("vz transport should connect");
-    }
-
-    #[test]
-    fn vz_transport_for_vm_targets_vsock_subdir() {
-        // for_vm must point at `<vm_state_dir>/vsock/` (Vz nests one subdir
-        // deeper than libkrun's `<vm_state_dir>/`), and the error names the
-        // backend so console failures are diagnosable.
-        let t = VzTransport::for_vm("no-such-vz-vm");
-        let err = t
-            .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
-            .expect_err("should fail to connect")
-            .to_string();
-        assert!(
-            err.contains("Vz vsock") && err.contains("/vsock/vsock-5252.sock"),
-            "error didn't show the vz vsock-subdir path: {err}"
-        );
-    }
-
-    #[test]
-    fn for_vm_selects_vz_when_only_vz_socket_present() {
-        use std::os::unix::net::UnixListener;
-        // With a Vz workload's socket present (and no libkrun/firecracker
-        // surface), the picker must select the Vz transport rather
-        // than falling through to the firecracker error. Regression for the
-        // "console can't reach a Vz workload" gap.
-        let _lock = crate::vm::DATA_DIR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("MVM_DATA_DIR", dir.path()) };
-        let name = "vz-picker-probe";
-        let sock =
-            mvm_core::config::vm_vz_vsock_port_socket(name, mvm_guest::vsock::GUEST_AGENT_PORT);
-        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
-        let _listener = UnixListener::bind(&sock).unwrap();
-
-        let t = for_vm(name).expect("picker should find the vz transport");
-        t.connect(mvm_guest::vsock::GUEST_AGENT_PORT)
-            .expect("selected transport should connect to the vz socket");
-
-        unsafe { std::env::remove_var("MVM_DATA_DIR") };
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::commands::shared::{
     clap_volume_spec, materialize_disk_volumes, merge_volume_specs, parse_volume_spec,
     vm_volume_from_spec_validated,
 };
-use mvm_backend::{LibkrunBackend, VzBackend};
+use mvm_backend::LibkrunBackend;
 use mvm_core::platform::{self, Platform};
 use mvm_core::user_config::MvmConfig;
 use mvm_core::vm_backend::{VmBackend, VmId, VmStartConfig, VmStatus, VmVolume};
@@ -316,59 +316,6 @@ fn bail_no_dev_backend() -> Result<()> {
     );
 }
 
-/// Cross-backend coexistence helpers for the libkrun dev path.
-///
-/// The libkrun dev VM and a Vz workload VM can both bind the runtime
-/// name `dev_vz::DEV_VM_NAME` ("mvm-dev"). LibkrunBackend's status
-/// probe only sees its *own* state, so without an explicit cross-check
-/// a `dev up` on libkrun would silently leave a stale Vz "mvm-dev"
-/// running. The canonical Vz dev path is a separate persistent builder
-/// that reaps its own supervisor, so this dance is libkrun-only.
-///
-/// Returns `Some("vz")` when a Vz "mvm-dev" is currently running,
-/// otherwise `None`. Errors propagated — a status probe failure
-/// shouldn't be silently swallowed (it may mean the backend is wedged,
-/// which is its own kind of "running").
-fn vz_dev_vm_running() -> Result<Option<&'static str>> {
-    let id = VmId(dev_vz::DEV_VM_NAME.to_string());
-    if matches!(
-        VzBackend.status(&id)?,
-        VmStatus::Running | VmStatus::Starting
-    ) {
-        Ok(Some("vz"))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Pure: the info line to print when libkrun takes over a stale Vz dev
-/// VM (None = stay quiet). Lifted out for hermetic unit tests; the
-/// caller passes the probe result so the test doesn't need to spoof the
-/// live host.
-fn switch_notice(other_running: Option<&str>) -> Option<String> {
-    other_running.map(|other| format!("Switching dev builder backend {other} → libkrun."))
-}
-
-/// When a stale Vz `mvm-dev` is up, stop it and take over instead of
-/// refusing. The dev VM is an ephemeral builder; both backends share
-/// the `mvm-dev` name + dev network and so can't coexist, making
-/// "switch" the only sensible outcome. Mirrors the best-effort
-/// cross-stop already in `cmd_dev_libkrun_down`.
-fn take_over_stale_vz_dev_vm() -> Result<()> {
-    let probe = vz_dev_vm_running()?;
-    if let Some(line) = switch_notice(probe) {
-        ui::info(&line);
-        let id = VmId(dev_vz::DEV_VM_NAME.to_string());
-        if let Err(e) = VzBackend.stop(&id) {
-            // Don't block the new boot on a stale-VM stop failure; surface it.
-            ui::warn(&format!(
-                "Could not stop the stale dev VM cleanly: {e}. Continuing."
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Resolve the dev VM's custom volumes: `MVM_VOLUMES` env baseline +
 /// `--volume` flags, parsed and validated (reserved-mount + encryption
 /// gates) into backend-agnostic [`VmVolume`]s. The dev VM is the
@@ -413,9 +360,6 @@ fn cmd_dev_libkrun(
     let backend = LibkrunBackend;
     let id = VmId(dev_vz::DEV_VM_NAME.to_string());
 
-    // Take over a stale Vz dev VM rather than refusing.
-    take_over_stale_vz_dev_vm()?;
-
     if matches!(backend.status(&id)?, VmStatus::Running) {
         ui::success("libkrun dev VM already running.");
         if open_shell {
@@ -457,13 +401,6 @@ fn cmd_dev_libkrun_down(json: bool) -> Result<bool> {
         LibkrunBackend.status(&id),
         Ok(VmStatus::Running | VmStatus::Starting | VmStatus::Paused)
     );
-    // Best-effort stop of the Vz side too (no-op if not running;
-    // status check + stop is cheap).
-    if let Ok(VmStatus::Running | VmStatus::Starting | VmStatus::Paused) = VzBackend.status(&id)
-        && let Err(e) = VzBackend.stop(&id)
-    {
-        tracing::warn!(error = %e, "best-effort Vz dev VM stop failed during libkrun dev down");
-    }
     LibkrunBackend.stop(&id)?;
     if !json && was_running {
         ui::success("Dev VM stopped.");
@@ -521,13 +458,6 @@ fn cmd_dev_libkrun_status(json: bool) -> Result<()> {
     ui::info("Backend:  libkrun (Hypervisor.framework)");
     ui::info(&format!("VM:       {}", dev_vz::DEV_VM_NAME));
     ui::info(&format!("Status:   {state}"));
-    // Surface the other backend's state too.
-    if let Ok(Some(other)) = vz_dev_vm_running() {
-        ui::info(&format!(
-            "Note: a {other} dev VM is also running. The next `mvmctl dev up` \
-             switches to this backend automatically; `mvmctl dev down` stops both."
-        ));
-    }
     Ok(())
 }
 
@@ -551,7 +481,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
 
     // `current_backend()` honours `MVM_BUILDER_BACKEND=vz` / `--builder vz`
     // (folded into env at startup by `commands::run`) directly, routing the
-    // dev VM through `VzBackend`.
+    // dev VM through the Vz builder path (`dev_vz`).
     let backend = current_backend();
     match action {
         DevAction::Up {
@@ -775,29 +705,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{DevBackend, effective_up_shell, select_dev_backend, switch_notice};
+    use super::{DevBackend, effective_up_shell, select_dev_backend};
     use mvm_core::platform::Platform;
-
-    // ──────────────────────────────────────────────────────────────
-    // Cross-backend coexistence dispatch (libkrun taking over a stale
-    // Vz dev VM).
-    // ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn switch_notice_libkrun_takes_over_vz() {
-        let line = switch_notice(Some("vz")).expect("a running vz VM must yield a switch notice");
-        assert!(line.contains("vz → libkrun"), "got: {line}");
-        assert!(
-            !line.contains("--builder"),
-            "must not leak --builder: {line}"
-        );
-    }
-
-    #[test]
-    fn switch_notice_silent_when_no_stale_vz() {
-        // No leftover Vz VM → nothing to announce, boot proceeds.
-        assert!(switch_notice(None).is_none());
-    }
 
     #[test]
     fn dev_up_opens_shell_by_default() {

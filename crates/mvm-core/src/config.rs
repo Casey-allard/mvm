@@ -448,12 +448,12 @@ pub fn vm_vsock_proxy_socket(name: &str) -> std::path::PathBuf {
     vm_state_dir(name).join("vsock.sock")
 }
 
-/// The directory the Vz supervisor nests its per-port vsock listener
-/// sockets under: `<vm_state_dir>/vsock`. Unlike libkrun (which binds
-/// `<vm_state_dir>/vsock-<port>.sock` directly), the Vz `VsockProxy`
-/// listens inside this subdir. Single source of truth for the subdir so
-/// `mvm-backend`'s supervisor config and the host-side `VzTransport`
-/// can't drift.
+/// The directory a per-port vsock listener nests its sockets under:
+/// `<vm_state_dir>/vsock`. Unlike libkrun's root-level
+/// `<vm_state_dir>/vsock-<port>.sock`, the in-house/dev-console path binds
+/// `<vm_state_dir>/vsock/vsock-<port>.sock`. Single source of truth for the
+/// subdir so `mvm-backend`'s supervisor config and the host-side console
+/// transport can't drift.
 pub fn vm_vz_vsock_dir(name: &str) -> std::path::PathBuf {
     vm_state_dir(name).join("vsock")
 }
@@ -939,9 +939,9 @@ mod tests {
             vm_vsock_proxy_socket("foo"),
             std::path::PathBuf::from("/custom/data/vms/foo/vsock.sock")
         );
-        // Vz nests its per-port listener under a `vsock/` subdir (vz.rs
-        // builds `<state_dir>/vsock`); the console VzTransport must derive
-        // the same path so they can't drift.
+        // The in-house/dev-console path nests its per-port listener under a
+        // `vsock/` subdir (`<state_dir>/vsock`); the console transport must
+        // derive the same path so they can't drift.
         assert_eq!(
             vm_vz_vsock_port_socket("foo", 5252),
             std::path::PathBuf::from("/custom/data/vms/foo/vsock/vsock-5252.sock")

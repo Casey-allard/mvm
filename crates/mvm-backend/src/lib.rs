@@ -5,8 +5,6 @@
 //!
 //! - **Firecracker** (`backend::FirecrackerBackend`) + the `AnyBackend`
 //!   dispatch enum + `FirecrackerConfig` — the production Tier 1 path.
-//! - **Vz** (`vz::VzBackend`) — the one Apple Virtualization.framework
-//!   backend (per-VM Rust objc2 supervisor); macOS-26 auto-default.
 //! - **libkrun** (`libkrun::LibkrunBackend`) — raw libkrun shim
 //!   (Linux KVM / macOS HVF).
 //!
@@ -32,7 +30,6 @@ pub mod artifacts;
 pub mod audit_substrate;
 pub mod backend;
 pub mod catalog;
-pub mod checkpoint;
 pub mod codesign;
 pub mod driver;
 // Shared host-side substrate (config + shell + linux_env + ui +
@@ -47,6 +44,9 @@ pub mod base;
 /// Per-VM broker-services (`mvm-broker` / `mvm-audit-signer`) subprocess
 /// spawn/reap helpers, mirroring [`substitution_spawn`].
 pub(crate) mod broker_services_spawn;
+/// The builder role layer: boots a builder VM over the `VmmDriver` seam with the
+/// disk-only job/artifact transport (trusted, no egress endpoint, no virtio-fs).
+pub mod builder_runner;
 pub mod compat;
 /// Per-VM transparent egress redirect (nft prerouting REDIRECT scoped
 /// to the guest TAP) steering guest:80 to the host-side substitution
@@ -98,16 +98,6 @@ pub mod vmm;
 /// The single host-side vsock egress bridge. Backend-agnostic; every VMM path
 /// enforces claim-10 / claims-12/13 through exactly this module.
 pub mod vsock_egress_bridge;
-// Vz (Apple Virtualization.framework) backend. Currently a skeleton:
-// trait surface + capabilities + security profile + availability
-// probe; lifecycle methods land in a follow-up slice.
-pub mod vz;
-// Rust client for the Vz supervisor's control socket
-// (PAUSE / RESUME / BALLOON / SAVE). Used by VzBackend.
-/// The builder role layer: boots a builder VM over the `VmmDriver` seam with the
-/// disk-only job/artifact transport (trusted, no egress endpoint, no virtio-fs).
-pub mod builder_runner;
-pub mod vz_control;
 /// `WorkloadBackend` marker trait — the type-level permission to carry an
 /// untrusted workload. The admitted launch path accepts `&dyn WorkloadBackend`
 /// only, so a non-workload backend (QEMU dev/test, mock) cannot reach it.
@@ -119,7 +109,6 @@ pub use backend::{AnyBackend, FirecrackerBackend, FirecrackerConfig};
 pub use libkrun::LibkrunBackend;
 pub use mock::MockBackend;
 pub use qemu::QemuBackend;
-pub use vz::VzBackend;
 pub use workload_backend::{EgressSubstitutionTransport, WorkloadBackend};
 
 /// The per-VM egress-TLS cert/key split helper. `mvmctl up`

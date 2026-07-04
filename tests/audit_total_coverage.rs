@@ -156,15 +156,6 @@ const POOL_SUB: &[(&str, AuditPosture)] = &[
     ("status", AuditPosture::ReadOnly),
 ];
 
-const CHECKPOINT_SUB: &[(&str, AuditPosture)] = &[
-    ("create", AuditPosture::Emits("CheckpointCreated")),
-    ("restore", AuditPosture::Emits("CheckpointRestored")),
-    ("fork", AuditPosture::Emits("CheckpointForked")),
-    ("diff", AuditPosture::ReadOnly),
-    ("ls", AuditPosture::ReadOnly),
-    ("rm", AuditPosture::ReadOnly),
-];
-
 const IMAGE_SUB: &[(&str, AuditPosture)] = &[
     ("pull", AuditPosture::Emits("ImageFetch")),
     ("ls", AuditPosture::ReadOnly),
@@ -200,9 +191,6 @@ const MACHINE_SUB: &[(&str, AuditPosture)] = &[
     ("pause", AuditPosture::Emits("VmStop")),
     ("resume", AuditPosture::Emits("VmStart")),
     ("snapshot", AuditPosture::DelegatesToSub(SNAPSHOT_SUB)),
-    ("save", AuditPosture::Emits("CheckpointCreated")),
-    ("restore", AuditPosture::Emits("CheckpointRestored")),
-    ("checkpoint", AuditPosture::DelegatesToSub(CHECKPOINT_SUB)),
     ("cp", AuditPosture::Emits("VmFileCopy")),
     ("fs", AuditPosture::Emits("VmFsMutate")),
     ("proc", AuditPosture::DelegatesToSub(PROC_SUB)),

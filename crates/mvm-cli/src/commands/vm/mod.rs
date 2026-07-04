@@ -3,7 +3,6 @@
 pub(super) mod agent_verbs;
 pub(super) mod artifact;
 pub(super) mod audit_chain;
-pub(super) mod checkpoint;
 pub(crate) mod console;
 pub(super) mod cp;
 pub(super) mod diff;
@@ -30,7 +29,6 @@ pub(super) mod sandbox;
 pub(super) mod sdk_no_vm;
 pub(super) mod session;
 pub(super) mod set_ttl;
-pub(super) mod tenant_resolution;
 pub(super) mod up;
 pub(in crate::commands) mod verb_audit;
 pub(super) mod volume;

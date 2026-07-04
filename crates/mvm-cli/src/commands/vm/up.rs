@@ -1,7 +1,7 @@
 //! Internal admission and boot helpers consumed by `machine/mod.rs`:
 //! `start_persistent_oci_machine`, `admit_plan_for_boot`, `AdmitPlanForBootParams`,
 //! `AdmissionContext`, `emit_launched_if`, `emit_failed_if`,
-//! `persists_plan_before_start`, `resolve_workload_kernel`, `untrusted_transient_admit`,
+//! `persists_plan_before_start`, `untrusted_transient_admit`,
 //! and `load_workload_ir`.
 
 use anyhow::{Context, Result};
@@ -1258,48 +1258,6 @@ fn attach_runtime_overlay(
     }
 }
 
-/// Kernel-less images (mkGuest ships no kernel) boot fine on libkrun,
-/// which materializes its own bundled kernel and ignores this path. The
-/// out-of-process backends (vz and firecracker) need a real kernel file;
-/// fall back to the cached builder-VM kernel — the same kernel the builder
-/// and dev VMs boot — rather than handing them a missing path.
-///
-/// Firecracker's direct/manifest boot path already performs this same
-/// fallback; without it here the flake path would refuse a kernel-less
-/// mkGuest workload that the manifest path boots fine.
-pub(super) fn resolve_workload_kernel(
-    vmlinux_path: &str,
-    hypervisor: &str,
-) -> anyhow::Result<String> {
-    if std::path::Path::new(vmlinux_path).exists() {
-        return Ok(vmlinux_path.to_string());
-    }
-    // `virtualization` is the long-form alias the backend dispatcher
-    // accepts for vz; missing it here would skip the fallback and hand
-    // the backend a nonexistent kernel path. libkrun supplies its own
-    // bundled kernel, so it never needs the fallback.
-    if !matches!(hypervisor, "vz" | "virtualization" | "firecracker") {
-        return Ok(vmlinux_path.to_string());
-    }
-    let arch = if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x86_64"
-    };
-    let fallback = format!(
-        "{}/builder-vm/{arch}/vmlinux",
-        mvm_core::config::mvm_cache_dir()
-    );
-    if std::path::Path::new(&fallback).exists() {
-        return Ok(fallback);
-    }
-    anyhow::bail!(
-        "image has no kernel ({vmlinux_path} missing) and the {hypervisor} backend \
-         needs one; the builder-VM kernel fallback at {fallback} is also absent — \
-         run `mvmctl dev up` once to bootstrap it"
-    )
-}
-
 /// Resolve the locally-built workload kernel from the mvm cache for a
 /// `--kernel-pin` boot. Does not fall back to the image-supplied kernel or
 /// the builder-VM fallback: the pin is explicit, so an absent cache entry
@@ -1434,81 +1392,6 @@ mod runtime_overlay_attach_tests {
             sc.runtime_overlay_path.is_none(),
             "cold cache must not attach (legacy boot)"
         );
-    }
-}
-
-#[cfg(test)]
-mod resolve_workload_kernel_tests {
-    use super::*;
-    use mvm_core::util::test_env::TestEnv;
-
-    #[test]
-    fn existing_path_passes_through_unchanged() {
-        let tmp = tempfile::tempdir().unwrap();
-        let vmlinux = tmp.path().join("vmlinux");
-        std::fs::write(&vmlinux, b"kernel").unwrap();
-        let result = resolve_workload_kernel(vmlinux.to_str().unwrap(), "vz").unwrap();
-        assert_eq!(result, vmlinux.to_str().unwrap());
-    }
-
-    #[test]
-    fn non_vz_hypervisor_passes_through_even_when_missing() {
-        let mut env = TestEnv::new();
-        let tmp = tempfile::tempdir().unwrap();
-        env.set("MVM_CACHE_DIR", tmp.path());
-        let result = resolve_workload_kernel("/nonexistent/vmlinux", "libkrun").unwrap();
-        assert_eq!(result, "/nonexistent/vmlinux");
-    }
-
-    #[test]
-    fn vz_missing_kernel_falls_back_to_builder_vm_cache() {
-        let mut env = TestEnv::new();
-        let tmp = tempfile::tempdir().unwrap();
-        let arch = if cfg!(target_arch = "aarch64") {
-            "aarch64"
-        } else {
-            "x86_64"
-        };
-        let fallback_dir = tmp.path().join("builder-vm").join(arch);
-        std::fs::create_dir_all(&fallback_dir).unwrap();
-        let fallback = fallback_dir.join("vmlinux");
-        std::fs::write(&fallback, b"builder-kernel").unwrap();
-        env.set("MVM_CACHE_DIR", tmp.path());
-        let result = resolve_workload_kernel("/nonexistent/vmlinux", "vz").unwrap();
-        assert_eq!(result, fallback.to_str().unwrap());
-    }
-
-    #[test]
-    fn firecracker_missing_kernel_falls_back_to_builder_vm_cache() {
-        // The firecracker flake path must reuse the cached builder-VM
-        // kernel for a kernel-less mkGuest workload, exactly as the
-        // firecracker manifest path does — otherwise a `sleeper`-style
-        // image (no emitted vmlinux) can't boot under firecracker.
-        let mut env = TestEnv::new();
-        let tmp = tempfile::tempdir().unwrap();
-        let arch = if cfg!(target_arch = "aarch64") {
-            "aarch64"
-        } else {
-            "x86_64"
-        };
-        let fallback_dir = tmp.path().join("builder-vm").join(arch);
-        std::fs::create_dir_all(&fallback_dir).unwrap();
-        let fallback = fallback_dir.join("vmlinux");
-        std::fs::write(&fallback, b"builder-kernel").unwrap();
-        env.set("MVM_CACHE_DIR", tmp.path());
-        let result = resolve_workload_kernel("/nonexistent/vmlinux", "firecracker").unwrap();
-        assert_eq!(result, fallback.to_str().unwrap());
-    }
-
-    #[test]
-    fn vz_both_missing_returns_error_mentioning_dev_up() {
-        let mut env = TestEnv::new();
-        let tmp = tempfile::tempdir().unwrap();
-        env.set("MVM_CACHE_DIR", tmp.path());
-        let err = resolve_workload_kernel("/nonexistent/vmlinux", "vz").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("dev up"), "expected 'dev up' in: {msg}");
-        assert!(msg.contains("vz"), "expected hypervisor name in: {msg}");
     }
 }
 

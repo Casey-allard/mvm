@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "builder-vm")]
-use mvm::vsock_transport::{VsockTransport, VzTransport};
+use mvm::vsock_transport::{LibkrunTransport, VsockTransport};
 
 #[cfg(feature = "builder-vm")]
 use super::super::vm::console::console_interactive;
@@ -279,15 +279,15 @@ fn read_dev_base_provenance(_state_dir: &std::path::Path) -> Option<DevBaseProve
     None
 }
 
-/// Connect to the dev VM's guest agent over its Vz per-port vsock
-/// socket. The dev VM is a persistent Vz builder; its socket lives in
-/// the builder cache (not the data-dir path `VzTransport::for_vm`
-/// resolves), so the transport is built directly from the session's
-/// vsock dir.
+/// Connect to the dev VM's guest agent over its per-port vsock socket.
+/// The dev VM is a persistent Vz builder; its socket lives in the builder
+/// cache (not the data-dir per-VM dir), exposed as `<dir>/vsock-<port>.sock`
+/// — the same layout `LibkrunTransport::new` dials — so the transport is
+/// built directly from the session's vsock dir.
 #[cfg(feature = "builder-vm")]
 fn dev_vm_guest_agent_connect() -> Result<std::os::unix::net::UnixStream> {
     let vsock_dir = mvm_build::vz_builder::persistent_vz_vsock_dir(DEV_VM_SESSION_ID);
-    VzTransport::new(vsock_dir).connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+    LibkrunTransport::new(vsock_dir).connect(mvm_guest::vsock::GUEST_AGENT_PORT)
 }
 
 /// Check if the dev VM is running *and* reachable cross-process.

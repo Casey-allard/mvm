@@ -56,9 +56,6 @@ pub fn collect_sign_targets() -> Vec<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         out.push(exe);
     }
-    if let Ok(p) = crate::vz::resolve_supervisor_path() {
-        out.push(p);
-    }
     if let Ok(p) = crate::libkrun::resolve_supervisor_path() {
         out.push(p);
     }

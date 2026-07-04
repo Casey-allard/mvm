@@ -18,7 +18,7 @@ use super::machine;
 use super::ops;
 use super::ops::{audit, cache, config, metrics, secret};
 use super::trust;
-use super::vm::{checkpoint, console, cp, exec, forward, group, pause, sandbox, session, volume};
+use super::vm::{console, cp, exec, forward, group, pause, sandbox, session, volume};
 
 use audit::AuditAction;
 use cache::CacheAction;
@@ -1932,254 +1932,6 @@ fn test_snapshot_rm_json_parses() {
 }
 
 #[test]
-fn test_vm_save_json_parses() {
-    let cli = Cli::try_parse_from([
-        "mvmctl", "machine", "save", "myvm", "--tag", "gold", "--json",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Save(checkpoint::SaveArgs {
-                name,
-                tag: Some(tag),
-                json: true,
-            }))
-        }) if name == "myvm" && tag == "gold"
-    ));
-}
-
-#[test]
-fn test_vm_restore_json_parses() {
-    let cli = Cli::try_parse_from(["mvmctl", "machine", "restore", "ckpt-abc", "--json"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Restore(checkpoint::RestoreArgs { id, json: true }))
-        }) if id == "ckpt-abc"
-    ));
-}
-
-// --- Checkpoint CLI tests ---
-
-#[test]
-fn test_checkpoint_create_parses() {
-    let cli = Cli::try_parse_from([
-        "mvmctl",
-        "machine",
-        "checkpoint",
-        "create",
-        "myvm",
-        "--tag",
-        "gold",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Checkpoint(
-                checkpoint::CheckpointArgs {
-                    command: checkpoint::CheckpointCmd::Create { .. }
-                }
-            ))
-        })
-    ));
-}
-
-#[test]
-fn test_checkpoint_fork_parses() {
-    assert!(
-        Cli::try_parse_from([
-            "mvmctl",
-            "machine",
-            "checkpoint",
-            "fork",
-            "ckpt-abc",
-            "--new-id",
-            "child"
-        ])
-        .is_ok()
-    );
-}
-
-#[test]
-fn test_checkpoint_fork_json_parses() {
-    let cli = Cli::try_parse_from([
-        "mvmctl",
-        "machine",
-        "checkpoint",
-        "fork",
-        "ckpt-abc",
-        "--new-id",
-        "child",
-        "--json",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Checkpoint(
-                checkpoint::CheckpointArgs {
-                    command: checkpoint::CheckpointCmd::Fork { json: true, .. }
-                }
-            ))
-        })
-    ));
-}
-
-#[test]
-fn test_checkpoint_fork_rejects_traversal_new_id() {
-    // --new-id must not allow a path component that escapes the VM state dir.
-    let r = Cli::try_parse_from([
-        "mvmctl",
-        "machine",
-        "checkpoint",
-        "fork",
-        "ckpt-abc",
-        "--new-id",
-        "../escape",
-    ]);
-    assert!(r.is_err());
-}
-
-#[test]
-fn test_checkpoint_ls_json_parses() {
-    let cli = Cli::try_parse_from(["mvmctl", "machine", "checkpoint", "ls", "--json"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Checkpoint(
-                checkpoint::CheckpointArgs {
-                    command: checkpoint::CheckpointCmd::Ls { json: true }
-                }
-            ))
-        })
-    ));
-}
-
-#[test]
-fn test_checkpoint_create_vm_full_parses() {
-    let cli = Cli::try_parse_from([
-        "mvmctl",
-        "machine",
-        "checkpoint",
-        "create",
-        "myvm",
-        "--class",
-        "vm-full",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Checkpoint(
-                checkpoint::CheckpointArgs {
-                    command: checkpoint::CheckpointCmd::Create {
-                        class: checkpoint::CheckpointClassArg::VmFull,
-                        ..
-                    }
-                }
-            ))
-        })
-    ));
-}
-
-#[test]
-fn test_checkpoint_restore_parses() {
-    assert!(
-        Cli::try_parse_from(["mvmctl", "machine", "checkpoint", "restore", "ckpt-abc"]).is_ok()
-    );
-}
-
-#[test]
-fn test_checkpoint_restore_json_parses() {
-    let cli = Cli::try_parse_from([
-        "mvmctl",
-        "machine",
-        "checkpoint",
-        "restore",
-        "ckpt-abc",
-        "--json",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Checkpoint(
-                checkpoint::CheckpointArgs {
-                    command: checkpoint::CheckpointCmd::Restore { json: true, .. }
-                }
-            ))
-        })
-    ));
-}
-
-#[test]
-fn test_checkpoint_rm_json_parses() {
-    let cli = Cli::try_parse_from([
-        "mvmctl",
-        "machine",
-        "checkpoint",
-        "rm",
-        "ckpt-abc",
-        "--json",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Checkpoint(
-                checkpoint::CheckpointArgs {
-                    command: checkpoint::CheckpointCmd::Rm { json: true, .. }
-                }
-            ))
-        })
-    ));
-}
-
-#[test]
-fn test_checkpoint_create_defaults_fs_quick() {
-    let cli = Cli::try_parse_from(["mvmctl", "machine", "checkpoint", "create", "myvm"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Checkpoint(
-                checkpoint::CheckpointArgs {
-                    command: checkpoint::CheckpointCmd::Create {
-                        class: checkpoint::CheckpointClassArg::FsQuick,
-                        ..
-                    }
-                }
-            ))
-        })
-    ));
-}
-
-#[test]
-fn test_checkpoint_diff_parses() {
-    let cli = Cli::try_parse_from([
-        "mvmctl",
-        "machine",
-        "checkpoint",
-        "diff",
-        "ckpt-a",
-        "ckpt-b",
-        "--json",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Machine(machine::Args {
-            action: machine::MachineAction::Vm(group::VmCmd::Checkpoint(
-                checkpoint::CheckpointArgs {
-                    command: checkpoint::CheckpointCmd::Diff { json: true, .. }
-                }
-            ))
-        })
-    ));
-}
-
-#[test]
 fn test_snapshot_save_is_gone() {
     assert!(Cli::try_parse_from(["mvmctl", "snapshot", "save", "vm", "--path", "/x"]).is_err());
 }
@@ -3817,8 +3569,6 @@ fn state_touching_commands_trigger_entry_convergence() {
     assert!(touches(&["mvmctl", "machine", "stop", "--all"]));
     assert!(touches(&["mvmctl", "machine", "console", "myvm"]));
     assert!(touches(&["mvmctl", "machine", "pause", "myvm"]));
-    assert!(touches(&["mvmctl", "machine", "save", "myvm"]));
-    assert!(touches(&["mvmctl", "machine", "restore", "ckpt-myvm"]));
     assert!(touches(&["mvmctl", "ls"]));
     assert!(touches(&["mvmctl", "dev", "status"]));
 }
@@ -3861,16 +3611,6 @@ fn state_touching_json_commands_reserve_stdout_before_entry_convergence() {
     // is `machine run --json`.
     assert!(emits_machine_readable_stdout(&[
         "mvmctl", "run", "--json", "--", "true"
-    ]));
-    assert!(emits_machine_readable_stdout(&[
-        "mvmctl", "machine", "save", "myvm", "--json"
-    ]));
-    assert!(emits_machine_readable_stdout(&[
-        "mvmctl",
-        "machine",
-        "restore",
-        "ckpt-myvm",
-        "--json"
     ]));
     assert!(emits_machine_readable_stdout(&[
         "mvmctl", "machine", "snapshot", "ls", "--json"

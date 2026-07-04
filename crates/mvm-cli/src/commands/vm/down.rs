@@ -18,11 +18,11 @@ pub(in crate::commands) struct Args {
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
-    // Platform default for VMs with no pid-file marker (the vz supervisor
-    // tracks state out-of-band, so `for_started_vm` returns None).
+    // Platform default for VMs with no pid-file marker. On the macOS VMM tier
+    // that's the in-house VMM backend; elsewhere the Firecracker default.
     let platform_default = || {
         if mvm_core::platform::current().is_macos_vmm_tier() {
-            AnyBackend::from_hypervisor("vz")
+            AnyBackend::from_hypervisor("hvf")
         } else {
             AnyBackend::default_backend()
         }

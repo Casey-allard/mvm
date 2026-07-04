@@ -117,10 +117,9 @@ fn dev_vsock_dir(vm_id: &str) -> std::path::PathBuf {
 }
 
 /// Connect to the AVF dev VM's guest-agent vsock through the vz supervisor's
-/// per-port Unix socket (`<vsock_dir>/vsock-<port>.sock`) — the same listener
-/// `VzTransport` uses. AVF dev VMs run under the per-VM vz supervisor; the
-/// supervisor is the cross-process vsock server, so a plain connect to its
-/// listener is the whole transport.
+/// per-port Unix socket (`<vsock_dir>/vsock-<port>.sock`). AVF dev VMs run
+/// under the per-VM vz supervisor; the supervisor is the cross-process vsock
+/// server, so a plain connect to its listener is the whole transport.
 fn connect_dev_vsock(vm_id: &str, port: u32) -> std::io::Result<std::os::unix::net::UnixStream> {
     let sock = dev_vsock_dir(vm_id).join(mvm_core::config::vsock_socket_filename(port));
     std::os::unix::net::UnixStream::connect(sock)
