@@ -131,10 +131,13 @@ impl AgentBridge {
         }
     }
 
-    /// Read each established host connection once (non-blocking). Returns
-    /// `(conn_id, bytes)` for the device to `OP_RW` to the guest. A peer EOF/error
-    /// closes that stream in place (dropping it from the open set).
-    pub fn drain_host(&mut self) -> Vec<(u32, Vec<u8>)> {
+    /// Read each established host connection once (non-blocking). Returns the
+    /// `(conn_id, bytes)` for the device to `OP_RW` to the guest, plus the
+    /// `conn_id`s whose host side hit EOF/error — the device must `OP_SHUTDOWN`
+    /// those to the guest so a guest that serves connections serially (the
+    /// single-threaded agent accept loop) stops blocking on a stream the host
+    /// already finished and services the next one.
+    pub fn drain_host(&mut self) -> (Vec<(u32, Vec<u8>)>, Vec<u32>) {
         let mut ready = Vec::new();
         let mut closed = Vec::new();
         for (conn_id, c) in self.conns.iter_mut() {
@@ -152,10 +155,10 @@ impl AgentBridge {
                 Err(_) => closed.push(*conn_id),
             }
         }
-        for conn_id in closed {
+        for &conn_id in &closed {
             self.close(conn_id);
         }
-        ready
+        (ready, closed)
     }
 
     /// Write guest→host data (`OP_RW` the device received) to the host socket.
@@ -253,7 +256,7 @@ mod tests {
 
         // Before the guest accepts, request bytes stay buffered (not yet read).
         assert!(
-            bridge.drain_host().is_empty(),
+            bridge.drain_host().0.is_empty(),
             "no host bytes read before the stream is established"
         );
 
@@ -261,7 +264,7 @@ mod tests {
         bridge.on_established(conn_id);
         let mut got = None;
         for _ in 0..200 {
-            let ready = bridge.drain_host();
+            let (ready, _closed) = bridge.drain_host();
             if let Some((cid, bytes)) = ready.into_iter().next() {
                 assert_eq!(cid, conn_id);
                 got = Some(bytes);
@@ -290,6 +293,40 @@ mod tests {
         bridge.close(conn_id);
         assert_eq!(active.load(Ordering::Relaxed), 0);
         assert!(!bridge.is_agent_stream(conn_id));
+    }
+
+    /// When the host side of an established stream closes (client hangs up),
+    /// `drain_host` reports that conn id in the `closed` set (so the device can
+    /// `OP_SHUTDOWN` the guest) and drops it from the open set. Without this the
+    /// guest's serial accept loop would block forever on a finished stream.
+    #[test]
+    fn host_close_is_reported_so_the_guest_can_be_shut_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("agent.sock");
+        let mut bridge = AgentBridge::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        bridge.set_activity(active.clone());
+        bridge.bind(&sock).unwrap();
+
+        let client = UnixStream::connect(&sock).unwrap();
+        let opened = bridge.accept_new();
+        let conn_id = opened[0];
+        bridge.on_established(conn_id);
+
+        // Host client hangs up → the next drain sees EOF and reports the close.
+        drop(client);
+        let mut closed_seen = Vec::new();
+        for _ in 0..200 {
+            let (_ready, closed) = bridge.drain_host();
+            if !closed.is_empty() {
+                closed_seen = closed;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(closed_seen, vec![conn_id], "closed stream reported once");
+        assert!(!bridge.is_agent_stream(conn_id), "and dropped from open set");
+        assert_eq!(active.load(Ordering::Relaxed), 0, "active counter drops");
     }
 
     /// No listener bound → accept is a no-op, never a panic.

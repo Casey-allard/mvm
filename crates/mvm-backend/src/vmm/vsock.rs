@@ -536,12 +536,17 @@ impl VsockShared {
         for conn_id in opened {
             self.queue_host_packet(conn_id, mvm_guest::vsock::GUEST_AGENT_PORT, OP_REQUEST, &[]);
         }
-        for (conn_id, bytes) in self.agent.drain_host() {
+        let (ready, closed) = self.agent.drain_host();
+        for (conn_id, bytes) in ready {
             agent_dbg(&format!(
                 "host→guest {} bytes on stream {conn_id}",
                 bytes.len()
             ));
             self.queue_host_packet(conn_id, mvm_guest::vsock::GUEST_AGENT_PORT, OP_RW, &bytes);
+        }
+        for conn_id in closed {
+            agent_dbg(&format!("host closed stream {conn_id} → OP_SHUTDOWN"));
+            self.queue_host_shutdown(conn_id, mvm_guest::vsock::GUEST_AGENT_PORT);
         }
         if self.flush_rx() {
             Some(self.irq)
@@ -562,8 +567,12 @@ impl VsockShared {
         for (conn_id, guest_port) in self.console.accept_new() {
             self.queue_host_packet(conn_id, guest_port, OP_REQUEST, &[]);
         }
-        for (conn_id, guest_port, bytes) in self.console.drain_host() {
+        let (ready, closed) = self.console.drain_host();
+        for (conn_id, guest_port, bytes) in ready {
             self.queue_host_packet(conn_id, guest_port, OP_RW, &bytes);
+        }
+        for (conn_id, guest_port) in closed {
+            self.queue_host_shutdown(conn_id, guest_port);
         }
         if self.flush_rx() {
             Some(self.irq)
@@ -616,6 +625,27 @@ impl VsockShared {
             fwd_cnt: self.fwd_cnt_for(src_port, dst_port),
         };
         self.pending_rx.push((hdr, payload.to_vec()));
+    }
+
+    /// Queue an `OP_SHUTDOWN` (full RCV|SEND) for a host-initiated stream whose
+    /// host side closed — tells the guest to tear its side down so a serial
+    /// accept loop (the single-threaded agent) stops blocking on it and serves
+    /// the next connection. Without this the guest waits forever for more bytes
+    /// on a stream the host already dropped.
+    fn queue_host_shutdown(&mut self, src_port: u32, dst_port: u32) {
+        let hdr = Hdr {
+            src_cid: HOST_CID,
+            dst_cid: GUEST_CID,
+            src_port,
+            dst_port,
+            len: 0,
+            typ: TYPE_STREAM,
+            op: OP_SHUTDOWN,
+            flags: 3,
+            buf_alloc: HOST_BUF_ALLOC,
+            fwd_cnt: self.fwd_cnt_for(src_port, dst_port),
+        };
+        self.pending_rx.push((hdr, Vec::new()));
     }
 
     /// Queue a host→guest reply (src/dst swapped from the inbound header).
@@ -1346,6 +1376,64 @@ mod tests {
             }
         }
         assert_eq!(&buf[..n], b"# ", "guest PTY output reaches the host socket");
+    }
+
+    /// When the host side of an established console stream closes, `drain_console`
+    /// frames an `OP_SHUTDOWN` to the guest on that stream's console port — so the
+    /// guest console listener (and, for the agent path, the guest's serial accept
+    /// loop) stops waiting on a session the host already ended.
+    #[test]
+    fn host_close_frames_op_shutdown_to_the_guest() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let port = 20007u32;
+        let sock = dir.path().join("vsock-20007.sock");
+        let mut d = dev();
+        d.set_console_sockets([(port, sock.as_path())]).unwrap();
+
+        let mut client = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        client.write_all(b"x").unwrap();
+        client.set_nonblocking(true).unwrap();
+
+        // Open + establish the stream.
+        let mut conn_id = None;
+        for _ in 0..200 {
+            let _ = d.drain_console();
+            if let Some((h, _)) = d.pending_rx.iter().find(|(h, _)| h.op == OP_REQUEST) {
+                conn_id = Some(h.src_port);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let conn_id = conn_id.expect("console stream opened");
+        let accept = Hdr {
+            src_cid: GUEST_CID,
+            dst_cid: HOST_CID,
+            src_port: port,
+            dst_port: conn_id,
+            op: OP_RESPONSE,
+            typ: TYPE_STREAM,
+            ..Default::default()
+        };
+        d.handle_packet(accept, &[]);
+        d.pending_rx.clear();
+
+        // Host client hangs up → drain_console must frame an OP_SHUTDOWN on the port.
+        drop(client);
+        let mut shut = false;
+        for _ in 0..200 {
+            let _ = d.drain_console();
+            if d.pending_rx
+                .iter()
+                .any(|(h, _)| h.op == OP_SHUTDOWN && h.dst_port == port && h.src_port == conn_id)
+            {
+                shut = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(shut, "host close frames OP_SHUTDOWN to the guest console port");
+        assert!(!d.console.is_console_stream(conn_id), "stream dropped");
     }
 
     /// Sealed prod: an empty console-socket list binds no listeners, so

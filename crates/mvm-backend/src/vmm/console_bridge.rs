@@ -87,6 +87,12 @@ impl ConsoleBridge {
         ports: impl IntoIterator<Item = (u32, &'a Path)>,
     ) -> std::io::Result<()> {
         for (guest_port, path) in ports {
+            // Console sockets live one subdir deeper than the agent socket
+            // (`<state_dir>/vsock/vsock-<port>.sock`); create that dir first or
+            // every bind fails with ENOENT — which was silently swallowed below.
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::remove_file(path);
             match UnixListener::bind(path) {
                 Ok(l) => {
@@ -167,10 +173,13 @@ impl ConsoleBridge {
         }
     }
 
-    /// Read each established host connection once (non-blocking). Returns
+    /// Read each established host connection once (non-blocking). Returns the
     /// `(conn_id, guest_port, bytes)` for the device to `OP_RW` to the guest on the
-    /// right console port. A peer EOF/error closes that stream in place.
-    pub fn drain_host(&mut self) -> Vec<(u32, u32, Vec<u8>)> {
+    /// right console port, plus the `(conn_id, guest_port)` of streams whose host
+    /// side hit EOF/error — the device must `OP_SHUTDOWN` those to the guest on
+    /// their console port so the guest console listener tears its side down instead
+    /// of blocking on a session the host already ended.
+    pub fn drain_host(&mut self) -> (Vec<(u32, u32, Vec<u8>)>, Vec<(u32, u32)>) {
         let mut ready = Vec::new();
         let mut closed = Vec::new();
         for (conn_id, c) in self.conns.iter_mut() {
@@ -179,19 +188,19 @@ impl ConsoleBridge {
             }
             let mut buf = vec![0u8; READ_CHUNK];
             match c.stream.read(&mut buf) {
-                Ok(0) => closed.push(*conn_id),
+                Ok(0) => closed.push((*conn_id, c.guest_port)),
                 Ok(n) => {
                     buf.truncate(n);
                     ready.push((*conn_id, c.guest_port, buf));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => closed.push(*conn_id),
+                Err(_) => closed.push((*conn_id, c.guest_port)),
             }
         }
-        for conn_id in closed {
+        for &(conn_id, _) in &closed {
             self.close(conn_id);
         }
-        ready
+        (ready, closed)
     }
 
     /// Write guest→host data (`OP_RW` the device received) to the host socket.
@@ -277,7 +286,7 @@ mod tests {
 
         // Before the guest accepts, request bytes stay buffered (not yet read).
         assert!(
-            bridge.drain_host().is_empty(),
+            bridge.drain_host().0.is_empty(),
             "no host bytes read before the stream is established"
         );
 
@@ -285,7 +294,7 @@ mod tests {
         bridge.on_established(conn_id);
         let mut got = None;
         for _ in 0..200 {
-            let ready = bridge.drain_host();
+            let (ready, _closed) = bridge.drain_host();
             if let Some((cid, gp, bytes)) = ready.into_iter().next() {
                 assert_eq!(cid, conn_id);
                 assert_eq!(gp, port);
