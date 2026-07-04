@@ -2420,6 +2420,23 @@ fn run_entrypoint_action(args: MachineRunArgs, resolved_flake_slot: Option<Strin
 /// For `--flake` runs the flake is built in the builder VM first (before mode
 /// dispatch) so all three lifecycles can reference the resulting slot hash
 /// uniformly. The build happens once regardless of mode.
+/// Warm-pool size for a run, forcing a cold boot (`0`) when an explicit
+/// `--hypervisor` override is present.
+///
+/// A warm claim matches a standby by image + config compat, *not* by backend
+/// identity, and the pool's standbys are pre-booted under the auto-detected
+/// backend. So without this an explicit `--hypervisor vz` could be silently
+/// satisfied by an in-house standby — the override would not be honored. An
+/// explicit backend choice is a deliberate A/B/debug run, not a throughput
+/// path, so cold-booting the exact requested backend is the right trade.
+fn resolved_warm_pool_size(mode: MachineRunMode, has_name: bool, hypervisor_override: bool) -> u32 {
+    if hypervisor_override {
+        0
+    } else {
+        mode.warm_pool_size(None, has_name)
+    }
+}
+
 fn run_dispatch(cli: &Cli, mut args: MachineRunArgs, cfg: &MvmConfig) -> Result<()> {
     // If a flake was given, build it into a slot before dispatching.
     // The resolved slot hash replaces the `--flake` flag so all paths
@@ -2440,7 +2457,8 @@ fn run_dispatch(cli: &Cli, mut args: MachineRunArgs, cfg: &MvmConfig) -> Result<
     }
 
     let mode = args.resolve_mode()?;
-    let warm_pool_size = mode.warm_pool_size(None, args.name.is_some());
+    let warm_pool_size =
+        resolved_warm_pool_size(mode, args.name.is_some(), args.hypervisor.is_some());
     // Resolve warm-pool eligibility per mode. Threaded into the
     // claim path next; logged here so the dark-landed decision is observable
     // (unnamed transient/interactive-transient take the residency size, named
@@ -2998,6 +3016,28 @@ mod tests {
         // of any override.
         assert_eq!(MachineRunMode::Persistent.warm_pool_size(Some(5), false), 0);
         assert_eq!(MachineRunMode::Persistent.warm_pool_size(None, true), 0);
+    }
+
+    #[test]
+    fn explicit_hypervisor_override_forces_cold_boot() {
+        // Without an override an unnamed transient run is warm-claim eligible
+        // (env-dependent size; assert it's not force-zeroed by this gate).
+        let base = resolved_warm_pool_size(MachineRunMode::Transient, false, false);
+        assert_eq!(
+            base,
+            MachineRunMode::Transient.warm_pool_size(None, false),
+            "no override → unchanged pool eligibility"
+        );
+        // An explicit `--hypervisor` forces a cold boot so the pool (auto-detected
+        // backend) can't silently satisfy the override with a different VMM.
+        assert_eq!(
+            resolved_warm_pool_size(MachineRunMode::Transient, false, true),
+            0
+        );
+        assert_eq!(
+            resolved_warm_pool_size(MachineRunMode::InteractiveTransient, false, true),
+            0
+        );
     }
 
     #[test]
