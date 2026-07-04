@@ -238,7 +238,7 @@ fn parse_allow_host(entry: &str) -> Result<mvm_core::network_policy::HostPort> {
 
 /// Resolve the requested hypervisor to the effective one for this host. `firecracker`
 /// (the default `--hypervisor`) auto-detects: KVM → firecracker, macOS 26+ Apple Silicon
-/// → vz, macOS 13-25 + libkrun → libkrun, else firecracker (surfaces a clear
+/// → inhouse (the HVF VMM), macOS 13-25 + libkrun → libkrun, else firecracker (surfaces a clear
 /// "not available" error). Any explicit value is returned as-is. The `MVM_HYPERVISOR`
 /// env var (alias `MVM_BACKEND`) overrides auto-detect — the workload-VMM override
 /// mirroring `MVM_BUILDER_BACKEND` for the builder, so a Linux/KVM host can opt into
@@ -263,7 +263,13 @@ pub fn resolve_effective_hypervisor(requested: &str) -> String {
     if plat.has_kvm() {
         "firecracker"
     } else if plat.is_vz_default_tier() {
-        "vz"
+        // macOS 26+ Apple Silicon → the in-house HVF VMM (Vz's replacement).
+        // `is_vz_default_tier` keeps its historical name but now selects the
+        // in-house runner, matching `AnyBackend::auto_select` so the persistent
+        // (`up` / `machine run --name`) and transient paths agree on the default.
+        // Vz is reachable only via an explicit `--hypervisor vz` until it is
+        // removed.
+        "inhouse"
     } else if plat.has_libkrun() {
         "libkrun"
     } else {
