@@ -69,8 +69,8 @@ fn pick_console_transport(name: &str) -> Result<Arc<dyn VsockTransport>> {
     // this arm, without needing an `is_dev_mode()` gate that would wrongly bar
     // an unsealed `machine run -it` outside a dev-shell session.
     if let Some(port) = mvm_guest::vsock::dev_console_data_ports().next() {
-        let console_sock =
-            mvm_core::config::vm_vz_vsock_dir(name).join(mvm_core::config::vsock_socket_filename(port));
+        let console_sock = mvm_core::config::vm_vz_vsock_dir(name)
+            .join(mvm_core::config::vsock_socket_filename(port));
         if console_sock.exists() {
             return Ok(Arc::new(DevConsoleTransport::for_vm(name)));
         }

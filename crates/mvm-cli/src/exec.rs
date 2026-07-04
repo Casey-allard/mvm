@@ -193,6 +193,25 @@ pub struct ExecRequest {
     /// stdin (`GuestRequest::Exec.stdin = None`). Set from piped host stdin
     /// when the host is not a TTY; always empty for PTY / interactive modes.
     pub stdin: Vec<u8>,
+    /// Explicit `--hypervisor` override for this transient run. `None` ⇒
+    /// auto-detect the platform default (`AnyBackend::auto_select`). `Some(name)`
+    /// forces `AnyBackend::from_hypervisor(name)` — the transient path used to
+    /// drop the flag and always auto-detect, so `--hypervisor vz` on a `machine
+    /// run` was silently ignored. Threaded from `RunArgs::hypervisor`.
+    pub hypervisor: Option<String>,
+}
+
+impl ExecRequest {
+    /// Resolve the workload backend for this request: the explicit
+    /// `--hypervisor` override when set, else the platform auto-detect. Single
+    /// point of truth so the boot path and its ctrl-c teardown pick the same
+    /// VMM (a mismatch would leak the VM the boot actually started).
+    fn resolve_backend(&self) -> AnyBackend {
+        match self.hypervisor.as_deref() {
+            Some(name) => AnyBackend::from_hypervisor(name),
+            None => AnyBackend::auto_select(),
+        }
+    }
 }
 
 impl ExecRequest {
@@ -413,14 +432,21 @@ pub fn transient_vm_name() -> String {
     mvm_core::naming::generate_machine_name()
 }
 
-/// Whether a transient run should pre-open interactive console data sockets.
+/// Whether a machine should pre-open the interactive dev-console data sockets.
 ///
-/// `true` only when the caller requested a PTY (`pty`) AND the image is not
-/// verity-sealed (`verity_path.is_none()`). Sealed images carry no dev-shell
-/// agent, so pre-opening the sockets would be wasteful and misleading; the
-/// interactive attach is separately refused at `enforce_accessible_gate`.
-pub fn transient_run_dev_console(pty: bool, verity_path: Option<&str>) -> bool {
-    pty && verity_path.is_none()
+/// `true` only for an **interactive, non-sealed** machine: the caller wants a
+/// console (`interactive`) AND the image is not sealed prod (`!sealed`). Both
+/// the transient (`machine run -it`) and persistent (`machine run --name`,
+/// dev-accessible for its lifetime via `machine shell` / `console`) paths route
+/// through this single predicate so the claim-15 exclusion can never drift
+/// between them.
+///
+/// For a sealed image the sockets would be inert anyway — the prod agent links
+/// no console symbol (claim 15) and `enforce_accessible_gate` refuses the attach
+/// — so keeping them closed is the belt-and-suspenders posture, not the only
+/// line of defense.
+pub fn dev_console_enabled(interactive: bool, sealed: bool) -> bool {
+    interactive && !sealed
 }
 
 /// Decide whether snapshot restore is safe for this request.
@@ -506,7 +532,7 @@ fn run_inner(
     capture: bool,
     admit: Option<&SessionAdmit<'_>>,
 ) -> Result<Either<i32, ExecOutput>> {
-    let backend = AnyBackend::auto_select();
+    let backend = req.resolve_backend();
 
     // Phase timing (off unless `MVM_PHASE_TIMING` is set): capture a
     // host-monotonic mark at each run seam, then emit a one-line breakdown
@@ -603,7 +629,7 @@ fn run_inner(
     // Pre-open console data sockets for interactive PTY runs against
     // non-sealed images. Sealed images carry no dev-shell agent; the
     // enforce_accessible_gate will refuse the attach separately.
-    let dev_console = transient_run_dev_console(req.pty, verity_path.as_deref());
+    let dev_console = dev_console_enabled(req.pty, verity_path.is_some());
 
     // Template-restore VMs run without plan admission. Leave tenant_id /
     // plan_json / bundle_json at their None defaults (via
@@ -724,14 +750,20 @@ fn run_inner(
     }
     let t_backend_started = timing.then(std::time::Instant::now);
 
-    // Install Ctrl-C handler that tears the VM down.
+    // Install Ctrl-C handler that tears the VM down. Resolve through the same
+    // `--hypervisor` override the boot used (not a bare auto_select) so the
+    // interrupt stops the VMM we actually started, not the platform default.
     let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let interrupted = interrupted.clone();
         let vm_name = vm_name.clone();
+        let hypervisor = req.hypervisor.clone();
         let _ = ctrlc::set_handler(move || {
             interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
-            let backend = AnyBackend::auto_select();
+            let backend = match hypervisor.as_deref() {
+                Some(name) => AnyBackend::from_hypervisor(name),
+                None => AnyBackend::auto_select(),
+            };
             let _ = backend.stop_transient(&VmId(vm_name.clone()));
         });
     }
@@ -1159,6 +1191,8 @@ pub fn dispatch_in_session(
         // running, so this never reaches a backend boot.
         network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
         stdin: Vec::new(),
+        // Never boots a backend here (see above); auto-detect is inert.
+        hypervisor: None,
     };
     let wrapper = build_guest_wrapper(&req, &[]);
     let transport = vsock_transport::for_vm(&vm.vm_name)?;
@@ -1364,6 +1398,7 @@ mod tests {
             pty: false,
             network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
             stdin: Vec::new(),
+            hypervisor: None,
         };
         assert_eq!(req.target_command(), "exec 'uname' '-a'");
     }
@@ -1386,6 +1421,7 @@ mod tests {
             pty: false,
             network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
             stdin: Vec::new(),
+            hypervisor: None,
         };
         let script = build_guest_wrapper(&req, &[]);
         assert!(script.starts_with("set -e\n"));
@@ -1416,6 +1452,7 @@ mod tests {
             pty: false,
             network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
             stdin: Vec::new(),
+            hypervisor: None,
         };
         let script = build_guest_wrapper(&req, &["mvm-extra-0".to_string()]);
         assert!(script.contains("mkdir -p '/g'"));
@@ -1446,6 +1483,7 @@ mod tests {
             pty: false,
             network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
             stdin: Vec::new(),
+            hypervisor: None,
         };
         let script = build_guest_wrapper(&req, &["mvm-extra-0".to_string()]);
         // RW mount is unqualified — no `-o ro`.
@@ -1681,6 +1719,7 @@ mod tests {
             pty: false,
             network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
             stdin: Vec::new(),
+            hypervisor: None,
         };
         assert_eq!(req.target_command(), "exec 'python' '-m' 'x'");
     }
@@ -1710,6 +1749,7 @@ mod tests {
             pty: false,
             network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
             stdin: Vec::new(),
+            hypervisor: None,
         };
         let script = build_guest_wrapper(&req, &[]);
         // Env from entrypoint exported.
@@ -1750,6 +1790,7 @@ mod tests {
             pty: false,
             network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
             stdin: Vec::new(),
+            hypervisor: None,
         };
         let script = build_guest_wrapper(&req, &[]);
         assert!(!script.contains("cd "));
@@ -1807,30 +1848,62 @@ mod tests {
         assert!(!snapshot_eligible(&prebuilt(), &[], true, true));
     }
 
-    // --- transient_run_dev_console ---
+    // --- dev_console_enabled (shared by the transient + persistent paths) ---
 
     #[test]
-    fn interactive_transient_run_sets_dev_console_when_not_sealed() {
-        // PTY-mode run against a non-sealed image must pre-open console sockets
-        // so the in-house backend can host-dial the guest's data port.
-        assert!(transient_run_dev_console(true, None));
+    fn interactive_non_sealed_enables_dev_console() {
+        // An interactive run against a non-sealed image must pre-open console
+        // sockets so the in-house backend can host-dial the guest's data port.
+        assert!(dev_console_enabled(true, false));
     }
 
     #[test]
-    fn non_interactive_transient_run_leaves_dev_console_unset() {
-        // A non-PTY run never needs the interactive console data sockets.
-        assert!(!transient_run_dev_console(false, None));
+    fn non_interactive_leaves_dev_console_unset() {
+        // A non-interactive run never needs the interactive console data sockets.
+        assert!(!dev_console_enabled(false, false));
     }
 
     #[test]
-    fn interactive_sealed_run_leaves_dev_console_unset() {
-        // A verity-sealed image has no dev-shell agent; pre-opening sockets
-        // is wasteful. enforce_accessible_gate refuses the attach separately.
-        assert!(!transient_run_dev_console(true, Some("/rootfs.verity")));
+    fn interactive_sealed_leaves_dev_console_unset() {
+        // A sealed prod image has no dev-shell console symbol (claim 15);
+        // keep the ports closed. enforce_accessible_gate refuses separately.
+        assert!(!dev_console_enabled(true, true));
     }
 
     #[test]
-    fn non_interactive_sealed_run_leaves_dev_console_unset() {
-        assert!(!transient_run_dev_console(false, Some("/rootfs.verity")));
+    fn non_interactive_sealed_leaves_dev_console_unset() {
+        assert!(!dev_console_enabled(false, true));
+    }
+
+    // --- resolve_backend (transient path honors --hypervisor) ---
+
+    #[test]
+    fn resolve_backend_honors_explicit_hypervisor_override() {
+        // The transient path used to always `auto_select()`, silently ignoring
+        // `--hypervisor`. An explicit override must now win — deterministically,
+        // regardless of the host platform.
+        let mut req = ExecRequest {
+            name: None,
+            warm_pool_size: 0,
+            image: ImageSource::Template("t".into()),
+            cpus: 1,
+            memory_mib: 256,
+            mem_initial_mib: None,
+            add_dirs: Vec::new(),
+            env: Vec::new(),
+            target: ExecTarget::Inline { argv: Vec::new() },
+            timeout_secs: None,
+            pty: false,
+            network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
+            stdin: Vec::new(),
+            hypervisor: Some("firecracker".into()),
+        };
+        assert_eq!(req.resolve_backend().name(), "firecracker");
+        req.hypervisor = Some("libkrun".into());
+        assert_eq!(req.resolve_backend().name(), "libkrun");
+        // `inhouse`/`in-house` both select the WorkloadRunner, whose driver
+        // reports the concrete VMM name (`hvf`).
+        req.hypervisor = Some("inhouse".into());
+        assert_eq!(req.resolve_backend().name(), "hvf");
     }
 }

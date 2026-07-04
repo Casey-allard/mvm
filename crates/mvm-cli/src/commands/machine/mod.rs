@@ -295,6 +295,7 @@ impl MachineRunArgs {
             // transient mode.
             warm_pool_size: 0,
             pty: false,
+            hypervisor: self.hypervisor,
             vm_name: self.name,
             image: self.image,
             net: self.net,

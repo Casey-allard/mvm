@@ -1432,7 +1432,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(shut, "host close frames OP_SHUTDOWN to the guest console port");
+        assert!(
+            shut,
+            "host close frames OP_SHUTDOWN to the guest console port"
+        );
         assert!(!d.console.is_console_stream(conn_id), "stream dropped");
     }
 

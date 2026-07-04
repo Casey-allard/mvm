@@ -34,6 +34,12 @@ use super::agent_bridge::write_nonblocking;
 
 /// Per-drain read budget per host connection.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// Console reads ready to `OP_RW` to the guest: `(conn_id, guest_port, bytes)`.
+type ConsoleReady = Vec<(u32, u32, Vec<u8>)>;
+/// Console streams whose host side closed, to `OP_SHUTDOWN` to the guest:
+/// `(conn_id, guest_port)`.
+type ConsoleClosed = Vec<(u32, u32)>;
 /// First host-assigned vsock port for console streams. Kept well above both the
 /// guest's well-known listener ports and the agent bridge's host-port space so a
 /// console conn id can never collide with an agent conn id (they share the device's
@@ -179,7 +185,7 @@ impl ConsoleBridge {
     /// side hit EOF/error — the device must `OP_SHUTDOWN` those to the guest on
     /// their console port so the guest console listener tears its side down instead
     /// of blocking on a session the host already ended.
-    pub fn drain_host(&mut self) -> (Vec<(u32, u32, Vec<u8>)>, Vec<(u32, u32)>) {
+    pub fn drain_host(&mut self) -> (ConsoleReady, ConsoleClosed) {
         let mut ready = Vec::new();
         let mut closed = Vec::new();
         for (conn_id, c) in self.conns.iter_mut() {

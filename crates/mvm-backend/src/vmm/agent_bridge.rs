@@ -325,7 +325,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(closed_seen, vec![conn_id], "closed stream reported once");
-        assert!(!bridge.is_agent_stream(conn_id), "and dropped from open set");
+        assert!(
+            !bridge.is_agent_stream(conn_id),
+            "and dropped from open set"
+        );
         assert_eq!(active.load(Ordering::Relaxed), 0, "active counter drops");
     }
 

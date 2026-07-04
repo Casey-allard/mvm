@@ -14,7 +14,8 @@ use mvm_core::plan::SecretBinding;
 use mvm_core::policy::RedactionPolicy;
 use mvm_core::policy::network_policy::NetworkPolicy;
 use mvm_core::vm_backend::{
-    VmBackend, VmCapabilities, VmExitStatus, VmId, VmInfo, VmStartConfig, VmStatus,
+    BackendSecurityProfile, ClaimStatus, LayerCoverage, VmBackend, VmCapabilities, VmExitStatus,
+    VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
 use crate::driver::{RunningVm, VmmDriver};
@@ -161,6 +162,34 @@ impl<D: VmmDriver, S: EndpointSpawner> WorkloadRunner<D, S> {
 impl<D: VmmDriver + 'static, S: EndpointSpawner + 'static> VmBackend for WorkloadRunner<D, S> {
     fn name(&self) -> &str {
         self.driver.name()
+    }
+
+    fn security_profile(&self) -> BackendSecurityProfile {
+        // The in-house HVF VMM is the destination macOS backend and Vz's
+        // replacement: a hardware-isolated microVM on Hypervisor.framework with
+        // the same host↔guest posture, so its claim table mirrors Vz's (`vz.rs`).
+        // Tier 2 rather than Tier 1 because claim 3 (verified boot / dm-verity)
+        // targets Firecracker today. Without this override the trait default
+        // reported tier "Unknown", so `mvmctl doctor` showed no posture on the
+        // macOS-26 default.
+        BackendSecurityProfile {
+            claims: [
+                ClaimStatus::Holds, // 1 — host-fs isolation via HVF (ro virtio-blk rootfs) + host-side admission gate
+                ClaimStatus::Holds, // 2 — uid-0 protections (guest-side, backend-independent)
+                ClaimStatus::DoesNotHold, // 3 — verified-boot pipeline targets Firecracker today
+                ClaimStatus::Holds, // 4 — prod guest agent links no do_exec
+                ClaimStatus::Holds, // 5 — vsock framing fuzzed
+                ClaimStatus::Holds, // 6 — dev image hash verified
+                ClaimStatus::Holds, // 7 — cargo deps audited
+            ],
+            layer_coverage: LayerCoverage::all_layers(),
+            tier: "Tier 2",
+            notes: &[
+                "Hardware isolation via the in-house Hypervisor.framework VMM (macOS 26+ default).",
+                "Claim 10 egress default-deny enforced by the per-VM substitution endpoint over vsock.",
+                "Claim 3 (verified boot) partial — the dm-verity pipeline targets Firecracker today.",
+            ],
+        }
     }
 
     fn capabilities(&self) -> VmCapabilities {
@@ -362,6 +391,26 @@ mod tests {
             .find(|p| p.guest_port == EGRESS_PORT)
             .map(|p| p.host_uds.as_path())
             .expect("spec carries an EGRESS_PORT vsock channel")
+    }
+
+    #[test]
+    fn security_profile_is_tier_2_with_claim_3_partial() {
+        // The in-house runner reports a real posture (Tier 2, claim 3 partial),
+        // parity with Vz — not the trait default's "Unknown", which left
+        // `mvmctl doctor` blank on the macOS-26 default backend.
+        let runner =
+            WorkloadRunner::new(MockDriver::default(), RecordingSpawner::new("/run/ep.sock"));
+        let p = runner.security_profile();
+        assert_eq!(p.tier, "Tier 2");
+        assert_eq!(p.claims[2], ClaimStatus::DoesNotHold, "claim 3 partial");
+        assert!(
+            p.claims
+                .iter()
+                .enumerate()
+                .all(|(i, &c)| i == 2 || c == ClaimStatus::Holds),
+            "all claims but 3 hold"
+        );
+        assert!(p.layer_coverage.is_microvm(), "hardware-isolated microVM");
     }
 
     #[test]

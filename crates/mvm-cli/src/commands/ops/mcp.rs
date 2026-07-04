@@ -430,6 +430,8 @@ impl ExecDispatcher {
             // MCP runs untrusted code: deny egress by default.
             network_policy: mvm_core::network_policy::NetworkPolicy::deny_all(),
             stdin: Vec::new(),
+            // MCP doesn't expose a hypervisor flag — platform auto-detect.
+            hypervisor: None,
         };
         // Admit the run (see `mcp_untrusted_admit`): without it no bridge spawns
         // and the deny-all above is inert on the libkrun/Vz backends.

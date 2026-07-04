@@ -1200,11 +1200,13 @@ pub(in crate::commands) fn start_persistent_oci_machine(
     // A persistent named/detached machine is dev-accessible for its lifetime:
     // `machine run -t` boots through here, and `machine shell` / `machine
     // console` attach to it later. Pre-open the interactive-console data range
-    // so those attaches reach the agent's dynamic data port on the
-    // per-port-UDS backends (libkrun, Vz). Claim 15 still bars a sealed prod
-    // guest at the agent + `enforce_accessible_gate`, leaving the listeners
-    // inert there.
-    start_config.dev_console = true;
+    // so those attaches reach the agent's dynamic data port on the per-port-UDS
+    // backends (in-house, libkrun, Vz) — but only for a non-sealed image. The
+    // same `dev_console_enabled` predicate the transient `-it` path uses gates
+    // it here, so the claim-15 exclusion can't drift between the two paths: a
+    // sealed prod guest keeps the ports closed (belt-and-suspenders over the
+    // no-console-symbol agent + `enforce_accessible_gate`).
+    start_config.dev_console = crate::exec::dev_console_enabled(true, profile != "dev");
     attach_runtime_overlay_if_cached(&mut start_config, &effective_hypervisor);
     if let Some(ctx) = admission.as_ref() {
         thread_tenant_id(&mut start_config, &ctx.admitted);

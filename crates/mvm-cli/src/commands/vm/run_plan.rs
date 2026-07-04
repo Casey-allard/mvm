@@ -531,6 +531,7 @@ mod tests {
             manifest: None,
             warm_pool_size: 0,
             pty: false,
+            hypervisor: None,
             vm_name: None,
             image: None,
             net: false,

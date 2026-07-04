@@ -40,6 +40,10 @@ pub(in crate::commands) struct Args {
     /// Internal (not a CLI flag): attach the command to a PTY.
     #[arg(skip)]
     pub pty: bool,
+    /// Internal (not a CLI flag): explicit `--hypervisor` override, carried
+    /// from `RunArgs::hypervisor` (ultimately `machine run --hypervisor`).
+    #[arg(skip)]
+    pub hypervisor: Option<String>,
     /// Internal (not a CLI flag): optional foreground transient VM identity.
     #[arg(skip)]
     pub vm_name: Option<String>,
@@ -115,6 +119,12 @@ pub(in crate::commands) struct RunArgs {
     /// Internal (not a CLI flag): attach the command to a PTY.
     #[arg(skip)]
     pub pty: bool,
+    /// Internal (not a CLI flag): explicit `--hypervisor` override for the
+    /// workload backend, threaded from `MachineRunArgs::hypervisor`. `None` ⇒
+    /// platform auto-detect. The user-facing flag lives on `machine run`; the
+    /// hidden `run` SDK verb doesn't expose it, so it's `#[arg(skip)]` here.
+    #[arg(skip)]
+    pub hypervisor: Option<String>,
     /// Internal (not a CLI flag): optional foreground transient VM identity.
     #[arg(skip)]
     pub vm_name: Option<String>,
@@ -262,6 +272,7 @@ impl RunArgs {
             manifest: self.manifest,
             warm_pool_size: self.warm_pool_size,
             pty: self.pty,
+            hypervisor: self.hypervisor,
             vm_name: self.vm_name,
             cpus: self.cpus,
             memory: self.memory,
@@ -328,9 +339,12 @@ pub(in crate::commands) fn run_secure(cli: &Cli, args: RunArgs, cfg: &MvmConfig)
     // unfiltered path. The closure runs inside the boot path with the resolved
     // rootfs + generated vm_name. cpus/mem are captured here because `args` is
     // consumed by `into_exec_args()` below.
-    let admit_backend = mvm_backend::backend::AnyBackend::auto_select()
-        .name()
-        .to_string();
+    let admit_backend = match args.hypervisor.as_deref() {
+        Some(name) => mvm_backend::backend::AnyBackend::from_hypervisor(name),
+        None => mvm_backend::backend::AnyBackend::auto_select(),
+    }
+    .name()
+    .to_string();
     // The closure below moves `admit_backend`; keep a copy for the receipt's
     // honest per-backend enforcement tier.
     let receipt_backend = admit_backend.clone();
@@ -704,6 +718,7 @@ fn build_exec_request(
         network_policy,
         warm_pool_size: args.warm_pool_size,
         stdin: args.stdin,
+        hypervisor: args.hypervisor,
     })
 }
 
@@ -1373,6 +1388,7 @@ mod tests {
         RunArgs {
             warm_pool_size: 0,
             pty: false,
+            hypervisor: None,
             vm_name: None,
             manifest: None,
             image: None,
