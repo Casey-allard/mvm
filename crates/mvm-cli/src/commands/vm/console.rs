@@ -22,10 +22,11 @@ use crate::ui;
 ///    its socket is present (the dev VM lives in the builder cache, a
 ///    different path than `VzTransport::for_vm` resolves).
 /// 2. libkrun per-port Unix socket.
-/// 3. In-house runner (`WorkloadRunner` / HVF) agent socket at
-///    `<vm_state_dir>/agent.sock`, only when `is_dev_mode()` — the
-///    pre-opened console sockets exist only when the dev console was
-///    enabled at boot.
+/// 3. In-house runner (`WorkloadRunner` / HVF): selected when a pre-opened
+///    console data socket (`<vm_state_dir>/vsock/vsock-<port>.sock`) exists —
+///    which happens only when `dev_console` was set at boot (an unsealed
+///    interactive run; a sealed prod rootfs never has one, upholding claim 15).
+///    Agent RPC then dials `<vm_state_dir>/agent.sock`.
 /// 4. Vz per-port Unix socket (`<vm_state_dir>/vsock/vsock-<port>.sock`) —
 ///    the macOS AVF path.
 /// 5. Firecracker UDS multiplexer (fleet/production path).
@@ -60,13 +61,18 @@ fn pick_console_transport(name: &str) -> Result<Arc<dyn VsockTransport>> {
     }
     // In-house runner (WorkloadRunner / HVF) exposes the agent at
     // `<vm_state_dir>/agent.sock` and console data ports at
-    // `<vm_state_dir>/vsock/vsock-<port>.sock`. Dev-only: the pre-opened
-    // console sockets are only present when `dev_console` was set at boot,
-    // and this arm is gated on `is_dev_mode()`.
-    if mvm_core::config::is_dev_mode() {
-        let inhouse = DevConsoleTransport::for_vm(name);
-        if inhouse.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
-            return Ok(Arc::new(inhouse));
+    // `<vm_state_dir>/vsock/vsock-<port>.sock`. Select by EXISTENCE of a
+    // pre-opened console data socket, not a connect-probe (on the in-house VMM
+    // every host connect is a real guest OP_REQUEST). Claim 15: those sockets
+    // exist only when `dev_console` was set at boot — never for a sealed prod
+    // rootfs (verity ⇒ dev_console=false) — so a sealed guest never matches
+    // this arm, without needing an `is_dev_mode()` gate that would wrongly bar
+    // an unsealed `machine run -it` outside a dev-shell session.
+    if let Some(port) = mvm_guest::vsock::dev_console_data_ports().next() {
+        let console_sock =
+            mvm_core::config::vm_vz_vsock_dir(name).join(mvm_core::config::vsock_socket_filename(port));
+        if console_sock.exists() {
+            return Ok(Arc::new(DevConsoleTransport::for_vm(name)));
         }
     }
     // Vz workloads expose the agent at `<vm_state_dir>/vsock/vsock-<port>.sock`
@@ -758,34 +764,41 @@ mod picker_inhouse_tests {
 
     use super::*;
 
-    /// Bind `agent.sock` under a fresh temp state-dir, set `MVM_DATA_DIR` so
-    /// `vm_state_dir` resolves there, and set `MVM_ENV=dev` so the inhouse arm
-    /// in `pick_console_transport` fires. Returns the guard objects that keep
-    /// the socket and env alive for the test.
+    /// Bind `agent.sock` AND a pre-opened console data socket
+    /// (`vsock/vsock-20001.sock`) under a fresh temp state-dir, set
+    /// `MVM_DATA_DIR` so `vm_state_dir` resolves there. The console data
+    /// socket's existence is what selects the in-house arm (it is bound only
+    /// when `dev_console` was set at boot — i.e. an unsealed interactive run).
+    /// Returns the guards that keep the sockets and env alive for the test.
     fn setup_inhouse_agent(
         name: &str,
     ) -> (
         tempfile::TempDir,
         mvm_core::util::test_env::TestEnv,
         UnixListener,
+        UnixListener,
     ) {
         let mut env = mvm_core::util::test_env::TestEnv::new();
         let tmp = tempfile::tempdir_in("/tmp").expect("state tempdir");
         env.set("MVM_DATA_DIR", tmp.path());
-        env.set("MVM_ENV", "dev");
         let state = mvm_core::config::vm_state_dir(name);
         std::fs::create_dir_all(&state).unwrap();
-        let agent = state.join("agent.sock");
-        let listener = UnixListener::bind(&agent).unwrap();
-        (tmp, env, listener)
+        let agent_l = UnixListener::bind(state.join("agent.sock")).unwrap();
+        // Pre-opened console data socket: existence selects the in-house arm.
+        let vdir = mvm_core::config::vm_vz_vsock_dir(name);
+        std::fs::create_dir_all(&vdir).unwrap();
+        let port = mvm_guest::vsock::dev_console_data_ports().next().unwrap();
+        let console_l =
+            UnixListener::bind(vdir.join(mvm_core::config::vsock_socket_filename(port))).unwrap();
+        (tmp, env, agent_l, console_l)
     }
 
-    // TDD RED: picker selects DevConsoleTransport for an in-house dev workload
-    // when agent.sock is reachable and MVM_ENV=dev.
+    // Picker selects DevConsoleTransport for an in-house interactive workload
+    // when its console data socket was pre-opened (dev_console set at boot).
     #[test]
     fn pick_console_transport_selects_inhouse_for_dev_workload() {
         let name = "inhouse-dev-workload";
-        let (_tmp, _env, _listener) = setup_inhouse_agent(name);
+        let (_tmp, _env, _agent, _console) = setup_inhouse_agent(name);
 
         let transport =
             pick_console_transport(name).expect("picker must resolve inhouse transport");
@@ -794,23 +807,23 @@ mod picker_inhouse_tests {
             .expect("selected transport must connect to agent.sock");
     }
 
-    // TDD RED: without MVM_ENV=dev the inhouse arm must NOT fire even when
-    // agent.sock is present — falls through to Firecracker (or errors).
+    // Claim 15: with NO pre-opened console data socket (a sealed / non-dev_console
+    // boot), the inhouse arm must NOT fire even though agent.sock is present —
+    // falls through to Firecracker (or errors).
     #[test]
-    fn pick_console_transport_skips_inhouse_when_not_dev_mode() {
+    fn pick_console_transport_skips_inhouse_without_console_sockets() {
         let mut env = mvm_core::util::test_env::TestEnv::new();
         let tmp = tempfile::tempdir_in("/tmp").expect("state tempdir");
         env.set("MVM_DATA_DIR", tmp.path());
-        // Explicitly not dev mode — either unset or prod.
-        env.set("MVM_ENV", "prod");
 
-        let name = "inhouse-prod-workload";
+        let name = "inhouse-sealed-workload";
         let state = mvm_core::config::vm_state_dir(name);
         std::fs::create_dir_all(&state).unwrap();
         let agent = state.join("agent.sock");
         let _listener = UnixListener::bind(&agent).unwrap();
+        // Deliberately NO vsock/vsock-20001.sock → the existence gate misses.
 
-        // Non-dev: inhouse arm must not fire. The picker falls through; the Vz
+        // No console socket: inhouse arm must not fire. The picker falls through; the Vz
         // probe will also miss (no vsock/ socket), so Firecracker fallback runs.
         // A successful fallback would be wrong here (no FC socket either), so we
         // accept either an Err OR a transport that can't connect to agent.sock —
@@ -854,12 +867,18 @@ mod picker_inhouse_tests {
         std::fs::create_dir_all(dev_sock.parent().unwrap()).unwrap();
         let _dev_listener = UnixListener::bind(&dev_sock).unwrap();
 
-        // Workload's inhouse agent.sock also present.
+        // Workload's inhouse agent.sock + a pre-opened console data socket
+        // (the existence gate for the in-house arm) also present.
         let name = "inhouse-with-dev-present";
         let state = mvm_core::config::vm_state_dir(name);
         std::fs::create_dir_all(&state).unwrap();
         let workload_agent = state.join("agent.sock");
         let _workload_listener = UnixListener::bind(&workload_agent).unwrap();
+        let vdir = mvm_core::config::vm_vz_vsock_dir(name);
+        std::fs::create_dir_all(&vdir).unwrap();
+        let cport = mvm_guest::vsock::dev_console_data_ports().next().unwrap();
+        let _console_listener =
+            UnixListener::bind(vdir.join(mvm_core::config::vsock_socket_filename(cport))).unwrap();
 
         // The picker must select the workload's own inhouse socket, not the
         // dev/builder socket. Connection to agent.sock must succeed.
