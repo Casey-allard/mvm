@@ -210,11 +210,24 @@ pub fn sweep(
     report
 }
 
-/// Supervisor pid-file names a per-VM state dir may carry. `pid` is the
-/// Apple-Container dev-VM owner file; `libkrun.pid` / `vz.pid` are the
-/// workload-supervisor files. The first one that exists and points at a
-/// live process marks the dir as having a live owner.
-const PID_FILE_NAMES: &[&str] = &["libkrun.pid", "vz.pid", "pid"];
+/// Supervisor pid-file names a per-VM state dir may carry, one per workload
+/// backend — kept in step with the backend catalog's `marker_file`s
+/// (`fc.pid` / `libkrun.pid` / `vz.pid` / `qemu.pid` / `hvf.pid`). `pid` is the
+/// legacy dev-VM owner file. The first one that exists and points at a live
+/// process marks the dir as having a live owner.
+///
+/// Every backend's marker MUST appear here: a missing name makes convergence
+/// read a live VM of that backend as a dead-process leftover and reap its state
+/// dir out from under the running supervisor. `hvf.pid` (the in-house VMM) was
+/// absent, so `machine ls` on an in-house macOS host wiped live machines.
+const PID_FILE_NAMES: &[&str] = &[
+    "fc.pid",
+    "libkrun.pid",
+    "vz.pid",
+    "qemu.pid",
+    "hvf.pid",
+    "pid",
+];
 
 /// `kill(pid, 0)` existence probe — delivers no signal, just checks the
 /// process is alive. The cheap half of the live-vs-orphan discrimination
@@ -408,6 +421,25 @@ mod tests {
             std::fs::write(dir.join("libkrun.pid"), pid.to_string()).unwrap();
         }
         dir.to_string_lossy().into_owned()
+    }
+
+    /// Every backend's supervisor marker must count as a live owner — a
+    /// missing name (notably `hvf.pid` for the in-house VMM) makes convergence
+    /// reap a live VM's state dir. Regression for the in-house `machine ls` wipe.
+    #[test]
+    fn dir_has_live_process_recognizes_every_backend_marker() {
+        let live = std::process::id() as i32;
+        for marker in PID_FILE_NAMES {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(marker), live.to_string()).unwrap();
+            assert!(
+                dir_has_live_process(tmp.path()),
+                "{marker} pointing at a live pid must mark the dir as live-owned"
+            );
+        }
+        // An empty state dir (no marker) has no live owner.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!dir_has_live_process(empty.path()));
     }
 
     /// In-memory [`RuntimeView`] for hermetic classification tests.

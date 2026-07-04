@@ -61,19 +61,27 @@ fn pick_console_transport(name: &str) -> Result<Arc<dyn VsockTransport>> {
     }
     // In-house runner (WorkloadRunner / HVF) exposes the agent at
     // `<vm_state_dir>/agent.sock` and console data ports at
-    // `<vm_state_dir>/vsock/vsock-<port>.sock`. Select by EXISTENCE of a
-    // pre-opened console data socket, not a connect-probe (on the in-house VMM
-    // every host connect is a real guest OP_REQUEST). Claim 15: those sockets
-    // exist only when `dev_console` was set at boot — never for a sealed prod
-    // rootfs (verity ⇒ dev_console=false) — so a sealed guest never matches
-    // this arm, without needing an `is_dev_mode()` gate that would wrongly bar
-    // an unsealed `machine run -it` outside a dev-shell session.
-    if let Some(port) = mvm_guest::vsock::dev_console_data_ports().next() {
-        let console_sock = mvm_core::config::vm_vz_vsock_dir(name)
-            .join(mvm_core::config::vsock_socket_filename(port));
-        if console_sock.exists() {
-            return Ok(Arc::new(DevConsoleTransport::for_vm(name)));
-        }
+    // `<vm_state_dir>/vsock/vsock-<port>.sock`. Select by EXISTENCE (not a
+    // connect-probe — on the in-house VMM every host connect is a real guest
+    // OP_REQUEST) when EITHER:
+    //   - `agent.sock` exists — every in-house machine binds it, so this is the
+    //     selector for agent RPC (`machine exec` / non-interactive), including a
+    //     persistent `machine run -d` that never set `dev_console`; or
+    //   - a pre-opened console data socket exists — an interactive `-it` boot.
+    // `DevConsoleTransport` serves both the agent port and the console ports.
+    // Claim 15 is unaffected: a sealed prod guest still binds `agent.sock` for
+    // entrypoint dispatch, but its agent carries no `do_exec`/console symbol and
+    // the interactive attach is separately refused at `enforce_accessible_gate`,
+    // so matching here never grants interactive access to a sealed VM.
+    let inhouse_agent_sock = mvm_core::config::vm_state_dir(name).join("agent.sock");
+    let inhouse_console_sock = mvm_guest::vsock::dev_console_data_ports()
+        .next()
+        .map(|port| {
+            mvm_core::config::vm_vz_vsock_dir(name)
+                .join(mvm_core::config::vsock_socket_filename(port))
+        });
+    if inhouse_agent_sock.exists() || inhouse_console_sock.is_some_and(|sock| sock.exists()) {
+        return Ok(Arc::new(DevConsoleTransport::for_vm(name)));
     }
     // Vz workloads expose the agent at `<vm_state_dir>/vsock/vsock-<port>.sock`
     // (one subdir deeper than libkrun); without this probe `console` fell
@@ -807,43 +815,31 @@ mod picker_inhouse_tests {
             .expect("selected transport must connect to agent.sock");
     }
 
-    // Claim 15: with NO pre-opened console data socket (a sealed / non-dev_console
-    // boot), the inhouse arm must NOT fire even though agent.sock is present —
-    // falls through to Firecracker (or errors).
+    // A persistent in-house machine with NO pre-opened console data socket (a
+    // non-`dev_console` boot — e.g. `machine run -d --image`) still binds
+    // `agent.sock`, so the inhouse arm DOES fire: `machine exec` needs the agent
+    // RPC port even without an interactive console. Claim 15 is not weakened —
+    // interactive attach to a sealed VM is refused at `enforce_accessible_gate`
+    // (before the picker) and the sealed prod agent links no `do_exec`/console
+    // symbol, so reaching `agent.sock` grants no interactive access.
     #[test]
-    fn pick_console_transport_skips_inhouse_without_console_sockets() {
+    fn pick_console_transport_selects_inhouse_by_agent_sock_without_console_sockets() {
         let mut env = mvm_core::util::test_env::TestEnv::new();
         let tmp = tempfile::tempdir_in("/tmp").expect("state tempdir");
         env.set("MVM_DATA_DIR", tmp.path());
 
-        let name = "inhouse-sealed-workload";
+        let name = "inhouse-persistent-workload";
         let state = mvm_core::config::vm_state_dir(name);
         std::fs::create_dir_all(&state).unwrap();
         let agent = state.join("agent.sock");
         let _listener = UnixListener::bind(&agent).unwrap();
-        // Deliberately NO vsock/vsock-20001.sock → the existence gate misses.
+        // Deliberately NO vsock/vsock-20001.sock — agent.sock alone must select.
 
-        // No console socket: inhouse arm must not fire. The picker falls through; the Vz
-        // probe will also miss (no vsock/ socket), so Firecracker fallback runs.
-        // A successful fallback would be wrong here (no FC socket either), so we
-        // accept either an Err OR a transport that can't connect to agent.sock —
-        // the important thing is the transport is NOT the DevConsoleTransport.
-        match pick_console_transport(name) {
-            Err(_) => {
-                // Expected: picker fell through to FC which failed — fine.
-            }
-            Ok(transport) => {
-                // If somehow a transport was selected, it must NOT be the inhouse
-                // one — it must fail to connect to agent.sock (FC path won't know
-                // about agent.sock).
-                assert!(
-                    transport
-                        .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
-                        .is_err(),
-                    "non-dev mode must not route to the inhouse agent socket"
-                );
-            }
-        }
+        let transport = pick_console_transport(name)
+            .expect("picker must resolve the inhouse transport from agent.sock alone");
+        transport
+            .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+            .expect("selected transport must connect to agent.sock");
     }
 
     // Extend the boundary test: even with MVM_ENV=dev (which enables the

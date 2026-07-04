@@ -2150,8 +2150,16 @@ fn resolve_persistent_spec(
 
 /// `kill(pid,0)`-cheap liveness probe via the active backend.
 fn machine_is_running(name: &str) -> bool {
-    let backend =
-        AnyBackend::from_hypervisor(&super::shared::resolve_effective_hypervisor("firecracker"));
+    // Resolve the backend that ACTUALLY started this machine, by probing its
+    // per-VM marker file (`fc.pid` / `vz.pid` / `hvf.pid` / …), before falling
+    // back to the platform default. A machine booted under the in-house VMM
+    // writes `hvf.pid`, but `resolve_effective_hypervisor` still returns "vz" on
+    // macOS-26 — so the old default-backend probe looked for `vz.pid`, never
+    // found it, and reported every in-house machine as `stopped` even while its
+    // supervisor was live.
+    let backend = AnyBackend::for_started_vm(name).unwrap_or_else(|| {
+        AnyBackend::from_hypervisor(&super::shared::resolve_effective_hypervisor("firecracker"))
+    });
     matches!(
         backend.status(&VmId(name.to_string())),
         Ok(VmStatus::Running)
