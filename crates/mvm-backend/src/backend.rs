@@ -12,7 +12,6 @@ use mvm_core::vm_backend::{
 use crate::base::config::{PortMapping, VMS_DIR, VmSlot};
 use crate::base::shell::run_in_vm_stdout;
 use crate::driver::InHouseDriver;
-use crate::hvf_backend::HvfBackend;
 use crate::image::RuntimeVolume;
 use crate::libkrun::LibkrunBackend;
 use crate::microvm::{DriveFile, FlakeRunConfig};
@@ -486,18 +485,13 @@ pub enum AnyBackend {
     /// [`crate::mock::MockBackend`] for the rationale and security
     /// profile (Tier 3 / claims unknown).
     Mock(MockBackend),
-    /// Raw HVF — Hypervisor.framework on macOS / Apple silicon,
-    /// driven by the unified `vmm::run` loop via the detached
-    /// `mvm-hvf-supervisor`. Opt-in via `--hypervisor hvf` / `MVM_BACKEND=hvf`;
-    /// `auto_select` doesn't pick it yet (Vz remains the macOS-26 default until
-    /// HVF reaches workload parity). The destination macOS backend.
-    Hvf(HvfBackend),
-    /// The in-house VMM driven through the unified `WorkloadRunner` over the
-    /// driver seam — the role-runner that will replace the per-backend
-    /// Hvf/Libkrun/Vz/FC `start()` copies. Opt-in via `--hypervisor inhouse`;
-    /// the `hvf` selector still resolves to `HvfBackend` until the runner is the
-    /// proven default. Same in-house VMM, tier, and security profile as `Hvf` —
-    /// just reached via the runner role.
+    /// The in-house VMM (Hypervisor.framework on macOS / Apple silicon, KVM on
+    /// Linux) driven through the unified `WorkloadRunner` over the `VmmDriver`
+    /// seam. This is the sole in-house macOS backend and Vz's replacement: the
+    /// `hvf` and `inhouse` selectors both resolve here, `auto_select` picks it on
+    /// the macOS-26 Apple-Silicon tier, and it reports `name()` "hvf" /
+    /// `BackendKind::Hvf` with the `hvf.pid` marker. The claim-10 egress gate and
+    /// secret substitution live in the per-VM host endpoint the runner binds.
     InHouse(InHouseRunner),
 }
 
@@ -522,17 +516,9 @@ impl AnyBackend {
     ///
     /// Supported: `"firecracker"` (default), `"qemu"` (Linux dev/test),
     /// `"vz"` (Apple Virtualization.framework, macOS), `"libkrun"`
-    /// (Linux KVM / macOS HVF). Unknown names fall back to Firecracker.
+    /// (Linux KVM / macOS HVF), and `"hvf"` / `"inhouse"` (the in-house VMM via
+    /// the `WorkloadRunner`). Unknown names fall back to Firecracker.
     pub fn from_hypervisor(name: &str) -> Self {
-        // The runner isn't const-constructible, so it can't live in the catalog
-        // table; special-case its opt-in selector before the descriptor lookup.
-        // Every other selector — `hvf` included — stays byte-identical.
-        if matches!(name, "inhouse" | "in-house") {
-            return Self::InHouse(WorkloadRunner::new(
-                InHouseDriver::new(),
-                RealEndpointSpawner,
-            ));
-        }
         catalog::descriptor_for_selector(name)
             .map(|descriptor| descriptor.instantiate())
             .unwrap_or_else(Self::default_backend)
@@ -628,7 +614,7 @@ impl AnyBackend {
             Self::Vz(_) => catalog::BackendKind::Vz,
             Self::Qemu(_) => catalog::BackendKind::Qemu,
             Self::Mock(_) => catalog::BackendKind::Mock,
-            Self::Hvf(_) | Self::InHouse(_) => catalog::BackendKind::Hvf,
+            Self::InHouse(_) => catalog::BackendKind::Hvf,
         }
     }
 
@@ -639,7 +625,6 @@ impl AnyBackend {
             Self::Vz(backend) => backend,
             Self::Qemu(backend) => backend,
             Self::Mock(backend) => backend,
-            Self::Hvf(backend) => backend,
             Self::InHouse(backend) => backend,
         }
     }
@@ -655,7 +640,6 @@ impl AnyBackend {
             Self::Vz(backend) => std::sync::Arc::new(backend) as std::sync::Arc<dyn VmBackend>,
             Self::Qemu(backend) => std::sync::Arc::new(backend) as std::sync::Arc<dyn VmBackend>,
             Self::Mock(backend) => std::sync::Arc::new(backend) as std::sync::Arc<dyn VmBackend>,
-            Self::Hvf(backend) => std::sync::Arc::new(backend) as std::sync::Arc<dyn VmBackend>,
             Self::InHouse(backend) => std::sync::Arc::new(backend) as std::sync::Arc<dyn VmBackend>,
         }
     }
@@ -706,13 +690,10 @@ impl AnyBackend {
             AnyBackend::Vz(b) => Some(b),
             AnyBackend::Mock(b) => Some(b),
             AnyBackend::Qemu(_) => None,
-            // HVF carries untrusted workloads: claim-10 default-deny egress, a real
-            // mkGuest workload boot, a host-reachable guest agent, and now the
-            // secret-substitution gateway (claim-10 at the substitution bridge,
-            // claims 12/13 at the per-VM endpoint) all run on the in-house VMM.
-            AnyBackend::Hvf(b) => Some(b),
-            // Same in-house VMM as Hvf, reached via the runner role: claim-10 at
-            // the endpoint, claims 12/13 at the per-VM substitution endpoint.
+            // The in-house VMM carries untrusted workloads via the runner role:
+            // claim-10 default-deny egress at the per-VM substitution endpoint, a
+            // real mkGuest workload boot, a host-reachable guest agent, and the
+            // secret-substitution gateway (claims 12/13 at the per-VM endpoint).
             AnyBackend::InHouse(b) => Some(b),
         }
     }
@@ -1061,43 +1042,22 @@ mod tests {
     }
 
     #[test]
-    fn test_any_backend_from_hypervisor_hvf() {
-        // `--hypervisor hvf` (and the `hypervisor` alias) resolve to HvfBackend.
-        for sel in ["hvf", "hypervisor"] {
-            let backend = AnyBackend::from_hypervisor(sel);
-            assert!(matches!(backend, AnyBackend::Hvf(_)), "selector {sel}");
-            assert_eq!(backend.name(), "hvf");
-        }
-        assert_eq!(
-            AnyBackend::from_hypervisor("hvf").kind(),
-            catalog::BackendKind::Hvf
-        );
-    }
-
-    #[test]
-    fn from_hypervisor_inhouse_selects_the_workload_runner() {
-        // The opt-in `inhouse`/`in-house` selector constructs the runner-role
-        // backend. Its VmBackend name delegates to the in-house driver ("hvf"),
-        // and it is a workload backend (carries untrusted workloads).
-        for sel in ["inhouse", "in-house"] {
+    fn from_hypervisor_hvf_and_inhouse_all_select_the_workload_runner() {
+        // The in-house VMM is reached only through the runner: `hvf`, its
+        // `hypervisor` alias, and the `inhouse`/`in-house` selectors all resolve
+        // to the same `InHouse` runner backend. It reports name "hvf" /
+        // `BackendKind::Hvf` and is a workload backend (carries untrusted
+        // workloads), so every existing "hvf" classifier keeps working.
+        for sel in ["hvf", "hypervisor", "inhouse", "in-house"] {
             let backend = AnyBackend::from_hypervisor(sel);
             assert!(matches!(backend, AnyBackend::InHouse(_)), "selector {sel}");
-            assert_eq!(backend.as_vm_backend().name(), "hvf", "selector {sel}");
+            assert_eq!(backend.name(), "hvf", "selector {sel}");
+            assert_eq!(backend.kind(), catalog::BackendKind::Hvf, "selector {sel}");
             assert!(
                 backend.as_workload_backend().is_some(),
-                "selector {sel}: runner must be a workload backend"
+                "selector {sel}: the in-house runner must be a workload backend"
             );
-            assert_eq!(backend.kind(), catalog::BackendKind::Hvf, "selector {sel}");
         }
-    }
-
-    #[test]
-    fn from_hypervisor_hvf_still_selects_hvf_backend() {
-        // The new selector is purely additive: `hvf` must still resolve to the
-        // raw HvfBackend, unchanged by the runner opt-in.
-        let backend = AnyBackend::from_hypervisor("hvf");
-        assert!(matches!(backend, AnyBackend::Hvf(_)));
-        assert_eq!(backend.name(), "hvf");
     }
 
     #[test]
@@ -1250,7 +1210,7 @@ mod tests {
                 ),
                 (
                     "hvf",
-                    vec!["hypervisor"],
+                    vec!["hypervisor", "inhouse", "in-house"],
                     BackendTier::Tier2,
                     Some("hvf.pid"),
                     Some(5),

@@ -3,7 +3,6 @@
 //! implement it; the admitted launch path accepts `&dyn WorkloadBackend`
 //! only, so a non-workload backend cannot reach it.
 use crate::backend::{AnyBackend, FirecrackerBackend};
-use crate::hvf_backend::HvfBackend;
 use crate::libkrun::LibkrunBackend;
 use crate::mock::MockBackend;
 use crate::vz::VzBackend;
@@ -68,14 +67,9 @@ impl WorkloadBackend for VzBackend {
         EgressSubstitutionTransport::VsockUdsChannel
     }
 }
-impl WorkloadBackend for HvfBackend {
-    fn egress_substitution_transport(&self) -> EgressSubstitutionTransport {
-        // Proxy-aware substitution over the vsock gateway: the guest dials the
-        // egress port, the in-house VMM's bridge enforces claim-10 then relays to
-        // the per-VM endpoint (claims 12/13). No transparent :80/:443 terminator.
-        EgressSubstitutionTransport::VsockUdsChannel
-    }
-}
+// The in-house VMM's `WorkloadBackend` lives on the driver-generic
+// `WorkloadRunner` (`workload_runner::runner`), which routes egress through the
+// per-VM vsock UDS endpoint (`EgressSubstitutionTransport::VsockUdsChannel`).
 // `MockBackend` is the hermetic lifecycle test double — it carries no real
 // workload, so it stands in for a workload backend on the admitted path in
 // tests. `QemuBackend` (a real dev/test VMM) is deliberately NOT a
@@ -127,16 +121,22 @@ mod tests {
 
     #[test]
     fn workload_backends_implement_marker() {
+        use crate::driver::InHouseDriver;
+        use crate::workload_runner::{RealEndpointSpawner, WorkloadRunner};
         assert_is_workload_backend::<FirecrackerBackend>();
         assert_is_workload_backend::<LibkrunBackend>();
         assert_is_workload_backend::<VzBackend>();
-        assert_is_workload_backend::<HvfBackend>();
+        // The in-house VMM carries workloads via the runner role.
+        assert_is_workload_backend::<WorkloadRunner<InHouseDriver, RealEndpointSpawner>>();
         assert_is_workload_backend::<MockBackend>();
     }
 
     #[test]
-    fn hvf_declares_vsock_uds_channel() {
-        let transport = HvfBackend.egress_substitution_transport();
+    fn in_house_runner_declares_vsock_uds_channel() {
+        use crate::driver::InHouseDriver;
+        use crate::workload_runner::{RealEndpointSpawner, WorkloadRunner};
+        let runner = WorkloadRunner::new(InHouseDriver::new(), RealEndpointSpawner);
+        let transport = runner.egress_substitution_transport();
         assert_eq!(transport, EgressSubstitutionTransport::VsockUdsChannel);
         assert!(transport.supports_proxy_aware_substitution());
         assert!(!transport.supports_transparent_terminator());

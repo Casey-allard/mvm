@@ -204,7 +204,7 @@ pub fn boot_kernel(
 /// persistent-until-stop VM — and drives egress + the agent/substitution channels
 /// through the caller-supplied [`HostChannels`] (the supervisor builds them from
 /// the admitted plan + per-VM socket paths). The supervisor sets `stop` from a
-/// SIGTERM handler so `HvfBackend::stop` ends the guest cleanly. `timeout` still
+/// SIGTERM handler so the in-house driver `kill` ends the guest cleanly. `timeout` still
 /// caps the run.
 pub fn boot_kernel_until(
     image: &[u8],

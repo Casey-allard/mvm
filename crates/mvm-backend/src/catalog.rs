@@ -165,8 +165,11 @@ backend_catalog![
     {
         kind: Hvf,
         selector: "hvf",
-        aliases: ["hypervisor"],
-        constructor: AnyBackend::Hvf(crate::hvf_backend::HvfBackend),
+        aliases: ["hypervisor", "inhouse", "in-house"],
+        constructor: AnyBackend::InHouse(crate::workload_runner::WorkloadRunner::new(
+            crate::driver::InHouseDriver::new(),
+            crate::workload_runner::RealEndpointSpawner,
+        )),
         tier: Tier2,
         marker_file: Some("hvf.pid"),
         started_vm_probe_order: Some(5),

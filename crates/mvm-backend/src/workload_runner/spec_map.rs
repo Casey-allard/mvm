@@ -22,7 +22,7 @@ use crate::driver::{BlockDev, ConsoleCapture, KernelImage, VmmSpec, VsockDirecti
 /// is treated as no overlay rather than a half-configured boot.
 ///
 /// An empty `rootfs_path` yields no disks at all — an initramfs-only guest boots
-/// entirely from RAM (matching `HvfBackend`'s own empty-path skip). The verity
+/// entirely from RAM (matching the in-house driver's own empty-path skip). The verity
 /// and overlay disks presuppose a rootfs, so they are dropped with it.
 pub fn workload_blocks(config: &VmStartConfig) -> Vec<BlockDev> {
     let ro = |source: &str, slot: u8| BlockDev {

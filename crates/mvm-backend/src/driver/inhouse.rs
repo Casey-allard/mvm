@@ -1,6 +1,6 @@
 //! `InHouseDriver` — the `VmmDriver` for the first-party VMM (HVF on macOS, KVM
-//! on Linux via the shared `vmm` device model). Identity and capabilities
-//! delegate to the proven `HvfBackend`. `boot` maps a policy-free `VmmSpec` to a
+//! on Linux via the shared `vmm` device model). It reports the in-house VMM's
+//! identity (`name()` "hvf") and capabilities directly. `boot` maps a policy-free `VmmSpec` to a
 //! relay supervisor config, spawns `mvm-hvf-supervisor`, and returns a live
 //! handle. The claim-10 egress gate and secret substitution live in the
 //! host-side endpoint the caller binds to the spec's `EGRESS_PORT` socket; the
@@ -15,30 +15,22 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use mvm_build::hvf_supervisor::{ConsoleDataSocket, HvfDisk, HvfSupervisorConfig};
 use mvm_core::config::{vm_state_dir, vsock_socket_filename};
-use mvm_core::vm_backend::{
-    SnapshotCapability, VmBackend, VmCapabilities, VmExitStatus, VmId, VmStatus,
-};
+use mvm_core::vm_backend::{SnapshotCapability, VmCapabilities, VmExitStatus, VmId, VmStatus};
 use mvm_guest::vsock::{CONSOLE_PORT_BASE, EGRESS_PORT, GUEST_AGENT_PORT, dev_console_data_ports};
 
 use crate::driver::spec::KernelImage;
 use crate::driver::{DuplexStream, RunningVm, VmmDriver, VmmSpec};
-use crate::hvf_backend::{
-    self, HvfBackend, PID_FILE_NAME, PID_FILE_TIMEOUT, resolve_supervisor_path,
-};
+use crate::hvf_backend::{self, PID_FILE_NAME, PID_FILE_TIMEOUT, resolve_supervisor_path};
 
 /// The first-party VMM driver: pure VMM mechanics, no policy and no admission.
 /// It boots what a `VmmSpec` describes and relays the guest's egress port to the
 /// host-side bridge; the claim-10 gate and substitution live in that bridge, not
 /// here.
-pub struct InHouseDriver {
-    backend: HvfBackend,
-}
+pub struct InHouseDriver;
 
 impl InHouseDriver {
     pub fn new() -> Self {
-        Self {
-            backend: HvfBackend,
-        }
+        Self
     }
 }
 
@@ -165,19 +157,28 @@ fn relay_supervisor_config(spec: &VmmSpec, paths: &SupervisorPaths) -> Result<Hv
 
 impl VmmDriver for InHouseDriver {
     fn name(&self) -> &str {
-        self.backend.name()
+        "hvf"
     }
 
     fn is_available(&self) -> Result<bool> {
-        self.backend.is_available()
+        Ok(hvf_backend::hvf_probe())
     }
 
     fn capabilities(&self) -> VmCapabilities {
-        self.backend.capabilities()
+        // vsock is live-proven through the unified run loop; the rest land as
+        // pause/snapshot/networking are wired onto the primitive.
+        VmCapabilities {
+            vsock: true,
+            // The in-house VMM is vsock-only by design: no guest NIC, and egress
+            // rides the host vsock proxy (the gating endpoint), not a guest NIC.
+            no_guest_nic: true,
+            host_vsock_proxy: true,
+            ..Default::default()
+        }
     }
 
     fn snapshot_capability(&self) -> SnapshotCapability {
-        self.backend.snapshot_capability()
+        SnapshotCapability::Unsupported
     }
 
     fn boot(&self, spec: &VmmSpec) -> Result<Box<dyn RunningVm>> {
@@ -187,7 +188,7 @@ impl VmmDriver for InHouseDriver {
         // Create/truncate the console capture up front.
         let _ = crate::libkrun::open_console_capture(&state_dir.join("console.log"));
 
-        // MVM_HVF_TIMEOUT is only a backstop cap (0 = none) — matches HvfBackend.
+        // MVM_HVF_TIMEOUT is only a backstop cap (0 = none) — matches the in-house VMM boot path.
         let timeout_secs = std::env::var("MVM_HVF_TIMEOUT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -404,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_and_capabilities_delegate_to_the_hvf_backend() {
+    fn reports_in_house_identity_and_capabilities() {
         let d = InHouseDriver::new();
         assert_eq!(d.name(), "hvf");
         assert!(d.capabilities().vsock);
