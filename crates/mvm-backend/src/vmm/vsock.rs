@@ -1278,6 +1278,74 @@ mod tests {
         );
     }
 
+    /// When the host side of an established *agent* stream closes (the
+    /// non-interactive `machine run -- cmd` client finished a RunEntrypoint call
+    /// and hung up), `drain_agent` frames an `OP_SHUTDOWN` to the guest on the
+    /// agent port and drops the stream. Without this the guest agent's
+    /// single-threaded accept loop would block forever on a finished stream and
+    /// never service the next connection — the non-interactive-relay hang. Sibling
+    /// to `host_close_frames_op_shutdown_to_the_guest` (the console path).
+    #[test]
+    fn host_close_frames_op_shutdown_to_the_guest_agent() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("agent.sock");
+        let mut d = dev();
+        d.set_agent_socket(&sock).unwrap();
+
+        let mut client = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        client.write_all(b"x").unwrap();
+        client.set_nonblocking(true).unwrap();
+
+        // Open the stream: drain_agent frames an OP_REQUEST to the agent port.
+        let mut conn_id = None;
+        for _ in 0..200 {
+            let _ = d.drain_agent();
+            if let Some((h, _)) = d.pending_rx.iter().find(|(h, _)| h.op == OP_REQUEST) {
+                conn_id = Some(h.src_port);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let conn_id = conn_id.expect("agent stream opened");
+
+        // Guest accepts (OP_RESPONSE) → the stream is established, so a subsequent
+        // host EOF is read and reported (drain_host only reads established streams).
+        let accept = Hdr {
+            src_cid: GUEST_CID,
+            dst_cid: HOST_CID,
+            src_port: mvm_guest::vsock::GUEST_AGENT_PORT,
+            dst_port: conn_id,
+            op: OP_RESPONSE,
+            typ: TYPE_STREAM,
+            ..Default::default()
+        };
+        d.handle_packet(accept, &[]);
+        d.pending_rx.clear();
+
+        // Host client hangs up → drain_agent must frame an OP_SHUTDOWN on the agent
+        // port so the guest's serial accept loop advances to the next connection.
+        drop(client);
+        let mut shut = false;
+        for _ in 0..200 {
+            let _ = d.drain_agent();
+            if d.pending_rx.iter().any(|(h, _)| {
+                h.op == OP_SHUTDOWN
+                    && h.dst_port == mvm_guest::vsock::GUEST_AGENT_PORT
+                    && h.src_port == conn_id
+            }) {
+                shut = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            shut,
+            "host close frames OP_SHUTDOWN to the guest agent port"
+        );
+        assert!(!d.agent.is_agent_stream(conn_id), "stream dropped");
+    }
+
     /// A host connect on a *console* data port opens a guest listener on that same
     /// port (not the hardwired agent port) and relays bytes both ways: the device
     /// frames `OP_REQUEST`→console port, routes the guest's reply back to the host
