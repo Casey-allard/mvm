@@ -313,7 +313,7 @@ impl LinuxEnv for VzDevEnv {
 pub fn create_linux_env() -> Box<dyn LinuxEnv> {
     let plat = platform::current();
 
-    if plat.is_vz_default_tier() {
+    if plat.is_macos_vmm_tier() {
         return Box::new(VzDevEnv::new(DEV_VM_NAME));
     }
 

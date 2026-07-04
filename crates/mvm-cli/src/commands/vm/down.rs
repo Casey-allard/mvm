@@ -21,7 +21,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     // Platform default for VMs with no pid-file marker (the vz supervisor
     // tracks state out-of-band, so `for_started_vm` returns None).
     let platform_default = || {
-        if mvm_core::platform::current().is_vz_default_tier() {
+        if mvm_core::platform::current().is_macos_vmm_tier() {
             AnyBackend::from_hypervisor("vz")
         } else {
             AnyBackend::default_backend()

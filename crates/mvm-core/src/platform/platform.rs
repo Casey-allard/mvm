@@ -75,14 +75,16 @@ impl Platform {
         matches!(self, Platform::LinuxNative)
     }
 
-    /// Whether this host is the macOS tier where Vz is the auto-detect
-    /// default backend (macOS 26+ — the Apple Silicon arch half is
-    /// asserted by callers via `cfg!(target_arch = "aarch64")`).
+    /// Whether this host is the macOS 26+ Apple Silicon tier where the in-house
+    /// HVF VMM is the auto-detect default workload and builder backend (Vz's
+    /// replacement; the Apple Silicon arch half is asserted by callers via
+    /// `cfg!(target_arch = "aarch64")`).
     ///
-    /// Distinct from [`Self::has_vz`], which reports mere Vz *availability*
-    /// from macOS 13 up. Vz is opt-in on macOS 13-25 and only the
-    /// default from 26 on, so the selection paths gate on this.
-    pub fn is_vz_default_tier(self) -> bool {
+    /// The selection paths — workload hypervisor auto-detect, builder-backend
+    /// auto-detect, residency, and the dev-VM path — gate on this to pick the
+    /// in-house VMM. macOS 13-25 stays on libkrun. Named for the tier it selects,
+    /// not the (now legacy) Vz backend.
+    pub fn is_macos_vmm_tier(self) -> bool {
         if !matches!(self, Platform::MacOS) {
             return false;
         }
@@ -445,11 +447,11 @@ mod tests {
     }
 
     #[test]
-    fn test_is_vz_default_tier_non_macos() {
-        assert!(!Platform::LinuxNative.is_vz_default_tier());
-        assert!(!Platform::LinuxNoKvm.is_vz_default_tier());
-        assert!(!Platform::Wsl2.is_vz_default_tier());
-        assert!(!Platform::Windows.is_vz_default_tier());
+    fn test_is_macos_vmm_tier_non_macos() {
+        assert!(!Platform::LinuxNative.is_macos_vmm_tier());
+        assert!(!Platform::LinuxNoKvm.is_macos_vmm_tier());
+        assert!(!Platform::Wsl2.is_macos_vmm_tier());
+        assert!(!Platform::Windows.is_macos_vmm_tier());
     }
 
     #[test]
@@ -479,7 +481,7 @@ mod tests {
         let p = current();
         let _ = p.has_kvm();
         let _ = p.supports_native_runner();
-        let _ = p.is_vz_default_tier();
+        let _ = p.is_macos_vmm_tier();
     }
 
     #[test]

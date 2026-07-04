@@ -551,7 +551,7 @@ impl AnyBackend {
         // 2. macOS 26+ Apple Silicon → the in-house VMM driven through the
         //    WorkloadRunner (the destination macOS backend). Vz stays reachable
         //    via `--hypervisor vz` until it is removed.
-        if plat.is_vz_default_tier() {
+        if plat.is_macos_vmm_tier() {
             return Self::InHouse(WorkloadRunner::new(
                 InHouseDriver::new(),
                 RealEndpointSpawner,

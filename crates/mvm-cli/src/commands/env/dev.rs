@@ -91,7 +91,7 @@ fn select_dev_backend(
     prefers_vz: bool,
     prefers_libkrun: bool,
     has_vz: bool,
-    is_vz_default_tier: bool,
+    is_macos_vmm_tier: bool,
     has_libkrun: bool,
     has_kvm: bool,
 ) -> DevBackend {
@@ -106,7 +106,7 @@ fn select_dev_backend(
         return DevBackend::Libkrun;
     }
     // 3-6. Standard auto-detect tree.
-    if is_vz_default_tier {
+    if is_macos_vmm_tier {
         DevBackend::Vz
     } else if matches!(plat, Platform::MacOS) && has_libkrun {
         DevBackend::Libkrun
@@ -155,7 +155,7 @@ fn current_backend() -> DevBackend {
         builder_prefers_vz(),
         builder_prefers_libkrun(),
         plat.has_vz(),
-        plat.is_vz_default_tier(),
+        plat.is_macos_vmm_tier(),
         plat.has_libkrun(),
         plat.has_kvm(),
     )
@@ -827,7 +827,7 @@ mod tests {
                 /* prefers_vz */ true,
                 /* prefers_libkrun */ false,
                 /* has_vz */ true,
-                /* is_vz_default_tier */ false,
+                /* is_macos_vmm_tier */ false,
                 /* has_libkrun */ true,
                 /* has_kvm */ false,
             ),
@@ -879,7 +879,7 @@ mod tests {
                 /* prefers_vz */ false,
                 /* prefers_libkrun */ false,
                 true,
-                /* is_vz_default_tier */ true,
+                /* is_macos_vmm_tier */ true,
                 true,
                 false,
             ),
@@ -898,7 +898,7 @@ mod tests {
                 /* prefers_vz */ false,
                 /* prefers_libkrun */ true,
                 /* has_vz */ true,
-                /* is_vz_default_tier */ true,
+                /* is_macos_vmm_tier */ true,
                 /* has_libkrun */ true,
                 /* has_kvm */ false,
             ),
@@ -918,7 +918,7 @@ mod tests {
                 /* prefers_vz */ false,
                 /* prefers_libkrun */ true,
                 /* has_vz */ false,
-                /* is_vz_default_tier */ true,
+                /* is_macos_vmm_tier */ true,
                 /* has_libkrun */ false,
                 /* has_kvm */ false,
             ),

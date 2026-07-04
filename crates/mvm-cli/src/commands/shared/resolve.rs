@@ -260,12 +260,8 @@ pub fn resolve_effective_hypervisor(requested: &str) -> String {
         }
     }
     let plat = mvm_core::platform::current();
-    platform_default_hypervisor(
-        plat.has_kvm(),
-        plat.is_vz_default_tier(),
-        plat.has_libkrun(),
-    )
-    .to_string()
+    platform_default_hypervisor(plat.has_kvm(), plat.is_macos_vmm_tier(), plat.has_libkrun())
+        .to_string()
 }
 
 /// The auto-detect ladder for the platform default hypervisor, as a pure function
