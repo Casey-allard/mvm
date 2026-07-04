@@ -238,7 +238,7 @@ fn parse_allow_host(entry: &str) -> Result<mvm_core::network_policy::HostPort> {
 
 /// Resolve the requested hypervisor to the effective one for this host. `firecracker`
 /// (the default `--hypervisor`) auto-detects: KVM → firecracker, macOS 26+ Apple Silicon
-/// → inhouse (the HVF VMM), macOS 13-25 + libkrun → libkrun, else firecracker (surfaces a clear
+/// → hvf (the in-house HVF VMM), macOS 13-25 + libkrun → libkrun, else firecracker (surfaces a clear
 /// "not available" error). Any explicit value is returned as-is. The `MVM_HYPERVISOR`
 /// env var (alias `MVM_BACKEND`) overrides auto-detect — the workload-VMM override
 /// mirroring `MVM_BUILDER_BACKEND` for the builder, so a Linux/KVM host can opt into
@@ -260,22 +260,42 @@ pub fn resolve_effective_hypervisor(requested: &str) -> String {
         }
     }
     let plat = mvm_core::platform::current();
-    if plat.has_kvm() {
+    platform_default_hypervisor(
+        plat.has_kvm(),
+        plat.is_vz_default_tier(),
+        plat.has_libkrun(),
+    )
+    .to_string()
+}
+
+/// The auto-detect ladder for the platform default hypervisor, as a pure function
+/// of the host's capabilities so it is unit-testable off the target platform.
+///
+/// - KVM present → `firecracker` (the Linux workload backend).
+/// - macOS 26+ Apple Silicon tier → `hvf` (the in-house HVF VMM, Vz's
+///   replacement). Resolved to the `"hvf"` name rather than `"inhouse"` because
+///   `"hvf"` is the classifier-complete surface: every hypervisor-name string
+///   match (e.g. `persists_plan_before_start`, which gates the claim-10
+///   endpoint's `plan.json`) already recognises `"hvf"`, and the in-house VMM's
+///   `VmBackend::name()` reports `"hvf"` for both the inline `Hvf` backend and
+///   the `InHouse` runner. Vz is reachable only via an explicit `--hypervisor vz`
+///   until it is removed.
+/// - libkrun present (macOS 13-25) → `libkrun`.
+/// - otherwise → `firecracker` (surfaces a clear "not available" error downstream).
+fn platform_default_hypervisor(
+    has_kvm: bool,
+    is_macos_vmm_tier: bool,
+    has_libkrun: bool,
+) -> &'static str {
+    if has_kvm {
         "firecracker"
-    } else if plat.is_vz_default_tier() {
-        // macOS 26+ Apple Silicon → the in-house HVF VMM (Vz's replacement).
-        // `is_vz_default_tier` keeps its historical name but now selects the
-        // in-house runner, matching `AnyBackend::auto_select` so the persistent
-        // (`up` / `machine run --name`) and transient paths agree on the default.
-        // Vz is reachable only via an explicit `--hypervisor vz` until it is
-        // removed.
-        "inhouse"
-    } else if plat.has_libkrun() {
+    } else if is_macos_vmm_tier {
+        "hvf"
+    } else if has_libkrun {
         "libkrun"
     } else {
         "firecracker"
     }
-    .to_string()
 }
 
 #[cfg(test)]
@@ -383,6 +403,27 @@ mod tests {
     /// An explicit `--hypervisor <x>` (anything but the `firecracker`
     /// auto-detect sentinel) is returned verbatim — so a Linux/KVM host can
     /// select `libkrun` (or any other backend) without env.
+    #[test]
+    fn platform_default_ladder_maps_each_tier() {
+        // KVM wins first (Linux workload backend).
+        assert_eq!(
+            platform_default_hypervisor(true, false, false),
+            "firecracker"
+        );
+        assert_eq!(platform_default_hypervisor(true, true, true), "firecracker");
+        // macOS 26+ Apple Silicon tier → the in-house HVF VMM, named "hvf" (the
+        // classifier-complete surface), NOT "vz" and NOT "inhouse".
+        assert_eq!(platform_default_hypervisor(false, true, false), "hvf");
+        assert_eq!(platform_default_hypervisor(false, true, true), "hvf");
+        // libkrun tier (macOS 13-25).
+        assert_eq!(platform_default_hypervisor(false, false, true), "libkrun");
+        // Nothing available → firecracker (a clear "not available" surfaces later).
+        assert_eq!(
+            platform_default_hypervisor(false, false, false),
+            "firecracker"
+        );
+    }
+
     #[test]
     fn explicit_hypervisor_is_returned_verbatim() {
         assert_eq!(resolve_effective_hypervisor("libkrun"), "libkrun");
