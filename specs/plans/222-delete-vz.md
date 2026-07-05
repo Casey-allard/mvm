@@ -49,15 +49,14 @@ Brings the in-house builder onto the branch, then removes the two Vz paths that 
 
 The dev VM needs live `/work` (host CWD) + `/job`/`/out`. Decide the mechanism, then implement it in the in-house VMM. **This is the single largest piece and gates the whole deletion.**
 
-- [ ] **2.0 Design decision (needs owner sign-off):** pick the host↔guest share mechanism:
-  - **(A) virtio-fs** — parity with Vz/libkrun, best UX (DAX, POSIX). Cost: implement a virtio-fs device in the Rust HVF VMM (FUSE-over-virtio + shared-memory region) — a substantial new device. Guest kernel already has `CONFIG_VIRTIO_FS` (Plan 209).
-  - **(B) virtio-9p** — simpler protocol than virtio-fs, no DAX/shared-mem; weaker perf/semantics. Requires `CONFIG_9P_FS`/`CONFIG_NET_9P` in the guest kernel (verify; likely add).
-  - **(C) disk-image `/work`** — reuse `InHouseBuilderVm`'s approach; NO live host-CWD editing (a real dev-UX regression). Cheapest. Only viable if the team accepts editing-in-guest or a sync step.
-  - Recommendation: **(A)** for the destination, but **(B)** or **(C)** may be an acceptable interim. Record the choice + rationale in an ADR.
-- [ ] **2.1** Add the chosen device to the `vmm/` device model (new `vmm/virtio_fs.rs` or `virtio_9p.rs`), wired into the run loop like the existing virtio-blk/vsock devices.
-- [ ] **2.2** Extend `HvfSupervisorConfig` (`mvm-build/src/hvf_supervisor.rs`) with a `dir_shares: Vec<DirShare>` field (tag, host_path, read_only), and `VmmSpec` (`driver/spec.rs`) with the same; map them in `InHouseDriver::relay_supervisor_config` (`driver/inhouse.rs`).
-- [ ] **2.3** Guest-side mount: ensure the in-house guest `/init` (or the dev rootfs init) mounts the shares at `/work`/`/job`/`/out`. Reuse the `machine run --volume` mount path if it already covers this on the in-house backend; else add it.
-- [ ] **2.4** Live-proof: an in-house VM with a `/work` share sees host-CWD edits live (write on host → read in guest, and vice versa). Fuzz/parse coverage for the new device's untrusted-input surface (claim 5 family).
+- [x] **2.0 Design decision:** **(A) virtio-fs** (owner-approved 2026-07-04). Parity with Vz/libkrun, best dev-workload UX; guest kernel already has `CONFIG_VIRTIO_FS` (Plan 209) so it's a host-side-only build. v1 is FUSE-over-virtio **without DAX** (a plain read/write device — still far better than 9p; DAX perf path later). No `virtiofsd` on macOS, so the FUSE server is in-house.
+- [x] **2.1a Device: FUSE wire ABI** — `vmm/fuse/abi.rs`: the fixed FUSE structs as explicit LE encode/decode + a fail-closed cursor; layout tests assert the ABI sizes (40/16/88/128/104/64/16). 7 tests.
+- [x] **2.1b Device: passthrough FUSE server** — `vmm/fuse/server.rs`: `PassthroughFs::dispatch(&[u8]) -> Option<Vec<u8>>` executing FUSE against a host dir (INIT/GETATTR/SETATTR/LOOKUP/FORGET/OPENDIR/READDIR/OPEN/READ/WRITE/CREATE/MKDIR/UNLINK/RMDIR/RENAME/RELEASE/FLUSH/ACCESS/STATFS). Fails closed; rejects `/`/`..` escape. Transport-free, tested against a temp dir. 10 tests.
+- [x] **2.1c Device: virtio-fs mmio transport** — `vmm/virtio_fs.rs`: `VirtioFs` (virtio id 26), per-queue split-virtqueue (hiprio + request), gathers request descriptors → `dispatch` → scatters reply; config tag + num_request_queues. End-to-end FUSE INIT+LOOKUP driven through the virtqueue. 3 tests. **20 virtio-fs tests total, all VM-free + clippy -D warnings clean.**
+- [ ] **2.1d Run-loop + FDT integration (needs live HVF)** — register `VirtioFs` in the in-house run loop (`vmm/run.rs`): dispatch its MMIO exits, raise its IRQ; add a `virtio_mmio` node to the FDT (`vmm/fdt.rs`) so the guest kernel probes it. cfg-gated macOS/HVF; validated by live boot, not unit tests.
+- [ ] **2.2** Extend `HvfSupervisorConfig` (`mvm-build/src/hvf_supervisor.rs`) with `dir_shares: Vec<DirShare>` (tag, host_path, read_only) + `VmmSpec` (`driver/spec.rs`); map in `InHouseDriver::relay_supervisor_config`. Supervisor constructs a `VirtioFs` per share.
+- [ ] **2.3** Guest-side mount: the in-house guest `/init` mounts `virtio-fs` by tag at `/work`/`/job`/`/out` (`mount -t virtiofs work /work`).
+- [ ] **2.4** Live-proof: an in-house VM with a `/work` share sees host-CWD edits live (write on host → read in guest, and vice versa). Add the FUSE-request parser to the fuzz job (claim 5 family).
 
 ## Phase 3 — (optional) in-house snapshot for `dev park`
 
