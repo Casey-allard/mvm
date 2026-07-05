@@ -66,6 +66,8 @@ The dev VM needs live `/work` (host CWD) + `/job`/`/out`. Decide the mechanism, 
 
 Wire `mvmctl dev` to a long-lived in-house dev VM, reusing the persistent-VM lifecycle + Plan 221 console + Phase 2 shares. Then the Vz dev path (and its supervisor dependency) can go.
 
+> **Depends on [[specs/plans/223-vsock-tsi-egress.md]] Phases 1–3** — the dev VM needs internet for `nix build`, and the in-house VMM has no general egress yet. Networking is **vsock-only TSI** (no NIC, no gvproxy/passt/rvproxy). The dev VM boots `TrustTier::Trusted` with the TSI vsock port + `mvm-guest-netd`.
+
 - [ ] **4.1** Add `DevBackend::InHouse`; `detect_backend` returns it on `is_macos_vmm_tier` (replacing `DevBackend::Vz`); `effective_hypervisor` reports `"hvf"`.
 - [ ] **4.2** Implement the in-house dev-VM boot (new `dev_inhouse.rs`, sibling to the kept `dev_vz.rs` helpers): boot a long-lived in-house VM named `DEV_VM_NAME` via the persistent runner path, with the nix-store overlay disk (`/dev/vdb`), the `/work`/`/job`/`/out` shares (Phase 2), and networking; reuse `ensure_dev_image`, image cache, JSON builders from `dev_vz.rs`.
 - [ ] **4.3** Wire `dev up/shell/status/down` arms: `up` → boot/reuse; `shell` → Plan 221 `console_interactive(DEV_VM_NAME)` (already in-house-capable); `status` → persistent-VM `status()`; `down` → `stop()`. `park` → per Phase 3.
