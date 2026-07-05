@@ -154,6 +154,7 @@ mod tests {
             blocks: vec![],
             vsock: vec![],
             dir_shares: Vec::new(),
+            uvols_cmdline: None,
             console: ConsoleCapture {
                 log_path: "/tmp/console.log".into(),
             },

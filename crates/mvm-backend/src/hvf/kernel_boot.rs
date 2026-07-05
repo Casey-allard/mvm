@@ -197,6 +197,13 @@ pub struct HostChannels {
     /// Host directory shares exposed to the guest over virtio-fs (the dev VM's
     /// `/work`/`/job`/`/out`). Empty for a plain workload — nothing is shared.
     pub dir_shares: Vec<DirShare>,
+    /// Extra kernel-cmdline args appended after the resolved base cmdline —
+    /// the `mvm.uvols=<tag>:<hex(path)>:<mode>:<fs|blk>;…` string the guest
+    /// `/init` reads to mount virtio-fs shares at their guest paths. `None`
+    /// (no user volumes) leaves the base cmdline untouched. Kept as an append
+    /// (not folded into `cmdline`) so it rides on top of the built-in
+    /// [`default_bootargs`] without the caller having to reconstruct it.
+    pub uvols: Option<String>,
 }
 
 /// Boot `image` (an arm64 `Image`) under HVF, optionally with an `initramfs`
@@ -224,6 +231,7 @@ pub fn boot_kernel(
             cmdline: None,
             mem_mib: 0,
             dir_shares: Vec::new(),
+            uvols: None,
         },
     )
 }
@@ -310,6 +318,16 @@ fn boot_kernel_impl(
         if !extra.is_empty() {
             bootargs.push(' ');
             bootargs.push_str(extra);
+        }
+    }
+    // User-volume mounts (`mvm.uvols=…`) ride on top of the base cmdline so the
+    // guest `/init` mounts virtio-fs shares at their guest paths — without the
+    // append this would replace `console=`/`root=`/`init=` and break the boot.
+    if let Some(uvols) = channels.uvols.as_deref() {
+        let uvols = uvols.trim();
+        if !uvols.is_empty() {
+            bootargs.push(' ');
+            bootargs.push_str(uvols);
         }
     }
     let initrd_bounds = initramfs.map(|rd| {

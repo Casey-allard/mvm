@@ -215,9 +215,19 @@ pub fn encode_user_volumes_cmdline(volumes: &[VmVolume]) -> Option<String> {
         };
         let mode = if v.read_only { "ro" } else { "rw" };
         let hexpath: String = v.guest.bytes().map(|b| format!("{b:02x}")).collect();
-        entries.push(format!("uvol{idx}:{hexpath}:{mode}:{kind}"));
+        entries.push(format!("{}:{hexpath}:{mode}:{kind}", uvol_tag(idx)));
     }
     Some(format!("mvm.uvols={}", entries.join(";")))
+}
+
+/// The virtio-fs / virtio-blk mount tag for the user volume at index `idx` in a
+/// [`VmStartConfig`]'s `volumes`. The single source of truth shared by
+/// [`encode_user_volumes_cmdline`] (which the guest `/init` reads) and the
+/// host-side device attach (a backend's `dir_shares`), so the tag the guest
+/// mounts always matches the tag the device advertises. `idx` is the position in
+/// the full `volumes` list (disks and shares alike), not among shares only.
+pub fn uvol_tag(idx: usize) -> String {
+    format!("uvol{idx}")
 }
 
 /// Encode the per-VM egress intermediate **cert** (PEM) as a single

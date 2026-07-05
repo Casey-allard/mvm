@@ -60,6 +60,8 @@ pub fn inject_host_binaries(req: &InjectRequest<'_>) -> Result<()> {
         // Default cmdline runs the initramfs /init (the patcher); the default RAM
         // is plenty for a mount + copy.
         cmdline: None,
+        // The injector boots a fixed initramfs patcher, not a user workload.
+        uvols: None,
         memory_mib: 0,
         initramfs: Some(initramfs_path),
         disks: vec![HvfDisk {

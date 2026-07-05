@@ -96,6 +96,12 @@ pub struct VmmSpec {
     /// Host directory shares exposed over virtio-fs (the dev VM's `/work`/`/job`/
     /// `/out`). Empty for a workload — nothing is shared.
     pub dir_shares: Vec<DirShare>,
+    /// `mvm.uvols=…` kernel-cmdline append the guest `/init` reads to mount the
+    /// `dir_shares` (and declare any disk volumes) at their guest paths. `None`
+    /// when there are no user volumes. Carries the guest mount path that
+    /// `dir_shares` (tag + host only) drops, so the guest mounts at the right
+    /// place.
+    pub uvols_cmdline: Option<String>,
     pub console: ConsoleCapture,
     /// Trusted-builder VM: it carries no untrusted workload, so it boots WITHOUT
     /// the claim-10 egress gate (no `EGRESS_PORT` relay required). A workload

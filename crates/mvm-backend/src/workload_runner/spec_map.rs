@@ -73,32 +73,24 @@ pub fn workload_blocks(config: &VmStartConfig) -> Vec<BlockDev> {
     blocks
 }
 
-/// Directory-share volumes (`VmVolumeKind::DirShare`) → virtio-fs shares. The
-/// mount tag is the guest mount point's final path component (`/work` → `work`),
-/// which the guest mounts with `mount -t virtiofs <tag> <guest>`. Empty for a
-/// plain workload that declares no shares (the common case).
+/// Directory-share volumes (`VmVolumeKind::DirShare`) → virtio-fs shares. Each
+/// device advertises the `uvol{idx}` tag [`encode_user_volumes_cmdline`] wrote
+/// onto the guest cmdline (same `mvm_core::vm_backend::uvol_tag` source of
+/// truth), so the tag the guest `/init` mounts matches the tag the device
+/// advertises. `idx` is the position in the full `volumes` list (disks and
+/// shares alike) so it lines up with the encoder's indexing. Empty for a plain
+/// workload that declares no shares (the common case).
 pub fn workload_dir_shares(config: &VmStartConfig) -> Vec<DirShare> {
     config
         .volumes
         .iter()
-        .filter(|v| matches!(v.kind, VmVolumeKind::DirShare) && !v.host.is_empty())
-        .map(|v| DirShare {
-            tag: share_tag(&v.guest),
+        .enumerate()
+        .filter(|(_, v)| matches!(v.kind, VmVolumeKind::DirShare) && !v.host.is_empty())
+        .map(|(idx, v)| DirShare {
+            tag: mvm_core::vm_backend::uvol_tag(idx),
             host_path: v.host.clone().into(),
         })
         .collect()
-}
-
-/// Derive a virtio-fs mount tag from a guest mount point: its last path component
-/// (`/work` → `work`, `/a/b/` → `b`), falling back to `share` for an empty path.
-fn share_tag(guest: &str) -> String {
-    guest
-        .trim_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("share")
-        .to_string()
 }
 
 /// The host-side unix sockets a workload's standing vsock channels bind to.
@@ -205,6 +197,10 @@ pub fn workload_spec(inputs: &WorkloadSpecInputs) -> VmmSpec {
         blocks: workload_blocks(config),
         vsock: workload_vsock_ports(&inputs.sockets),
         dir_shares: workload_dir_shares(config),
+        // The `mvm.uvols=` cmdline the guest `/init` reads to mount the shares
+        // (and note disk volumes) at their guest paths — carries the guest path
+        // that `dir_shares` (tag + host only) drops. `None` when no user volumes.
+        uvols_cmdline: mvm_core::vm_backend::encode_user_volumes_cmdline(&config.volumes),
         console: ConsoleCapture {
             log_path: inputs.console_log.clone(),
         },
@@ -268,11 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn dir_share_volume_maps_to_a_virtio_fs_share_tagged_by_mount() {
+    fn dir_share_device_tag_matches_the_uvols_cmdline_tag() {
+        // The device tag MUST equal the `uvol{idx}` tag the cmdline carries
+        // (full-list index), or the guest mounts a tag no device advertises.
         let cfg = VmStartConfig {
             volumes: vec![
-                vol("/host/project", "/work", VmVolumeKind::DirShare),
-                vol("/host/nix-store.img", "/nix", VmVolumeKind::Disk),
+                vol("/host/nix-store.img", "/nix", VmVolumeKind::Disk), // idx 0
+                vol("/host/project", "/work", VmVolumeKind::DirShare),  // idx 1
             ],
             ..base()
         };
@@ -280,16 +278,32 @@ mod tests {
         assert_eq!(nodes(&workload_blocks(&cfg)), vec!["/dev/vda", "/dev/vdb"]);
         let shares = workload_dir_shares(&cfg);
         assert_eq!(shares.len(), 1);
-        assert_eq!(shares[0].tag, "work");
+        // The share is the 2nd volume (index 1) → tag `uvol1`, matching the
+        // cmdline the guest reads.
+        assert_eq!(shares[0].tag, mvm_core::vm_backend::uvol_tag(1));
+        assert_eq!(shares[0].tag, "uvol1");
         assert_eq!(shares[0].host_path, PathBuf::from("/host/project"));
+        let uvols = mvm_core::vm_backend::encode_user_volumes_cmdline(&cfg.volumes).unwrap();
+        assert!(
+            uvols.contains("uvol1:"),
+            "cmdline tags the share uvol1: {uvols}"
+        );
     }
 
     #[test]
-    fn share_tag_takes_the_final_path_component() {
-        assert_eq!(share_tag("/work"), "work");
-        assert_eq!(share_tag("/a/b/"), "b");
-        assert_eq!(share_tag(""), "share");
-        assert_eq!(share_tag("/"), "share");
+    fn dir_share_volume_populates_the_uvols_cmdline() {
+        // The virtio-fs share must ride the `mvm.uvols=` cmdline so the guest
+        // `/init` mounts it — the device alone (dir_shares) isn't enough, the
+        // guest needs the tag→path mapping the cmdline carries.
+        let cfg = VmStartConfig {
+            volumes: vec![vol("/host/project", "/work", VmVolumeKind::DirShare)],
+            ..base()
+        };
+        let uvols = mvm_core::vm_backend::encode_user_volumes_cmdline(&cfg.volumes)
+            .expect("a DirShare volume yields a uvols cmdline");
+        assert!(uvols.starts_with("mvm.uvols="), "got: {uvols}");
+        // No user volumes → no uvols cmdline (the plain-workload common case).
+        assert!(mvm_core::vm_backend::encode_user_volumes_cmdline(&base().volumes).is_none());
     }
 
     #[test]

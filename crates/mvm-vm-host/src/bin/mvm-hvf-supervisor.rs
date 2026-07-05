@@ -205,6 +205,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|c| (c.guest_port, c.host_socket.clone()))
                 .collect(),
             cmdline: cfg.cmdline.clone(),
+            uvols: cfg.uvols.clone(),
             mem_mib: cfg.memory_mib,
             dir_shares: cfg
                 .dir_shares

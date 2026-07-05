@@ -140,6 +140,7 @@ fn relay_supervisor_config(spec: &VmmSpec, paths: &SupervisorPaths) -> Result<Hv
     Ok(HvfSupervisorConfig {
         kernel,
         cmdline,
+        uvols: spec.uvols_cmdline.clone(),
         memory_mib: spec.memory_mib,
         initramfs: spec.initramfs.clone(),
         disks,
@@ -402,6 +403,7 @@ mod tests {
             blocks,
             vsock,
             dir_shares: Vec::new(),
+            uvols_cmdline: None,
             console: ConsoleCapture {
                 log_path: "/tmp/console.log".into(),
             },

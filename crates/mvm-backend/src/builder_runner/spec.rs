@@ -81,6 +81,9 @@ pub fn builder_spec(inputs: &BuilderSpecInputs<'_>) -> VmmSpec {
         ],
         vsock,
         dir_shares: Vec::new(),
+        // The builder rootfs boots the static `/sbin/mvm-host-vm-init`, which
+        // handles its own disk/share mounts — it does not read `mvm.uvols=`.
+        uvols_cmdline: None,
         console: ConsoleCapture {
             log_path: inputs.console_log.clone(),
         },

@@ -60,6 +60,12 @@ pub struct HvfDirShare {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HvfSupervisorConfig {
+    /// `mvm.uvols=…` kernel-cmdline append the guest `/init` reads to mount its
+    /// virtio-fs user volumes at their guest paths. `None`/absent ⇒ no user
+    /// volumes (the common case). `#[serde(default)]` so a config written by an
+    /// older supervisor build without the key still deserializes.
+    #[serde(default)]
+    pub uvols: Option<String>,
     /// arm64 `Image` to boot.
     pub kernel: PathBuf,
     /// Full kernel cmdline. `None` ⇒ the supervisor's built-in default (workload
@@ -133,6 +139,7 @@ mod tests {
     fn json_roundtrip_with_all_fields() {
         let cfg = HvfSupervisorConfig {
             kernel: "/k/Image".into(),
+            uvols: None,
             cmdline: Some("console=ttyAMA0 root=/dev/vda ro init=/sbin/mvm-host-vm-init".into()),
             memory_mib: 8192,
             initramfs: Some("/k/initrd.cpio".into()),
@@ -198,6 +205,7 @@ mod tests {
     fn hvf_supervisor_console_data_sockets_roundtrip() {
         let cfg = HvfSupervisorConfig {
             kernel: "/k/Image".into(),
+            uvols: None,
             cmdline: None,
             memory_mib: 0,
             initramfs: None,
