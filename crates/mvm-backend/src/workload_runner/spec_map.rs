@@ -5,10 +5,12 @@
 use std::path::{Path, PathBuf};
 
 use mvm_core::config::vsock_socket_filename;
-use mvm_core::vm_backend::VmStartConfig;
+use mvm_core::vm_backend::{VmStartConfig, VmVolumeKind};
 use mvm_guest::vsock::{EGRESS_PORT, GUEST_AGENT_PORT, WORKLOAD_EXIT_PORT, dev_console_data_ports};
 
-use crate::driver::{BlockDev, ConsoleCapture, KernelImage, VmmSpec, VsockDirection, VsockPort};
+use crate::driver::{
+    BlockDev, ConsoleCapture, DirShare, KernelImage, VmmSpec, VsockDirection, VsockPort,
+};
 
 /// The ordered virtio-blk list for a sealed workload: the read-only rootfs at
 /// `/dev/vda` (slot 0), its dm-verity Merkle sidecar at `/dev/vdb` (slot 1) when
@@ -52,7 +54,51 @@ pub fn workload_blocks(config: &VmStartConfig) -> Vec<BlockDev> {
         blocks.push(ro(overlay_verity, 3));
     }
 
+    // Extra writable `Disk` volumes (beyond the rootfs/verity/overlay) ride as
+    // additional virtio-blk devices in slot order — e.g. the dev VM's persistent
+    // nix-store overlay. Writable + non-ephemeral so writes hit the host file.
+    let mut slot = blocks.len() as u8;
+    for v in &config.volumes {
+        if matches!(v.kind, VmVolumeKind::Disk) && !v.host.is_empty() {
+            blocks.push(BlockDev {
+                source: v.host.clone().into(),
+                read_only: v.read_only,
+                ephemeral: false,
+                slot,
+            });
+            slot += 1;
+        }
+    }
+
     blocks
+}
+
+/// Directory-share volumes (`VmVolumeKind::DirShare`) → virtio-fs shares. The
+/// mount tag is the guest mount point's final path component (`/work` → `work`),
+/// which the guest mounts with `mount -t virtiofs <tag> <guest>`. Empty for a
+/// plain workload that declares no shares (the common case).
+pub fn workload_dir_shares(config: &VmStartConfig) -> Vec<DirShare> {
+    config
+        .volumes
+        .iter()
+        .filter(|v| matches!(v.kind, VmVolumeKind::DirShare) && !v.host.is_empty())
+        .map(|v| DirShare {
+            tag: share_tag(&v.guest),
+            host_path: v.host.clone().into(),
+        })
+        .collect()
+}
+
+/// Derive a virtio-fs mount tag from a guest mount point: its last path component
+/// (`/work` → `work`, `/a/b/` → `b`), falling back to `share` for an empty path.
+fn share_tag(guest: &str) -> String {
+    guest
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("share")
+        .to_string()
 }
 
 /// The host-side unix sockets a workload's standing vsock channels bind to.
@@ -158,7 +204,7 @@ pub fn workload_spec(inputs: &WorkloadSpecInputs) -> VmmSpec {
         mem_initial_mib: config.mem_initial_mib,
         blocks: workload_blocks(config),
         vsock: workload_vsock_ports(&inputs.sockets),
-        dir_shares: Vec::new(),
+        dir_shares: workload_dir_shares(config),
         console: ConsoleCapture {
             log_path: inputs.console_log.clone(),
         },
@@ -190,6 +236,73 @@ mod tests {
         assert_eq!(nodes(&blocks), vec!["/dev/vda"]);
         assert_eq!(blocks[0].source, PathBuf::from("/img/rootfs.ext4"));
         assert!(blocks[0].read_only);
+    }
+
+    fn vol(host: &str, guest: &str, kind: VmVolumeKind) -> mvm_core::vm_backend::VmVolume {
+        mvm_core::vm_backend::VmVolume {
+            host: host.into(),
+            guest: guest.into(),
+            size: String::new(),
+            read_only: false,
+            kind,
+            encrypted: false,
+        }
+    }
+
+    #[test]
+    fn extra_disk_volume_rides_after_the_base_blocks() {
+        // A writable `Disk` volume (e.g. the dev VM's nix-store overlay) lands in
+        // the slot after the rootfs, writable and non-ephemeral so it persists.
+        let cfg = VmStartConfig {
+            volumes: vec![vol("/host/nix-store.img", "/nix", VmVolumeKind::Disk)],
+            ..base()
+        };
+        let blocks = workload_blocks(&cfg);
+        assert_eq!(nodes(&blocks), vec!["/dev/vda", "/dev/vdb"]);
+        assert_eq!(blocks[1].source, PathBuf::from("/host/nix-store.img"));
+        assert!(!blocks[1].read_only, "extra disk volume is writable");
+        assert!(
+            !blocks[1].ephemeral,
+            "extra disk volume persists to the host"
+        );
+    }
+
+    #[test]
+    fn dir_share_volume_maps_to_a_virtio_fs_share_tagged_by_mount() {
+        let cfg = VmStartConfig {
+            volumes: vec![
+                vol("/host/project", "/work", VmVolumeKind::DirShare),
+                vol("/host/nix-store.img", "/nix", VmVolumeKind::Disk),
+            ],
+            ..base()
+        };
+        // A `DirShare` never becomes a block; only the `Disk` does.
+        assert_eq!(nodes(&workload_blocks(&cfg)), vec!["/dev/vda", "/dev/vdb"]);
+        let shares = workload_dir_shares(&cfg);
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].tag, "work");
+        assert_eq!(shares[0].host_path, PathBuf::from("/host/project"));
+    }
+
+    #[test]
+    fn share_tag_takes_the_final_path_component() {
+        assert_eq!(share_tag("/work"), "work");
+        assert_eq!(share_tag("/a/b/"), "b");
+        assert_eq!(share_tag(""), "share");
+        assert_eq!(share_tag("/"), "share");
+    }
+
+    #[test]
+    fn empty_host_volumes_are_skipped() {
+        let cfg = VmStartConfig {
+            volumes: vec![
+                vol("", "/work", VmVolumeKind::DirShare),
+                vol("", "/nix", VmVolumeKind::Disk),
+            ],
+            ..base()
+        };
+        assert_eq!(nodes(&workload_blocks(&cfg)), vec!["/dev/vda"]);
+        assert!(workload_dir_shares(&cfg).is_empty());
     }
 
     #[test]

@@ -9,5 +9,7 @@ pub mod traits;
 
 pub use inhouse::InHouseDriver;
 pub use mock::{MockDriver, MockRunningVm};
-pub use spec::{BlockDev, ConsoleCapture, KernelImage, VmmSpec, VsockDirection, VsockPort};
+pub use spec::{
+    BlockDev, ConsoleCapture, DirShare, KernelImage, VmmSpec, VsockDirection, VsockPort,
+};
 pub use traits::{DuplexStream, RunningVm, VmmDriver};

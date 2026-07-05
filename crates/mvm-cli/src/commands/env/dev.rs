@@ -41,6 +41,12 @@ use super::linux_native;
 enum DevBackend {
     /// macOS with libkrun — Hypervisor.framework-backed dev VM.
     Libkrun,
+    /// macOS 26+ Apple Silicon — the in-house HVF VMM (the destination dev
+    /// backend, Vz's replacement). A long-lived in-house VM with the nix-store
+    /// overlay + `/work` virtio-fs share + vsock-only egress. Named `Hvf` to
+    /// match `BackendKind::Hvf` / `name() == "hvf"` / the `hvf.pid` marker.
+    /// Opt-in via `MVM_DEV_BACKEND=hvf` until it is the proven default.
+    Hvf,
     /// macOS 13+ with Apple Virtualization.framework — long-lived Vz
     /// builder VM. The canonical macOS dev path. Selected by macOS 26+
     /// Apple Silicon auto-detect and by an explicit `--builder vz` /
@@ -88,6 +94,7 @@ enum DevBackend {
 /// the same VMM.
 fn select_dev_backend(
     plat: Platform,
+    prefers_hvf: bool,
     prefers_vz: bool,
     prefers_libkrun: bool,
     has_vz: bool,
@@ -95,6 +102,12 @@ fn select_dev_backend(
     has_libkrun: bool,
     has_kvm: bool,
 ) -> DevBackend {
+    // 0. Opt-in to the in-house HVF dev VM (`MVM_DEV_BACKEND=hvf`), highest
+    //    priority on the macOS-26 tier. Vz stays the default until this is the
+    //    proven default (the flip is a one-line change to step 3 below).
+    if prefers_hvf && is_macos_vmm_tier {
+        return DevBackend::Hvf;
+    }
     // 1. Builder override picked Vz AND Vz is actually usable.
     if prefers_vz && has_vz {
         return DevBackend::Vz;
@@ -148,10 +161,20 @@ fn builder_prefers_libkrun() -> bool {
     false
 }
 
+/// Opt-in to the in-house HVF dev VM: `MVM_DEV_BACKEND=hvf` (case-insensitive).
+/// Temporary selector while the in-house dev VM is validated; the auto-detect
+/// default flips to it once proven.
+fn dev_prefers_hvf() -> bool {
+    std::env::var("MVM_DEV_BACKEND")
+        .map(|v| v.trim().eq_ignore_ascii_case("hvf"))
+        .unwrap_or(false)
+}
+
 fn current_backend() -> DevBackend {
     let plat = platform::current();
     select_dev_backend(
         plat,
+        dev_prefers_hvf(),
         builder_prefers_vz(),
         builder_prefers_libkrun(),
         plat.has_vz(),
