@@ -29,8 +29,8 @@
 - **Interception (guest):** two fidelities, same host side.
   - **Userspace TSI (v1, TRUSTED VMs only — dev/builder):** a baked guest daemon `mvm-guest-netd` installs nft `TPROXY` (TCP+UDP) → a local listener; per flow it reads the original destination (`SO_ORIGINAL_DST` / `IP_RECVORIGDSTADDR`) and relays over vsock. No kernel patch; needs nft in the rootfs — which we control for the dev VM.
   - **Kernel TSI (end-state, ALL workloads):** the guest kernel's `AF_INET` transport is vsock-backed (libkrun-style), so interception is unforgeable from userspace. Bigger lift; lands after v1.
-- **Transport:** one dedicated host-listen vsock port (the TSI port), per-VM, host-mediated. Distinct from the agent/console/substitution ports.
-- **Host forwarder:** a per-VM role in `mvm-hostd` (sibling to the substitution endpoint). It is where claim-10 enforcement, the SSRF guardrail, and the audit live.
+- **Transport:** the existing per-VM vsock `EGRESS_PORT` relay (device → host UDS). No new port needed.
+- **Host forwarder — REUSE, do not rebuild.** The host end already exists as `mvm_hostd::supervisor::raw_egress::serve_raw_egress` (+ `serve_raw_egress_vsock`): a NIC-less guest sends `host:port\n`, it is decided by the shared `EgressGate`, then byte-spliced (`copy_bidirectional`). **`EgressGate` already implements R1 + R3 + R4:** mandatory-deny (loopback/link-local/metadata/SSH) is built in (R1), `from_network_policy` gives claim-10 default-deny for a workload vs open for `unrestricted`/`trusted_build_egress` (R3), and the `host:port` line parser fails closed (`Malformed`, bounded length) (R4). Host-side DNS: the gate resolves the hostname via the admission DNS pins, so the guest sends **hostnames**, not IPs — no guest resolver needed. **The genuine host-side gap is R6/R7 per-flow audit** (raw_egress emits none today).
 
 ## Threat model → the 7 mitigations (each is a REQUIREMENT with a witness)
 
@@ -72,11 +72,11 @@ UDP (esp. DNS) is a classic low-bandwidth exfil path.
 ## Phases
 
 ### Phase 1 — Host-side TSI forwarder (VM-free, fully unit-tested)
-- [ ] **1.1** `TsiForwarder` (per-VM role in `mvm-hostd`): accept a vsock stream, parse the frame header (**R4** parser, fail-closed), then TCP-relay to a real host socket. Pure `(dest,port)` in, byte relay out. Unit-tested with a loopback stand-in.
-- [ ] **1.2** **R1 destination guardrail** — pure `is_denied(dest) -> bool` (loopback/link-local/metadata/host-control), enforced before connect; unit tests per class.
-- [ ] **1.3** **R3 trust gate + claim-10 hook** — `TrustTier::{Trusted, Workload}`; Trusted → guardrail only; Workload → guardrail + `NetworkPolicy` per destination (reuse `mvm_core::network_policy`). Tests: untrusted default-deny; trusted ungated-but-guardrailed.
-- [ ] **1.4** **R6/R7 audit** — emit a chain-signed per-flow record `(vm, proto, dest, port, bytes, verdict, ts)`; DNS/UDP flows included. Tests assert flows + DNS land in the audit.
-- [ ] **1.5** **R4 fuzz target** — `fuzz_tsi_frame`; wire into `security.yml`'s fuzz job.
+> **Reuse first: the forwarder + gate ALREADY EXIST.** `raw_egress` (serve loop + `splice`) + `EgressGate` cover 1.1/1.2/1.3/R4 already (relay, mandatory-deny guardrail R1, claim-10 trust gate R3, fail-closed `host:port` parse R4). Do NOT rebuild them. Phase 1 is therefore small: add the missing audit, provision the trusted gate, and lock the reused pieces with tests.
+- [x] **1.1/1.2/1.3/R4 — reused.** `raw_egress::serve_raw_egress` + `EgressGate::from_network_policy` provide the NIC-less-guest `host:port` relay, the R1 mandatory-deny guardrail, the R3 claim-10 trust gate (deny-all vs unrestricted), and the R4 fail-closed target parser.
+- [ ] **1.4** **R6/R7 per-flow audit (the genuine host gap)** — emit a chain-signed per-flow record `(vm, proto, host:port, verdict)` from the raw-egress serve path for every decision (allow + deny), incl. DNS (host-resolved) — reusing the existing audit signer, not a new one. Tests assert allow + deny + DNS flows land in the audit.
+- [ ] **1.5** **R3 provisioning + regression tests** — a helper that builds the dev VM's gate from `NetworkPolicy::trusted_build_egress()` (ungated-but-guardrailed) vs a workload's `deny_all` (fail-closed); tests: trusted reaches public + is still mandatory-denied for loopback/metadata; workload default-denies.
+- [ ] **1.6** **R4 fuzz** — confirm/add a cargo-fuzz target over `EgressGate::decide_request` / the `host:port` line reader; wire into `security.yml`'s fuzz job if absent.
 
 ### Phase 2 — Guest-side userspace TSI daemon (Linux)
 - [ ] **2.1** `mvm-guest-netd` (`mvm-guest-helpers` `[[bin]]`): nft `TPROXY` install for TCP+UDP → local listener; per-conn `SO_ORIGINAL_DST` (TCP) / `IP_RECVORIGDSTADDR` (UDP) → frame `(proto,dest,port)` → vsock relay to the TSI port. `just check-linux` compiles it.
