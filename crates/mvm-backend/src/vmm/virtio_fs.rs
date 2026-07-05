@@ -161,7 +161,15 @@ impl VirtioFs {
             R_INTERRUPT_STATUS => self.interrupt_status,
             R_STATUS => self.status,
             o if (R_CONFIG..R_CONFIG + (TAG_LEN as u64) + 4).contains(&o) => {
-                self.config_u32(o - R_CONFIG)
+                let v = self.config_u32(o - R_CONFIG);
+                if std::env::var_os("MVM_HVF_VIRTIO_DEBUG").is_some() {
+                    eprintln!(
+                        "virtio-fs: config read off={:#x} -> {:#010x}",
+                        o - R_CONFIG,
+                        v
+                    );
+                }
+                v
             }
             _ => 0,
         })
@@ -292,6 +300,18 @@ impl VirtioFs {
             }
         }
 
+        if std::env::var_os("MVM_HVF_VIRTIO_DEBUG").is_some() {
+            let op = if req.len() >= 8 {
+                u32::from_le_bytes(req[4..8].try_into().unwrap())
+            } else {
+                0
+            };
+            eprintln!(
+                "virtio-fs: req len={} opcode={op} writable_descs={}",
+                req.len(),
+                writable.len()
+            );
+        }
         let Some(reply) = self.fs.dispatch(&req) else {
             // FORGET and friends have no reply.
             return 0;
