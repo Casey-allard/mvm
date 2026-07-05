@@ -18,6 +18,7 @@ pub mod device;
 pub use crate::vsock_egress_bridge::egress_gate;
 pub(crate) use crate::vsock_egress_bridge::substitution_bridge;
 pub mod fdt;
+pub mod fuse;
 pub mod guest_mem;
 pub mod hv;
 pub mod kernel_image;
