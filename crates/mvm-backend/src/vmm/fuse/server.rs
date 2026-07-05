@@ -727,7 +727,7 @@ mod tests {
             for _ in 0..((n + pad) / 8) {
                 c.u64();
             }
-            if (n + pad) % 8 != 0 {
+            if !(n + pad).is_multiple_of(8) {
                 break;
             }
         }
