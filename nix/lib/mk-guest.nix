@@ -769,7 +769,7 @@ let
     # workload that reads stdin shortly after boot. /dev/null is the correct
     # stdin for a non-interactive sealed workload; stdout/stderr stay on the
     # console for capture, and the exit-code capture below is unaffected.
-   . "$MVM_BOOT" </dev/null
+    . "$MVM_BOOT" </dev/null
     MVM_CODE=$?
     # Report the exit code to the host (best-effort), then power off —
     # never reboot. The host reads it from the control vsock port.
