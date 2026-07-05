@@ -94,6 +94,11 @@ pub(super) fn cmd_dev_hvf(cpus: u32, memory_gib: u32, open_shell: bool) -> Resul
         cpus,
         memory_mib,
         volumes: vec![work_share_volume()],
+        // No cmdline is threaded: the in-house supervisor's workload default
+        // (`console=ttyAMA0 root=/dev/vda rw init=/init`) already boots the dev
+        // image's own `/init` on the captured PL011 serial — the console this
+        // VMM models (it has no hvc0, so the Vz/libkrun `console=hvc0` cmdline
+        // would go to an uncaptured device).
         // The dev VM is trusted build infrastructure: it gets the gated egress
         // endpoint with an open (trusted) policy, not the default-deny a
         // workload receives. Egress still rides vsock-only through the host
