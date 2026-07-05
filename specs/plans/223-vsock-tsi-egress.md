@@ -26,9 +26,8 @@
                                                   → audit every flow (chain-signed)  (R6/R7)
 ```
 
-- **Interception (guest):** two fidelities, same host side.
-  - **Userspace TSI (v1, TRUSTED VMs only — dev/builder):** a baked guest daemon `mvm-guest-netd` installs nft `TPROXY` (TCP+UDP) → a local listener; per flow it reads the original destination (`SO_ORIGINAL_DST` / `IP_RECVORIGDSTADDR`) and relays over vsock. No kernel patch; needs nft in the rootfs — which we control for the dev VM.
-  - **Kernel TSI (end-state, ALL workloads):** the guest kernel's `AF_INET` transport is vsock-backed (libkrun-style), so interception is unforgeable from userspace. Bigger lift; lands after v1.
+- **Interception (guest) — REUSE, already built.** `mvm-guest-helpers::egress_client` + the `mvm-egress-client` bin is an in-guest **SOCKS5 (socks5h, hostname-preserving) → vsock** proxy: per connection it learns the target from the SOCKS handshake, opens AF_VSOCK to `EGRESS_PORT`, sends `host:port`, and splices. Apps opt in via `ALL_PROXY=socks5h://127.0.0.1:<port>` (loopback, no NIC). **The guest `/init` already starts it + exports the proxy env when the boot env requests vsock egress** (`nix/packages/mvm-egress-client.nix`), and it pushes DNS host-side (no guest resolver). This is userspace TSI for the dev VM — no nft/kernel work needed for v1.
+  - **Kernel TSI (end-state, ALL workloads):** the guest kernel's `AF_INET` transport is vsock-backed (libkrun-style), so interception is transparent + unforgeable from userspace (no per-app proxy env). Bigger lift; lands after v1 (**R5**).
 - **Transport:** the existing per-VM vsock `EGRESS_PORT` relay (device → host UDS). No new port needed.
 - **Host forwarder — REUSE, do not rebuild.** The host end already exists as `mvm_hostd::supervisor::raw_egress::serve_raw_egress` (+ `serve_raw_egress_vsock`): a NIC-less guest sends `host:port\n`, it is decided by the shared `EgressGate`, then byte-spliced (`copy_bidirectional`). **`EgressGate` already implements R1 + R3 + R4:** mandatory-deny (loopback/link-local/metadata/SSH) is built in (R1), `from_network_policy` gives claim-10 default-deny for a workload vs open for `unrestricted`/`trusted_build_egress` (R3), and the `host:port` line parser fails closed (`Malformed`, bounded length) (R4). Host-side DNS: the gate resolves the hostname via the admission DNS pins, so the guest sends **hostnames**, not IPs — no guest resolver needed. **The genuine host-side gap is R6/R7 per-flow audit** (raw_egress emits none today).
 
@@ -78,13 +77,14 @@ UDP (esp. DNS) is a classic low-bandwidth exfil path.
 - [ ] **1.5** **R3 provisioning + regression tests** — a helper that builds the dev VM's gate from `NetworkPolicy::trusted_build_egress()` (ungated-but-guardrailed) vs a workload's `deny_all` (fail-closed); tests: trusted reaches public + is still mandatory-denied for loopback/metadata; workload default-denies.
 - [ ] **1.6** **R4 fuzz** — confirm/add a cargo-fuzz target over `EgressGate::decide_request` / the `host:port` line reader; wire into `security.yml`'s fuzz job if absent.
 
-### Phase 2 — Guest-side userspace TSI daemon (Linux)
-- [ ] **2.1** `mvm-guest-netd` (`mvm-guest-helpers` `[[bin]]`): nft `TPROXY` install for TCP+UDP → local listener; per-conn `SO_ORIGINAL_DST` (TCP) / `IP_RECVORIGDSTADDR` (UDP) → frame `(proto,dest,port)` → vsock relay to the TSI port. `just check-linux` compiles it.
-- [ ] **2.2** Fail-closed: if the vsock TSI port is unreachable, connections are refused (never leak to a non-existent NIC). Baked into the dev rootfs by `mkGuest`; started by the dev `/init` before the shell.
+### Phase 2 — Guest-side TSI client — REUSED (already built)
+- [x] **2.1/2.2 — reused.** `mvm-egress-client` (SOCKS5→vsock, socks5h hostname-preserving, fail-closed on host refusal) + the guest `/init` already start it and export `ALL_PROXY=socks5h://…` when the boot env requests vsock egress. No new guest daemon; no nft. `nix`(libcurl)/`git`/`curl` honor the proxy env. (nft-transparent + kernel TSI are the general end-state, Phase 6.)
 
-### Phase 3 — Wire into the dev VM + live-proof
-- [ ] **3.1** The in-house dev VM (Plan 222 Phase 4 `DevBackend::InHouse`) boots with the TSI vsock port bound + `mvm-guest-netd` started, `TrustTier::Trusted`.
-- [ ] **3.2** **Live-proof** on macOS-26: inside the dev VM, `curl https://…` and a real `nix build` fetch succeed **over vsock only** (no NIC: `ip link` shows only `lo`); the flows appear in the audit; `127.0.0.1`/metadata are refused (**R1**).
+### Phase 3 — Provision the dev VM's trusted egress endpoint + live-proof (THE real remaining build)
+The host relay + gate + guest client all exist. What's missing: today a `trusted_builder` in-house VM gets `egress_relay_socket = None` (network-isolated). The dev VM instead needs a **trusted** egress endpoint.
+- [ ] **3.1** In `InHouseDriver::relay_supervisor_config` (or the Plan 222 Phase 4 dev-VM spec), a **dev/trusted** VM wires an `EGRESS_PORT` relay to a raw-egress serve loop whose `EgressGate` is built from `NetworkPolicy::trusted_build_egress()` (unrestricted → open, but **mandatory-deny still applies** = R1). This is distinct from a workload (`deny_all`, R3) and from a build-only trusted VM (still `None`).
+- [ ] **3.2** Ensure the dev rootfs boot env requests vsock egress so `/init` starts `mvm-egress-client` + exports `ALL_PROXY`; point `nix`/`git` at the proxy env.
+- [ ] **3.3** **Live-proof** on macOS-26: inside the dev VM, `curl https://…` and a real `nix build` fetch succeed **over vsock only** (no NIC: `ip link` shows only `lo`); the flows appear in the audit (**R6**); `127.0.0.1`/metadata are refused (**R1**).
 
 ### Phase 4 — UDP/DNS completeness + hardening
 - [ ] **4.1** UDP flow support end-to-end (DNS working for nix); **R7** audit of DNS.
