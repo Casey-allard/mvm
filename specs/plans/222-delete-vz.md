@@ -62,16 +62,45 @@ The dev VM needs live `/work` (host CWD) + `/job`/`/out`. Decide the mechanism, 
 
 - [ ] **3.1** Decide: implement in-house pause/snapshot/resume (memory + disk state via the HVF supervisor), OR **descope `dev park`** on the in-house backend (document the loss; `dev up`/`down` still work). If descoped, `dev park` prints a clear "not supported on the in-house VMM" and Phase 4 omits the park arm. Recommendation: **descope for v1**, revisit under a warm-start plan.
 
-## Phase 4 — `DevBackend::InHouse`: migrate the interactive dev VM
+## Phase 4 — `DevBackend::Hvf`: migrate the interactive dev VM ✅ boot proven
 
 Wire `mvmctl dev` to a long-lived in-house dev VM, reusing the persistent-VM lifecycle + Plan 221 console + Phase 2 shares. Then the Vz dev path (and its supervisor dependency) can go.
 
-> **Depends on [[specs/plans/223-vsock-tsi-egress.md]] Phases 1–3** — the dev VM needs internet for `nix build`, and the in-house VMM has no general egress yet. Networking is **vsock-only TSI** (no NIC, no gvproxy/passt/rvproxy). The dev VM boots `TrustTier::Trusted` with the TSI vsock port + `mvm-guest-netd`.
+> **Naming:** the backend is `DevBackend::Hvf` (not `InHouse`), matching
+> `BackendKind::Hvf` / `name()=="hvf"` / the `hvf.pid` marker.
+>
+> **Networking ([[specs/plans/223-vsock-tsi-egress.md]]) is only needed for in-VM
+> `nix build`, not for the boot** — the dev VM boots to a listening agent with **no
+> egress wired** (proven in 4.4). Egress is vsock-only TSI (no NIC/gvproxy/passt/rvproxy).
 
-- [ ] **4.1** Add `DevBackend::InHouse`; `detect_backend` returns it on `is_macos_vmm_tier` (replacing `DevBackend::Vz`); `effective_hypervisor` reports `"hvf"`.
-- [ ] **4.2** Implement the in-house dev-VM boot (new `dev_inhouse.rs`, sibling to the kept `dev_vz.rs` helpers): boot a long-lived in-house VM named `DEV_VM_NAME` via the persistent runner path, with the nix-store overlay disk (`/dev/vdb`), the `/work`/`/job`/`/out` shares (Phase 2), and networking; reuse `ensure_dev_image`, image cache, JSON builders from `dev_vz.rs`.
-- [ ] **4.3** Wire `dev up/shell/status/down` arms: `up` → boot/reuse; `shell` → Plan 221 `console_interactive(DEV_VM_NAME)` (already in-house-capable); `status` → persistent-VM `status()`; `down` → `stop()`. `park` → per Phase 3.
-- [ ] **4.4** Live-proof on macOS-26: `mvmctl dev up` boots the dev VM **on the in-house VMM** (no `mvm-vz-supervisor` process), `dev shell` gives an interactive shell with a live `/work`, `nix build` works inside, `dev status`/`down` correct. Update `is_vz_dev_running` → `is_dev_vm_running` (backend-agnostic) across cache/cleanup/tests callers.
+- [x] **4.1** `DevBackend::Hvf` added; `select_dev_backend` returns it on
+  `is_macos_vmm_tier` **as an opt-in** (`MVM_DEV_BACKEND=hvf`, rule 0) — Vz stays the
+  auto-detect default until the flip (rule 3) after more validation. `select_dev_backend`
+  refactored 8 args → `DevSelection` params struct (dodges the banned
+  `too_many_arguments`). `dev_backend_report_name`/status report `"hvf"`. (`1226bdb9`)
+- [x] **4.2** `dev_hvf.rs` (sibling to `dev_vz.rs`): boots a long-lived in-house VM
+  named `DEV_VM_NAME` as a **workload** via `AnyBackend::from_hypervisor("hvf")` +
+  `VmStartConfig` (dev rootfs, `/work` virtio-fs DirShare, `trusted_build_egress()`
+  policy, `dev_console=true`); reuses `ensure_dev_image`. spec_map now translates
+  `Disk`→virtio-blk + `DirShare`→virtio-fs (`3ce08893`). No cmdline override — the
+  in-house VMM models only PL011/ttyAMA0 (no hvc0), so the supervisor's workload-default
+  cmdline (`console=ttyAMA0 root=/dev/vda rw init=/init`) is correct. nix-store `/dev/vdb`
+  deferred (not needed for boot; only in-VM `nix build`). (`1226bdb9`)
+- [x] **4.3** `dev up/shell/status/down`/rebuild arms wired: `up` → boot/reuse
+  (idempotent); `shell` → `console_interactive(DEV_VM_NAME)`; `status`/`down` reuse the
+  generic `AnyBackend::for_started_vm` marker (no Hvf-specific machinery). `park` bails
+  (no in-house snapshot yet). (`1226bdb9`)
+- [x] **4.4 (boot proven; polish remains)** Live on macOS-26: `MVM_DEV_BACKEND=hvf
+  mvmctl dev up` boots the dev VM **on the in-house VMM** (`mvm-hvf-supervisor`, no
+  `mvm-vz-supervisor`). console.log flush on `dev down` shows `Run /init as init process`
+  → `mvm-guest-agent: profile=Dev` → `control plane ready` → `listening on vsock port
+  5252`. **Root-cause fix that unblocked it:** `nix/lib/mk-guest.nix` initScript had a
+  3-space-indented line dropping Nix's `''` min-indent strip to 3 → a leading space
+  before `#!/bin/sh` → `/init` ENOEXEC panic on strict binfmt (affected every
+  mkGuest guest). Fixed → 4 spaces (`fix(mkGuest)`).
+  **Remaining:** `dev shell` interactive-attach live check; nix-store `/dev/vdb` +
+  Plan 223 egress for in-VM `nix build`; flip the default (rule 3) Vz→Hvf; rename
+  `is_vz_dev_running`→backend-agnostic across cache/cleanup callers.
 
 ## Phase 5 — Delete `mvm-vz-supervisor` + all remaining Vz
 
