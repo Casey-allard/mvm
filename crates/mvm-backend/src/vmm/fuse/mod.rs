@@ -8,3 +8,6 @@
 //! against a real temp directory with no VM.
 
 pub mod abi;
+pub mod server;
+
+pub use server::PassthroughFs;
