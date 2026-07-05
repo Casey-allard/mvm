@@ -158,6 +158,7 @@ pub fn workload_spec(inputs: &WorkloadSpecInputs) -> VmmSpec {
         mem_initial_mib: config.mem_initial_mib,
         blocks: workload_blocks(config),
         vsock: workload_vsock_ports(&inputs.sockets),
+        dir_shares: Vec::new(),
         console: ConsoleCapture {
             log_path: inputs.console_log.clone(),
         },

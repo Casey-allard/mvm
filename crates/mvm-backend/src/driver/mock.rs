@@ -153,6 +153,7 @@ mod tests {
             mem_initial_mib: None,
             blocks: vec![],
             vsock: vec![],
+            dir_shares: Vec::new(),
             console: ConsoleCapture {
                 log_path: "/tmp/console.log".into(),
             },

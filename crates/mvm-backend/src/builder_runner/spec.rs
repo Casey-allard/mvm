@@ -80,6 +80,7 @@ pub fn builder_spec(inputs: &BuilderSpecInputs<'_>) -> VmmSpec {
             block(inputs.output_disk, 3, false), // vdd: output tar, RW persist
         ],
         vsock,
+        dir_shares: Vec::new(),
         console: ConsoleCapture {
             log_path: inputs.console_log.clone(),
         },

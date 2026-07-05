@@ -44,6 +44,18 @@ pub struct ConsoleDataSocket {
     pub host_socket: PathBuf,
 }
 
+/// A host directory shared into the guest over virtio-fs, mounted by `tag`
+/// (`mount -t virtiofs <tag> <mountpoint>` in the guest). The dev VM's `/work`
+/// (host CWD), `/job`, `/out` shares. Empty for a plain workload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HvfDirShare {
+    /// virtio-fs mount tag the guest mounts by.
+    pub tag: String,
+    /// Host directory served into the guest.
+    pub host_path: PathBuf,
+}
+
 /// Everything the supervisor needs to boot one guest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,6 +119,10 @@ pub struct HvfSupervisorConfig {
     /// Populated by the driver when `VmStartConfig.dev_console` is true.
     #[serde(default)]
     pub console_data_sockets: Vec<ConsoleDataSocket>,
+    /// Host directory shares exposed to the guest over virtio-fs (the dev VM's
+    /// `/work`/`/job`/`/out`). Empty for a plain workload — nothing is shared.
+    #[serde(default)]
+    pub dir_shares: Vec<HvfDirShare>,
 }
 
 #[cfg(test)]
@@ -141,6 +157,7 @@ mod tests {
             substitution_socket: Some("/state/substitution-endpoint.sock".into()),
             egress_relay_socket: Some("/state/egress-bridge.sock".into()),
             console_data_sockets: vec![],
+            dir_shares: vec![],
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert_eq!(
@@ -203,6 +220,10 @@ mod tests {
                     host_socket: "/state/vsock/vsock-20002.sock".into(),
                 },
             ],
+            dir_shares: vec![HvfDirShare {
+                tag: "work".into(),
+                host_path: "/host/project".into(),
+            }],
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let decoded: HvfSupervisorConfig = serde_json::from_str(&json).unwrap();
@@ -212,6 +233,12 @@ mod tests {
         assert_eq!(
             decoded.console_data_sockets[0].host_socket,
             PathBuf::from("/state/vsock/vsock-20001.sock")
+        );
+        assert_eq!(decoded.dir_shares.len(), 1);
+        assert_eq!(decoded.dir_shares[0].tag, "work");
+        assert_eq!(
+            decoded.dir_shares[0].host_path,
+            PathBuf::from("/host/project")
         );
     }
 

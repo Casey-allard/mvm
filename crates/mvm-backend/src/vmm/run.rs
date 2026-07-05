@@ -212,6 +212,23 @@ impl RunDevice for super::virtio::VirtioBlk {
     }
 }
 
+impl RunDevice for super::virtio_fs::VirtioFs {
+    fn contains(&self, addr: u64) -> bool {
+        self.contains(addr)
+    }
+    fn base(&self) -> u64 {
+        self.base()
+    }
+    fn read(&mut self, offset: u64, _size: u8) -> u64 {
+        (*self).read(offset)
+    }
+    fn write(&mut self, offset: u64, value: u64, _size: u8) -> Option<u32> {
+        // A queue notify is serviced synchronously (the FUSE request runs inline),
+        // like virtio-blk; the guest gets one used-buffer interrupt.
+        self.write(offset, value).then(|| self.irq())
+    }
+}
+
 impl RunDevice for super::vsock::VirtioVsock {
     fn contains(&self, addr: u64) -> bool {
         self.contains(addr)

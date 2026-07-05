@@ -175,6 +175,7 @@ fn main() {
                 host_uds: uds.clone(),
                 direction: VsockDirection::GuestDials,
             }],
+            dir_shares: Vec::new(),
             console: ConsoleCapture {
                 log_path: state_dir.join("console.log"),
             },

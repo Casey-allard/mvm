@@ -66,6 +66,16 @@ pub struct ConsoleCapture {
     pub log_path: PathBuf,
 }
 
+/// A host directory shared into the guest over virtio-fs, mounted by `tag`. The
+/// dev VM's `/work` (host CWD), `/job`, `/out` shares; empty for a workload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirShare {
+    /// virtio-fs mount tag the guest mounts by (`mount -t virtiofs <tag> <mnt>`).
+    pub tag: String,
+    /// Host directory served into the guest.
+    pub host_path: PathBuf,
+}
+
 /// The backend-agnostic physical recipe a [`VmmDriver`](crate::driver::VmmDriver)
 /// boots. No NIC: vsock is the only channel off the guest besides storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +93,9 @@ pub struct VmmSpec {
     pub mem_initial_mib: Option<u32>,
     pub blocks: Vec<BlockDev>,
     pub vsock: Vec<VsockPort>,
+    /// Host directory shares exposed over virtio-fs (the dev VM's `/work`/`/job`/
+    /// `/out`). Empty for a workload — nothing is shared.
+    pub dir_shares: Vec<DirShare>,
     pub console: ConsoleCapture,
     /// Trusted-builder VM: it carries no untrusted workload, so it boots WITHOUT
     /// the claim-10 egress gate (no `EGRESS_PORT` relay required). A workload

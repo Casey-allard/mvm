@@ -29,6 +29,7 @@ use crate::vmm::device::Pl011;
 use crate::vmm::hv::{CoreReg, HypervisorVcpu, SysReg, VcpuHandle};
 use crate::vmm::run::{self, RunControl, RunDevice, RunOutcome};
 use crate::vmm::virtio::{DiskImage, VirtioBlk};
+use crate::vmm::virtio_fs::VirtioFs;
 use crate::vmm::vsock::VirtioVsock;
 use crate::vmm::{fdt, kernel_image};
 
@@ -67,6 +68,9 @@ const MMIO_STRIDE: u64 = 0x200;
 /// Max virtio-blk devices (`/dev/vda`..). Bounds the reserved window band.
 const MAX_DISKS: usize = 4;
 
+/// Max virtio-fs directory shares (`/work`, `/job`, `/out`, …).
+const MAX_SHARES: usize = 4;
+
 /// MMIO base + SPI for virtio-blk device `i` (`/dev/vda` = 0). Disk 0 keeps the
 /// original single-disk window; disks 1+ sit *above* the vsock slot, so vsock's
 /// address/IRQ stay fixed and the live-verified agent/egress path is untouched.
@@ -79,6 +83,26 @@ fn disk_mmio(i: usize) -> (u64, u32) {
             VIRTIO_IRQ + i as u32 + 1,
         )
     }
+}
+
+/// MMIO base + SPI for virtio-fs share `i`. The shares sit in slots *above* the
+/// whole disk band (`MAX_DISKS` disks + the vsock slot), so adding a share never
+/// shifts a disk/vsock window and the live-verified agent/egress path is untouched.
+fn share_mmio(i: usize) -> (u64, u32) {
+    let slot = MAX_DISKS + 1 + i;
+    (
+        VIRTIO_MMIO_BASE + (slot as u64) * MMIO_STRIDE,
+        VIRTIO_IRQ + slot as u32,
+    )
+}
+
+/// A host directory shared into the guest over virtio-fs, mounted by `tag`
+/// (`mount -t virtiofs <tag> <mountpoint>`). The dev VM's `/work` (host CWD),
+/// `/job`, `/out` shares.
+#[derive(Debug, Clone)]
+pub struct DirShare {
+    pub tag: String,
+    pub host_path: PathBuf,
 }
 
 const PSCI_VERSION_FN: u64 = 0x8400_0000;
@@ -170,6 +194,9 @@ pub struct HostChannels {
     /// Guest RAM in MiB. `0` ⇒ the built-in default (512 MiB). A builder sets
     /// several GiB so `nix build` doesn't OOM.
     pub mem_mib: u32,
+    /// Host directory shares exposed to the guest over virtio-fs (the dev VM's
+    /// `/work`/`/job`/`/out`). Empty for a plain workload — nothing is shared.
+    pub dir_shares: Vec<DirShare>,
 }
 
 /// Boot `image` (an arm64 `Image`) under HVF, optionally with an `initramfs`
@@ -196,6 +223,7 @@ pub fn boot_kernel(
             console_data_sockets: Vec::new(),
             cmdline: None,
             mem_mib: 0,
+            dir_shares: Vec::new(),
         },
     )
 }
@@ -225,9 +253,23 @@ fn boot_kernel_impl(
     vsock: bool,
     timeout: Duration,
     stop: &'static AtomicBool,
-    channels: HostChannels,
+    mut channels: HostChannels,
 ) -> Result<KernelBootResult, HvfError> {
-    if disks.len() > MAX_DISKS {
+    // Dev/test hook (mirrors `MVM_HVF_BOOTARGS`): `MVM_HVF_DIR_SHARE=tag:/host/path`
+    // (comma-separated for several) appends virtio-fs shares to any the config
+    // already carries, so a plain `machine run` can exercise the share device
+    // ahead of the dev-VM migration wiring it through `VmmSpec`.
+    if let Ok(spec) = std::env::var("MVM_HVF_DIR_SHARE") {
+        for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some((tag, path)) = entry.split_once(':') {
+                channels.dir_shares.push(DirShare {
+                    tag: tag.to_string(),
+                    host_path: PathBuf::from(path),
+                });
+            }
+        }
+    }
+    if disks.len() > MAX_DISKS || channels.dir_shares.len() > MAX_SHARES {
         return Err(HvfError::BadKernel);
     }
     // Validate it's an arm64 Image; we load at the fixed boot-protocol offset.
@@ -283,6 +325,12 @@ fn boot_kernel_impl(
     if vsock {
         virtio_nodes.push((VSOCK_MMIO_BASE, VSOCK_IRQ));
     }
+    // One generic virtio-mmio FDT node per directory share; the kernel reads the
+    // virtio-fs device id (26) from the window itself. Must match the `VirtioFs`
+    // devices the run loop builds below (same windows).
+    for i in 0..channels.dir_shares.len() {
+        virtio_nodes.push(share_mmio(i));
+    }
     let dtb = fdt::build_dtb(
         &bootargs,
         RAM_BASE,
@@ -332,6 +380,7 @@ fn boot_kernel_impl(
                 substitution_socket: channels.substitution_socket,
                 egress_relay: channels.egress_relay,
                 console_data_sockets: channels.console_data_sockets,
+                dir_shares: channels.dir_shares,
             },
             stop,
         );
@@ -364,6 +413,8 @@ struct RunInputs {
     /// Dev-only host console listeners (one `(guest_port, host_socket)` per console
     /// data port). Empty for a sealed prod config — nothing bound (claim 15).
     console_data_sockets: Vec<(u32, PathBuf)>,
+    /// Host directory shares exposed over virtio-fs (dev VM `/work`/`/job`/`/out`).
+    dir_shares: Vec<DirShare>,
 }
 
 unsafe fn run(
@@ -382,6 +433,7 @@ unsafe fn run(
         substitution_socket,
         egress_relay,
         console_data_sockets,
+        dir_shares,
     } = inputs;
     unsafe {
         // In-kernel GICv3 — created after the VM, before any vCPU. Base
@@ -500,6 +552,27 @@ unsafe fn run(
                 VirtioBlk::new(base, irq, ram, RAM_BASE, ram_size, img)
             })
             .collect();
+        // One virtio-fs device per directory share, in windows above the disk band
+        // (so the disk/vsock windows never move). Each serves its host directory
+        // into the guest, mounted by tag (`mount -t virtiofs <tag> <mountpoint>`).
+        let mut virtio_shares: Vec<VirtioFs> = dir_shares
+            .iter()
+            .enumerate()
+            .map(|(i, share)| {
+                let (base, irq) = share_mmio(i);
+                // SAFETY: `ram` is the mapped guest RAM, valid for the run (within
+                // the enclosing `unsafe` block).
+                VirtioFs::new(
+                    base,
+                    irq,
+                    ram,
+                    RAM_BASE,
+                    ram_size,
+                    &share.tag,
+                    &share.host_path,
+                )
+            })
+            .collect();
         let mut vsock_dev =
             vsock.then(|| VirtioVsock::new(VSOCK_MMIO_BASE, VSOCK_IRQ, ram, RAM_BASE, ram_size));
         if let Some(v) = vsock_dev.as_mut() {
@@ -571,6 +644,9 @@ unsafe fn run(
         let outcome = {
             let mut devices: Vec<&mut dyn RunDevice> = vec![&mut uart];
             for v in virtio_disks.iter_mut() {
+                devices.push(v);
+            }
+            for v in virtio_shares.iter_mut() {
                 devices.push(v);
             }
             if let Some(v) = vsock_dev.as_mut() {

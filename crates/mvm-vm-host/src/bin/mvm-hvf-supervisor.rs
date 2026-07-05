@@ -206,6 +206,14 @@ fn main() -> anyhow::Result<()> {
                 .collect(),
             cmdline: cfg.cmdline.clone(),
             mem_mib: cfg.memory_mib,
+            dir_shares: cfg
+                .dir_shares
+                .iter()
+                .map(|s| mvm_backend::hvf::DirShare {
+                    tag: s.tag.clone(),
+                    host_path: s.host_path.clone(),
+                })
+                .collect(),
         },
     );
 

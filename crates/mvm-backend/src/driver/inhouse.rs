@@ -152,6 +152,14 @@ fn relay_supervisor_config(spec: &VmmSpec, paths: &SupervisorPaths) -> Result<Hv
         substitution_socket: None,
         egress_relay_socket,
         console_data_sockets,
+        dir_shares: spec
+            .dir_shares
+            .iter()
+            .map(|s| mvm_build::hvf_supervisor::HvfDirShare {
+                tag: s.tag.clone(),
+                host_path: s.host_path.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -393,6 +401,7 @@ mod tests {
             mem_initial_mib: None,
             blocks,
             vsock,
+            dir_shares: Vec::new(),
             console: ConsoleCapture {
                 log_path: "/tmp/console.log".into(),
             },
