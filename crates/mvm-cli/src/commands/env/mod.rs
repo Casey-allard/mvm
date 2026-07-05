@@ -8,6 +8,7 @@ pub(super) mod artifact_verify;
 pub(super) mod bootstrap;
 pub(super) mod cleanup;
 pub(super) mod dev;
+pub(super) mod dev_hvf;
 pub(super) mod dev_vz;
 pub(super) mod doctor;
 pub(super) mod group;

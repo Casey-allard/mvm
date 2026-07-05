@@ -33,6 +33,7 @@ use mvm_core::vm_backend::{VmBackend, VmId, VmStartConfig, VmStatus, VmVolume};
 
 use super::super::vm::console;
 use super::Cli;
+use super::dev_hvf;
 use super::dev_vz;
 use super::linux_native;
 
@@ -92,16 +93,36 @@ enum DevBackend {
 /// `prefers_libkrun` is the one signal that overrides this — because it
 /// also moves the build boundary onto libkrun, keeping both halves on
 /// the same VMM.
-fn select_dev_backend(
+/// The host platform, capability probes, and builder-override preferences that
+/// drive [`select_dev_backend`]. Grouped into a params struct (not threaded as
+/// bare positional args) so the dispatch stays readable and the `too_many_
+/// arguments` clippy lint — banned via `#[allow]` in this repo — never fires.
+#[derive(Debug, Clone, Copy)]
+struct DevSelection {
     plat: Platform,
+    /// `MVM_DEV_BACKEND=hvf` — opt into the in-house HVF dev VM.
     prefers_hvf: bool,
+    /// `--builder vz` / `MVM_BUILDER_BACKEND=vz`.
     prefers_vz: bool,
+    /// `--builder libkrun` / `MVM_BUILDER_BACKEND=libkrun`.
     prefers_libkrun: bool,
     has_vz: bool,
     is_macos_vmm_tier: bool,
     has_libkrun: bool,
     has_kvm: bool,
-) -> DevBackend {
+}
+
+fn select_dev_backend(sel: DevSelection) -> DevBackend {
+    let DevSelection {
+        plat,
+        prefers_hvf,
+        prefers_vz,
+        prefers_libkrun,
+        has_vz,
+        is_macos_vmm_tier,
+        has_libkrun,
+        has_kvm,
+    } = sel;
     // 0. Opt-in to the in-house HVF dev VM (`MVM_DEV_BACKEND=hvf`), highest
     //    priority on the macOS-26 tier. Vz stays the default until this is the
     //    proven default (the flip is a one-line change to step 3 below).
@@ -172,16 +193,16 @@ fn dev_prefers_hvf() -> bool {
 
 fn current_backend() -> DevBackend {
     let plat = platform::current();
-    select_dev_backend(
+    select_dev_backend(DevSelection {
         plat,
-        dev_prefers_hvf(),
-        builder_prefers_vz(),
-        builder_prefers_libkrun(),
-        plat.has_vz(),
-        plat.is_macos_vmm_tier(),
-        plat.has_libkrun(),
-        plat.has_kvm(),
-    )
+        prefers_hvf: dev_prefers_hvf(),
+        prefers_vz: builder_prefers_vz(),
+        prefers_libkrun: builder_prefers_libkrun(),
+        has_vz: plat.has_vz(),
+        is_macos_vmm_tier: plat.is_macos_vmm_tier(),
+        has_libkrun: plat.has_libkrun(),
+        has_kvm: plat.has_kvm(),
+    })
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -435,6 +456,7 @@ fn cmd_dev_libkrun_down(json: bool) -> Result<bool> {
 fn dev_backend_report_name(backend: DevBackend) -> &'static str {
     match backend {
         DevBackend::Vz => "vz",
+        DevBackend::Hvf => "hvf",
         DevBackend::Libkrun => "libkrun",
         DevBackend::LinuxKvm => "linux-native",
         DevBackend::Unsupported => "unsupported",
@@ -566,6 +588,13 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                     warn_dev_volumes_unsupported(&dev_volumes, "Vz");
                     dev_vz::cmd_dev_vz(effective_cpus, effective_mem, open_shell, dev_base.as_ref())
                 }
+                DevBackend::Hvf => {
+                    if dev_base.is_some() {
+                        anyhow::bail!("`mvmctl dev up --base` is only supported by the Vz backend");
+                    }
+                    warn_dev_volumes_unsupported(&dev_volumes, "in-house HVF");
+                    dev_hvf::cmd_dev_hvf(effective_cpus, effective_mem, open_shell)
+                }
                 DevBackend::LinuxKvm => {
                     if dev_base.is_some() {
                         anyhow::bail!("`mvmctl dev up --base` is only supported by the Vz backend");
@@ -587,6 +616,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             let was_running = match backend {
                 DevBackend::Libkrun => cmd_dev_libkrun_down(json),
                 DevBackend::Vz => dev_vz::cmd_dev_vz_down(json, reset),
+                DevBackend::Hvf => dev_hvf::cmd_dev_hvf_down(json),
                 DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(json),
                 // Nothing to stop on unsupported hosts. The gc-root
                 // cleanup below still runs.
@@ -612,6 +642,10 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 DevBackend::Libkrun => anyhow::bail!(
                     "`mvmctl dev park` is only supported by the Vz dev backend; \
                      libkrun has no persistent memory snapshot"
+                ),
+                DevBackend::Hvf => anyhow::bail!(
+                    "`mvmctl dev park` is only supported by the Vz dev backend; \
+                     the in-house HVF dev VM has no persistent memory snapshot yet"
                 ),
                 DevBackend::LinuxKvm => {
                     anyhow::bail!("`mvmctl dev park` is only supported by the Vz dev backend")
@@ -648,12 +682,20 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 console::console_interactive(dev_vz::DEV_VM_NAME)
                     .context("Dev VM is running, but console attach failed")
             }
+            DevBackend::Hvf => {
+                if !dev_hvf::is_hvf_dev_running() {
+                    anyhow::bail!("Dev VM is not running. Start it with: mvmctl dev up");
+                }
+                console::console_interactive(dev_vz::DEV_VM_NAME)
+                    .context("Dev VM is running, but console attach failed")
+            }
             DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_shell(),
             DevBackend::Unsupported => bail_no_dev_backend(),
         },
         DevAction::Status { json } => match backend {
             DevBackend::Libkrun => cmd_dev_libkrun_status(json),
             DevBackend::Vz => dev_vz::cmd_dev_vz_status(json),
+            DevBackend::Hvf => dev_hvf::cmd_dev_hvf_status(json),
             DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_status(json),
             DevBackend::Unsupported => {
                 if json {
@@ -692,6 +734,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 DevBackend::Libkrun => cmd_dev_libkrun_down(false),
                 // Rebuild discards state, so don't park — cold-boot next.
                 DevBackend::Vz => dev_vz::cmd_dev_vz_down(false, /* reset = */ true),
+                DevBackend::Hvf => dev_hvf::cmd_dev_hvf_down(false),
                 DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(false),
                 DevBackend::Unsupported => Ok(false),
             };
@@ -716,6 +759,10 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                     warn_dev_volumes_unsupported(&dev_volumes, "Vz");
                     dev_vz::cmd_dev_vz(effective_cpus, effective_mem, shell, None).map(|_| ())
                 }
+                DevBackend::Hvf => {
+                    warn_dev_volumes_unsupported(&dev_volumes, "in-house HVF");
+                    dev_hvf::cmd_dev_hvf(effective_cpus, effective_mem, shell).map(|_| ())
+                }
                 DevBackend::LinuxKvm => {
                     warn_dev_volumes_unsupported(&dev_volumes, "native Linux/KVM");
                     linux_native::cmd_dev_linux_native(shell).map(|_| ())
@@ -728,8 +775,32 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{DevBackend, effective_up_shell, select_dev_backend};
+    use super::{DevBackend, DevSelection, effective_up_shell, select_dev_backend};
     use mvm_core::platform::Platform;
+
+    /// A macOS selection with every capability/preference off. Tests flip only
+    /// the fields they exercise via `..macos()` struct-update, so each case
+    /// reads as "these signals set, all else false".
+    fn macos() -> DevSelection {
+        DevSelection {
+            plat: Platform::MacOS,
+            prefers_hvf: false,
+            prefers_vz: false,
+            prefers_libkrun: false,
+            has_vz: false,
+            is_macos_vmm_tier: false,
+            has_libkrun: false,
+            has_kvm: false,
+        }
+    }
+
+    /// The native-Linux counterpart of [`macos`].
+    fn linux() -> DevSelection {
+        DevSelection {
+            plat: Platform::LinuxNative,
+            ..macos()
+        }
+    }
 
     #[test]
     fn dev_up_opens_shell_by_default() {
@@ -749,20 +820,48 @@ mod tests {
     // ──────────────────────────────────────────────────────────────
 
     #[test]
+    fn hvf_opt_in_on_vmm_tier_picks_hvf_over_vz_default() {
+        // `MVM_DEV_BACKEND=hvf` on the macOS-26 tier wins over the Vz
+        // auto-detect default (rule 0). The opt-in until Hvf is proven.
+        assert_eq!(
+            select_dev_backend(DevSelection {
+                prefers_hvf: true,
+                has_vz: true,
+                is_macos_vmm_tier: true,
+                has_libkrun: true,
+                ..macos()
+            }),
+            DevBackend::Hvf,
+        );
+    }
+
+    #[test]
+    fn hvf_opt_in_off_the_vmm_tier_falls_through() {
+        // The opt-in only takes effect on the in-house VMM tier: asking for
+        // hvf on a non-tier host (macOS 13-25) still lands on libkrun rather
+        // than an in-house backend that can't run there.
+        assert_eq!(
+            select_dev_backend(DevSelection {
+                prefers_hvf: true,
+                has_libkrun: true,
+                ..macos()
+            }),
+            DevBackend::Libkrun,
+        );
+    }
+
+    #[test]
     fn builder_vz_with_vz_available_picks_vz_dev_backend() {
         // Regression test: `MVM_BUILDER_BACKEND=vz` (or `--builder vz`)
         // must actually route the dev VM through `VzBackend` when the
         // host supports it — an earlier grace guard silently rejected.
         assert_eq!(
-            select_dev_backend(
-                Platform::MacOS,
-                /* prefers_vz */ true,
-                /* prefers_libkrun */ false,
-                /* has_vz */ true,
-                /* is_macos_vmm_tier */ false,
-                /* has_libkrun */ true,
-                /* has_kvm */ false,
-            ),
+            select_dev_backend(DevSelection {
+                prefers_vz: true,
+                has_vz: true,
+                has_libkrun: true,
+                ..macos()
+            }),
             DevBackend::Vz,
         );
     }
@@ -773,7 +872,13 @@ mod tests {
         // tier (rule 3) both land on Vz; the override path is exercised
         // here independent of the default tier.
         assert_eq!(
-            select_dev_backend(Platform::MacOS, true, false, true, true, true, false,),
+            select_dev_backend(DevSelection {
+                prefers_vz: true,
+                has_vz: true,
+                is_macos_vmm_tier: true,
+                has_libkrun: true,
+                ..macos()
+            }),
             DevBackend::Vz,
         );
     }
@@ -785,15 +890,11 @@ mod tests {
         // `has_vz()` is false, fall through to the standard tree
         // instead of returning a Vz backend that can't run.
         assert_eq!(
-            select_dev_backend(
-                Platform::LinuxNative,
-                true,
-                /* prefers_libkrun */ false,
-                /* has_vz */ false,
-                false,
-                false,
-                /* has_kvm */ true,
-            ),
+            select_dev_backend(DevSelection {
+                prefers_vz: true,
+                has_kvm: true,
+                ..linux()
+            }),
             DevBackend::LinuxKvm,
         );
     }
@@ -806,15 +907,12 @@ mod tests {
         // auto-detect libkrun does *not* divert off Vz — only an
         // explicit ask does (next test).
         assert_eq!(
-            select_dev_backend(
-                Platform::MacOS,
-                /* prefers_vz */ false,
-                /* prefers_libkrun */ false,
-                true,
-                /* is_macos_vmm_tier */ true,
-                true,
-                false,
-            ),
+            select_dev_backend(DevSelection {
+                has_vz: true,
+                is_macos_vmm_tier: true,
+                has_libkrun: true,
+                ..macos()
+            }),
             DevBackend::Vz,
         );
     }
@@ -825,15 +923,13 @@ mod tests {
         // sets MVM_BUILDER_BACKEND=libkrun on a macOS 26+ box (Vz default
         // tier) gets the dev VM on libkrun, not Vz.
         assert_eq!(
-            select_dev_backend(
-                Platform::MacOS,
-                /* prefers_vz */ false,
-                /* prefers_libkrun */ true,
-                /* has_vz */ true,
-                /* is_macos_vmm_tier */ true,
-                /* has_libkrun */ true,
-                /* has_kvm */ false,
-            ),
+            select_dev_backend(DevSelection {
+                prefers_libkrun: true,
+                has_vz: true,
+                is_macos_vmm_tier: true,
+                has_libkrun: true,
+                ..macos()
+            }),
             DevBackend::Libkrun,
         );
     }
@@ -845,15 +941,11 @@ mod tests {
         // backend that can't run — fall through to the auto-detect tree
         // (the Vz default tier).
         assert_eq!(
-            select_dev_backend(
-                Platform::MacOS,
-                /* prefers_vz */ false,
-                /* prefers_libkrun */ true,
-                /* has_vz */ false,
-                /* is_macos_vmm_tier */ true,
-                /* has_libkrun */ false,
-                /* has_kvm */ false,
-            ),
+            select_dev_backend(DevSelection {
+                prefers_libkrun: true,
+                is_macos_vmm_tier: true,
+                ..macos()
+            }),
             DevBackend::Vz,
         );
     }
@@ -862,15 +954,11 @@ mod tests {
     fn builder_libkrun_falls_back_to_libkrun_on_older_macos() {
         // macOS 13-25 (not the Vz default tier) + libkrun installed.
         assert_eq!(
-            select_dev_backend(
-                Platform::MacOS,
-                /* prefers_vz */ false,
-                /* prefers_libkrun */ false,
-                true,
-                false,
-                true,
-                false,
-            ),
+            select_dev_backend(DevSelection {
+                has_vz: true,
+                has_libkrun: true,
+                ..macos()
+            }),
             DevBackend::Libkrun,
         );
     }
@@ -878,15 +966,10 @@ mod tests {
     #[test]
     fn builder_libkrun_falls_through_to_linux_kvm() {
         assert_eq!(
-            select_dev_backend(
-                Platform::LinuxNative,
-                /* prefers_vz */ false,
-                /* prefers_libkrun */ false,
-                false,
-                false,
-                false,
-                true,
-            ),
+            select_dev_backend(DevSelection {
+                has_kvm: true,
+                ..linux()
+            }),
             DevBackend::LinuxKvm,
         );
     }
@@ -895,17 +978,6 @@ mod tests {
     fn unsupported_host_returns_unsupported() {
         // macOS without AC and without libkrun (Intel macOS, macOS
         // pre-13), Linux without KVM, etc.
-        assert_eq!(
-            select_dev_backend(
-                Platform::MacOS,
-                /* prefers_vz */ false,
-                /* prefers_libkrun */ false,
-                false,
-                false,
-                false,
-                false,
-            ),
-            DevBackend::Unsupported,
-        );
+        assert_eq!(select_dev_backend(macos()), DevBackend::Unsupported);
     }
 }
