@@ -98,9 +98,17 @@ Wire `mvmctl dev` to a long-lived in-house dev VM, reusing the persistent-VM lif
   3-space-indented line dropping Nix's `''` min-indent strip to 3 → a leading space
   before `#!/bin/sh` → `/init` ENOEXEC panic on strict binfmt (affected every
   mkGuest guest). Fixed → 4 spaces (`fix(mkGuest)`).
-  **Remaining:** `dev shell` interactive-attach live check; nix-store `/dev/vdb` +
-  Plan 223 egress for in-VM `nix build`; flip the default (rule 3) Vz→Hvf; rename
-  `is_vz_dev_running`→backend-agnostic across cache/cleanup callers.
+  Also live-proven: **interactive `dev shell`** (prompt + `uname`/`id` + exit, via
+  `expect`) and the **`/work` virtio-fs share** — `mvm.uvols=` cmdline threaded as an
+  append slot (`VmmSpec.uvols_cmdline` → `HvfSupervisorConfig.uvols` → `HostChannels`
+  → `kernel_boot`), device/cmdline tag unified on `mvm_core::vm_backend::uvol_tag`;
+  `mvm-init: mounted user volume uvol0 at /work`, `ls /work` shows the host CWD
+  (`daf6463c`).
+  **Remaining:** `/work` is effectively **read-only** — the dev image's baked-in
+  `work`/`out`/`job` mounts (Vz-builder `/work`=ro-flake-source convention) shadow the
+  `rw` `uvol0` mount; interactive editing wants RW, so reconcile the dev-image share
+  convention with `uvols`. Then nix-store `/dev/vdb` + Plan 223 egress for in-VM `nix
+  build`; flip the default (rule 3) Vz→Hvf; rename `is_vz_dev_running`→backend-agnostic.
 
 ## Phase 5 — Delete `mvm-vz-supervisor` + all remaining Vz
 
