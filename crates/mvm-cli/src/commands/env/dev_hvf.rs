@@ -62,6 +62,11 @@ fn work_share_volume() -> VmVolume {
 /// image name keeps it off the builder VM's shared `nix-store-<arch>.img`, so
 /// the single long-lived dev VM is its only user and the host flock can drop
 /// once the guest holds the file open.
+///
+/// Opt-in via `MVM_DEV_NIX_STORE=1` until the guest `/init` overlay lands: an
+/// unformatted image attached ahead of the rootfs shifts virtio-blk enumeration
+/// (the empty disk claims `vda`) and panics the kernel on root mount, so it must
+/// not be wired by default before the guest side consumes it.
 #[cfg(feature = "builder-vm")]
 fn nix_store_disk_volume() -> Result<VmVolume> {
     let arch = std::env::consts::ARCH;
@@ -81,6 +86,18 @@ fn nix_store_disk_volume() -> Result<VmVolume> {
         kind: VmVolumeKind::Disk,
         encrypted: false,
     })
+}
+
+/// The dev VM's disk/share set: always the `/work` virtio-fs share; the
+/// persistent Nix store disk is opt-in (see [`nix_store_disk_volume`]) until the
+/// guest overlay consumes it.
+#[cfg(feature = "builder-vm")]
+fn dev_volumes() -> Result<Vec<VmVolume>> {
+    let mut volumes = vec![work_share_volume()];
+    if std::env::var_os("MVM_DEV_NIX_STORE").is_some() {
+        volumes.push(nix_store_disk_volume()?);
+    }
+    Ok(volumes)
 }
 
 /// Boot the interactive dev VM on the in-house HVF VMM. Idempotent: a
@@ -121,7 +138,7 @@ pub(super) fn cmd_dev_hvf(cpus: u32, memory_gib: u32, open_shell: bool) -> Resul
         profile: Some("dev".to_string()),
         cpus,
         memory_mib,
-        volumes: vec![work_share_volume(), nix_store_disk_volume()?],
+        volumes: dev_volumes()?,
         // No cmdline is threaded: the in-house supervisor's workload default
         // (`console=ttyAMA0 root=/dev/vda rw init=/init`) already boots the dev
         // image's own `/init` on the captured PL011 serial — the console this
@@ -135,6 +152,9 @@ pub(super) fn cmd_dev_hvf(cpus: u32, memory_gib: u32, open_shell: bool) -> Resul
         // Interactive PTY-over-vsock console (dev-only; claim 15). Pre-opens the
         // console data ports so `dev shell` can attach.
         dev_console: true,
+        // The dev rootfs is unsealed and mounted `rw` — it must replay its ext4
+        // journal and persist writes, so `/dev/vda` is presented writable.
+        writable_rootfs: true,
         ..Default::default()
     };
 

@@ -39,7 +39,15 @@ pub fn workload_blocks(config: &VmStartConfig) -> Vec<BlockDev> {
         return Vec::new();
     }
 
-    let mut blocks = vec![ro(&config.rootfs_path, 0)];
+    // The rootfs is read-only by default (a sealed workload; verity-checked).
+    // The dev VM opts into a writable root — it boots `rw` and must replay its
+    // ext4 journal — via `writable_rootfs`.
+    let mut blocks = vec![BlockDev {
+        source: config.rootfs_path.clone().into(),
+        read_only: !config.writable_rootfs,
+        ephemeral: false,
+        slot: 0,
+    }];
 
     if let Some(verity) = &config.verity_path {
         blocks.push(ro(verity, 1));
@@ -232,6 +240,20 @@ mod tests {
         assert_eq!(nodes(&blocks), vec!["/dev/vda"]);
         assert_eq!(blocks[0].source, PathBuf::from("/img/rootfs.ext4"));
         assert!(blocks[0].read_only);
+    }
+
+    #[test]
+    fn writable_rootfs_presents_vda_read_write() {
+        // The dev VM boots `root=/dev/vda rw` and must replay its ext4 journal;
+        // `writable_rootfs` flips slot 0 writable. A read-only vda panics the
+        // kernel on root mount (EROFS) when the fs needs recovery.
+        let cfg = VmStartConfig {
+            writable_rootfs: true,
+            ..base()
+        };
+        let blocks = workload_blocks(&cfg);
+        assert_eq!(nodes(&blocks), vec!["/dev/vda"]);
+        assert!(!blocks[0].read_only, "writable_rootfs presents vda rw");
     }
 
     fn vol(host: &str, guest: &str, kind: VmVolumeKind) -> mvm_core::vm_backend::VmVolume {

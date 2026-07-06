@@ -144,6 +144,12 @@ pub struct VmStartConfig {
     /// interactive access to a sealed prod guest regardless of this flag, so
     /// the extra listeners are inert there.
     pub dev_console: bool,
+    /// Present the rootfs block device (`/dev/vda`) writable. A sealed workload
+    /// rootfs is read-only (dm-verity, claim 3), the default. The dev VM is
+    /// trusted, unsealed build infrastructure that boots `root=/dev/vda rw` and
+    /// must replay its ext4 journal + persist writes, so it opts in here. Off by
+    /// default so a workload can never silently get a writable root.
+    pub writable_rootfs: bool,
 }
 
 /// A host:guest port mapping, backend-agnostic.

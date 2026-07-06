@@ -405,6 +405,7 @@ mod tests {
             warm_pool_size: 0,
             network_policy: Default::default(),
             dev_console: false,
+            writable_rootfs: false,
         }
     }
 
