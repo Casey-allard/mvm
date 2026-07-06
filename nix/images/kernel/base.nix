@@ -316,6 +316,24 @@ let
     "ACPI_AC" "ACPI_WMI" "ACPI_PROCESSOR_AGGREGATOR"
     "SERIAL_8250_PCI"        # console is the platform ttyS0, not a PCI serial card
     "SERIAL_8250_EXTENDED"   # multiport / non-standard 8250 variants
+
+    # x86 power / thermal management. The shared list disables the CPU_FREQ /
+    # MAILBOX cores, but on x86 they get reselected — the audit's select-graph
+    # traced the anchors, so cut those (disabling the leaf drivers is useless,
+    # they get reselected too):
+    #   SCHED_MC_PRIO (Intel Turbo-Boost-Max/ITMT core-priority scheduling)
+    #     pins CPU_FREQ *and* X86_{INTEL,AMD}_PSTATE -> ACPI_CPPC_LIB -> PCC ->
+    #     MAILBOX. A guest vCPU has no ITMT topology and does no DVFS, so the
+    #     whole cpufreq/pstate/CPPC chain falls out with this one symbol.
+    #   PCMCIA pins FW_LOADER (via PCMCIA_LOAD_CIS) — a VM has no PC-Card slot.
+    # THERMAL and CPU_IDLE stay: both are pinned by ACPI_PROCESSOR (passive
+    # cooling + C-states), which is load-bearing on x86 (CPU enumeration) — the
+    # x86 analogue of arm64's uncuttable POWER_SUPPLY <= ARM64.
+    "SCHED_MC_PRIO"
+    "PCMCIA"
+    "INTEL_IDLE"
+    "X86_PKG_TEMP_THERMAL" "INTEL_POWERCLAMP" "INTEL_TCC_COOLING"
+    "INTEL_SOC_DTS_THERMAL" "INTEL_PCH_THERMAL" "INTEL_HFI_THERMAL"
   ];
 
   # Realize a `.config` from base + the caller's deltas. `runCommandCC`
