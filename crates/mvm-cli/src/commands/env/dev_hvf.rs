@@ -55,6 +55,34 @@ fn work_share_volume() -> VmVolume {
     }
 }
 
+/// The persistent Nix store: a dedicated writable ext4 image attached as the
+/// dev VM's second virtio-blk (`/dev/vdb`). The rootfs `/nix` is read-only, so
+/// in-VM `nix build` needs a writable store; the guest `/init` overlays this
+/// disk onto `/nix` (upperdir) with the rootfs seed as lowerdir. A dev-specific
+/// image name keeps it off the builder VM's shared `nix-store-<arch>.img`, so
+/// the single long-lived dev VM is its only user and the host flock can drop
+/// once the guest holds the file open.
+#[cfg(feature = "builder-vm")]
+fn nix_store_disk_volume() -> Result<VmVolume> {
+    let arch = std::env::consts::ARCH;
+    let lock = mvm_build::builder_vm_runtime::acquire_nix_store_image_lock_named(
+        &mvm_build::builder_vm::builder_vm_cache_dir(),
+        &format!("nix-store-dev-{arch}.img"),
+        8192,
+    )
+    .map_err(|e| anyhow::anyhow!("acquiring dev nix-store image: {e}"))?;
+    let host = lock.path().to_string_lossy().into_owned();
+    drop(lock);
+    Ok(VmVolume {
+        host,
+        guest: "/nix-store".into(),
+        size: String::new(),
+        read_only: false,
+        kind: VmVolumeKind::Disk,
+        encrypted: false,
+    })
+}
+
 /// Boot the interactive dev VM on the in-house HVF VMM. Idempotent: a
 /// second `dev up` on an already-running VM just (optionally) opens a shell.
 #[cfg(feature = "builder-vm")]
@@ -93,7 +121,7 @@ pub(super) fn cmd_dev_hvf(cpus: u32, memory_gib: u32, open_shell: bool) -> Resul
         profile: Some("dev".to_string()),
         cpus,
         memory_mib,
-        volumes: vec![work_share_volume()],
+        volumes: vec![work_share_volume(), nix_store_disk_volume()?],
         // No cmdline is threaded: the in-house supervisor's workload default
         // (`console=ttyAMA0 root=/dev/vda rw init=/init`) already boots the dev
         // image's own `/init` on the captured PL011 serial — the console this
