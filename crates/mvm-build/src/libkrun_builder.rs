@@ -79,10 +79,26 @@ use crate::builder_vm_runtime::{
     shell_job_exit_error, stage_job_dir, stage_shell_job_dir, supervisor_exit_error,
 };
 
-/// Default vCPU count for the builder VM. Nix builds are
-/// embarrassingly parallel at the derivation level; 4 cores is the
-/// sweet spot on M-series Macs without saturating the host.
+/// Floor vCPU count for the builder VM, and the value small hosts get.
+/// The single-derivation kernel compile only parallelises with vCPUs
+/// (`NIX_BUILD_CORES`), not `max-jobs`, so a 4-core cap left larger hosts
+/// idle; [`default_builder_vcpus`] scales up from here. Kept as a const so
+/// the deprecated Vz builder and the resource-mismatch tests have a stable
+/// anchor.
 pub const DEFAULT_VCPUS: u8 = 4;
+
+/// Host-adaptive builder vCPU count: `host_logical_cpus - 4`, clamped to
+/// `[DEFAULT_VCPUS, 8]`. Leaves headroom for the VMM threads, the gateway,
+/// and the user's own work, so an 8-core laptop is unchanged at 4 while a
+/// 12+-core workstation gets 8 — roughly halving the in-VM kernel compile.
+/// Capped at 8 so RAM ([`DEFAULT_MEMORY_MIB`]) comfortably covers that many
+/// parallel `cc`/`rustc` working sets without an OOM in the tmpfs build.
+pub fn default_builder_vcpus() -> u8 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(DEFAULT_VCPUS as usize);
+    cores.saturating_sub(4).clamp(DEFAULT_VCPUS as usize, 8) as u8
+}
 
 /// Default RAM in MiB. Originally 8 GiB (in-VM nix builds peak
 /// ~5-6 GiB). Raised to 16 GiB for headroom
@@ -353,7 +369,7 @@ pub struct BuilderShellResult {
 impl Default for LibkrunBuilderVm {
     fn default() -> Self {
         Self {
-            vcpus: DEFAULT_VCPUS,
+            vcpus: default_builder_vcpus(),
             memory_mib: DEFAULT_MEMORY_MIB,
             nix_store_mib: DEFAULT_NIX_STORE_MIB,
             image_override: None,
@@ -2346,7 +2362,7 @@ impl LibkrunPersistentHostVm {
     /// nix-store image size.
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
-            vcpus: DEFAULT_VCPUS,
+            vcpus: default_builder_vcpus(),
             memory_mib: DEFAULT_MEMORY_MIB,
             nix_store_mib: DEFAULT_NIX_STORE_MIB,
             image_override: None,
@@ -3684,9 +3700,22 @@ mod tests {
         // from single-shot to persistent don't see surprise
         // resource shifts.
         let vm = LibkrunPersistentHostVm::new(std::env::temp_dir());
-        assert_eq!(vm.vcpus, DEFAULT_VCPUS);
+        // Host-adaptive: both constructors resolve vCPUs the same way.
+        assert_eq!(vm.vcpus, default_builder_vcpus());
+        assert_eq!(vm.vcpus, LibkrunBuilderVm::default().vcpus);
         assert_eq!(vm.memory_mib, DEFAULT_MEMORY_MIB);
         assert_eq!(vm.nix_store_mib, DEFAULT_NIX_STORE_MIB);
+    }
+
+    #[test]
+    fn default_builder_vcpus_stays_in_bounds() {
+        // Never below the small-host floor, never above the RAM-safe cap,
+        // regardless of the host's core count.
+        let v = default_builder_vcpus();
+        assert!(
+            (DEFAULT_VCPUS..=8).contains(&v),
+            "adaptive vcpus {v} escaped [{DEFAULT_VCPUS}, 8]"
+        );
     }
 
     #[test]
