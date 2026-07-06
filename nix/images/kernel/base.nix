@@ -243,6 +243,28 @@ let
     # by BPF/CO-RE, which no mvm guest or builder loads.
     "DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT" "DEBUG_INFO_DWARF5"
     "DEBUG_INFO_DWARF4" "DEBUG_INFO_BTF"
+
+    # Shrink batch 7 — selector cuts. The batch-1..6 disables above for these
+    # families were silently reverted because a kept driver `select`s each; the
+    # disable audit's select-graph named the culprit, so cut the culprit and the
+    # family cascades out via olddefconfig:
+    #   ARCH_MA35 (Nuvoton MA35 SoC, the sibling ARCH_NUVOTON missed) pins
+    #     GPIOLIB + PINCTRL + RESET_CONTROLLER and the nuvoton DTB tree.
+    #   VT (kernel virtual-terminal layer) pins INPUT + its keyboard/mouse
+    #     subtree. A headless microVM logs to the ttyAMA0 serial console and the
+    #     dev shell is PTY-over-vsock (UNIX98 ptys, not VT), so no /dev/ttyN is
+    #     ever opened.
+    #   PHYLINK (SFP/fixed-link MAC glue) pins PHYLIB + MDIO_DEVICE — virtio-net
+    #     has no PHY.
+    #   Four PMIC MFD drivers pin MFD_CORE; RTC_NVMEM pins NVMEM; the SM3/SM4
+    #     generic + ARM64-CE variants pin those ciphers.
+    "ARCH_MA35"
+    "VT" "VT_CONSOLE"
+    "KEYBOARD_ATKBD" "MOUSE_PS2"
+    "PHYLINK"
+    "MFD_HI6421_PMIC" "MFD_MT6397" "MFD_VEXPRESS_SYSREG" "MFD_WCD934X"
+    "RTC_NVMEM"
+    "CRYPTO_SM4_GENERIC" "CRYPTO_SM3_GENERIC" "CRYPTO_SM3_ARM64_CE"
   ] ++ pkgs.lib.optionals (kernelArch == "arm64") [
     # arm64 boots from the FDT libkrun / Firecracker hand us; ACPI is
     # never consulted, so drop the ACPICA interpreter and the whole
