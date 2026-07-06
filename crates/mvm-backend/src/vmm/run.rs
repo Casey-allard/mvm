@@ -74,13 +74,7 @@ where
             let offset = addr - d.base();
             if write {
                 if let Some(irq) = d.write(offset, data, size) {
-                    // virtio-mmio IRQs are edge-rising (see fdt.rs): pulse the
-                    // line (raise then lower) so every serviced batch produces a
-                    // fresh rising edge. Asserting and never de-asserting means
-                    // only the first edge ever fires — the guest gets one
-                    // completion interrupt, then stalls waiting for the next.
                     set_irq(irq, true)?;
-                    set_irq(irq, false)?;
                 }
             } else {
                 let v = d.read(offset, size);
