@@ -104,11 +104,34 @@ Wire `mvmctl dev` to a long-lived in-house dev VM, reusing the persistent-VM lif
   → `kernel_boot`), device/cmdline tag unified on `mvm_core::vm_backend::uvol_tag`;
   `mvm-init: mounted user volume uvol0 at /work`, `ls /work` shows the host CWD
   (`daf6463c`).
-  **Remaining:** `/work` is effectively **read-only** — the dev image's baked-in
-  `work`/`out`/`job` mounts (Vz-builder `/work`=ro-flake-source convention) shadow the
-  `rw` `uvol0` mount; interactive editing wants RW, so reconcile the dev-image share
-  convention with `uvols`. Then nix-store `/dev/vdb` + Plan 223 egress for in-VM `nix
-  build`; flip the default (rule 3) Vz→Hvf; rename `is_vz_dev_running`→backend-agnostic.
+- [x] **Backend-agnostic dev-VM probes** (`9436e705`): `dev::is_dev_vm_running()` +
+  `dev::down_dev_vm()` dispatch on `current_backend()`; `cache.rs` prune-guard and
+  `cleanup.rs` `first_running_vm` route through them, so they respect an `hvf` dev VM
+  (not just Vz). `DevAction::Down`/`Rebuild` reuse `down_dev_vm` (dedup). Was the
+  "rename `is_vz_dev_running`" item.
+- [x] **`/work` write path proven host-side** (`9da7b881`): a device-level test drives
+  `FUSE_CREATE` through the full `VirtioFs` split-virtqueue and asserts the file
+  materializes on the host share. So `/work` is genuinely **read-write** at the
+  mechanism level — the earlier "read-only" note was a flaky-console artifact, not a
+  real host-side limitation.
+
+**Remaining Phase 4 work (needs better tooling / dedicated slices — NOT rushed):**
+- **Live guest→host write-through verification is blocked by tooling.** `dev shell`'s
+  first session works (read: `ls /work` = host CWD), but the in-house console relay's
+  output capture is unreliable across repeated sessions, and `MVM_HVF_VIRTIO_DEBUG`
+  perturbs the virtio-fs timing (Heisenbug). Host-side write path is proven correct
+  (test above); confirming the guest actually persists writes needs a reliable
+  guest-exec harness (agent-fs RPC, or console-relay hardening — its own item).
+- **nix-store `/dev/vdb` for in-VM `nix build`** — substantial: attach the nix-store
+  image (`acquire_nix_store_image_lock`), a **guest `/init` change** to overlay it onto
+  the RO rootfs `/nix/store` (the mkGuest `/init` explicitly does NOT auto-mount `blk`
+  volumes today), and the flock-lifetime design (the detached `mvm-hvf-supervisor`
+  should hold it, since `start()` returns). Gates in-VM builds.
+- **Flip the macOS-26 default Vz→Hvf** (rule 3 in `select_dev_backend`): **deliberately
+  deferred** — flipping now would default every macOS-26 `dev up` onto a VM that can't
+  yet run in-VM `nix build` (no `/dev/vdb`) and whose console relay needs hardening —
+  a dev-UX regression vs Vz. Flip only after the nix-store + console-reliability items
+  land. Plan 223 egress is also needed for in-VM builds that fetch.
 
 ## Phase 5 — Delete `mvm-vz-supervisor` + all remaining Vz
 
