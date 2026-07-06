@@ -204,6 +204,34 @@ let
     "IOMMU_SUPPORT"        # virtio-mmio uses direct DMA; no SMMU present
     "SERIAL_XILINX_PS_UART" "SERIAL_FSL_LPUART" "SERIAL_FSL_LINFLEXUART"
     "SERIAL_MCTRL_GPIO" "SERIAL_DEV_BUS"  # SoC/serdev UARTs — console is PL011
+
+    # Shrink batch 6 — leaf subsystems the resolved config still carried as
+    # `=y` (audited from a live guest's `/proc/config.gz`). Each is a whole
+    # driver family with no device behind it under libkrun / Firecracker / the
+    # in-house HVF VMM, and none is a transitive dep of the keep-set
+    # (virtio/vsock/ext4/overlay/fuse/verity/netfilter). A disable that a kept
+    # driver `select`s just stays `=y` (olddefconfig wins) — harmless — so this
+    # only ever removes dead weight, never a boot-path symbol.
+    "BLK_DEV_NVME" "NVME_CORE"   # no NVMe controller behind virtio
+    "NFC"                        # near-field comms — no radio in a VM
+    "TEE"                        # TrustZone/OP-TEE — no secure world here
+    "FPGA"                       # FPGA manager/bridge/region — no FPGA
+    "GNSS"                       # GPS/GNSS receivers
+    "RFKILL"                     # wireless kill switch — no wireless stack
+    "PPS" "PTP_1588_CLOCK"       # pulse-per-second / PTP — guest uses arch timer
+    "STM" "STM_SOURCE"           # System Trace Module — sibling to CORESIGHT
+    "MAILBOX"                    # SoC mailbox controllers
+    "HWSPINLOCK"                 # SoC hardware spinlocks
+    "RESET_CONTROLLER"           # SoC reset controllers — none on virt
+    "SOC_TI"                     # TI SoC drivers
+    "EXTCON"                     # external-connector (USB-C/jack) detection
+    "CRYPTO_HW"                  # hardware crypto offload — software crypto stays
+
+    # Debug info: a microVM kernel is never attached to a live kernel
+    # debugger, and the DWARF pass inflates both the vmlinux and compile
+    # time for zero runtime benefit. Drop it (the choice falls back to
+    # DEBUG_INFO_NONE).
+    "DEBUG_INFO"
   ] ++ pkgs.lib.optionals (kernelArch == "arm64") [
     # arm64 boots from the FDT libkrun / Firecracker hand us; ACPI is
     # never consulted, so drop the ACPICA interpreter and the whole
@@ -277,6 +305,23 @@ let
         echo "ERROR: requested kernel enables were dropped by olddefconfig:$missing" >&2
         echo "Each dropped symbol has an unmet Kconfig dependency, or a disable removed a symbol it needs. Investigate — do not suppress." >&2
         exit 1
+      fi
+
+      # Audit (warn-only): a requested disable that a still-kept driver
+      # `select`s is silently reverted to `=y` by olddefconfig — dead weight
+      # that survives the shrink with no signal (the disable mirror of the
+      # enable guard above). Naming the survivors here turns the next
+      # slimming pass into "cut the selector", not "guess what didn't take".
+      # Warn rather than fail: some reverts are load-bearing (a kept subsystem
+      # legitimately needs the symbol), so this is a lead to chase, not a gate.
+      reverted=""
+      for s in $disableList; do
+        if grep -q "^CONFIG_$s=y\$" .config; then
+          reverted="$reverted $s"
+        fi
+      done
+      if [ -n "$reverted" ]; then
+        echo "NOTE: requested kernel disables were reverted by olddefconfig (a kept driver selects them):$reverted" >&2
       fi
 
       cp .config $out
