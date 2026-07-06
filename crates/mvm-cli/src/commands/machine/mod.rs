@@ -72,6 +72,9 @@ pub(in crate::commands) enum MachineAction {
     /// Boot one or more persistent named machines without running a one-shot command
     #[command(display_order = 4)]
     Start(MachineStartCmd),
+    /// Restart one or more named machines (stop if running, then start)
+    #[command(display_order = 5)]
+    Restart(MachineStartCmd),
     /// Stop a running VM by name, or all running VMs with --all
     #[command(display_order = 5)]
     Stop(MachineStopArgs),
@@ -121,6 +124,7 @@ impl MachineAction {
             | MachineAction::Build(_)
             | MachineAction::Create(_)
             | MachineAction::Start(_)
+            | MachineAction::Restart(_)
             | MachineAction::Stop(_)
             | MachineAction::Reconfigure(_)
             | MachineAction::Rm(_)
@@ -747,6 +751,10 @@ pub(in crate::commands) struct MachineRemoveArgs {
     /// Skip the interactive confirmation prompt.
     #[arg(long)]
     pub yes: bool,
+    /// Stop a running machine before removing it. Without this, removing a
+    /// running machine is refused (its VM would be orphaned).
+    #[arg(long)]
+    pub force: bool,
     /// Print a JSON deletion summary.
     #[arg(long)]
     pub json: bool,
@@ -873,6 +881,40 @@ fn run_start(cmd: MachineStartCmd) -> Result<()> {
     Ok(())
 }
 
+/// `machine restart <name>...`: stop each running machine, then start it — the
+/// same stop→start sequence the config-change recreate path uses. Like
+/// `run_start`, `--receipt`/`--json`/`--dry-run` are single-machine; a batch
+/// continues past a failed restart. Dry-run only previews the start plan (it
+/// never stops a running machine).
+fn run_restart(cmd: MachineStartCmd) -> Result<()> {
+    if cmd.names.len() > 1 && (cmd.receipt.is_some() || cmd.json || cmd.dry_run) {
+        bail!(
+            "--receipt/--json/--dry-run report on a single machine; \
+             restart machines individually to use them"
+        );
+    }
+    let restart_one = |name: &str| -> Result<()> {
+        if !cmd.dry_run && machine_is_running(name) {
+            stop_running_machine(name);
+        }
+        start_machine(cmd.start_args_for(name))
+    };
+    if cmd.names.len() == 1 {
+        return restart_one(&cmd.names[0]);
+    }
+    let mut had_err = false;
+    for name in &cmd.names {
+        if let Err(err) = restart_one(name) {
+            eprintln!("failed to restart {name}: {err:#}");
+            had_err = true;
+        }
+    }
+    if had_err {
+        bail!("one or more machines failed to restart");
+    }
+    Ok(())
+}
+
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct MachineExecArgs {
     /// Persistent machine name.
@@ -887,8 +929,9 @@ pub(in crate::commands) struct MachineExecArgs {
     /// Accepted as an alias for `-t` so `-it` parses.
     #[arg(short = 'i', long = "interactive")]
     pub interactive: bool,
-    /// Argv to run inside the guest (use `--` to separate).
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    /// Argv to run inside the guest (use `--` to separate). Omit to drop into
+    /// an interactive shell, like `machine shell`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub argv: Vec<String>,
 }
 
@@ -1762,6 +1805,60 @@ fn machine_status_label(name: &str) -> &'static str {
     }
 }
 
+/// One rendered `machine ls` row (already stringified for display).
+struct MachineLsRow {
+    name: String,
+    status: String,
+    source: String,
+    age: String,
+}
+
+/// Coarse, human-friendly age of a machine from its `created_at` timestamp,
+/// relative to `now`. `-` when absent/unparseable. Takes `now` explicitly so
+/// the buckets are unit-testable.
+fn humanize_age(created: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Some(created) = created else {
+        return "-".to_string();
+    };
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(created) else {
+        return "-".to_string();
+    };
+    let secs = (now - then.with_timezone(&chrono::Utc)).num_seconds();
+    match secs {
+        s if s < 0 => "-".to_string(),
+        s if s < 60 => "just now".to_string(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
+}
+
+/// Render the `machine ls` table: a header plus left-aligned, padded columns
+/// (docker-style). Pure so the alignment is unit-testable.
+fn format_machine_table(rows: &[MachineLsRow]) -> String {
+    let header = MachineLsRow {
+        name: "NAME".to_string(),
+        status: "STATUS".to_string(),
+        source: "SOURCE".to_string(),
+        age: "AGE".to_string(),
+    };
+    let all = std::iter::once(&header).chain(rows);
+    let wn = all.clone().map(|r| r.name.len()).max().unwrap_or(0);
+    let ws = all.clone().map(|r| r.status.len()).max().unwrap_or(0);
+    let wsrc = all.clone().map(|r| r.source.len()).max().unwrap_or(0);
+    std::iter::once(&header)
+        .chain(rows)
+        .map(|r| {
+            // AGE is the last column, so it needs no trailing pad.
+            format!(
+                "{:<wn$}  {:<ws$}  {:<wsrc$}  {}",
+                r.name, r.status, r.source, r.age
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn list_machines(args: MachineListArgs) -> Result<()> {
     let specs = list_machine_specs()?;
     if args.json {
@@ -1776,19 +1873,22 @@ fn list_machines(args: MachineListArgs) -> Result<()> {
     } else if specs.is_empty() {
         println!("no machines");
     } else {
-        for spec in &specs {
-            let source = spec
-                .image
-                .as_deref()
-                .or(spec.manifest.as_deref())
-                .unwrap_or("<no source>");
-            println!(
-                "{}\t{}\t{}",
-                spec.name,
-                machine_status_label(&spec.name),
-                source
-            );
-        }
+        let now = chrono::Utc::now();
+        let rows: Vec<MachineLsRow> = specs
+            .iter()
+            .map(|spec| MachineLsRow {
+                name: spec.name.clone(),
+                status: machine_status_label(&spec.name).to_string(),
+                source: spec
+                    .image
+                    .as_deref()
+                    .or(spec.manifest.as_deref())
+                    .unwrap_or("<no source>")
+                    .to_string(),
+                age: humanize_age(spec.created_at.as_deref(), now),
+            })
+            .collect();
+        println!("{}", format_machine_table(&rows));
     }
     Ok(())
 }
@@ -1852,6 +1952,21 @@ fn resolve_remove_targets(all: bool, names: &[String]) -> Result<Vec<String>> {
     Ok(targets)
 }
 
+/// Refusal message when `machine rm` targets running machines without
+/// `--force`. Returns `None` when nothing is running (so removal proceeds).
+/// Pure so the wording is unit-testable.
+fn rm_running_refusal(running: &[String]) -> Option<String> {
+    if running.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing to remove running machine(s) {}: their VMs would be orphaned. \
+         Stop them first (`mvmctl machine stop {}`), or pass `--force` to stop and remove.",
+        running.join(", "),
+        running.join(" ")
+    ))
+}
+
 fn remove_machine(args: MachineRemoveArgs) -> Result<()> {
     let json = args.json;
     let targets = resolve_remove_targets(args.all, &args.names)?;
@@ -1893,8 +2008,24 @@ fn remove_machine(args: MachineRemoveArgs) -> Result<()> {
             bail!("machine {name:?} does not exist. Run `mvmctl machine ls` to list machines.");
         }
     }
+    // Removing a running machine's spec would orphan its VM (unmanageable by
+    // name afterwards). Refuse up front unless `--force` was passed, in which
+    // case each running machine is stopped just before removal.
+    if !args.force {
+        let running: Vec<String> = targets
+            .iter()
+            .filter(|name| machine_is_running(name))
+            .cloned()
+            .collect();
+        if let Some(msg) = rm_running_refusal(&running) {
+            bail!(msg);
+        }
+    }
     let mut summaries = Vec::with_capacity(targets.len());
     for name in &targets {
+        if args.force && machine_is_running(name) {
+            stop_running_machine(name);
+        }
         let summary = remove_machine_spec(name, true)?;
         mvm_core::audit_emit!(ConfigChange, vm: &summary.name, "action=machine.rm");
         if !json {
@@ -2248,21 +2379,28 @@ fn stop_failed_machine_start(name: &str) {
 
 fn exec_machine(cli: &Cli, args: MachineExecArgs, cfg: &MvmConfig) -> Result<()> {
     let spec = ensure_machine_spec_exists(&args.name)?;
+    // No argv: `machine exec <name>` drops into an interactive shell, matching
+    // `machine shell <name>` (command: None launches the guest's default shell).
+    let command = if args.argv.is_empty() {
+        None
+    } else {
+        Some(machine_exec_command(&args.argv))
+    };
     if args.tty || args.interactive {
         use std::io::IsTerminal as _;
         require_tty(std::io::stdin().is_terminal())?;
         super::vm::console::enforce_accessible_gate(&args.name, args.force)?;
-        return console::console_pty_command(
-            &args.name,
-            machine_exec_command(&args.argv),
-            machine_console_env(spec.ssh_agent),
-        );
+        let env = machine_console_env(spec.ssh_agent);
+        return match command {
+            Some(cmd) => console::console_pty_command(&args.name, cmd, env),
+            None => console::console_interactive_with_env_and_argv(&args.name, env, Vec::new()),
+        };
     }
     console::run(
         cli,
         console::Args {
             name: args.name,
-            command: Some(machine_exec_command(&args.argv)),
+            command,
             force: args.force,
             env: machine_console_env(spec.ssh_agent),
             pty_argv: Vec::new(),
@@ -2768,6 +2906,7 @@ pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result
         MachineAction::Inspect(inspect_args) => inspect_machine(inspect_args),
         MachineAction::Rm(remove_args) => remove_machine(remove_args),
         MachineAction::Start(start_cmd) => run_start(start_cmd),
+        MachineAction::Restart(restart_cmd) => run_restart(restart_cmd),
         MachineAction::Exec(exec_args) => exec_machine(cli, exec_args, cfg),
         MachineAction::Shell(shell_args) => shell_machine(cli, shell_args, cfg),
         MachineAction::Stop(stop_args) => stop_machine(cli, stop_args, cfg),
@@ -2977,6 +3116,7 @@ mod tests {
             MachineAction::Build(_) => "build",
             MachineAction::Create(_) => "create",
             MachineAction::Start(_) => "start",
+            MachineAction::Restart(_) => "restart",
             MachineAction::Stop(_) => "stop",
             MachineAction::Reconfigure(_) => "reconfigure",
             MachineAction::Rm(_) => "rm",
@@ -3974,6 +4114,14 @@ mod tests {
                 assert!(args.names.is_empty());
                 assert!(args.all);
                 assert!(args.yes);
+                assert!(!args.force, "force defaults off");
+            }
+            other => panic!("expected rm action, got {other:?}"),
+        }
+        match parse(&["rm", "web", "--yes", "--force"]).expect("parse") {
+            MachineAction::Rm(args) => {
+                assert_eq!(args.names, vec!["web"]);
+                assert!(args.force);
             }
             other => panic!("expected rm action, got {other:?}"),
         }
@@ -4027,6 +4175,23 @@ mod tests {
     }
 
     #[test]
+    fn restart_parses_names_and_flags() {
+        match parse(&["restart", "web", "db"]).expect("parse restart batch") {
+            MachineAction::Restart(cmd) => assert_eq!(cmd.names, vec!["web", "db"]),
+            other => panic!("expected restart action, got {other:?}"),
+        }
+        match parse(&["restart", "web", "--hypervisor", "mock"]).expect("parse restart") {
+            MachineAction::Restart(cmd) => {
+                assert_eq!(cmd.names, vec!["web"]);
+                assert_eq!(cmd.hypervisor.as_deref(), Some("mock"));
+            }
+            other => panic!("expected restart action, got {other:?}"),
+        }
+        let err = parse(&["restart"]).expect_err("a machine name is required");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
     fn already_running_notice_wording() {
         assert_eq!(
             already_running_notice("web", false),
@@ -4036,6 +4201,58 @@ mod tests {
             serde_json::from_str(&already_running_notice("web", true)).expect("valid json");
         assert_eq!(json["machine"], "web");
         assert_eq!(json["already_running"], true);
+    }
+
+    #[test]
+    fn humanize_age_buckets() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ago = |s: &str| humanize_age(Some(s), now);
+        assert_eq!(ago("2026-01-01T23:59:30Z"), "just now");
+        assert_eq!(ago("2026-01-01T23:30:00Z"), "30m");
+        assert_eq!(ago("2026-01-01T20:00:00Z"), "4h");
+        assert_eq!(ago("2025-12-30T00:00:00Z"), "3d");
+        assert_eq!(humanize_age(None, now), "-");
+        assert_eq!(humanize_age(Some("not-a-date"), now), "-");
+        // A future timestamp (clock skew) degrades to "-" rather than a negative.
+        assert_eq!(ago("2026-01-02T01:00:00Z"), "-");
+    }
+
+    #[test]
+    fn format_machine_table_aligns_columns_under_a_header() {
+        let rows = vec![
+            MachineLsRow {
+                name: "web".to_string(),
+                status: "running".to_string(),
+                source: "alpine".to_string(),
+                age: "3d".to_string(),
+            },
+            MachineLsRow {
+                name: "database-1".to_string(),
+                status: "stopped".to_string(),
+                source: "ghcr.io/acme/db".to_string(),
+                age: "5m".to_string(),
+            },
+        ];
+        let table = format_machine_table(&rows);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows");
+        assert!(lines[0].starts_with("NAME"), "header first: {}", lines[0]);
+        assert!(lines[0].contains("STATUS") && lines[0].contains("AGE"));
+        // The NAME column is padded to the widest name ("database-1" = 10),
+        // so every row's STATUS column starts at the same offset.
+        let status_col = lines[0].find("STATUS").expect("header has STATUS");
+        assert!(
+            lines[1][status_col..].starts_with("running"),
+            "row1: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2][status_col..].starts_with("stopped"),
+            "row2: {}",
+            lines[2]
+        );
     }
 
     #[test]
@@ -4067,9 +4284,16 @@ mod tests {
     }
 
     #[test]
-    fn exec_requires_argv() {
-        let err = parse(&["exec", "web"]).expect_err("argv is required");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    fn exec_argv_is_optional_for_interactive_shell() {
+        // `machine exec <name>` with no argv parses and yields an empty argv,
+        // which the handler turns into an interactive shell (like `machine shell`).
+        match parse(&["exec", "web"]).expect("parse") {
+            MachineAction::Exec(args) => {
+                assert_eq!(args.name, "web");
+                assert!(args.argv.is_empty());
+            }
+            other => panic!("expected exec action, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4813,8 +5037,19 @@ ssh_agent = true
             names: names.iter().map(|n| n.to_string()).collect(),
             all,
             yes,
+            force: false,
             json: false,
         }
+    }
+
+    #[test]
+    fn rm_running_refusal_wording() {
+        assert!(rm_running_refusal(&[]).is_none());
+        let msg = rm_running_refusal(&["web".to_string(), "db".to_string()])
+            .expect("running machines refuse");
+        assert!(msg.contains("web, db"), "lists the running names: {msg}");
+        assert!(msg.contains("machine stop web db"), "hints stop: {msg}");
+        assert!(msg.contains("--force"), "mentions --force: {msg}");
     }
 
     #[test]

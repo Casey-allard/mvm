@@ -410,15 +410,17 @@ or mounts private keys, `~/.ssh`, known-hosts material, or SSH config.
 | `mvmctl machine start <name> --dry-run --json` | Print the machine-start preflight summary as redacted JSON |
 | `mvmctl machine start <name> --json` | Print a redacted JSON start summary instead of plain text |
 | `mvmctl machine start <name> --receipt <path>` | Write a signed machine-start receipt with effective policy plus the resolved digest and start timestamp |
+| `mvmctl machine restart <name>...` | Restart one or more named machines: stop if running, then start (same stop→start as a config-change recreate) |
 | `mvmctl machine ls` (alias `ps`) | List persisted named machine specs |
 | `mvmctl machine ls --json` | Print persisted named machine specs as JSON |
 | `mvmctl machine inspect <name>` | Show one persisted named machine spec |
 | `mvmctl machine inspect <name> --json` | Print one persisted named machine spec as JSON |
-| `mvmctl machine rm <name>... --yes` | Remove one or more persisted named machine specs |
+| `mvmctl machine rm <name>... --yes` | Remove one or more persisted named machine specs (refuses a running machine; pass `--force` to stop then remove) |
 | `mvmctl machine rm --all --yes` | Remove every persisted named machine spec |
 | `mvmctl machine rm <name>... --yes --json` | Print a JSON array deletion summary |
 | `mvmctl machine exec <name> -- <cmd>...` | Run a command in an already-started named machine |
 | `mvmctl machine exec <name> -it -- <cmd>...` | Run a command in an already-started named machine attached to a PTY |
+| `mvmctl machine exec <name>` | Omit the command to drop into an interactive shell (same as `machine shell`) |
 | `mvmctl machine shell <name>` | Attach an interactive shell/console to an already-started named machine |
 | `mvmctl machine stop <name>...` | Stop one or more already-started named machines (prompts for confirmation; pass `--yes` to skip) |
 | `mvmctl machine reconfigure <name> [flags]` | Patch a persistent machine's config and relaunch it. Only the flags you pass are changed; everything else (image, volumes, profile) is preserved. When the machine is running, it is stopped and restarted automatically; when stopped, the change is staged for the next `machine start`. |
@@ -473,8 +475,8 @@ mvmctl machine stop  blue-fox-3f2a --yes      # tear it down when done
 **Interactive is dev-only.** `-t`/`--tty` attaches the foreground command to a
 PTY and is refused for a sealed/production image (claim 15 — no interactive
 access to a sealed microVM) and when stdin is not a terminal. `machine run -it`
-requires an argv after `--`; use `machine shell <name>` for the default
-shell on an already-running machine.
+requires an argv after `--`; use `machine shell <name>` (or `machine exec
+<name>` with no argv) for the default shell on an already-running machine.
 
 `machine create` accepts either `--image <ref>` or an image-backed manifest, not
 both. When `--image` is omitted, it searches the current directory for
