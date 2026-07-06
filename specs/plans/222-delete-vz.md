@@ -109,29 +109,32 @@ Wire `mvmctl dev` to a long-lived in-house dev VM, reusing the persistent-VM lif
   `cleanup.rs` `first_running_vm` route through them, so they respect an `hvf` dev VM
   (not just Vz). `DevAction::Down`/`Rebuild` reuse `down_dev_vm` (dedup). Was the
   "rename `is_vz_dev_running`" item.
-- [x] **`/work` write path proven host-side** (`9da7b881`): a device-level test drives
-  `FUSE_CREATE` through the full `VirtioFs` split-virtqueue and asserts the file
-  materializes on the host share. So `/work` is genuinely **read-write** at the
-  mechanism level — the earlier "read-only" note was a flaky-console artifact, not a
-  real host-side limitation.
+- [x] **`/work` read-write from the dev shell — LIVE-VERIFIED end to end.** The dev
+  shell (`id -u`=990) now `touch /work/X` → `WROTE_OK`, and the file appears in the host
+  worktree. Root cause was **not** the device (proven correct by the device-level
+  `FUSE_CREATE` test `9da7b881`, and by a uid-0 `/init` probe whose write persisted): the
+  `/work` passthrough presented files owned by the host user (501, mode 755), so the
+  uid-990 dev shell's own kernel permission check refused writes *before any FUSE op was
+  sent* (a uid-990 `/init` probe returned `READ_OK` + `WRITE_FAIL`). Fix (`e180d304`):
+  the FUSE server presents every file as owned by the request's caller (from
+  `fuse_in_header`), so the guest check passes; the server still performs the host op as
+  the host user. Correct for this trusted single-user dev share. Along the way: a gated
+  file-based FUSE oplog (`66bf98e4`, the tool that cracked it) and a reverted edge-IRQ
+  pulse that broke early boot (`7beeb1f1` — `hv_gic_set_spi(true)` already pulses).
 
-**Remaining Phase 4 work (needs better tooling / dedicated slices — NOT rushed):**
-- **Live guest→host write-through verification is blocked by tooling.** `dev shell`'s
-  first session works (read: `ls /work` = host CWD), but the in-house console relay's
-  output capture is unreliable across repeated sessions, and `MVM_HVF_VIRTIO_DEBUG`
-  perturbs the virtio-fs timing (Heisenbug). Host-side write path is proven correct
-  (test above); confirming the guest actually persists writes needs a reliable
-  guest-exec harness (agent-fs RPC, or console-relay hardening — its own item).
+**Remaining Phase 4 work (dedicated slices):**
 - **nix-store `/dev/vdb` for in-VM `nix build`** — substantial: attach the nix-store
   image (`acquire_nix_store_image_lock`), a **guest `/init` change** to overlay it onto
   the RO rootfs `/nix/store` (the mkGuest `/init` explicitly does NOT auto-mount `blk`
   volumes today), and the flock-lifetime design (the detached `mvm-hvf-supervisor`
   should hold it, since `start()` returns). Gates in-VM builds.
-- **Flip the macOS-26 default Vz→Hvf** (rule 3 in `select_dev_backend`): **deliberately
-  deferred** — flipping now would default every macOS-26 `dev up` onto a VM that can't
-  yet run in-VM `nix build` (no `/dev/vdb`) and whose console relay needs hardening —
-  a dev-UX regression vs Vz. Flip only after the nix-store + console-reliability items
-  land. Plan 223 egress is also needed for in-VM builds that fetch.
+- **Flip the macOS-26 default Vz→Hvf** (rule 3 in `select_dev_backend`): **deferred until
+  in-VM `nix build` works** — the dev VM now boots, gives an interactive shell, and has a
+  live read-write `/work`, but without `/dev/vdb` + Plan 223 egress it can't run `nix
+  build` inside, so defaulting every macOS-26 `dev up` onto it would regress the dev
+  workflow vs Vz. Flip once the nix-store item lands. (Also observed: the in-house
+  console relay's *output capture* was flaky under repeated automated `expect` sessions —
+  a test-harness annoyance, not a dev-UX blocker; interactive use worked.)
 
 ## Phase 5 — Delete `mvm-vz-supervisor` + all remaining Vz
 
