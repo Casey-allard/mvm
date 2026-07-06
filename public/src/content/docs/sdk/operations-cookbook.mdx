@@ -29,6 +29,7 @@ language SDK tests prove them.
 | Ports | Target helper | Target helper | port-forwarding CLI commands |
 | Pause/resume | Target helper | Target helper | `mvmctl pause`, `mvmctl resume` |
 | Checkpoint create/restore | Target helper | Target helper | `mvmctl checkpoint create --class vm-full`, `mvmctl checkpoint restore` |
+| Reconfigure machine | — | — | `mvmctl machine reconfigure <name> --cpus N --memory SZ` |
 | Stop cleanup | context manager or `kill()` | `using`/`Symbol.dispose` or `kill()` | `mvmctl machine stop` |
 
 ## Current paths

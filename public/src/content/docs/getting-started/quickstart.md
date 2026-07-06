@@ -41,6 +41,14 @@ mvmctl machine exec alpine-dev -- uname -a
 mvmctl machine stop alpine-dev
 ```
 
+To change a machine's CPUs, memory, or network later, reconfigure it instead of
+re-typing the full `create` — this patches the stored config and relaunches the
+machine, keeping its name and volumes:
+
+```bash
+mvmctl machine reconfigure alpine-dev --cpus 4 --memory 2G
+```
+
 ## 2. Launch the Dev Environment
 
 ```bash

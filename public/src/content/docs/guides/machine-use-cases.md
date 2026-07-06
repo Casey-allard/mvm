@@ -18,7 +18,8 @@ boundary only when a workflow actually needs Linux build or evaluation work.
 | Sandbox untrusted code | `mvmctl machine run --image alpine -- <cmd>` | Fresh transient microVM, command output, teardown on exit. |
 | Run a command in an OCI image | `mvmctl machine run --image ghcr.io/org/app:tag -- <cmd>` | OCI provenance, cache reuse, admission, receipts, and audit. |
 | Use a local image archive | `mvmctl machine run --image-archive ./image.tar -- <cmd>` | Offline-friendly image input through the same hardened unpack/admission path. |
-| Keep a dev machine around | `mvmctl machine create --name dev --image alpine` | Durable spec plus `start`, `exec`, `shell`, `stop`, `inspect`, and `rm`. |
+| Keep a dev machine around | `mvmctl machine create --name dev --image alpine` | Durable spec plus `start`, `exec`, `shell`, `stop`, `reconfigure`, `inspect`, and `rm`. |
+| Change a machine's config | `mvmctl machine reconfigure dev --cpus 4 --memory 2G` | Patches cpus/memory/network on the named machine and relaunches it, keeping its name and volumes. |
 | Forward your SSH agent | `mvmctl machine create --ssh-agent --name dev --image alpine` | Dev-tier agent socket forwarding; private key files stay on the host. |
 | Declare a repeatable machine | `mvmctl machine create --manifest ./mvm.toml --name dev` | TOML-backed image, sizing, network, volume, dev-init, and auth settings. |
 | Verify a portable artifact | `mvmctl machine check-artifact ./app.mvm --key ./publisher.pub` | Signature, hash, format, and host-architecture verification before admission. |

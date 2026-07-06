@@ -148,6 +148,12 @@ mvmctl machine stop coding-agent
 mvmctl volume lock coding-agent-work
 ```
 
+To resize or re-scope a long-lived workspace machine — more CPUs, more memory, a
+different egress allowlist — use `mvmctl machine reconfigure <name>` rather than
+recreating it. It patches the stored config and relaunches the machine under a
+fresh signed plan, and its managed volumes survive the relaunch, so workspace
+state is preserved.
+
 ## Cleanup checklist
 
 Before marking a stateful sandbox done:
