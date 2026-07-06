@@ -32,9 +32,22 @@ use crate::driver::InHouseDriver;
 const DEFAULT_NIX_STORE_MIB: u32 = 64 * 1024;
 /// Default output-disk size (MiB): must exceed the built rootfs + sidecars tar.
 const DEFAULT_OUTPUT_MIB: u32 = 4 * 1024;
-/// Default builder resources.
+/// Default builder resources. `DEFAULT_VCPUS` is the small-host floor;
+/// [`default_builder_vcpus`] scales up from it — the in-VM kernel compile
+/// only parallelises with vCPUs (`NIX_BUILD_CORES`), not `max-jobs`.
 const DEFAULT_VCPUS: u32 = 4;
 const DEFAULT_MEMORY_MIB: u32 = 8 * 1024;
+
+/// Host-adaptive builder vCPU count: `host_logical_cpus - 4`, clamped to
+/// `[DEFAULT_VCPUS, 8]` — an 8-core laptop stays at 4, a 12+-core host gets
+/// 8. Mirrors the libkrun builder's policy so switching builder backends
+/// doesn't change the compile's parallelism.
+fn default_builder_vcpus() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(DEFAULT_VCPUS as usize);
+    cores.saturating_sub(4).clamp(DEFAULT_VCPUS as usize, 8) as u32
+}
 
 /// The in-house HVF builder VM, exposed through the `BuilderVm` seam.
 pub struct InHouseBuilderVm {
@@ -56,7 +69,7 @@ impl InHouseBuilderVm {
             rootfs,
             nix_store_mib: DEFAULT_NIX_STORE_MIB,
             output_mib: DEFAULT_OUTPUT_MIB,
-            vcpus: DEFAULT_VCPUS,
+            vcpus: default_builder_vcpus(),
             memory_mib: DEFAULT_MEMORY_MIB,
         }
     }
