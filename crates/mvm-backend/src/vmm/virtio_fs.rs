@@ -238,6 +238,10 @@ impl VirtioFs {
         }
         let qsz = q.num as u16;
         let avail_idx = self.mem.rd_u16(q.avail + 2);
+        oplog_line(&format!(
+            "process_queue qi={qi} ready={} num={} avail_idx={avail_idx} last_avail={}",
+            q.ready, q.num, self.queues[qi].last_avail
+        ));
         let mut serviced = false;
         // `last_avail` is read live from `self.queues[qi]` each iteration so the
         // loop sees its own increments; `q` is only an immutable snapshot of the
@@ -312,12 +316,63 @@ impl VirtioFs {
                 writable.len()
             );
         }
-        let Some(reply) = self.fs.dispatch(&req) else {
+        let reply = self.fs.dispatch(&req);
+        // Low-volume per-FUSE-request trace to a file (not stderr): the sole way
+        // to see what the guest actually asks the device from a detached
+        // supervisor, without the MMIO-config-read spam that perturbs timing.
+        // Gated on `MVM_FUSE_OPLOG=<path>`; off in production.
+        oplog_fuse_request(&req, writable.len(), reply.as_deref());
+        let Some(reply) = reply else {
             // FORGET and friends have no reply.
             return 0;
         };
         scatter(&self.mem, &writable, &reply)
     }
+}
+
+/// Append one line per FUSE request to `$MVM_FUSE_OPLOG` (a file path): the
+/// opcode, target nodeid, request length, writable-descriptor count, and the
+/// reply's errno (0 = ok). A diagnostic for the write-through path — file-based
+/// (survives the detached supervisor) and low-volume (one line per FUSE op, not
+/// per MMIO access), so it neither perturbs timing nor needs stderr inheritance.
+/// A no-op when the env var is unset.
+fn oplog_line(msg: &str) {
+    let Some(path) = std::env::var_os("MVM_FUSE_OPLOG") else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+fn oplog_fuse_request(req: &[u8], writable_descs: usize, reply: Option<&[u8]>) {
+    if std::env::var_os("MVM_FUSE_OPLOG").is_none() {
+        return;
+    }
+    let opcode = if req.len() >= 8 {
+        u32::from_le_bytes(req[4..8].try_into().unwrap())
+    } else {
+        0
+    };
+    let nodeid = if req.len() >= 16 {
+        u64::from_le_bytes(req[8..16].try_into().unwrap())
+    } else {
+        0
+    };
+    // The `fuse_out_header` error is a signed i32 at offset 4 of the reply.
+    let errno = reply
+        .filter(|r| r.len() >= 8)
+        .map(|r| i32::from_le_bytes(r[4..8].try_into().unwrap()));
+    oplog_line(&format!(
+        "opcode={opcode} nodeid={nodeid} reqlen={} wdescs={writable_descs} errno={}",
+        req.len(),
+        errno.map_or_else(|| "none".to_string(), |e| e.to_string()),
+    ));
 }
 
 /// Copy `reply` across the writable descriptors in order, returning bytes written
