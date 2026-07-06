@@ -168,6 +168,35 @@ fn default_bootargs(has_disk: bool) -> String {
     args
 }
 
+/// Append the runtime extras onto the base cmdline (in order): the
+/// `MVM_HVF_BOOTARGS_EXTRA` dev override, the `mvm.uvols=` user-volume mounts,
+/// and — when the guest has a host egress relay — `MVM_VSOCK_EGRESS=1`. Each
+/// rides *on top of* the base so it never clobbers `console=`/`root=`/`init=`.
+///
+/// `MVM_VSOCK_EGRESS=1` is a `KEY=VALUE` token the kernel hands to PID 1's
+/// environment; the guest `/init` reads it to start the SOCKS5→vsock egress
+/// client and point the workload's proxy env at it — the in-house VMM's
+/// NIC-less, gvproxy-free path off the box. Omitted without a relay (the client
+/// would have nowhere to dial).
+fn append_boot_extras(
+    mut bootargs: String,
+    extra: Option<&str>,
+    uvols: Option<&str>,
+    egress_relay_present: bool,
+) -> String {
+    for token in [extra, uvols].into_iter().flatten() {
+        let token = token.trim();
+        if !token.is_empty() {
+            bootargs.push(' ');
+            bootargs.push_str(token);
+        }
+    }
+    if egress_relay_present {
+        bootargs.push_str(" MVM_VSOCK_EGRESS=1");
+    }
+    bootargs
+}
+
 /// Host-supplied boot inputs the supervisor threads into a guest: the vsock
 /// channels (per-VM host→guest agent RPC socket, substitution-endpoint socket,
 /// egress relay UDS) plus the kernel cmdline. Bundled so the boot entry stays
@@ -309,27 +338,16 @@ fn boot_kernel_impl(
     // built-in default. The append hook lets a caller thread runtime-discovered
     // values (e.g. a dynamically bound egress target) on top without reproducing
     // the whole base.
-    let mut bootargs = std::env::var("MVM_HVF_BOOTARGS")
+    let base = std::env::var("MVM_HVF_BOOTARGS")
         .ok()
         .or_else(|| channels.cmdline.clone())
         .unwrap_or_else(|| default_bootargs(!disks.is_empty()));
-    if let Ok(extra) = std::env::var("MVM_HVF_BOOTARGS_EXTRA") {
-        let extra = extra.trim();
-        if !extra.is_empty() {
-            bootargs.push(' ');
-            bootargs.push_str(extra);
-        }
-    }
-    // User-volume mounts (`mvm.uvols=…`) ride on top of the base cmdline so the
-    // guest `/init` mounts virtio-fs shares at their guest paths — without the
-    // append this would replace `console=`/`root=`/`init=` and break the boot.
-    if let Some(uvols) = channels.uvols.as_deref() {
-        let uvols = uvols.trim();
-        if !uvols.is_empty() {
-            bootargs.push(' ');
-            bootargs.push_str(uvols);
-        }
-    }
+    let bootargs = append_boot_extras(
+        base,
+        std::env::var("MVM_HVF_BOOTARGS_EXTRA").ok().as_deref(),
+        channels.uvols.as_deref(),
+        channels.egress_relay.is_some(),
+    );
     let initrd_bounds = initramfs.map(|rd| {
         (
             RAM_BASE + INITRD_OFFSET,
@@ -777,6 +795,44 @@ mod tests {
         assert!(
             without.contains("console=ttyAMA0"),
             "console wired: {without}"
+        );
+    }
+
+    #[test]
+    fn append_boot_extras_activates_vsock_egress_only_with_a_relay() {
+        let base = "console=ttyAMA0 root=/dev/vda rw init=/init".to_string();
+        // With an egress relay: the guest gets MVM_VSOCK_EGRESS=1 (starts the
+        // SOCKS5→vsock egress client) on top of the base, never clobbering it.
+        let with = append_boot_extras(base.clone(), None, None, true);
+        assert!(with.starts_with(&base), "base preserved: {with}");
+        assert!(
+            with.contains(" MVM_VSOCK_EGRESS=1"),
+            "egress activated: {with}"
+        );
+        // No relay: no egress token (the client would have nowhere to dial).
+        let without = append_boot_extras(base.clone(), None, None, false);
+        assert!(
+            !without.contains("MVM_VSOCK_EGRESS"),
+            "no relay ⇒ no egress: {without}"
+        );
+    }
+
+    #[test]
+    fn append_boot_extras_orders_extra_then_uvols_then_egress() {
+        let out = append_boot_extras(
+            "root=/dev/vda".to_string(),
+            Some("  debug  "),
+            Some("mvm.uvols=uvol0:2f:rw:fs"),
+            true,
+        );
+        assert_eq!(
+            out,
+            "root=/dev/vda debug mvm.uvols=uvol0:2f:rw:fs MVM_VSOCK_EGRESS=1"
+        );
+        // Empty/absent extras are skipped without leaving stray spaces.
+        assert_eq!(
+            append_boot_extras("root=/dev/vda".to_string(), Some("   "), None, false),
+            "root=/dev/vda"
         );
     }
 }
