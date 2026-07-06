@@ -205,6 +205,39 @@ fn current_backend() -> DevBackend {
     })
 }
 
+/// Backend-agnostic "is the dev VM up?" — dispatches to whichever backend this
+/// host selects so cross-cutting callers (cache prune, cleanup) respect an
+/// in-house (`hvf`) dev VM, not just the Vz one. Replaces the former
+/// `is_vz_dev_running` at those call sites; the per-backend checks
+/// (`dev_vz::is_vz_dev_running`, `dev_hvf::is_hvf_dev_running`) remain the
+/// implementation details this fans out to.
+pub(in crate::commands) fn is_dev_vm_running() -> bool {
+    match current_backend() {
+        DevBackend::Libkrun => matches!(
+            LibkrunBackend.status(&VmId(dev_vz::DEV_VM_NAME.to_string())),
+            Ok(VmStatus::Running)
+        ),
+        DevBackend::Hvf => dev_hvf::is_hvf_dev_running(),
+        DevBackend::Vz => dev_vz::is_vz_dev_running(),
+        // The native-Linux "dev VM" is the host shell itself; there is no
+        // long-lived guest to be running.
+        DevBackend::LinuxKvm | DevBackend::Unsupported => false,
+    }
+}
+
+/// Backend-agnostic dev-VM stop, dispatched to the owning backend. `reset` drops
+/// the Nix-store overlay (Vz only); other backends ignore it. Returns whether a
+/// VM was actually stopped.
+pub(in crate::commands) fn down_dev_vm(json: bool, reset: bool) -> Result<bool> {
+    match current_backend() {
+        DevBackend::Libkrun => cmd_dev_libkrun_down(json),
+        DevBackend::Vz => dev_vz::cmd_dev_vz_down(json, reset),
+        DevBackend::Hvf => dev_hvf::cmd_dev_hvf_down(json),
+        DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(json),
+        DevBackend::Unsupported => Ok(false),
+    }
+}
+
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
     #[command(subcommand)]
@@ -613,15 +646,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             Ok(())
         }
         DevAction::Down { reset, json } => {
-            let was_running = match backend {
-                DevBackend::Libkrun => cmd_dev_libkrun_down(json),
-                DevBackend::Vz => dev_vz::cmd_dev_vz_down(json, reset),
-                DevBackend::Hvf => dev_hvf::cmd_dev_hvf_down(json),
-                DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(json),
-                // Nothing to stop on unsupported hosts. The gc-root
-                // cleanup below still runs.
-                DevBackend::Unsupported => Ok(false),
-            }?;
+            // Nothing to stop on unsupported hosts; `down_dev_vm` returns
+            // `Ok(false)` there and the gc-root cleanup below still runs.
+            let was_running = down_dev_vm(json, reset)?;
             let reset_done = if reset {
                 reset_nix_store_overlay(json)
             } else {
@@ -730,14 +757,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             // Down (best-effort — Rebuild semantics is "discard and
             // start over," so a stop failure here shouldn't block the
             // re-up).
-            let _ = match backend {
-                DevBackend::Libkrun => cmd_dev_libkrun_down(false),
-                // Rebuild discards state, so don't park — cold-boot next.
-                DevBackend::Vz => dev_vz::cmd_dev_vz_down(false, /* reset = */ true),
-                DevBackend::Hvf => dev_hvf::cmd_dev_hvf_down(false),
-                DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(false),
-                DevBackend::Unsupported => Ok(false),
-            };
+            // Rebuild discards state, so reset the overlay and cold-boot next.
+            let _ = down_dev_vm(false, /* reset = */ true);
 
             // Clear cached dev image
             let cache_dir = format!("{}/dev", mvm_core::config::mvm_cache_dir());

@@ -3248,6 +3248,13 @@ fn test_is_vz_dev_running_returns_bool() {
     let _ = super::env::dev_vz::is_vz_dev_running();
 }
 
+#[test]
+fn test_is_dev_vm_running_backend_agnostic_returns_bool() {
+    // The backend-agnostic probe dispatches on the resolved dev backend; verify
+    // it doesn't panic on this host (result depends on platform + running VM).
+    let _ = super::env::dev::is_dev_vm_running();
+}
+
 // ---- admission flags (up retired; pin removal) ----
 
 #[test]

@@ -200,7 +200,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             json,
             force,
         } => {
-            use super::super::env::dev_vz;
+            use super::super::env::{dev, dev_vz};
 
             // Guard 1 — never yank the store from an in-flight bootstrap. A
             // held Stage 0 lock means another `dev up`/`build` is mid-bootstrap.
@@ -220,10 +220,10 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             // `dev up` restarts it. Skipped under --dry-run (which mutates
             // nothing). The stop is the reversible half of repair, so we do it
             // automatically rather than refuse.
-            if !dry_run && dev_vz::is_vz_dev_running() {
+            if !dry_run && dev::is_dev_vm_running() {
                 ui::warn("A dev builder VM is running; stopping it before clearing the store.");
                 // Clearing the store invalidates any snapshot, so don't park.
-                let _ = dev_vz::cmd_dev_vz_down(/* json = */ false, /* reset = */ true);
+                let _ = dev::down_dev_vm(/* json = */ false, /* reset = */ true);
             }
 
             let repair = mvm_build::builder_vm::clear_builder_store(dry_run)
