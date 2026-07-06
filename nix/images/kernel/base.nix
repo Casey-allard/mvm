@@ -73,7 +73,10 @@ let
     "TMPFS" "TMPFS_POSIX_ACL" "TMPFS_XATTR"
     "DEVTMPFS" "DEVTMPFS_MOUNT" "PROC_FS" "SYSFS"
 
-    # process basics
+    # process basics. EXPERT unlocks the config knobs a normal build hides —
+    # notably it makes CONFIG_VT (default-y, forced on otherwise) disable-able,
+    # which is what lets the VT/INPUT subtree actually drop below.
+    "EXPERT"
     "BINFMT_ELF" "BINFMT_SCRIPT" "FUTEX" "EPOLL" "SIGNALFD"
     "EVENTFD" "TIMERFD" "SYSVIPC"
     "MULTIUSER" "SYSCTL" "PRINTK" "PRINTK_TIME" "KALLSYMS" "BUG"
@@ -261,7 +264,9 @@ let
     "ARCH_MA35"
     "VT" "VT_CONSOLE"
     "KEYBOARD_ATKBD" "MOUSE_PS2"
-    "PHYLINK"
+    # PHYLINK's own selectors (second audit layer): NET_DSA (distributed
+    # switch) + PCS_XPCS (ethernet PCS). Neither has a device under virtio-net.
+    "PHYLINK" "NET_DSA" "PCS_XPCS"
     "MFD_HI6421_PMIC" "MFD_MT6397" "MFD_VEXPRESS_SYSREG" "MFD_WCD934X"
     "RTC_NVMEM"
     "CRYPTO_SM4_GENERIC" "CRYPTO_SM3_GENERIC" "CRYPTO_SM3_ARM64_CE"
