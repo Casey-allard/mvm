@@ -277,6 +277,29 @@ let
     # has no devicetree fallback and the hypervisor presents an ACPI/MADT
     # for SMP bringup, so disabling it there would not boot.
     "ACPI"
+  ] ++ pkgs.lib.optionals (kernelArch == "x86_64") [
+    # The x86_64 counterpart to the arm64 SoC cull. `x86_64_defconfig` is
+    # far fatter than arm64's: it ships decades of legacy-PC hardware, laptop
+    # ACPI/WMI platform drivers, and *other* hypervisors' guest additions that
+    # a Firecracker / QEMU-microvm / cloud-hypervisor guest never has. The
+    # shared list above already handles the arch-neutral families (virtio-only
+    # storage/net, no USB/DRM/sound/input, no NVMe, slim crypto); these are the
+    # x86-only leaves on top. ACPI *core* stays (boot + SMP/MADT + clean
+    # power-button shutdown), and the x86 console is the platform `ttyS0`
+    # (SERIAL_8250, kept in the shared enables) — neither is cut here.
+    "X86_PLATFORM_DEVICES"   # drivers/platform/x86 — thinkpad/dell/asus/… laptop WMI drivers
+    "HYPERV"                 # Microsoft Hyper-V guest additions — we are a KVM guest
+    "VMWARE_VMCI" "VMWARE_BALLOON" "VMWARE_PVSCSI"  # VMware guest additions
+    "HIBERNATION"            # a microVM never hibernates to a swap device
+    "EDAC"                   # RAM error detection/correction — the host owns ECC
+    "VGA_CONSOLE" "VGA_ARB" "VGA_SWITCHEROO" "AGP"  # no VGA text/graphics; serial only
+    # ACPI stays, but its appliance leaf drivers have no device in a VM.
+    # ACPI_BUTTON is deliberately kept — it delivers the power-button event a
+    # VMM uses for graceful shutdown.
+    "ACPI_BATTERY" "ACPI_FAN" "ACPI_THERMAL" "ACPI_VIDEO" "ACPI_DOCK"
+    "ACPI_AC" "ACPI_WMI" "ACPI_PROCESSOR_AGGREGATOR"
+    "SERIAL_8250_PCI"        # console is the platform ttyS0, not a PCI serial card
+    "SERIAL_8250_EXTENDED"   # multiport / non-standard 8250 variants
   ];
 
   # Realize a `.config` from base + the caller's deltas. `runCommandCC`
