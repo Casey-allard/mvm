@@ -227,11 +227,22 @@ let
     "EXTCON"                     # external-connector (USB-C/jack) detection
     "CRYPTO_HW"                  # hardware crypto offload — software crypto stays
 
-    # Debug info: a microVM kernel is never attached to a live kernel
-    # debugger, and the DWARF pass inflates both the vmlinux and compile
-    # time for zero runtime benefit. Drop it (the choice falls back to
-    # DEBUG_INFO_NONE).
-    "DEBUG_INFO"
+    # Foreign / legacy crypto ciphers + hashes defconfig enables that no mvm
+    # path uses. dm-verity (Claim 3) needs SHA-2 + CRC; TLS is userspace. These
+    # are compiled-in dead code — drop them. (AES / SHA / GCM / CHACHA / CRC32
+    # stay: they are not named here and defconfig keeps them.)
+    "CRYPTO_DES" "CRYPTO_SM4" "CRYPTO_SM3" "CRYPTO_CAMELLIA" "CRYPTO_SERPENT"
+    "CRYPTO_TWOFISH" "CRYPTO_ARIA" "CRYPTO_BLOWFISH" "CRYPTO_CAST5"
+    "CRYPTO_CAST6" "CRYPTO_SEED" "CRYPTO_TEA" "CRYPTO_KHAZAD" "CRYPTO_ANUBIS"
+    "CRYPTO_WP512" "CRYPTO_FCRYPT" "CRYPTO_STREEBOG" "CRYPTO_MD4"
+
+    # Turn off the DWARF pass (build-time only; the Image is stripped either
+    # way). `DEBUG_INFO` is a choice, so disable its DWARF members and let the
+    # choice fall back to `DEBUG_INFO_NONE` — done via the disable list (not an
+    # enable) so a revert is a warn, not a hard guard failure. BTF is only used
+    # by BPF/CO-RE, which no mvm guest or builder loads.
+    "DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT" "DEBUG_INFO_DWARF5"
+    "DEBUG_INFO_DWARF4" "DEBUG_INFO_BTF"
   ] ++ pkgs.lib.optionals (kernelArch == "arm64") [
     # arm64 boots from the FDT libkrun / Firecracker hand us; ACPI is
     # never consulted, so drop the ACPICA interpreter and the whole
