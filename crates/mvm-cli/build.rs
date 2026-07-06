@@ -74,9 +74,28 @@ fn main() {
         );
     }
 
+    // The `cargo zigbuild` cross-compile below is NOT byte-reproducible: two
+    // runs against identical source produce different bytes. build.rs reruns
+    // whenever any watched input changes (a `mvm-build` edit, a lockfile bump),
+    // so a naive re-cross-compile churns the binary's sha on every rerun — and
+    // that sha is the authoritative dev-image cache key (see
+    // `builder_vm_source_fingerprint`), so the dev image would rebuild (via the
+    // gvproxy builder) on every unrelated change. Gate the cross-compile on a
+    // content stamp of its real inputs and reuse the cached binary when they're
+    // unchanged, so the embedded bytes stay stable across reruns.
+    let stamp = host_bin_source_stamp(&workspace_root, &pin);
     for name in manifest.iter() {
         let out_file = bins_out.join(name);
-        if skip_embed {
+        let stamp_file = bins_out.join(format!("{name}.stamp"));
+        let cached = out_file.exists()
+            && std::fs::metadata(&out_file)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            && std::fs::read_to_string(&stamp_file).ok().as_deref() == Some(stamp.as_str());
+        if cached {
+            // Reuse the cached binary verbatim — for stub *and* real builds — so
+            // its bytes (and the fingerprint) don't shift on an unrelated rerun.
+        } else if skip_embed {
             std::fs::write(&out_file, b"")
                 .unwrap_or_else(|e| panic!("write stub {}: {e}", out_file.display()));
         } else {
@@ -87,6 +106,7 @@ fn main() {
                 &pin.target,
                 &out_file,
             );
+            let _ = std::fs::write(&stamp_file, &stamp);
         }
         let sha = sha256_hex(&out_file);
         entries.push((name.clone(), out_file.clone(), sha));
@@ -361,6 +381,45 @@ fn sha256_hex(p: &Path) -> String {
     let mut h = Sha256::new();
     h.update(&bytes);
     format!("{:x}", h.finalize())
+}
+
+/// Content stamp of everything that determines the cross-compiled host binaries:
+/// the `mvm-build` bin + lib source, the workspace lockfile (their dep closure),
+/// and the pinned cross toolchain. Stable across `build.rs` reruns as long as
+/// none of those changed — the signal used to skip the non-reproducible
+/// cross-compile and reuse the cached binary, keeping the dev-image cache key
+/// stable. Same inputs the `rerun-if-changed` lines below watch.
+fn host_bin_source_stamp(root: &Path, pin: &Pin) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [&pin.target, &pin.zig, &pin.cargo_zigbuild] {
+        h.update(part.as_bytes());
+        h.update(b"\0");
+    }
+    hash_path_recursive(&mut h, &root.join("crates/mvm-build/src"));
+    hash_path_recursive(&mut h, &root.join("Cargo.lock"));
+    format!("{:x}", h.finalize())
+}
+
+/// Fold a file (or a directory's contents, recursively, in sorted order) into
+/// `h`. Sorted traversal makes the stamp deterministic regardless of readdir
+/// order. Absolute paths are stable per machine (the stamp is a local cache
+/// key), so keying on them is fine.
+fn hash_path_recursive(h: &mut sha2::Sha256, path: &Path) {
+    use sha2::Digest;
+    if path.is_dir() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        entries.sort();
+        for e in entries {
+            hash_path_recursive(h, &e);
+        }
+    } else if let Ok(bytes) = std::fs::read(path) {
+        h.update(path.to_string_lossy().as_bytes());
+        h.update(b"\0");
+        h.update(&bytes);
+    }
 }
 
 fn render_embedded_rs(entries: &[(String, PathBuf, String)]) -> String {
