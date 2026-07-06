@@ -45,6 +45,15 @@ pub struct PassthroughFs {
     next_inode: u64,
     handles: HashMap<u64, Handle>,
     next_fh: u64,
+    /// The uid/gid of the guest process that issued the request currently being
+    /// handled (from each `fuse_in_header`). We present every file as owned by
+    /// this caller so the guest's own permission check passes — the share is a
+    /// single-user dev mount, and the host operation still runs as the host
+    /// user regardless. Without this, a dev shell running as a non-root uid
+    /// can't write a `/work` file the host owns (host uid ≠ guest uid), even
+    /// though the FUSE server would happily perform the write.
+    caller_uid: u32,
+    caller_gid: u32,
 }
 
 impl PassthroughFs {
@@ -58,6 +67,8 @@ impl PassthroughFs {
             next_inode: FUSE_ROOT_ID + 1,
             handles: HashMap::new(),
             next_fh: 1,
+            caller_uid: 0,
+            caller_gid: 0,
         }
     }
 
@@ -74,6 +85,9 @@ impl PassthroughFs {
             self.inodes.remove(&hdr.nodeid);
             return None;
         }
+        // Present ownership as this request's caller (see `caller_uid`).
+        self.caller_uid = hdr.uid;
+        self.caller_gid = hdr.gid;
         let result = self.handle(&hdr, body);
         Some(match result {
             Ok(payload) => FuseOutHeader::reply(hdr.unique, 0, &payload),
@@ -162,7 +176,7 @@ impl PassthroughFs {
         Ok(FuseAttrOut {
             attr_valid: 1,
             attr_valid_nsec: 0,
-            attr: attr_from(nodeid, &md),
+            attr: attr_from(nodeid, &md, self.caller_uid, self.caller_gid),
         }
         .to_bytes())
     }
@@ -195,7 +209,7 @@ impl PassthroughFs {
         Ok(FuseAttrOut {
             attr_valid: 1,
             attr_valid_nsec: 0,
-            attr: attr_from(nodeid, &md),
+            attr: attr_from(nodeid, &md, self.caller_uid, self.caller_gid),
         }
         .to_bytes())
     }
@@ -205,7 +219,7 @@ impl PassthroughFs {
         let path = self.child(parent, name)?;
         let md = std::fs::symlink_metadata(&path).map_err(errno)?;
         let nodeid = self.intern(&path);
-        Ok(entry_out(nodeid, &md))
+        Ok(entry_out(nodeid, &md, self.caller_uid, self.caller_gid))
     }
 
     fn opendir(&mut self, nodeid: u64) -> Result<Vec<u8>, i32> {
@@ -330,7 +344,7 @@ impl PassthroughFs {
         self.next_fh += 1;
         self.handles.insert(fh, Handle::File(file));
         // Reply is fuse_entry_out immediately followed by fuse_open_out.
-        let mut out = entry_out(nodeid, &md);
+        let mut out = entry_out(nodeid, &md, self.caller_uid, self.caller_gid);
         out.extend_from_slice(&FuseOpenOut { fh, open_flags: 0 }.to_bytes());
         Ok(out)
     }
@@ -346,7 +360,7 @@ impl PassthroughFs {
         chmod(&path, mode & 0o777).map_err(errno)?;
         let md = std::fs::symlink_metadata(&path).map_err(errno)?;
         let nodeid = self.intern(&path);
-        Ok(entry_out(nodeid, &md))
+        Ok(entry_out(nodeid, &md, self.caller_uid, self.caller_gid))
     }
 
     fn unlink(&mut self, parent: u64, body: &[u8], is_dir: bool) -> Result<Vec<u8>, i32> {
@@ -424,7 +438,7 @@ fn chmod(path: &Path, mode: u32) -> io::Result<()> {
 }
 
 /// Build a `fuse_entry_out` for a freshly-looked-up/created node.
-fn entry_out(nodeid: u64, md: &Metadata) -> Vec<u8> {
+fn entry_out(nodeid: u64, md: &Metadata, caller_uid: u32, caller_gid: u32) -> Vec<u8> {
     FuseEntryOut {
         nodeid,
         generation: 0,
@@ -432,14 +446,16 @@ fn entry_out(nodeid: u64, md: &Metadata) -> Vec<u8> {
         attr_valid: 1,
         entry_valid_nsec: 0,
         attr_valid_nsec: 0,
-        attr: attr_from(nodeid, md),
+        attr: attr_from(nodeid, md, caller_uid, caller_gid),
     }
     .to_bytes()
 }
 
 /// Convert host `Metadata` to a FUSE `fuse_attr`. `st_mode` already carries the
-/// file-type bits the guest needs, so it passes through unchanged.
-fn attr_from(nodeid: u64, md: &Metadata) -> FuseAttr {
+/// file-type bits the guest needs, so it passes through unchanged. `caller_uid`/
+/// `caller_gid` override the host ownership so the guest sees every file as its
+/// own (see [`PassthroughFs::caller_uid`]).
+fn attr_from(nodeid: u64, md: &Metadata, caller_uid: u32, caller_gid: u32) -> FuseAttr {
     FuseAttr {
         ino: nodeid,
         size: md.size(),
@@ -452,8 +468,8 @@ fn attr_from(nodeid: u64, md: &Metadata) -> FuseAttr {
         ctimensec: md.ctime_nsec() as u32,
         mode: md.mode(),
         nlink: md.nlink() as u32,
-        uid: md.uid(),
-        gid: md.gid(),
+        uid: caller_uid,
+        gid: caller_gid,
         rdev: md.rdev() as u32,
         blksize: 4096,
         flags: 0,
@@ -477,6 +493,48 @@ mod tests {
             .u32(0)
             .bytes(body);
         b.into_bytes()
+    }
+
+    /// Like [`req`] but stamps a non-zero caller `uid`/`gid` into the header.
+    fn req_as(opcode: u32, nodeid: u64, unique: u64, uid: u32, gid: u32, body: &[u8]) -> Vec<u8> {
+        let mut b = Builder::new();
+        b.u32((FuseInHeader::SIZE + body.len()) as u32)
+            .u32(opcode)
+            .u64(unique)
+            .u64(nodeid)
+            .u32(uid)
+            .u32(gid)
+            .u32(0)
+            .u32(0)
+            .bytes(body);
+        b.into_bytes()
+    }
+
+    /// `attr.uid` in a getattr/entry reply: after `FuseOutHeader` (16) +
+    /// `fuse_attr_out` preamble (attr_valid 8 + nsec 4 + pad 4 = 16), then within
+    /// `fuse_attr` past ino/size/blocks/atime/mtime/ctime (48) +
+    /// atimensec/mtimensec/ctimensec/mode/nlink (20) = 68 → offset 100.
+    const ATTR_UID_OFF: usize = 16 + 16 + 68;
+
+    #[test]
+    fn getattr_presents_the_caller_uid_not_the_host_owner() {
+        // A dev shell running as a non-root uid must see files as its own so its
+        // kernel-side permission check lets it write the share (the server still
+        // performs the host op as the host user). The reply's attr.uid therefore
+        // reflects the caller's uid, not the on-disk owner.
+        let (_d, mut fs) = fs();
+        let reply = fs
+            .dispatch(&req_as(FUSE_GETATTR, FUSE_ROOT_ID, 2, 990, 991, &[]))
+            .unwrap();
+        assert_eq!(out_header(&reply).error, 0, "getattr ok");
+        let uid = u32::from_le_bytes(reply[ATTR_UID_OFF..ATTR_UID_OFF + 4].try_into().unwrap());
+        let gid = u32::from_le_bytes(
+            reply[ATTR_UID_OFF + 4..ATTR_UID_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(uid, 990, "attr.uid presents the caller, not the host owner");
+        assert_eq!(gid, 991, "attr.gid presents the caller group");
     }
 
     fn out_header(reply: &[u8]) -> FuseOutHeader {
