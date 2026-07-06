@@ -333,6 +333,24 @@ let
       done
       if [ -n "$reverted" ]; then
         echo "NOTE: requested kernel disables were reverted by olddefconfig (a kept driver selects them):$reverted" >&2
+        # Build the Kconfig select graph once (OWNER -> SELECTED per `select`
+        # line, tracking the enclosing `config`/`menuconfig`), then for each
+        # reverted symbol name the =y owners that select it. That is the exact
+        # cut list for the next slimming pass — no guessing which driver pins
+        # the dead subsystem. Runs under `set +e`: the per-symbol grep is
+        # expected to return non-zero (no match) and must not abort the build.
+        set +e
+        graph=$(find . -name 'Kconfig*' -print0 | xargs -0 awk '
+          /^[[:space:]]*(menu)?config[[:space:]]+/ { cur=$2 }
+          /^[[:space:]]*select[[:space:]]+/ { print cur, $2 }
+        ')
+        for s in $reverted; do
+          owners=$(printf '%s\n' "$graph" | awk -v t="$s" '$2==t {print $1}' | sort -u \
+            | while read -r o; do grep -q "^CONFIG_$o=y\$" .config && echo "$o"; done \
+            | tr '\n' ' ')
+          echo "  select-graph: $s <= ''${owners:-<no =y direct selector — transitive or default-y>}" >&2
+        done
+        set -e
       fi
 
       cp .config $out
