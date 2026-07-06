@@ -270,6 +270,22 @@ let
     "MFD_HI6421_PMIC" "MFD_MT6397" "MFD_VEXPRESS_SYSREG" "MFD_WCD934X"
     "RTC_NVMEM"
     "CRYPTO_SM4_GENERIC" "CRYPTO_SM3_GENERIC" "CRYPTO_SM3_ARM64_CE"
+
+    # Shrink batch 8 — kernel-infra features, not device drivers, that no mvm
+    # guest or builder exercises. Arch-neutral, so both x86_64 and arm64 shed
+    # them together. None is on the boot path; each is a large, self-contained
+    # subsystem that defconfig turns on by habit.
+    #   FUNCTION_TRACER also instruments every function with a mcount/nop at
+    #   compile time, so dropping the tracer shrinks *and* speeds the code, not
+    #   just removes the trace UI.
+    "FTRACE" "FUNCTION_TRACER" "FUNCTION_GRAPH_TRACER" "STACK_TRACER"
+    "DYNAMIC_FTRACE" "FTRACE_SYSCALLS" "KPROBE_EVENTS" "UPROBE_EVENTS"
+    "KPROBES"                 # no in-guest kprobe/BPF instrumentation
+    "KEXEC" "KEXEC_FILE" "CRASH_DUMP"  # a microVM does not kexec / kdump
+    "PROFILING"               # no oprofile/perf sampling in a workload guest
+    # LSMs mvm does not use — confinement is seccomp + setpriv bounding-set +
+    # read-only bind mounts, never SELinux/AppArmor/Smack/TOMOYO policy.
+    "SECURITY_SELINUX" "SECURITY_APPARMOR" "SECURITY_SMACK" "SECURITY_TOMOYO"
   ] ++ pkgs.lib.optionals (kernelArch == "arm64") [
     # arm64 boots from the FDT libkrun / Firecracker hand us; ACPI is
     # never consulted, so drop the ACPICA interpreter and the whole
