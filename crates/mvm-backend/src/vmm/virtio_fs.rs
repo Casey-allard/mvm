@@ -461,6 +461,94 @@ mod tests {
         assert!(nodeid > FUSE_ROOT_ID, "LOOKUP returned a fresh nodeid");
     }
 
+    /// FUSE_CREATE driven through the full split-virtqueue device must
+    /// materialize the file on the host share — the write-side counterpart of
+    /// the LOOKUP round-trip, proving the device routes create requests (data in
+    /// readable descriptors) to the server and persists them, not just reads.
+    #[test]
+    fn create_through_the_device_materializes_a_host_file() {
+        let share = tempfile::tempdir().unwrap();
+
+        let mut h = Harness::new();
+        let (desc, avail, used) = (BASE + 0x1000, BASE + 0x2000, BASE + 0x3000);
+        let (reqbuf, replybuf) = (BASE + 0x4000, BASE + 0x5000);
+        h.put(desc, &mk_desc(reqbuf, 512, VIRTQ_DESC_F_NEXT, 1));
+        h.put(desc + 16, &mk_desc(replybuf, 4096, VIRTQ_DESC_F_WRITE, 0));
+        h.put(avail + 2, &1u16.to_le_bytes());
+        h.put(avail + 4, &0u16.to_le_bytes());
+
+        let mut dev = unsafe {
+            VirtioFs::new(
+                0x0a00_0000,
+                50,
+                h.ram.as_mut_ptr(),
+                BASE,
+                h.ram.len(),
+                "work",
+                share.path(),
+            )
+        };
+        dev.write(R_QUEUE_SEL, 1);
+        dev.write(R_QUEUE_NUM, 4);
+        dev.write(R_QUEUE_DESC_LO, desc & 0xffff_ffff);
+        dev.write(R_QUEUE_DRIVER_LO, avail & 0xffff_ffff);
+        dev.write(R_QUEUE_DEVICE_LO, used & 0xffff_ffff);
+        dev.write(R_QUEUE_READY, 1);
+
+        // FUSE_INIT.
+        let init_body = {
+            let mut b = Builder::new();
+            b.u32(7).u32(31).u32(0x2_0000).u32(0);
+            b.into_bytes()
+        };
+        let mut init = Builder::new();
+        init.u32((FuseInHeader::SIZE + init_body.len()) as u32)
+            .u32(FUSE_INIT)
+            .u64(1)
+            .u64(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .bytes(&init_body);
+        h.put(reqbuf, &init.into_bytes());
+        assert!(dev.write(R_QUEUE_NOTIFY, 1));
+
+        // FUSE_CREATE new.txt (advance avail to idx=2).
+        h.put(avail + 6, &0u16.to_le_bytes());
+        h.put(avail + 2, &2u16.to_le_bytes());
+        let create_body = {
+            let mut b = Builder::new();
+            b.u32((libc::O_RDWR | libc::O_CREAT) as u32)
+                .u32(0o644)
+                .u32(0)
+                .u32(0)
+                .bytes(b"new.txt\0");
+            b.into_bytes()
+        };
+        let mut create = Builder::new();
+        create
+            .u32((FuseInHeader::SIZE + create_body.len()) as u32)
+            .u32(FUSE_CREATE)
+            .u64(2)
+            .u64(FUSE_ROOT_ID)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .bytes(&create_body);
+        h.put(reqbuf, &create.into_bytes());
+        h.put(replybuf, &[0u8; 256]);
+        assert!(dev.write(R_QUEUE_NOTIFY, 1));
+        let reply = h.get(replybuf, 16);
+        let err = i32::from_le_bytes(reply[4..8].try_into().unwrap());
+        assert_eq!(err, 0, "CREATE ok");
+        assert!(
+            share.path().join("new.txt").exists(),
+            "create through the device persisted the file to the host share"
+        );
+    }
+
     #[test]
     fn identity_and_config_report_fs_id_and_tag() {
         let share = tempfile::tempdir().unwrap();
