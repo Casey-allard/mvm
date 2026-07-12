@@ -140,7 +140,11 @@ fn run_rootfs_output(name: &str) -> PathBuf {
 /// run-rootfs cache, reusing the CLI's shared `run_image` orchestration.
 fn materialize_from_dir(dir: &Path, name: &str) -> Result<PathBuf> {
     let output = run_rootfs_output(name);
-    let cache_root = PathBuf::from(mvm_core::config::mvm_cache_dir());
+    // The `oci` segment matches the CLI's `oci_cache_root()` — the guest-agent
+    // binary cache lives at `<cache>/oci/guest-agent/…`, and passing the bare
+    // cache dir here made this path look in `<cache>/guest-agent/…`, miss, and
+    // try a source cross-compile the caller's environment may not support.
+    let cache_root = PathBuf::from(mvm_core::config::mvm_cache_dir()).join("oci");
     // The library carries no embedded guest binaries, so it resolves them from
     // the cache or a source checkout.
     // `{:#}` keeps the anyhow context chain — the top context alone
