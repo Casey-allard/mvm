@@ -101,28 +101,40 @@ mod linux {
     }
 
     /// Raise `RLIMIT_NOFILE` so the recursive seed-store copy (and `nix`
-    /// itself) don't hit `EMFILE` under the bundled kernel's low default.
-    /// Best-effort: as PID 1/root we can lift the hard limit, but a kernel
-    /// ceiling below 65536 just clamps — we then take whatever the hard
-    /// limit allows. Never fatal.
+    /// itself) don't hit `EMFILE`. libkrunfw's bundled kernel ships a low
+    /// `fs.nr_open` — the ceiling `RLIMIT_NOFILE`'s hard limit can't exceed —
+    /// so lift that first, as PID 1/root, or the setrlimit below just clamps
+    /// and `nix build` hits `EMFILE` reading the workspace source on a fresh
+    /// fetch (the QEMU builder kernel ships a high ceiling, so it never did).
+    /// Best-effort + never fatal; logs the effective limit for diagnosis.
     fn raise_fd_limit() {
+        let _ = std::fs::write("/proc/sys/fs/nr_open", b"1048576\n");
         // SAFETY: getrlimit/setrlimit with a valid resource id + struct ptr.
         unsafe {
             let want = libc::rlimit {
                 rlim_cur: 65536,
                 rlim_max: 65536,
             };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
-                return;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) != 0 {
+                // Ceiling still below 65536: take whatever the hard limit allows.
+                let mut cur = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut cur) == 0 {
+                    cur.rlim_cur = cur.rlim_max;
+                    let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &cur);
+                }
             }
-            // Hard ceiling below 65536: raise the soft limit to the hard limit.
-            let mut cur = libc::rlimit {
+            let mut eff = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
             };
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut cur) == 0 {
-                cur.rlim_cur = cur.rlim_max;
-                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &cur);
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut eff) == 0 {
+                eprintln!(
+                    "stage0-init: RLIMIT_NOFILE soft={} hard={}",
+                    eff.rlim_cur, eff.rlim_max
+                );
             }
         }
     }
