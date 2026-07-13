@@ -13,15 +13,15 @@ nothing more, nothing less.
 |---|---|---|
 | [CLI user with an OCI image](#cli-image-user) | `--workflow cli-run` | Run a command in a transient image-backed microVM. |
 | [CLI user with a flake](#cli-user) | `--workflow cli-run` | Boot a microVM from a Nix flake. |
+| [CLI user with a manifest](#manifest-user) | `--workflow cli-run` | Build and boot a manifest-backed microVM. |
 | [Python SDK user](#python-sdk) | `--workflow python-sdk` | Run a `@mvm.app()`-decorated Python script. |
 | [TypeScript / Node SDK user](#typescript-sdk) | `--workflow typescript-sdk` | Run an `mvm.app()` TypeScript app. |
 | [Prebuilt bundle operator](#bundle-run) | `--workflow bundle-run` | Launch a signed `.mvmpkg` artifact. |
-| [`mvmctl dev` user](#dev-shell) | `--workflow dev-shell` | Drop into a builder-VM shell for tinkering. |
 
 The preflight filter (plan 74 W5 / ADR-050 §1) only fails on missing
 prerequisites your workflow actually needs. A bundle operator no
 longer sees a "missing `cargo`" failure they don't care about; a
-`mvmctl dev` user no longer needs host rustup.
+flake CLI user isn't blocked by SDK-only prerequisites they don't need.
 
 ## <a id="cli-image-user"></a>CLI user with an OCI image
 
@@ -74,12 +74,37 @@ source checkout); subsequent runs reuse the warm builder. Skip the
 
 - `host nix not required` errors → none expected. mvm's builder VM
   owns Nix; the host doesn't need it.
-- `dev VM not running — run mvmctl dev up to verify` → that's just
+- `dev VM not running; run mvmctl bootstrap to verify` → that's just
   doctor telling you tool checks were skipped because the builder
   VM is asleep. It's not a failure; `mvmctl machine run` boots it on
   demand.
 - `disk space < N GiB` → free space on `~/.mvm/` (default cache
   location); `mvmctl cache info` shows what's there.
+
+## <a id="manifest-user"></a>CLI user with a manifest
+
+You already have an `mvm.toml` / `Mvmfile.toml` and want to build and boot the
+microVM it describes.
+
+```bash
+mvmctl doctor --workflow cli-run                # preflight
+mvmctl build                                    # discover manifest + build
+mvmctl machine run --manifest .                 # boot the built microVM
+```
+
+This is the shortest path when the project is already modeled as a manifest.
+The manifest selects the source (`flake` or `image`) plus sizing, while
+`mvmctl build` and `mvmctl machine run --manifest .` reuse the same project
+slot across runs.
+
+**Failure recovery:**
+
+- `manifest not found` → run from the project directory or pass an explicit
+  manifest path.
+- `host nix not required` errors → none expected. Manifest-backed flake builds
+  still run inside the builder VM, not on the host.
+- `drift detected` → the manifest's source or profile changed; rebuild or force
+  the update after confirming the new target is intentional.
 
 ## <a id="python-sdk"></a>Python SDK user
 
@@ -154,32 +179,6 @@ remain.
 - `bundle pin missing` (audit-chain admission) → the supervisor's
   signed-plan path failed to find a matching `PlanArtifact`. Pull
   a fresh copy from the publisher.
-
-## <a id="dev-shell"></a>`mvmctl dev` user
-
-You want a shell with a real Linux toolchain — for building, testing,
-or just exploring.
-
-```bash
-mvmctl doctor --workflow dev-shell              # preflight (no host rust needed)
-mvmctl dev                                      # boot + drop into shell
-# inside the shell: do work; exit / Ctrl+D returns you to the host
-```
-
-`mvmctl dev` auto-bootstraps the first time (downloads the dev image
-or builds it locally from `nix/images/dev-shell/`). Your project
-directory is bind-mounted at `/work`. Background services keep
-running after you exit; `mvmctl dev down` stops them.
-
-**Failure recovery:**
-
-- `builder VM image missing` → `mvmctl dev up` downloads or builds
-  it. From a source checkout, the in-repo flakes are always
-  preferred over published artifacts.
-- `dev shell exited immediately with no command output` → check
-  `~/.mvm/dev/console.log` for the kernel/init transcript. Plan
-  72 W5.D documented the nine bring-up bugs that produced this
-  symptom; if you hit one of them the log names it.
 
 ## See also
 
