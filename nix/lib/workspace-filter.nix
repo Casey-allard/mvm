@@ -41,6 +41,10 @@ builtins.path {
       ".build"
       "dev-prebuilt"
       # Test / generated outputs.
+      # Fuzz corpora aren't a build input (the fuzz crates are
+      # workspace-excluded), and traversing them trips EMFILE in the Stage 0
+      # guest's virtio-fs workspace copy.
+      "fuzz"
       ".mvm-test"
       "graphify-out"
       ".ur-seed-result"
