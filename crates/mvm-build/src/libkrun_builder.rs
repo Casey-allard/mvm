@@ -2217,6 +2217,11 @@ pub fn steady_state_rootfs_builder_unavailable_reason_for(
 fn ensure_steady_state_libkrun_builder_supported_on(
     plat: mvm_core::platform::Platform,
 ) -> Result<(), BuilderVmError> {
+    // DEBUG-ONLY override to run the guarded libkrun steady-state builder on
+    // Linux/KVM for boot diagnosis. Never set this in production.
+    if std::env::var_os("MVM_DEBUG_ALLOW_LIBKRUN_LINUX").is_some() {
+        return Ok(());
+    }
     match steady_state_rootfs_builder_unavailable_reason_for(plat) {
         Some(reason) => Err(BuilderVmError::LibkrunUnavailable(reason.to_string())),
         None => Ok(()),
