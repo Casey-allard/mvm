@@ -579,7 +579,7 @@ pub fn build_image_with_options(
             Kind::File => p.size.div_ceil(BLOCK_SIZE as u64) as u32,
             Kind::Symlink => {
                 // Fast symlink: target ≤ 60 bytes lives in i_block, no data block.
-                if p.size <= 60 {
+                if p.size < 60 {
                     0
                 } else {
                     p.size.div_ceil(BLOCK_SIZE as u64) as u32

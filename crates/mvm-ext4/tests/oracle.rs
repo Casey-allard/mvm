@@ -129,6 +129,36 @@ fn tree_round_trips_through_real_reader() {
     assert_eq!(link_inode.size, "hosts".len() as u64);
 }
 
+/// Fast-symlink boundary. A fast symlink stores its target in the 60-byte
+/// `i_block`, so it is only valid for a target strictly **< 60 bytes**; a
+/// 60-byte target must be a slow symlink backed by a data block. The threshold
+/// was `<= 60`, which inlined a 60-byte target and dropped its last byte on
+/// readback (a 60-byte `.../claude.exe` link became `.../claude.ex`). Here a
+/// 60- and a 100-byte target must round-trip verbatim through the independent
+/// reader's data-block path; before the fix the 60-byte case had no data block
+/// and read back empty.
+#[test]
+fn symlink_target_survives_the_60_byte_boundary() {
+    for len in [60usize, 100] {
+        let target = "x".repeat(len);
+        let nodes = vec![Node::Symlink {
+            path: "/link".into(),
+            target: target.clone(),
+        }];
+        let fs = mount(build_image(&nodes).expect("symlink image builds"));
+        let (ino, ft) = find(&list_dir(&fs, 2), "link").expect("/link present");
+        assert_eq!(ft, DirEntryType::Symlink);
+        let (inode, _) = fs.read_inode_verified(ino).expect("read symlink inode");
+        assert!(inode.is_symlink());
+        assert_eq!(inode.size, len as u64, "{len}-byte target sizes the inode");
+        assert_eq!(
+            read_file(&fs, ino),
+            target.as_bytes(),
+            "{len}-byte slow-symlink target must round-trip verbatim",
+        );
+    }
+}
+
 /// The empty-growable `mkfs` path (a writable Stage 0 store, not a sealed
 /// rootfs) must also produce a filesystem the independent reader mounts: a bare
 /// root directory holding only "." and "..", sized to the full device with free
