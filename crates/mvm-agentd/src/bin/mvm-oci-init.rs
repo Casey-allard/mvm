@@ -496,7 +496,29 @@ mod linux {
             .unwrap_or(false)
     }
 
+    fn install_post_restore_signal_handler() {
+        // The host signals post-restore by sending SIGUSR1 to PID 1. The
+        // default action terminates the process, which would kill the whole
+        // microVM. Ignore it so the resumed guest keeps running; the agent
+        // has already reseeded the VMGenID before this signal is sent.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_sigusr1 as *const () as usize;
+            let _ = libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = 0;
+            if libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()) != 0 {
+                eprintln!(
+                    "mvm-oci-init: sigaction(SIGUSR1): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    unsafe extern "C" fn on_sigusr1(_sig: libc::c_int) {}
+
     fn idle_forever() -> ! {
+        install_post_restore_signal_handler();
         loop {
             std::thread::sleep(Duration::from_secs(2_147_483_647));
         }
