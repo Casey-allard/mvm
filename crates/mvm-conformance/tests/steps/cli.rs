@@ -128,6 +128,41 @@ fn run_mvmctl_isolated_live_home(world: &mut CliWorld, args: String) {
     world.last_run = Some(output);
 }
 
+#[when(expr = "I run mvmctl in an isolated live home with {string} with a {int} second timeout")]
+async fn run_mvmctl_isolated_live_home_with_timeout(
+    world: &mut CliWorld,
+    args: String,
+    seconds: i64,
+) {
+    let duration =
+        Duration::from_secs(u64::try_from(seconds).expect("timeout must be non-negative"));
+
+    if world.isolated_home.is_none() {
+        world.isolated_home = Some(tempfile::tempdir().expect("create isolated MVM_HOME"));
+    }
+    let home = world
+        .isolated_home
+        .as_ref()
+        .expect("isolated home is set above")
+        .path()
+        .to_path_buf();
+
+    let handle = spawn_blocking(move || {
+        mvmctl_command()
+            .current_dir(workspace_root())
+            .args(args.split_whitespace())
+            .env("MVM_HOME", home)
+            .output()
+            .expect("failed to spawn mvmctl")
+    });
+
+    let output = timeout(duration, handle)
+        .await
+        .unwrap_or_else(|_| panic!("mvmctl did not exit within {seconds}s"))
+        .expect("spawn_blocking task panicked");
+    world.last_run = Some(output);
+}
+
 #[then(expr = "the isolated mvm home does not contain directory {string}")]
 fn isolated_home_no_dir(world: &mut CliWorld, rel: String) {
     let home = world
