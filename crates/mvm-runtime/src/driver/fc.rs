@@ -347,6 +347,16 @@ fn escalate_kill(
     }
 }
 
+/// Drop guard that runs a closure on scope exit.
+struct OnDrop<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 impl VmmDriver for FcDriver {
     fn name(&self) -> &str {
         self.backend.name()
@@ -403,6 +413,18 @@ impl VmmDriver for FcDriver {
         let runtime_dir = state_dir.join("runtime");
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|e| anyhow!("create runtime dir {}: {e}", runtime_dir.display()))?;
+
+        // Mark the state dir as "launch in progress" so convergence passes
+        // do not reap it before Firecracker writes fc.pid. Removed on exit
+        // from this function (success or error) once the dir either has a
+        // live PID file or is no longer needed.
+        let starting_lock = state_dir.join(".mvm-starting.lock");
+        if let Err(e) = std::fs::write(&starting_lock, "") {
+            tracing::warn!(error = %e, path = %starting_lock.display(), "failed to write Firecracker startup lock");
+        }
+        let _starting_lock_guard = OnDrop(Some(|| {
+            let _ = std::fs::remove_file(&starting_lock);
+        }));
 
         let abs_dir = state_dir.to_string_lossy().into_owned();
         let pid_file = fc_pid_path(&spec.name)

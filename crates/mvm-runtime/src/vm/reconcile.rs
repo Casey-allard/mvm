@@ -237,6 +237,13 @@ fn read_pid_file(path: &Path) -> Option<i32> {
 
 /// Does `dir` carry a supervisor pid file pointing at a live process?
 fn dir_has_live_process(dir: &Path) -> bool {
+    // A Firecracker VM that is still launching writes its startup lock before
+    // spawning the VMM and removes it once fc.pid is in place. Treat the lock
+    // as a live owner so convergence does not reap the dir in the narrow
+    // window between state-dir creation and PID-file creation.
+    if dir.join(".mvm-starting.lock").exists() {
+        return true;
+    }
     PID_FILE_NAMES
         .iter()
         .filter_map(|f| read_pid_file(&dir.join(f)))
