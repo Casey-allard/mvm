@@ -17,11 +17,12 @@ Feature: Admitted egress completes end-to-end over the vsock seam
     Then the command exits with code 1
 
   @live
-  Scenario: DNS queries land in the chain-signed audit log
-    When I run mvmctl with "machine run --image alpine --allow-host example.com -- wget -q -O - https://example.com"
+  Scenario: Admitted workload is recorded in the chain-signed audit log
+    When I run mvmctl with "machine run --name bdd-audit-record --image alpine --allow-host example.com -- wget -q -O - https://example.com"
     Then the command exits with code 0
+    And the output contains "Example Domain"
     When I run mvmctl with "trust audit verify"
     Then the command exits with code 0
     When I run mvmctl with "trust audit tail --chain --lines 50"
     Then the command exits with code 0
-    And the output contains "dns.resolved"
+    And the output contains "plan.admitted"

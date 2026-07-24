@@ -17,10 +17,10 @@ Feature: Transient sandbox boot
     Then the command exits with code 7
 
   @live
-  Scenario: machine run reaches an admitted host with ping
-    When I run mvmctl in an isolated live home with "machine run --name bdd-egress-ping --image alpine --allow-host google.com --timeout 120 -- /bin/ping -c 1 google.com"
+  Scenario: machine run reaches an admitted host over HTTP
+    When I run mvmctl in an isolated live home with "machine run --name bdd-egress-http --image alpine --allow-host httpbin.org --timeout 120 -- wget -q -O - https://httpbin.org/get"
     Then the command exits with code 0
-    And the output contains "1 received"
+    And the output contains "httpbin.org"
 
   @live
   Scenario: machine run removes the transient VM state directory on guest exit

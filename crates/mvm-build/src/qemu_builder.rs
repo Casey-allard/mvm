@@ -327,22 +327,56 @@ fn stage_qemu_vsock_guest_modules(host_bins_dir: &Path) -> Result<(), BuilderVmE
     std::fs::create_dir_all(&dest_dir)
         .map_err(|e| io_err("creating stage0 vsock module dir", &dest_dir, e))?;
     for module in QEMU_STAGE0_VSOCK_GUEST_MODULES {
-        let src = module_root.join(module);
-        if !src.is_file() {
-            return Err(BuilderVmError::VmmUnavailable {
-                requested: "qemu-stage0-vsock-modules".to_string(),
-                reason: format!(
-                    "required guest vsock module {} missing on host; install the distro kernel modules package for {}",
-                    src.display(),
-                    release
-                ),
-            });
-        }
+        let (src, compressed) = find_vsock_module(&module_root, module)?;
         let dst = dest_dir.join(module);
-        std::fs::copy(&src, &dst)
-            .map_err(|e| io_err("copying stage0 vsock guest module", &src, e))?;
+        if compressed {
+            let status = Command::new("zstd")
+                .arg("-d")
+                .arg("-f")
+                .arg("-o")
+                .arg(&dst)
+                .arg(&src)
+                .status()
+                .map_err(|e| io_err("decompressing stage0 vsock guest module", &src, e))?;
+            if !status.success() {
+                return Err(BuilderVmError::VmmUnavailable {
+                    requested: "qemu-stage0-vsock-modules".to_string(),
+                    reason: format!(
+                        "zstd -d {} -> {} failed; install zstd or provide an uncompressed .ko module",
+                        src.display(),
+                        dst.display()
+                    ),
+                });
+            }
+        } else {
+            std::fs::copy(&src, &dst)
+                .map_err(|e| io_err("copying stage0 vsock guest module", &src, e))?;
+        }
     }
     Ok(())
+}
+
+/// Locate a vsock kernel module, tolerating modern distros that ship
+/// modules compressed with zstd (`.ko.zst`). Returns the source path and
+/// whether it needs decompression before the guest initramfs can `insmod` it.
+fn find_vsock_module(module_root: &Path, module: &str) -> Result<(PathBuf, bool), BuilderVmError> {
+    let plain = module_root.join(module);
+    if plain.is_file() {
+        return Ok((plain, false));
+    }
+    let compressed = module_root.join(format!("{module}.zst"));
+    if compressed.is_file() {
+        return Ok((compressed, true));
+    }
+    Err(BuilderVmError::VmmUnavailable {
+        requested: "qemu-stage0-vsock-modules".to_string(),
+        reason: format!(
+            "required guest vsock module {} (or {}.zst) missing on host; install the distro kernel modules package for {}",
+            plain.display(),
+            plain.display(),
+            module_root.display()
+        ),
+    })
 }
 
 /// Create + populate an ext4 image from a directory tree without mounting it

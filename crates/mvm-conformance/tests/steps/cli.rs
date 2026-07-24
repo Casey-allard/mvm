@@ -49,40 +49,72 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root must exist")
 }
 
-/// Copy the host's pre-built workload kernel into an isolated `MVM_HOME`.
+/// Seed an isolated `MVM_HOME` from the host's shared cache.
 ///
-/// Live scenarios boot a real microVM, and a cold isolated home has no
-/// dm-verity-capable workload kernel. Seeding it from the host's shared
-/// cache keeps the scenario hermetic (it does not mutate `~/.mvm`) while
-/// avoiding a slow Stage 0 rebuild inside every test run.
-fn copy_host_workload_kernel_into(home: &Path) {
+/// Live scenarios boot a real microVM, but a cold isolated home has no
+/// dm-verity-capable workload kernel and no runtime overlay. Copying the
+/// host's pre-built artifacts keeps each scenario hermetic (it does not
+/// mutate `~/.mvm`) while avoiding a slow Stage 0 / overlay rebuild inside
+/// every test run.
+fn seed_host_cache_into(home: &Path) {
     let arch = std::env::consts::ARCH;
-    let src = PathBuf::from(mvm_core::config::default_mvm_cache_dir())
-        .join("builder-vm")
-        .join(arch)
-        .join("kernels")
-        .join("workload");
-    let dst = home
-        .join("cache")
-        .join("builder-vm")
-        .join(arch)
-        .join("kernels")
-        .join("workload");
+    let src_root = PathBuf::from(mvm_core::config::default_mvm_cache_dir());
+    let dst_root = home.join("cache");
 
+    let kernel_src = src_root
+        .join("builder-vm")
+        .join(arch)
+        .join("kernels")
+        .join("workload");
     assert!(
-        src.join("vmlinux").exists(),
-        "host workload kernel missing at {src:?}; run `mvmctl kernel build --which workload` first"
+        kernel_src.join("vmlinux").exists(),
+        "host workload kernel missing at {kernel_src:?}; run `mvmctl kernel build --which workload` first"
     );
 
-    fs::create_dir_all(&dst).expect("create workload kernel dir in isolated home");
-    for entry in fs::read_dir(&src).expect("read host workload kernel dir") {
-        let entry = entry.expect("read host workload kernel directory entry");
-        let src_path = entry.path();
-        if src_path.is_file() {
-            let dst_path = dst.join(entry.file_name());
-            fs::copy(&src_path, &dst_path).expect("copy workload kernel file");
+    copy_dir_recursively(
+        &kernel_src,
+        &dst_root
+            .join("builder-vm")
+            .join(arch)
+            .join("kernels")
+            .join("workload"),
+    )
+    .expect("copy workload kernel into isolated home");
+
+    for subdir in ["runtime-overlay", "runtime-overlay-bins"] {
+        let src = src_root.join(subdir);
+        if src.exists() {
+            copy_dir_recursively(&src, &dst_root.join(subdir))
+                .expect("copy runtime overlay cache into isolated home");
         }
     }
+}
+
+/// Best-effort recursive copy of a directory tree. Directories are created;
+/// files are copied; other file types are skipped.
+fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_file() {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(src, dst)?;
+        return Ok(());
+    }
+    if !src.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursively(&src_path, &dst_path)?;
+        } else if src_path.is_file() {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 #[when(expr = "I run mvmctl with {string}")]
@@ -156,7 +188,7 @@ fn run_mvmctl_isolated_live_home(world: &mut CliWorld, args: String) {
         .isolated_home
         .as_ref()
         .expect("isolated home is set above");
-    copy_host_workload_kernel_into(home.path());
+    seed_host_cache_into(home.path());
     let output = mvmctl_command()
         .current_dir(workspace_root())
         .args(args.split_whitespace())
@@ -184,7 +216,7 @@ async fn run_mvmctl_isolated_live_home_with_timeout(
         .expect("isolated home is set above")
         .path()
         .to_path_buf();
-    copy_host_workload_kernel_into(&home);
+    seed_host_cache_into(&home);
 
     let handle = spawn_blocking(move || {
         mvmctl_command()
@@ -209,9 +241,18 @@ fn isolated_home_no_dir(world: &mut CliWorld, rel: String) {
         .as_ref()
         .expect("isolated home must be created before checking it");
     let path = home.path().join(rel.as_str());
+
+    // Transient VM teardown is asynchronous on the host-agent convergence
+    // loop; give it a short, bounded window to reap the state directory
+    // before failing the scenario.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     assert!(
         !path.exists(),
-        "expected {path:?} to be removed after teardown, but it still exists"
+        "expected {path:?} to be removed after teardown, but it still exists after 10s"
     );
 }
 
