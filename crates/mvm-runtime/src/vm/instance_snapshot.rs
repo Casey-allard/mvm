@@ -41,6 +41,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use ed25519_dalek::Signer;
 
 use crate::base::shell::{run_in_vm, shell_quote};
@@ -115,18 +116,37 @@ pub trait SnapshotIO {
     fn load_snapshot(&self, dir: &Path) -> Result<()>;
 }
 
+/// Best-effort copy of the VM runtime sidecars that the resume path
+/// needs but that live in the ephemeral `vms/<name>/` directory.  The
+/// instance-snapshot directory outlives a VMM restart, so preserving them
+/// here lets `post_restore_grant_envelope` mint a fresh grant after restore.
+fn copy_runtime_sidecars_to_snapshot(vm_name: &str, snapshot_dir: &Path) {
+    let state_dir = mvm_core::config::vm_state_dir(vm_name);
+    for name in ["verb-grant.json", "plan.json"] {
+        let src = state_dir.join(name);
+        let dst = snapshot_dir.join(name);
+        if src.exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+}
+
 /// Pause + seal one VM's snapshot. Returns the sealed sidecar so
 /// callers can record what they sealed.
 ///
 /// 1. Ensure the snapshot dir exists (mode 0700).
 /// 2. Ask the IO impl to write `vmstate.bin` + `mem.bin`.
-/// 3. Tighten file modes to 0600.
-/// 4. Bump the per-instance epoch counter.
-/// 5. Seal the HMAC envelope with the new epoch.
+/// 3. Copy runtime sidecars (verb-grant, plan) into the snapshot dir so the
+///    resume path can mint a fresh grant even after the ephemeral `vms/`
+///    directory is cleaned up.
+/// 4. Tighten file modes to 0600.
+/// 5. Bump the per-instance epoch counter.
+/// 6. Seal the HMAC envelope with the new epoch.
 pub fn pause_and_seal<IO: SnapshotIO + ?Sized>(vm_name: &str, io: &IO) -> Result<IntegritySidecar> {
     let dir = prepare_instance_snapshot_dir(vm_name)?;
     io.create_snapshot(&dir)
         .with_context(|| format!("Firecracker create_snapshot({})", dir.display()))?;
+    copy_runtime_sidecars_to_snapshot(vm_name, &dir);
     tighten_snapshot_file_modes(&dir)?;
 
     // Encrypt vmstate + mem in place under the tenant DEK if one is
@@ -392,24 +412,35 @@ fn load_host_signer_secret() -> Result<ed25519_dalek::SigningKey> {
 /// Mint a fresh verb-grant envelope that authorizes `post-restore` for the
 /// running session.  The guest agent verifies the envelope against the
 /// boot-pinned host-signer anchor and re-pins the grant before handling
-/// PostRestore.  Returns `None` when the VM was booted without a verb grant.
+/// PostRestore.  The new grant refreshes `not_after` so a paused VM can be
+/// resumed after the original short-lived grant would have expired, up to the
+/// plan's `valid_until` ceiling.  Returns `None` when the VM was booted without
+/// a verb grant.
 fn post_restore_grant_envelope(
     vm_name: &str,
 ) -> Result<Option<mvm_core::protocol::vm_backend::VerbGrantEnvelope>> {
-    use mvm_core::plan::{VerbGrant, VerbId};
+    use mvm_core::plan::{ExecutionPlan, SignedExecutionPlan, VerbGrant, VerbId};
+
+    const RESUME_GRANT_TTL_MINUTES: i64 = 30;
 
     let state_dir = mvm_core::config::vm_state_dir(vm_name);
-    let sidecar_path = state_dir.join("verb-grant.json");
+    let snapshot_dir = mvm_core::config::instance_snapshot_dir(vm_name);
+    let sidecar_path = if snapshot_dir.join("verb-grant.json").exists() {
+        snapshot_dir.join("verb-grant.json")
+    } else {
+        state_dir.join("verb-grant.json")
+    };
     let sidecar_bytes = match std::fs::read(&sidecar_path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(anyhow::Error::from(e))
-                .with_context(|| format!("read verb-grant sidecar {}", sidecar_path.display()))
+                .with_context(|| format!("read verb-grant sidecar {}", sidecar_path.display()));
         }
     };
-    let existing: mvm_core::protocol::vm_backend::VerbGrantEnvelope = serde_json::from_slice(&sidecar_bytes)
-        .with_context(|| format!("parse verb-grant sidecar {}", sidecar_path.display()))?;
+    let existing: mvm_core::protocol::vm_backend::VerbGrantEnvelope =
+        serde_json::from_slice(&sidecar_bytes)
+            .with_context(|| format!("parse verb-grant sidecar {}", sidecar_path.display()))?;
 
     let signer = load_host_signer_secret()?;
     let mut verbs = existing.grant.verbs.clone();
@@ -419,14 +450,46 @@ fn post_restore_grant_envelope(
         verbs.push(post_restore);
     }
 
+    let now = Utc::now();
+    let candidate = now + chrono::Duration::minutes(RESUME_GRANT_TTL_MINUTES);
+    let plan_path = if snapshot_dir.join("plan.json").exists() {
+        snapshot_dir.join("plan.json")
+    } else {
+        state_dir.join("plan.json")
+    };
+    let plan_valid_until = std::fs::read(plan_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SignedExecutionPlan>(&bytes).ok())
+        .and_then(|signed| serde_json::from_slice::<ExecutionPlan>(&signed.0.payload).ok())
+        .map(|plan| plan.valid_until);
+    let not_after = match plan_valid_until {
+        Some(cap) => candidate.min(cap),
+        None => candidate,
+    };
+    if not_after <= now {
+        bail!(
+            "cannot mint post-restore grant for {vm_name}: validity window expired at {not_after}"
+        );
+    }
+
     let mut grant = VerbGrant {
         session_id: existing.grant.session_id.clone(),
         plan_nonce: existing.grant.plan_nonce.clone(),
-        not_after: existing.grant.not_after,
+        not_after,
         verbs,
         sig: Vec::new(),
     };
     grant.sig = signer.sign(&grant.signing_bytes()).to_bytes().to_vec();
+
+    // Sanity-check the freshly-minted envelope before handing it to the guest.
+    {
+        use ed25519_dalek::Verifier;
+        let sig = ed25519_dalek::Signature::from_slice(&grant.sig)
+            .expect("minted grant signature is valid Ed25519 bytes");
+        if let Err(e) = signer.verifying_key().verify(&grant.signing_bytes(), &sig) {
+            bail!("minted post-restore grant signature does not verify against host anchor: {e}");
+        }
+    }
 
     let pubkey_hex: String = signer
         .verifying_key()
@@ -436,13 +499,18 @@ fn post_restore_grant_envelope(
         .collect();
     let plan_nonce_hex = existing.grant.plan_nonce.as_hex().to_string();
 
-    Ok(Some(mvm_core::protocol::vm_backend::VerbGrantEnvelope {
+    let envelope = mvm_core::protocol::vm_backend::VerbGrantEnvelope {
         pubkey_hex,
         plan_nonce_hex: plan_nonce_hex.clone(),
         predecessor_session_id: Some(existing.grant.session_id),
         predecessor_plan_nonce_hex: Some(plan_nonce_hex),
         grant,
-    }))
+    };
+    eprintln!(
+        "DEBUG post-restore envelope for {vm_name}: {}",
+        serde_json::to_string(&envelope).unwrap_or_default()
+    );
+    Ok(Some(envelope))
 }
 
 /// Production [`PostRestoreSignal`] — sends `GuestRequest::PostRestore` over

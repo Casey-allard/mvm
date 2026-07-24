@@ -95,7 +95,7 @@ pub fn start_vm_firecracker(abs_dir: &str, abs_socket: &str) -> Result<()> {
         rm -f {vsock} {dir}/v.sock
         touch {dir}/console.log {dir}/firecracker.log
         sudo bash -c 'nohup setsid firecracker --api-sock {socket} --enable-pci \
-            </dev/null >{dir}/console.log 2>{dir}/firecracker.log &
+            </dev/null >>{dir}/console.log 2>>{dir}/firecracker.log &
             echo $! > {dir}/fc.pid'
 
         echo "[mvm] Waiting for API socket..."

@@ -286,7 +286,7 @@ impl GuestAgentBuildSpec {
             "--features".to_string(),
             "mvm-agentd/interactive".to_string(),
             "--features".to_string(),
-            "mvm-agentd/addons".to_string(),
+            "mvm-agentd/addons,mvm-agentd/interactive".to_string(),
         ]
     }
 
@@ -608,7 +608,7 @@ fn build_runtime_overlay_guest_binaries_into_cache(
         // bins gated behind mvm-agentd's `addons` feature (see its
         // Cargo.toml) so the sealed agent's default build stays tokio-free.
         "--features".to_string(),
-        "mvm-agentd/addons".to_string(),
+        "mvm-agentd/addons,mvm-agentd/interactive".to_string(),
     ];
     run_zigbuild(&spec, cargo.as_os_str(), &prod_args)?;
     let output_dir = spec.output_dir();
