@@ -215,7 +215,7 @@ pub fn sweep(
 /// the workload-supervisor files (one per backend). The first one that exists
 /// and points at a live process marks the dir as having a live owner. HVF must
 /// be listed here or convergence reaps every running HVF machine's state dir.
-const PID_FILE_NAMES: &[&str] = &["libkrun.pid", "vz.pid", "hvf.pid", "pid"];
+const PID_FILE_NAMES: &[&str] = &["fc.pid", "libkrun.pid", "vz.pid", "hvf.pid", "pid"];
 
 /// `kill(pid, 0)` existence probe — delivers no signal, just checks the
 /// process is alive. The cheap half of the live-vs-orphan discrimination
