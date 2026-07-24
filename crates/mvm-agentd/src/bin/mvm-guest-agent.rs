@@ -51,7 +51,8 @@ use std::sync::{Arc, Mutex};
 use mvm_agentd::vsock::{
     GuestRequest, GuestResponse, HOST_SIGNER_PUBKEY_PATH, TrafficPlane, TrustDecision,
     VERB_TRUST_POLICY_PATH, enforce_verb_grant, is_verb_trust_baseline, launch_requires_grant,
-    load_host_signer_verifying_key, load_pinned_verb_grant, load_verb_trust_policy, trust_decision,
+    load_host_signer_verifying_key, load_pinned_verb_grant, load_verb_trust_policy,
+    re_pin_verb_grant, trust_decision,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -224,6 +225,30 @@ fn handle_client(
     // not validly pinned. Baseline verbs (protocol-hello, ping, readiness-status)
     // pass through so the host can still observe liveness; all other control RPCs
     // are refused with the same VerbNotAuthorized shape as the verb-grant gate.
+    let (trust_denied, verb_grant) = boot_state.grant_state();
+    if trust_denied && !is_verb_trust_baseline(req.kind_name()) {
+        let resp = GuestResponse::VerbNotAuthorized {
+            verb: req.kind_name().to_string(),
+        };
+        write_response(&mut file, &resp);
+        return;
+    }
+
+    // PostRestore may carry a host-signed grant envelope that widens the
+    // pinned verb set (e.g., to authorize post-restore itself after a pause).
+    // Verify it against the boot-pinned host-signer anchor and re-pin before
+    // the verb-grant gate so a valid envelope can authorize its own request.
+    if let GuestRequest::PostRestore { grant_envelope: Some(ref envelope), .. } = req
+        && let Some(anchor) = boot_state.host_signer_key()
+    {
+        let now = chrono::Utc::now();
+        if let Some(new_grant) =
+            re_pin_verb_grant(envelope, verb_grant.as_ref(), &anchor, now)
+        {
+            boot_state.set_verb_grant(new_grant);
+        }
+    }
+
     let (trust_denied, verb_grant) = boot_state.grant_state();
     if trust_denied && !is_verb_trust_baseline(req.kind_name()) {
         let resp = GuestResponse::VerbNotAuthorized {
