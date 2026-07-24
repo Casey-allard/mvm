@@ -94,6 +94,8 @@ fn main() {
         "mvm-guest-agent",
         "mvm-guest-netinit",
         "mvm-guest-netd",
+        "mvm-oci-init",
+        "mvm-oci-entrypoint",
         "mvm-egress-client",
         "mvm-verity-init",
     ] {
