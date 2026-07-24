@@ -10,8 +10,8 @@ use crate::base::ui;
 
 use super::daemon::{api_put_socket, prepare_vsock_runtime_dir};
 use super::egress_bridge::{
-    egress_ca_cmdline_token, require_grant_cmdline_token, secret_env_cmdline_token,
-    verb_grant_cmdline_token,
+    egress_ca_cmdline_token, host_signer_pub_cmdline_token, require_grant_cmdline_token,
+    secret_env_cmdline_token, verb_grant_cmdline_token,
 };
 use super::firecracker_vsock_uds_path;
 use super::flake_run::{FlakeRunConfig, create_dev_config_drive, create_dev_secrets_drive};
@@ -345,6 +345,10 @@ fn configure_boot_source(
         None => boot_args,
     };
     let boot_args = match verb_grant_cmdline_token(&config.slot.name) {
+        Some(token) => format!("{boot_args} {token}"),
+        None => boot_args,
+    };
+    let boot_args = match host_signer_pub_cmdline_token(&config.slot.name) {
         Some(token) => format!("{boot_args} {token}"),
         None => boot_args,
     };
