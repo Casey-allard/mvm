@@ -2,6 +2,7 @@
 //! its exit code / stdout. Covers the CLI-surface suite; scenarios that need
 //! a running microVM call through `mvm-client` instead as those suites land.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -46,6 +47,42 @@ fn workspace_root() -> PathBuf {
         .join("..")
         .canonicalize()
         .expect("workspace root must exist")
+}
+
+/// Copy the host's pre-built workload kernel into an isolated `MVM_HOME`.
+///
+/// Live scenarios boot a real microVM, and a cold isolated home has no
+/// dm-verity-capable workload kernel. Seeding it from the host's shared
+/// cache keeps the scenario hermetic (it does not mutate `~/.mvm`) while
+/// avoiding a slow Stage 0 rebuild inside every test run.
+fn copy_host_workload_kernel_into(home: &Path) {
+    let arch = std::env::consts::ARCH;
+    let src = PathBuf::from(mvm_core::config::default_mvm_cache_dir())
+        .join("builder-vm")
+        .join(arch)
+        .join("kernels")
+        .join("workload");
+    let dst = home
+        .join("cache")
+        .join("builder-vm")
+        .join(arch)
+        .join("kernels")
+        .join("workload");
+
+    assert!(
+        src.join("vmlinux").exists(),
+        "host workload kernel missing at {src:?}; run `mvmctl kernel build --which workload` first"
+    );
+
+    fs::create_dir_all(&dst).expect("create workload kernel dir in isolated home");
+    for entry in fs::read_dir(&src).expect("read host workload kernel dir") {
+        let entry = entry.expect("read host workload kernel directory entry");
+        let src_path = entry.path();
+        if src_path.is_file() {
+            let dst_path = dst.join(entry.file_name());
+            fs::copy(&src_path, &dst_path).expect("copy workload kernel file");
+        }
+    }
 }
 
 #[when(expr = "I run mvmctl with {string}")]
@@ -119,6 +156,7 @@ fn run_mvmctl_isolated_live_home(world: &mut CliWorld, args: String) {
         .isolated_home
         .as_ref()
         .expect("isolated home is set above");
+    copy_host_workload_kernel_into(home.path());
     let output = mvmctl_command()
         .current_dir(workspace_root())
         .args(args.split_whitespace())
@@ -146,6 +184,7 @@ async fn run_mvmctl_isolated_live_home_with_timeout(
         .expect("isolated home is set above")
         .path()
         .to_path_buf();
+    copy_host_workload_kernel_into(&home);
 
     let handle = spawn_blocking(move || {
         mvmctl_command()
