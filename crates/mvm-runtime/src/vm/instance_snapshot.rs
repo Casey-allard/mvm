@@ -41,6 +41,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use ed25519_dalek::Signer;
 
 use crate::base::shell::{run_in_vm, shell_quote};
 use mvm_core::crypto::keystore;
@@ -377,6 +378,73 @@ pub fn signal_post_restore<S: PostRestoreSignal + ?Sized>(
     Ok(outcome)
 }
 
+/// Load the host-signer Ed25519 secret key from `~/.mvm/keys/host-signer.ed25519`.
+fn load_host_signer_secret() -> Result<ed25519_dalek::SigningKey> {
+    let path = mvm_core::config::mvm_keys_dir().join("host-signer.ed25519");
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read host signer secret {}", path.display()))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        anyhow::anyhow!("host signer secret must be 32 bytes, got {}", v.len())
+    })?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+}
+
+/// Mint a fresh verb-grant envelope that authorizes `post-restore` for the
+/// running session.  The guest agent verifies the envelope against the
+/// boot-pinned host-signer anchor and re-pins the grant before handling
+/// PostRestore.  Returns `None` when the VM was booted without a verb grant.
+fn post_restore_grant_envelope(
+    vm_name: &str,
+) -> Result<Option<mvm_core::protocol::vm_backend::VerbGrantEnvelope>> {
+    use mvm_core::plan::{VerbGrant, VerbId};
+
+    let state_dir = mvm_core::config::vm_state_dir(vm_name);
+    let sidecar_path = state_dir.join("verb-grant.json");
+    let sidecar_bytes = match std::fs::read(&sidecar_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("read verb-grant sidecar {}", sidecar_path.display()))
+        }
+    };
+    let existing: mvm_core::protocol::vm_backend::VerbGrantEnvelope = serde_json::from_slice(&sidecar_bytes)
+        .with_context(|| format!("parse verb-grant sidecar {}", sidecar_path.display()))?;
+
+    let signer = load_host_signer_secret()?;
+    let mut verbs = existing.grant.verbs.clone();
+    let post_restore =
+        VerbId::new("post-restore").expect("post-restore is a valid kebab-case verb id");
+    if !verbs.iter().any(|v| v.as_str() == post_restore.as_str()) {
+        verbs.push(post_restore);
+    }
+
+    let mut grant = VerbGrant {
+        session_id: existing.grant.session_id.clone(),
+        plan_nonce: existing.grant.plan_nonce.clone(),
+        not_after: existing.grant.not_after,
+        verbs,
+        sig: Vec::new(),
+    };
+    grant.sig = signer.sign(&grant.signing_bytes()).to_bytes().to_vec();
+
+    let pubkey_hex: String = signer
+        .verifying_key()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let plan_nonce_hex = existing.grant.plan_nonce.as_hex().to_string();
+
+    Ok(Some(mvm_core::protocol::vm_backend::VerbGrantEnvelope {
+        pubkey_hex,
+        plan_nonce_hex: plan_nonce_hex.clone(),
+        predecessor_session_id: Some(existing.grant.session_id),
+        predecessor_plan_nonce_hex: Some(plan_nonce_hex),
+        grant,
+    }))
+}
+
 /// Production [`PostRestoreSignal`] — sends `GuestRequest::PostRestore` over
 /// the backend-agnostic vsock transport (Firecracker / libkrun / Apple
 /// Container, selected per VM by `vsock_transport::for_vm`). Not unit-tested
@@ -408,11 +476,13 @@ impl PostRestoreSignal for VsockPostRestoreSignal {
         // `call_unary` enforces PostRestore's response contract — the agent
         // `Error` / off-contract cases surface as a typed `RpcError`, so the
         // only `Ok` variant here is the contracted `PostRestoreAck`.
+        let grant_envelope = post_restore_grant_envelope(vm_name)
+            .with_context(|| format!("building post-restore grant envelope for {vm_name}"))?;
         match call_unary(
             &mut stream,
             &GuestRequest::PostRestore {
                 token: self.token,
-                grant_envelope: None,
+                grant_envelope,
             },
         )? {
             GuestResponse::PostRestoreAck {
