@@ -57,6 +57,7 @@ pub(super) fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
     run_in_vm_visible(&format!(
         r#"
         mkdir -p {dir}
+        mkdir -p {dir}/runtime
         sudo rm -f {socket}
         rm -f {vsock} {dir}/v.sock
         touch {dir}/console.log {dir}/firecracker.log
@@ -89,6 +90,7 @@ pub fn start_vm_firecracker(abs_dir: &str, abs_socket: &str) -> Result<()> {
     run_in_vm_visible(&format!(
         r#"
         mkdir -p {dir}
+        mkdir -p {dir}/runtime
         sudo rm -f {socket}
         rm -f {vsock} {dir}/v.sock
         touch {dir}/console.log {dir}/firecracker.log
