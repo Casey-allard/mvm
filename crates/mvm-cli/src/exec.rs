@@ -794,7 +794,10 @@ fn remove_transient_state_dir(staging_dir: &str) {
             #[cfg(target_os = "linux")]
             {
                 let quoted = mvm_runtime::shell::shell_quote(staging_dir);
-                match mvm_runtime::shell::run_in_vm(&format!("sudo rm -rf {quoted}")) {
+                match std::process::Command::new("bash")
+                    .args(["-c", &format!("sudo rm -rf {quoted}")])
+                    .output()
+                {
                     Ok(output) if output.status.success() => {}
                     Ok(output) => {
                         tracing::debug!(
