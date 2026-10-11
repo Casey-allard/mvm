@@ -14,6 +14,7 @@
 //! it to `mvm_hostd::run::admit_and_boot_local`. A workload never boots on a
 //! path that skipped admission.
 
+mod capture_recovery;
 pub(crate) mod oci;
 mod state;
 
@@ -1335,7 +1336,7 @@ impl MvmClient for LocalBackend {
         let outcome = if let Some(key) = &snapshot_key {
             let io = self.snapshot_io_for(&backend, name)?;
             let sidecar = pause_and_seal(name, &*io, key)
-                .map_err(|e| backend_err(format!("pausing VM {name:?}: {e:#}")))?;
+                .map_err(|e| capture_recovery::resume_after_failed_capture(&*io, name, &e))?;
             write_fc_paused_marker(name)?;
             set_registry_paused(name, true)?;
             PauseOutcome {
