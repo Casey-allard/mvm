@@ -189,6 +189,10 @@ pub struct AdmitPlanForBootParams<'a> {
     /// decide whether the optional glibc SDK sidecar must be attached. Empty
     /// (the common case) means the workload calls no host service.
     pub services: Vec<mvm_contract::protocol::broker::ServiceId>,
+    /// Whether this launch arms the GPU remoting plane. Its shims dial the
+    /// host GPU endpoint over vsock from inside the workload, so admission
+    /// raises the seccomp tier to one that opens `AF_VSOCK` sockets.
+    pub gpu: bool,
     /// True iff this run should receive an attenuated (ProdSafe-only) agent-verb
     /// grant. Set this with `grant_eligible(pty, has_ad_hoc_argv, is_dev_profile)`.
     /// Interactive / ad-hoc / dev runs must pass `false`: they issue DevOnly verbs
@@ -668,6 +672,7 @@ pub fn admit_plan_for_boot_configured_ingress(
         &p.network_policy,
         &ingress,
         &p.services,
+        p.gpu,
     );
     let input = SynthesisInput {
         outputs: p.outputs.clone(),
@@ -1550,6 +1555,7 @@ pub(crate) mod admit_plan_tests {
         ledger: &'a InMemoryNonceLedger,
     ) -> AdmitPlanForBootParams<'a> {
         AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -1758,6 +1764,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             kernel_path: Some(kernel.as_path()),
@@ -1805,6 +1812,7 @@ pub(crate) mod admit_plan_tests {
         let admit = |kind| {
             let ledger = InMemoryNonceLedger::new();
             admit_plan_for_boot(AdmitPlanForBootParams {
+                gpu: false,
                 instructions: Default::default(),
                 outputs: Vec::new(),
                 kernel_path: Some(kernel.as_path()),
@@ -1842,6 +1850,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             kernel_path: Some(kernel.as_path()),
@@ -1873,6 +1882,7 @@ pub(crate) mod admit_plan_tests {
         let boot_artifact = mvm_sdk::deploy::digest_boot_artifact(&rootfs).unwrap();
         let ledger = InMemoryNonceLedger::new();
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -1942,6 +1952,7 @@ pub(crate) mod admit_plan_tests {
         let audit_dir = tempfile::tempdir().unwrap();
         let ledger = InMemoryNonceLedger::new();
         let err = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2026,6 +2037,7 @@ pub(crate) mod admit_plan_tests {
         ] {
             let ledger = InMemoryNonceLedger::new();
             let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+                gpu: false,
                 instructions: Default::default(),
                 outputs: Vec::new(),
                 network_mode: mode,
@@ -2086,6 +2098,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let a1 = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2124,6 +2137,7 @@ pub(crate) mod admit_plan_tests {
         })
         .unwrap();
         let a2 = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2176,6 +2190,7 @@ pub(crate) mod admit_plan_tests {
         let rootfs = write_rootfs(rootfs_dir.path(), vm_name.as_bytes());
         let ledger = InMemoryNonceLedger::new();
         admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2306,6 +2321,7 @@ pub(crate) mod admit_plan_tests {
         let rootfs = write_rootfs(rootfs_dir.path(), b"local-default-payload");
         let ledger = InMemoryNonceLedger::new();
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2370,6 +2386,7 @@ pub(crate) mod admit_plan_tests {
         let rootfs = write_rootfs(rootfs_dir.path(), b"allow-list-payload");
         let ledger = InMemoryNonceLedger::new();
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2451,6 +2468,7 @@ pub(crate) mod admit_plan_tests {
         let rootfs = write_rootfs(rootfs_dir.path(), b"unrestricted-payload");
         let ledger = InMemoryNonceLedger::new();
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2566,6 +2584,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             keys_dir: Some(keys_dir.path()),
@@ -2628,6 +2647,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2696,6 +2716,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2753,6 +2774,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let err = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2819,6 +2841,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let err = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2881,6 +2904,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -2935,6 +2959,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -3017,6 +3042,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         let err = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
@@ -3047,6 +3073,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
@@ -3067,6 +3094,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
@@ -3125,6 +3153,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
@@ -3146,6 +3175,7 @@ pub(crate) mod admit_plan_tests {
         let ledger = InMemoryNonceLedger::new();
 
         admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
@@ -3343,6 +3373,7 @@ allow_hosts = ["localhost:8443"]
         let rootfs = write_rootfs(rootfs_dir.path());
         let ledger = InMemoryNonceLedger::new();
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -3453,6 +3484,7 @@ allow_hosts = ["localhost:8443"]
         let rootfs = write_rootfs(rootfs_dir.path());
         let ledger = InMemoryNonceLedger::new();
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -3629,6 +3661,7 @@ allow_hosts = ["localhost:8443"]
         let rootfs = write_rootfs(rootfs_dir.path());
         let ledger = InMemoryNonceLedger::new();
         let err = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
@@ -3699,6 +3732,7 @@ allow_hosts = ["localhost:8443"]
         let rootfs = write_rootfs(rootfs_dir.path());
         let ledger = InMemoryNonceLedger::new();
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
+            gpu: false,
             instructions: Default::default(),
             outputs: Vec::new(),
             network_mode: mvm_contract::plan::NetworkMode::default(),
