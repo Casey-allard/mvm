@@ -1925,20 +1925,39 @@ remains explicitly unsupported. See
 [pack authoring](/guides/pack-authoring/#built-image-release-assets) for resource
 limits and the split registry/release inventory.
 
-`pool warm` is optional. Unnamed runs already leave one standby of each image
-they boot (see [One-shot Run](#one-shot-run-transient-runner)), so a second run
-of an image is warm without it; `pool warm` makes the first one warm too, or
-holds more than one standby of an image:
+On Linux and other non-HVF hosts, the default residency remains `parked`
+(`warm_pool_size=0`). `pool warm` prepares capacity but does not change that
+policy. For a prepared, unnamed launch without extra volumes, enable claims
+explicitly:
 
 ```bash
 mvmctl image pull alpine
 mvmctl pool warm --image alpine          # optional pre-warm
-mvmctl machine run --image alpine -- /bin/true   # claims it
+MVM_RESIDENCY=warm mvmctl machine run --image alpine -- /bin/true   # claims it
 ```
 
-A launch with no matching standby cold-boots rather than failing. Named launches
-and shapes with extra volumes (including directory mounts) always take the cold
-path. `MVM_RESIDENCY=cold` turns implicit standbys off.
+Without a source flag, `pool warm` warms the most recently pulled images,
+bounded by the residency standby target (at least one). With no pull history
+it warms the default image. `pool warm --default` selects the default image
+regardless of pull history; it conflicts with the explicit source flags.
+
+`pool warm` takes the same source a launch names: `--image`, `--manifest`
+(a manifest, a built slot, an installed bundle sha256 or a signed `.mvmpkg`
+archive) or `--flake` with an optional `--flake-profile`. An archive is
+verified and installed exactly as `machine run` does it. Standbys are keyed by
+the verified bundle or slot digest and the image digest, so a launch of a
+different artifact, or of the same rootfs under the host runtime, never claims
+one. A bundle that pins its own boot assets (`bundle build`) keeps its cold
+path: the guest runtime it pins predates the claim handshake. `pool warm`
+refuses that bundle before preparing a standby, rather than creating capacity
+that no launch can claim.
+
+Remove any explicit `warm_pool_size=0` configuration override: an explicit
+size takes precedence over `MVM_RESIDENCY`. Eligible launches attempt a claim
+when standbys are enabled. If no compatible standby is ready, the launch
+declares a cold boot rather than reporting it as a warm claim. Named launches,
+shapes with extra volumes (including directory mounts), and launches with
+standbys disabled retain their cold path.
 
 A launch that allows egress (`--allow-host`, `--net`) claims a standby warmed
 with `pool warm --egress`, or the one an earlier egress-allowing run left
