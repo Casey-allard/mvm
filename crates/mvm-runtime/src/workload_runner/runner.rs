@@ -74,7 +74,7 @@ use refusal::{
 use sockets::standing_sockets;
 pub use spawner::{
     FlowMuxIdentitySource, NetworkEndpointSpawnRequest, NetworkEndpointSpawner,
-    RealNetworkEndpointSpawner, SpawnedEndpoint,
+    RealNetworkEndpointSpawner, SpawnedEndpoint, TelemetryStart,
 };
 /// What the runner needs to register the per-VM host-services broker after boot.
 pub struct BrokerRegisterRequest<'a> {
@@ -915,12 +915,14 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 spec.id
             ))
         })?;
-        let boot = slotted_factory_parent_spec(
+        let mut boot = slotted_factory_parent_spec(
             &parent_config,
             &state_dir,
             |has_disk| self.driver.workload_base_bootargs(has_disk),
             slots,
         );
+        let identity = spawner::prepare_standby_identity(&self.spawner, spec)?;
+        spawner::assert_standby_telemetry(&state_dir, &mut boot.cmdline);
         // The same truncation refusal a workload boot gets, for the same reason
         // and then some: a child inherits its parent's cmdline out of restored
         // memory rather than deriving its own, so a parent whose trailing tokens
@@ -931,7 +933,6 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 spec.id
             )));
         }
-        let identity = spawner::prepare_standby_identity(&self.spawner, spec)?;
         let boot = mvm_vmm::host::spec_map::with_identity_drive(boot, identity.as_deref());
         let mut handle = self
             .driver
@@ -1525,12 +1526,37 @@ mod tests {
             &self,
             req: &NetworkEndpointSpawnRequest<'_>,
         ) -> Result<Option<PathBuf>> {
+            // The real spawner clears any stale provisioning marker here, so a
+            // re-used state dir never asserts a previous boot's telemetry.
+            let _ = mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(
+                req.state_dir,
+                false,
+            );
             Ok(
                 matches!(req.identity, FlowMuxIdentitySource::Mint).then(|| {
                     req.state_dir
                         .join(mvm_vmm::host::flowmux_identity::IDENTITY_DRIVE_FILE)
                 }),
             )
+        }
+
+        fn start_telemetry_without_endpoint(
+            &self,
+            req: &NetworkEndpointSpawnRequest<'_>,
+        ) -> TelemetryStart {
+            // Recorded now because the guest's cmdline is built from the
+            // marker; the double itself starts no collector process.
+            let provisioned = spawner::telemetry_for_boot(
+                mvm_vmm::host::telemetry_provisioning::telemetry_collection_enabled(),
+                req.identity,
+            );
+            if provisioned {
+                let _ = mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(
+                    req.state_dir,
+                    true,
+                );
+            }
+            TelemetryStart::default()
         }
 
         fn spawn(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<SpawnedEndpoint> {
@@ -1541,9 +1567,19 @@ mod tests {
                 policy: req.network_policy.clone(),
                 network_limits: req.network_limits,
             });
+            let identity_drive = self.prepare_identity(req)?;
+            // The same record the real endpoint spawn writes, so the cmdline
+            // token gate observes this boot's provisioning decision.
+            let _ = mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(
+                req.state_dir,
+                spawner::telemetry_for_boot(
+                    mvm_vmm::host::telemetry_provisioning::telemetry_collection_enabled(),
+                    req.identity,
+                ),
+            );
             Ok(SpawnedEndpoint {
                 egress_uds: self.uds.clone(),
-                identity_drive: self.prepare_identity(req)?,
+                identity_drive,
             })
         }
     }
