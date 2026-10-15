@@ -948,7 +948,23 @@ impl VmmDriver for FcDriver {
         mvm_vmm::host::late_volumes::ensure_placeholders(req.child_dir, self.late_volume_slots())
             .map_err(|error| preload_spawn_error("create late-volume placeholders", error))?;
         crate::fc::FcForkRestorer
-            .restore_fork_paused(req.child_vm_name, req.child_dir)
+            .restore_fork_paused(
+                req.child_vm_name,
+                req.child_dir,
+                &crate::fc::ForkRuntimeEvidence {
+                    observation_sha256: req.runtime_artifacts_sha256.ok_or_else(|| {
+                        StandbyError::SpawnFailed(
+                            "Firecracker preload requires authenticated runtime evidence".into(),
+                        )
+                    })?,
+                    anchors_sha256: req.device_anchors_sha256.ok_or_else(|| {
+                        StandbyError::SpawnFailed(
+                            "Firecracker preload requires authenticated device anchors".into(),
+                        )
+                    })?,
+                    reseeded_identity_sha256: None,
+                },
+            )
             .map_err(|error| preload_spawn_error("load paused child", error))?;
         let pid = read_firecracker_pid(&req.child_dir.to_string_lossy())
             .map_err(|e| StandbyError::SpawnFailed(format!("read paused child pid: {e}")))?;
@@ -984,10 +1000,14 @@ impl VmmDriver for FcDriver {
             ))
         })?;
         let io = crate::fc::io::FirecrackerIO::new(req.child_dir.join("fc.socket"));
-        crate::fc::host::attach_late_volumes(&io, req.late_volumes)
-            .map_err(|e| StandbyError::ClaimFailed(format!("resume preloaded child: {e:#}")))?;
-        <crate::fc::io::FirecrackerIO as mvm_vmm::snapshot::SnapshotIO>::resume(&io)
-            .map_err(|e| StandbyError::ClaimFailed(format!("resume preloaded child: {e}")))
+        crate::fc::host::resume_preloaded_fork_child(
+            &io,
+            req.child_dir,
+            req.runtime_artifacts_sha256,
+            req.device_anchors_sha256,
+            req.late_volumes,
+        )
+        .map_err(|error| StandbyError::ClaimFailed(format!("{error:#}")))
     }
 
     fn fork_standby_child(
@@ -1052,6 +1072,19 @@ impl VmmDriver for FcDriver {
                 req.child_dir,
                 req.cpu_grant,
                 req.late_volumes,
+                &crate::fc::ForkRuntimeEvidence {
+                    observation_sha256: req.runtime_artifacts_sha256.ok_or_else(|| {
+                        StandbyError::ClaimFailed(
+                            "Firecracker restore requires authenticated runtime evidence".into(),
+                        )
+                    })?,
+                    anchors_sha256: req.device_anchors_sha256.ok_or_else(|| {
+                        StandbyError::ClaimFailed(
+                            "Firecracker restore requires authenticated device anchors".into(),
+                        )
+                    })?,
+                    reseeded_identity_sha256: None,
+                },
             )
             .map_err(fork_restore_error)?;
         Ok(())
@@ -2606,6 +2639,8 @@ mod tests {
         let req = ChildForkRequest {
             child_vm_name: "child-vm-1",
             child_dir: &missing,
+            runtime_artifacts_sha256: None,
+            device_anchors_sha256: None,
             parent_vm_name: None,
             genid: sample_generation_token(),
             channels: &workload_channels(),
@@ -2633,6 +2668,8 @@ mod tests {
         let req = ChildForkRequest {
             child_vm_name: "child-vm-2",
             child_dir: &child_dir,
+            runtime_artifacts_sha256: None,
+            device_anchors_sha256: None,
             parent_vm_name: None,
             genid: sample_generation_token(),
             channels: &workload_channels(),
@@ -2670,6 +2707,8 @@ mod tests {
         let req = ChildForkRequest {
             child_vm_name: "child-vm-3",
             child_dir: &child_dir,
+            runtime_artifacts_sha256: None,
+            device_anchors_sha256: None,
             parent_vm_name: None,
             genid: sample_generation_token(),
             channels: &channels,

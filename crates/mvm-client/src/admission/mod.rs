@@ -15,7 +15,7 @@ use mvm_core::policy::PolicyBundle;
 use mvm_core::security::{AgentProfile, SecurityPolicy};
 use mvm_hostd::plan_admission::{
     AdmittedPlan, BundleAdmissionContext, BundleImageAdmissionContext, InMemoryNonceLedger,
-    RunPosture, SystemClock, admit_for_run,
+    SystemClock, admit_for_run,
 };
 use mvm_sdk::deploy::{BootArtifactIdentity, read_deploy_record, verify_boot_artifact};
 
@@ -123,6 +123,8 @@ pub struct AdmitPlanForBootParams<'a> {
     /// boot. When present, both labeled digests and the byte count are
     /// reverified before plan synthesis.
     pub boot_artifact_identity: Option<&'a BootArtifactIdentity>,
+    /// The exact selected runtime, verified before it can contribute assurance.
+    pub runtime_config: Option<&'a mvm_core::vm_backend::VmStartConfig>,
     pub cpus: u32,
     pub mem_mib: u64,
     /// The transport this launch gives the guest, recorded on the plan.
@@ -822,18 +824,7 @@ fn admit(
         p.ledger,
         p.keys_dir,
         admission_ctx.as_ref(),
-        // A caller that already resolved its backend hands the typed kind over,
-        // and the grant gate measures against the mechanisms that tier really
-        // has. A caller that has not resolved one yet passes `None` and gets
-        // the fail-closed answer: a sealed run refuses a grant whose
-        // enforceability nothing can confirm, a dev run is warned. The plan's
-        // own `runtime_profile` is never consulted for this — it is a label its
-        // author chose, and believing it would let a mislabelled plan pick the
-        // controls it is measured against.
-        match p.backend_kind {
-            Some(kind) => RunPosture::on_backend(variant, kind),
-            None => RunPosture::without_backend(variant),
-        },
+        crate::admission::run_grants::run_posture(variant, p.backend_kind, p.runtime_config),
     )
     .or_else(|err| -> Result<_> {
         if let Some(refused) =
@@ -1800,6 +1791,7 @@ pub(crate) mod admit_plan_tests {
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-pinned",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: rootfs,
@@ -2189,6 +2181,7 @@ pub(crate) mod admit_plan_tests {
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-happy",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -2259,6 +2252,7 @@ pub(crate) mod admit_plan_tests {
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-missing",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: std::path::Path::new("/nonexistent/rootfs.ext4"),
@@ -2346,6 +2340,7 @@ pub(crate) mod admit_plan_tests {
                 backend_kind: None,
                 tenant: "local",
                 vm_name: "vm-transport",
+                runtime_config: None,
                 backend_name: "firecracker",
                 configured_images_dir: None,
                 rootfs_path: &rootfs,
@@ -2405,6 +2400,7 @@ pub(crate) mod admit_plan_tests {
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-1",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -2444,6 +2440,7 @@ pub(crate) mod admit_plan_tests {
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-2",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -2498,6 +2495,7 @@ pub(crate) mod admit_plan_tests {
             tenant: "local",
             vm_name,
             backend_name: "firecracker",
+            runtime_config: None,
             configured_images_dir: None,
             rootfs_path: &rootfs,
             kernel_path: None,
@@ -2670,6 +2668,7 @@ pub(crate) mod admit_plan_tests {
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-local-default",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -2735,6 +2734,7 @@ pub(crate) mod admit_plan_tests {
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-allow-list",
+            runtime_config: None,
             backend_name: "libkrun",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -2817,6 +2817,7 @@ pub(crate) mod admit_plan_tests {
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-unrestricted",
+            runtime_config: None,
             backend_name: "hvf",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -2997,6 +2998,7 @@ pub(crate) mod admit_plan_tests {
             boot_artifact_identity: None,
             tenant: "local",
             vm_name: "vm-non-shell-granted",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -3066,6 +3068,7 @@ pub(crate) mod admit_plan_tests {
             boot_artifact_identity: None,
             tenant: "local",
             vm_name: "vm-shell-ungranted",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -3124,6 +3127,7 @@ pub(crate) mod admit_plan_tests {
             boot_artifact_identity: None,
             tenant: "local",
             vm_name: "vm-shell-granted",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -3209,6 +3213,7 @@ pub(crate) mod admit_plan_tests {
             boot_artifact_identity: None,
             tenant: "local",
             vm_name: "vm-entrypoint-unknown",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -3272,6 +3277,7 @@ pub(crate) mod admit_plan_tests {
             boot_artifact_identity: None,
             tenant: "local",
             vm_name: "vm-entrypoint-unknown-ungranted",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -3327,6 +3333,7 @@ pub(crate) mod admit_plan_tests {
             boot_artifact_identity: None,
             tenant: "local",
             vm_name: "vm-dev-shell",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -3740,6 +3747,7 @@ allow_hosts = ["localhost:8443"]
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-shares",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -3851,6 +3859,7 @@ allow_hosts = ["localhost:8443"]
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-granted",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -4028,6 +4037,7 @@ allow_hosts = ["localhost:8443"]
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-over-ceiling",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
@@ -4099,6 +4109,7 @@ allow_hosts = ["localhost:8443"]
             network_mode: mvm_contract::plan::NetworkMode::default(),
             tenant: "local",
             vm_name: "vm-ungranted",
+            runtime_config: None,
             backend_name: "firecracker",
             configured_images_dir: None,
             rootfs_path: &rootfs,
