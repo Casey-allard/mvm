@@ -4,6 +4,16 @@ use assert_cmd::cargo::CommandCargoExt;
 use std::process::Command;
 
 #[test]
+fn pack_build_help_advertises_explicit_input_observation() {
+    let out = Command::new(env!("CARGO_BIN_EXE_mvmctl"))
+        .args(["pack", "build", "--help"])
+        .output()
+        .expect("pack build help");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--input-observation <PATH>"));
+}
+
+#[test]
 fn env_verify_runtime_missing_proof_emits_no_success_json() {
     let directory = tempfile::tempdir().expect("runtime verifier input directory");
     let config = directory.path().join("launch.json");
