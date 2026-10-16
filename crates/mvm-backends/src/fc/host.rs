@@ -914,18 +914,21 @@ pub(crate) fn resume_preloaded_fork_child(
     late_volumes: &[mvm_vmm::driver::traits::LateVolumeAttach],
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    let expected = super::runtime_artifacts::authenticated_fork_capture(
-        child_dir,
-        &super::ForkRuntimeEvidence {
-            observation_sha256: runtime_artifacts_sha256
-                .context("Firecracker prepared claim requires authenticated runtime evidence")?,
-            anchors_sha256: device_anchors_sha256
-                .context("prepared claim requires authenticated device anchors")?,
-            reseeded_identity_sha256: None,
-        },
-    )?;
-    if let Err(error) = super::runtime_artifacts::verify_restored_layout(&io.socket_path, &expected)
-    {
+    let verified = (|| -> anyhow::Result<()> {
+        let expected = super::runtime_artifacts::authenticated_fork_capture(
+            child_dir,
+            &super::ForkRuntimeEvidence {
+                observation_sha256: runtime_artifacts_sha256.context(
+                    "Firecracker prepared claim requires authenticated runtime evidence",
+                )?,
+                anchors_sha256: device_anchors_sha256
+                    .context("prepared claim requires authenticated device anchors")?,
+                reseeded_identity_sha256: None,
+            },
+        )?;
+        super::runtime_artifacts::verify_restored_layout(&io.socket_path, &expected)
+    })();
+    if let Err(error) = verified {
         let _ = mvm_vmm::snapshot::SnapshotIO::teardown_paused(io);
         return Err(error.context("prepared runtime verification"));
     }
@@ -1000,6 +1003,29 @@ impl FcForkRestorer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn preloaded_authentication_refusals_clean_up_before_resume_or_attachment() {
+        let digest = "a".repeat(64);
+        for (runtime, anchors) in [
+            (None, None),
+            (Some(digest.as_str()), None),
+            (Some(digest.as_str()), Some(digest.as_str())),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("fc.socket");
+            // No VMM was started: only a marker to observe teardown's cleanup.
+            std::fs::write(&socket, b"not a live API socket").unwrap();
+            let io = crate::fc::io::FirecrackerIO::new(socket.clone());
+            let error = super::resume_preloaded_fork_child(&io, dir.path(), runtime, anchors, &[])
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("prepared runtime verification"),
+                "{error:#}"
+            );
+            assert!(!socket.exists(), "an authentication refusal must tear down");
+        }
+    }
 
     /// The direct probe answers exactly what the shell probe it replaced did:
     /// yes only for a readable marker naming a pid whose `comm` is
