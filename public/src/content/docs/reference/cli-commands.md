@@ -2038,6 +2038,7 @@ replace publisher signatures or existing authenticated installed pins.
 | `mvmctl pack verify ns/name[@version] [--json]`           | Re-verify an installed workload pack's lock pin, publisher signature, and every payload file; report its actual signer and manifest digest or fail closed |
 | `mvmctl pack lock SPEC.json --mvm-revision COMMIT [--out FILE \| --stdout]` | Resolve an authored `mvm.pack-spec/v1` document against its source tree and write the frozen `pack.lock.json` beside it: spec, source snapshot and lowered-workload digests, compiler version and the pinned mvm commit. The spec is read as data; no author code runs |
 | `mvmctl pack compile SPEC.json --out DIR [--lock FILE]` | Compile a pack spec into a flake artifact only when its lock still matches; a missing lock or any stale field (named in the error) is refused before anything is written |
+| `mvmctl pack build SPEC.json --out FILE.mvmpkg [--lock FILE] [--health-timeout SECS] [--hypervisor H]` | Compile a locked pack spec, build it in the builder VM, boot its entrypoint as a health check, and seal it into a `.mvmpkg` signed by the host key. The archive carries a sealed-prod posture and a signed environment naming the entrypoint, target and sizing. A stale lock, a non-zero health exit, or any artifact that changes between the health boot and signing is refused, and nothing is signed. Python (`mvm.packs`) and TypeScript (`packs`) write the spec as data |
 | `mvmctl pack search [QUERY] [--json]`                     | Search the pack registry and mark installed packs; same behavior as `mvmctl search`                                                                               |
 | `mvmctl pack pull ns/name[@version] [--json]`             | Fetch, verify, install, and pin a workload pack; same trust policy and behavior as `mvmctl pull`                                                                  |
 | `mvmctl pack registry ls`                                 | Compatibility spelling of `pack ls`                                                                                                                               |
@@ -2061,6 +2062,31 @@ replace publisher signatures or existing authenticated installed pins.
 | `mvmctl deps capture` / `install`                         | Capture or install application dependencies into a sealed volume                                                                                                  |
 | `mvmctl pool warm [COUNT]`                                | Optional: pre-spawn standby microVMs so even the first run of an image claims a warm one                                                                          |
 | `mvmctl pool status [--json]`                             | Report standby pool occupancy                                                                                                                                     |
+
+Locked `pack build` inputs never receive the contributor build's automatic
+local-checkout `mvm` override: the compiled GitHub input remains the lock's pinned
+commit even when `mvmctl` was compiled from a local checkout. Each invocation owns
+its compile directory, checked builder-input snapshot and private template slot
+until health checking and export finish. The snapshot is verified before builder
+preparation and immediately before submission to the canonical one-shot builder;
+it is verified again after builder consumption.
+The disk-input staging filter must preserve every locked file and mode or the
+build is refused. Locked builds do not reuse a resident builder's unrelated
+`/work` or the contributor-source cache. Ordinary contributor builds retain their
+automatic source overrides.
+
+The private slot retains the builder's returned revision and refuses a changed
+`current` selection at health/export boundaries. This is invocation ownership,
+not support for launching arbitrary historical revisions through public manifest
+aliases. Temporary source and slot records are removed when the invocation ends;
+the archive records the exact pack lock as provenance, not a temporary source
+path. The sealed posture, health exit requirement and before/after artifact
+digests remain mandatory.
+
+Concurrent invocations must use distinct `--out` destinations. Private build slots
+do not make archive promotion or rollback safe for a shared output path; that
+separate ownership repair is tracked in
+[#4432](https://github.com/tinylabscom/mvm/issues/4432).
 
 For a built-image pack, `pull` authenticates its descriptor before fetching the
 exact public GitHub release assets, verifies their sizes, hashes, rootfs
