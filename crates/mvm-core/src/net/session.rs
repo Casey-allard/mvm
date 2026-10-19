@@ -1043,7 +1043,6 @@ mod tests {
     use rand::Rng;
     use serde::Deserialize;
     use std::io::Cursor;
-    #[cfg(unix)]
     use std::time::Duration;
 
     fn test_keypair() -> SigningKey {
@@ -1052,12 +1051,10 @@ mod tests {
         SigningKey::from_bytes(&seed)
     }
 
-    #[cfg(unix)]
-    fn pair() -> (
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixStream,
-    ) {
-        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+    fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let a = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (b, _) = listener.accept().unwrap();
         a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         (a, b)
@@ -1076,7 +1073,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn handshake_host_and_guest_succeed() {
         let (mut host_stream, mut guest_stream) = pair();
         let host_key = test_keypair();
@@ -1386,7 +1382,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn handshake_with_wrong_anchor_fails() {
         let (mut host_stream, mut guest_stream) = pair();
         let host_key = test_keypair();

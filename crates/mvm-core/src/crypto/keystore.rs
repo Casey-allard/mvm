@@ -473,14 +473,16 @@ mod tests {
     // FileKeyProvider
     // ──────────────────────────────────────────────────────────────
 
-    fn write_key_file(dir: &Path, tenant: &str, bytes: &[u8], _mode: u32) -> PathBuf {
+    fn write_key_file(dir: &Path, tenant: &str, bytes: &[u8], mode: u32) -> PathBuf {
         #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
         let path = dir.join(format!("{tenant}.key"));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        options.mode(_mode);
+        options.mode(mode);
+        #[cfg(not(unix))]
+        assert_eq!(mode, 0o600, "non-Unix fixtures cannot model POSIX modes");
         let mut f = options.open(&path).unwrap();
         std::io::Write::write_all(&mut f, bytes).unwrap();
         path
