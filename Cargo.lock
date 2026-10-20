@@ -3743,6 +3743,7 @@ dependencies = [
  "mvm-core",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
 ]
 

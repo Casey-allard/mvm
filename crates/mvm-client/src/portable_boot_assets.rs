@@ -293,6 +293,18 @@ impl PreparedPortableBootAssets {
         inputs: &mvm_bundler::BundleExportInputs<'_>,
         signer: &dyn mvm_bundler::BundleSigner,
     ) -> Result<mvm_bundler::ExportedBundle> {
+        self.stage(inputs, signer)?.publish()
+    }
+
+    /// Seal the same verified closure into an owned, unpublished archive.
+    ///
+    /// The returned guard owns its sealed bytes until publication or explicit
+    /// abort. It is not registry admission or authority to run a workload.
+    pub fn stage(
+        &self,
+        inputs: &mvm_bundler::BundleExportInputs<'_>,
+        signer: &dyn mvm_bundler::BundleSigner,
+    ) -> Result<mvm_bundler::StagedBundle> {
         self.verify_build_kernel(Path::new(inputs.vmlinux))?;
         verify_export_selection(inputs, &self.runtime.arch, &sha256_file(&self.initrd)?)?;
         let files = [
@@ -336,8 +348,10 @@ impl PreparedPortableBootAssets {
             root: self.publisher.root(),
             revocations: self.publisher.revocations(),
         });
-        let output = mvm_bundler::export_bundle_with_signer(&selected, signer)?;
-        self.verify_integrity()?;
+        let output = mvm_bundler::stage_bundle_with_signer(&selected, signer)?;
+        if let Err(error) = self.verify_integrity() {
+            return Err(output.abort(error));
+        }
         Ok(output)
     }
 }

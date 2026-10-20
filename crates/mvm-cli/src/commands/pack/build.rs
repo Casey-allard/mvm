@@ -11,7 +11,6 @@
 //! TypeScript; an SDK that produced the spec ran in the author's own process.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -24,19 +23,17 @@ use mvm_core::arch::GuestArch;
 use mvm_core::plan::BundleResources;
 use mvm_core::plan::bundle::{
     ArtifactRole, BundleManifest, ENVIRONMENT_DESCRIPTOR_VERSION, EnvironmentDescriptor,
-    EnvironmentEntrypoint, MANIFEST_FILENAME,
+    EnvironmentEntrypoint,
 };
 use mvm_core::plan::types::{BuildProvenance, InputKind};
 use mvm_core::security::AgentProfile;
 
 use super::author::{LoadedSpec, locked_revision, read_lock};
-use super::staged::StagedArchive;
-use crate::commands::bundle::export::{TemplateExport, export_template};
+use crate::commands::bundle::export::{TemplateExport, stage_template};
 use crate::commands::vm::denial_review::{NoManifest, ReviewSource};
 use crate::commands::vm::invoke::{EntrypointCall, EntrypointStdin, boot_entrypoint};
 use mvm_client::bundle::{
-    ExportedBundle, PostureInputs, seal_template_rootfs, template_artifact_digests,
-    template_entrypoint,
+    PostureInputs, seal_template_rootfs, template_artifact_digests, template_entrypoint,
 };
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -47,7 +44,7 @@ pub(in crate::commands) struct BuildArgs {
     /// The lock the build must match (default: pack.lock.json beside the spec)
     #[arg(long, value_name = "FILE")]
     pub lock: Option<PathBuf>,
-    /// Where to write the signed `.mvmpkg` archive
+    /// New path for the signed `.mvmpkg` archive; existing destinations are refused
     #[arg(long, value_name = "FILE.mvmpkg")]
     pub out: PathBuf,
     /// Seconds the health boot's entrypoint may run before it counts as failed
@@ -177,29 +174,42 @@ pub(super) fn run(args: BuildArgs) -> Result<()> {
 
     // ---- 5. Seal and sign under the host key ----
     producer.build.verify_revision()?;
-    let staged = StagedArchive::new(&args.out)?;
-    let mut export = pack_export(staged.path(), &loaded.spec, &lock, image_argv)?;
+    let mut export = pack_export(&args.out, &loaded.spec, &lock, image_argv)?;
     export.portable_boot_assets = Some(std::sync::Arc::clone(&producer.boot));
-    let exported = match export_template(slot, export) {
-        Ok(exported) => exported,
-        Err(error) => return Err(staged.discard(error)),
-    };
+    let mut staged = stage_template(slot, export)?;
     // The exporter re-read the slot's files; what it sealed must be what the
-    // health check booted. Failures remove only this invocation's staging file.
-    let digest = match verify_sealed(&producer.build, &exported.path, &expected_export) {
+    // health check booted. Read and hash the same owned file before publication.
+    let validation = (|| -> Result<String> {
+        producer
+            .build
+            .verify_revision()
+            .context("private build revision changed during export; archive not published")?;
+        producer.boot.verify_integrity()?;
+        let sealed = SlotDigests::from_manifest(&staged.manifest()?);
+        if sealed != expected_export {
+            bail!(
+                "the sealed archive differs from the health-checked build ({}); \
+                 archive not published",
+                expected_export.changed(&sealed).join(", ")
+            );
+        }
+        let digest = staged.sha256()?;
+        producer
+            .build
+            .verify_revision()
+            .context("private build revision changed during validation; archive not published")?;
+        if let (Some(report), Some(destination)) = (observation, &args.input_observation) {
+            report
+                .persist_noclobber(destination)
+                .context("publishing input observation without overwriting")?;
+        }
+        Ok(digest)
+    })();
+    let digest = match validation {
         Ok(digest) => digest,
-        Err(error) => return Err(staged.discard(error)),
+        Err(error) => return Err(staged.abort(error)),
     };
-    let final_path = staged.publish()?;
-    let exported = ExportedBundle {
-        path: final_path,
-        ..exported
-    };
-    if let (Some(report), Some(destination)) = (observation, &args.input_observation) {
-        report
-            .persist_noclobber(destination)
-            .context("publishing input observation without overwriting")?;
-    }
+    let exported = staged.publish()?;
     mvm_core::audit_emit!(
         PackBuild,
         "pack={},workload_sha256={},bundle_sha256={digest},key_id={}",
@@ -411,8 +421,7 @@ impl SlotDigests {
     }
 
     /// The same digests, as the manifest of a sealed archive records them.
-    fn sealed(archive: &Path) -> Result<Self> {
-        let manifest = sealed_manifest(archive)?;
+    fn from_manifest(manifest: &BundleManifest) -> Self {
         let digest = |role: ArtifactRole| {
             manifest
                 .artifacts
@@ -420,12 +429,12 @@ impl SlotDigests {
                 .find(|artifact| artifact.role == role)
                 .map(|artifact| artifact.sha256.clone())
         };
-        Ok(Self::from_digests(
+        Self::from_digests(
             digest(ArtifactRole::Kernel),
             digest(ArtifactRole::Initrd),
             digest(ArtifactRole::Rootfs),
             digest(ArtifactRole::VerityHashSidecar),
-        ))
+        )
     }
 
     fn from_digests(
@@ -459,47 +468,6 @@ impl SlotDigests {
             .map(|((name, _), _)| *name)
             .collect()
     }
-}
-
-/// The manifest of an archive this process just sealed. Only its artifact
-/// digests are read, to compare with the build; the signature over it was
-/// made a moment ago by this process.
-fn sealed_manifest(archive: &Path) -> Result<BundleManifest> {
-    let file = fs::File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
-    let mut entries = tar::Archive::new(file);
-    for entry in entries
-        .entries()
-        .with_context(|| format!("reading {}", archive.display()))?
-    {
-        let entry = entry.with_context(|| format!("reading {}", archive.display()))?;
-        if entry.path()?.as_os_str() == MANIFEST_FILENAME {
-            return serde_json::from_reader(entry.take(MAX_MANIFEST_BYTES))
-                .with_context(|| format!("parsing the manifest of {}", archive.display()));
-        }
-    }
-    bail!("{} carries no {MANIFEST_FILENAME}", archive.display())
-}
-
-/// Bound on the manifest read back from a sealed archive.
-const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Re-check a staged archive against the health-checked build and hash it.
-fn verify_sealed(
-    owned: &crate::commands::build::build::FrozenFlakeSlot,
-    archive: &Path,
-    checked: &SlotDigests,
-) -> Result<String> {
-    owned
-        .verify_revision()
-        .context("private build revision changed during export")?;
-    let sealed = SlotDigests::sealed(archive)?;
-    if &sealed != checked {
-        bail!(
-            "the sealed archive differs from the health-checked build ({})",
-            checked.changed(&sealed).join(", ")
-        );
-    }
-    file_sha256(archive)
 }
 
 fn file_sha256(path: &Path) -> Result<String> {
@@ -682,19 +650,56 @@ mod tests {
     }
 
     #[test]
-    fn an_archive_without_a_manifest_is_not_taken_as_sealed() {
-        let dir = TempDir::new().unwrap();
-        let archive = dir.path().join("x.mvmpkg");
-        let mut tar = tar::Builder::new(fs::File::create(&archive).unwrap());
-        let mut header = tar::Header::new_gnu();
-        header.set_size(1);
-        header.set_cksum();
-        tar.append_data(&mut header, "artifacts/vmlinux", &b"k"[..])
-            .unwrap();
-        tar.finish().unwrap();
-        drop(tar);
-        let error = SlotDigests::sealed(&archive).unwrap_err();
-        assert!(error.to_string().contains(MANIFEST_FILENAME), "{error:#}");
+    fn sealed_digests_follow_manifest_roles_and_expose_missing_artifacts() {
+        use mvm_core::plan::bundle::BundleArtifact;
+
+        let artifact = |role, name: &str, digest: &str| BundleArtifact {
+            name: name.to_owned(),
+            role,
+            path: format!("artifacts/{name}"),
+            sha256: digest.to_owned(),
+            size_bytes: 1,
+        };
+        let mut manifest = BundleManifest {
+            schema_version: 1,
+            publisher: "host:test".into(),
+            key_id: mvm_core::plan::KeyId("test-key".into()),
+            arch: "aarch64".into(),
+            kernel_version: None,
+            profile: None,
+            workload_label: None,
+            created_at: "2026-10-16T00:00:00Z".into(),
+            labels: Default::default(),
+            artifacts: vec![
+                artifact(ArtifactRole::Rootfs, "rootfs", &"a".repeat(64)),
+                artifact(ArtifactRole::Kernel, "vmlinux", &"b".repeat(64)),
+                artifact(ArtifactRole::VerityHashSidecar, "verity", &"c".repeat(64)),
+            ],
+            members: Vec::new(),
+            verity: None,
+            resources: None,
+        };
+        let sealed = SlotDigests::from_manifest(&manifest);
+        let expected = SlotDigests::from_digests(
+            Some("b".repeat(64)),
+            None,
+            Some("a".repeat(64)),
+            Some("c".repeat(64)),
+        );
+        assert_eq!(sealed, expected);
+        assert!(sealed.missing("initrd"));
+        assert!(!sealed.missing("verity"));
+
+        manifest.artifacts[0].sha256 = "d".repeat(64);
+        assert_eq!(
+            sealed.changed(&SlotDigests::from_manifest(&manifest)),
+            vec!["rootfs"]
+        );
+        manifest.artifacts.clear();
+        let missing = SlotDigests::from_manifest(&manifest);
+        for name in ["kernel", "initrd", "rootfs", "verity"] {
+            assert!(missing.missing(name), "{name}");
+        }
     }
 
     #[test]
