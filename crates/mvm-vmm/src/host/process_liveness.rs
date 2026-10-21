@@ -26,7 +26,11 @@ pub fn pid_is_alive(pid: i32) -> bool {
             {
                 macos_process_is_zombie(pid)
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            {
+                linux_process_is_zombie(pid)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 let _ = pid;
                 false
@@ -63,6 +67,23 @@ fn kill_zero_reports_alive(result: i32, error: Option<i32>) -> bool {
     result == 0 || error == Some(libc::EPERM)
 }
 
+/// `kill(pid, 0)` also succeeds for an exited, unreaped child, so Linux reads
+/// the state field of `/proc/<pid>/stat` instead.
+#[cfg(target_os = "linux")]
+fn linux_process_is_zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .is_ok_and(|stat| stat_state_is_zombie(&stat))
+}
+
+/// The state is the first field after the parenthesised command name, which
+/// may itself contain spaces and parentheses, so split at the last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn stat_state_is_zombie(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z")
+}
+
 #[cfg(target_os = "macos")]
 fn macos_process_is_zombie(pid: i32) -> bool {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
@@ -77,6 +98,14 @@ fn macos_process_is_zombie(pid: i32) -> bool {
             std::mem::size_of::<libc::proc_bsdinfo>() as i32,
         )
     };
+    // The kernel still answers `kill(pid, 0)` for a zombie but refuses its
+    // process info with ESRCH, so an empty answer with that error is how an
+    // exited, unreaped child shows up here. A pid that is gone entirely gives
+    // the same answer and is just as dead; any other failure (EPERM for
+    // another user's process) proves nothing.
+    if bytes == 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
     if bytes != std::mem::size_of::<libc::proc_bsdinfo>() as i32 {
         return false;
     }
@@ -512,6 +541,15 @@ fn inspect_then_kill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_state_z_is_a_zombie_even_with_a_tricky_command_name() {
+        assert!(stat_state_is_zombie("42 (true) Z 1 2 3"));
+        assert!(stat_state_is_zombie("42 (a) Z (b) Z 1"));
+        assert!(!stat_state_is_zombie("42 (a) Z) S 1 2"));
+        assert!(!stat_state_is_zombie("42 (sleep) S 1 2 3"));
+        assert!(!stat_state_is_zombie("garbage"));
+    }
 
     #[test]
     fn identity_starttime_is_raw_field_22_even_with_complex_comm() {
