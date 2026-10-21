@@ -41,6 +41,7 @@ use mvm_vmm::driver::traits::{
 
 mod cold_channel;
 mod standby;
+mod stop_state;
 use cold_channel::{BootInputFiles, boot_with_custody, failed_owned_boot, require_cold_config};
 pub use cold_channel::{ColdHvfBootFailure, ColdHvfOwner, RetainedHvfLaunch};
 #[cfg(test)]
@@ -1420,7 +1421,17 @@ impl RunningVm for HvfRunningVm {
     fn terminate_with_kernel_exit(&self) -> Result<mvm_vmm::driver::traits::KernelStopOutcome> {
         let proof = match &self.owned {
             Some(owned) => owned.stop()?,
-            None => ConnectedInstance::connect_instance(self.instance.clone())?.stop()?,
+            None => match ConnectedInstance::connect_instance(self.instance.clone()) {
+                Ok(connected) => connected.stop()?,
+                Err(error) if self.stop_found_nothing_running(&error) => {
+                    mvm_vmm::host::ui::info(&format!("machine {} is already stopped", self.id.0));
+                    return Ok(mvm_vmm::driver::traits::KernelStopOutcome {
+                        timing: None,
+                        hvf_exit: None,
+                    });
+                }
+                Err(error) => return Err(error),
+            },
         };
         proof.verify_current()?;
         let timing = Some(RunningVmStopTiming {
