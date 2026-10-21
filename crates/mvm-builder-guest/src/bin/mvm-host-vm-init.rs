@@ -91,6 +91,12 @@ mod install;
 #[cfg(any(target_os = "linux", test))]
 #[path = "mvm-host-vm-init/install_spec.rs"]
 mod install_spec;
+/// Event-driven stderr capture for dispatched jobs. This stays outside the
+/// PID-1 module so its direct-child exit semantics and deterministic race
+/// regression coverage remain focused and independently testable.
+#[cfg(any(target_os = "linux", test))]
+#[path = "mvm-host-vm-init/stderr_capture.rs"]
+mod stderr_capture;
 /// Spawn a workload microVM inside the host VM via a `WorkloadVmm`
 /// backend (Firecracker today). Cross-platform trait +
 /// state-dir/lifecycle logic (tested on macOS); the signal-based
@@ -1353,6 +1359,9 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    #[cfg(test)]
+    use crate::stderr_capture::STDERR_TAIL_LINES;
+    use crate::stderr_capture::capture_stderr_until_exit;
     use std::path::Path;
     use std::process::{Command, ExitCode};
     use std::sync::{Arc, Mutex};
@@ -1470,12 +1479,6 @@ mod linux {
         ("mvm-bins", HOST_BIN_DIR),
         ("closure-seed", CLOSURE_SEED_DIR),
     ];
-
-    /// Max stderr lines we capture into `/job/result`. Keeps
-    /// the result file small; the host-side supervisor still
-    /// captures the full stream via the libkrun console
-    /// (`krun_set_console_output`).
-    const STDERR_TAIL_LINES: usize = 20;
 
     pub(crate) fn append_init_breadcrumb(stage: &str, detail: &str) {
         let mut persistent_targets = Vec::new();
@@ -3788,10 +3791,8 @@ mod linux {
         cmd_sh: &str,
         tmpdir: Option<&str>,
         isolation: Isolation,
-        mut on_line: F,
+        on_line: F,
     ) -> (i32, String) {
-        use std::collections::VecDeque;
-        use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::process::Stdio;
         // Switch between bare `/bin/sh
@@ -3847,65 +3848,15 @@ mod linux {
             }
         }
         let mut stderr = stderr;
-        let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
-        let mut pending = Vec::new();
-        let mut read_buf = [0u8; 4096];
-        let exit_code = loop {
-            let mut pipe_drained = false;
-            match stderr.read(&mut read_buf) {
-                Ok(0) => pipe_drained = true,
-                Ok(n) => {
-                    pending.extend_from_slice(&read_buf[..n]);
-                    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-                        let mut bytes = pending.drain(..=newline).collect::<Vec<_>>();
-                        bytes.pop();
-                        if bytes.last() == Some(&b'\r') {
-                            bytes.pop();
-                        }
-                        let Ok(line) = String::from_utf8(bytes) else {
-                            pipe_drained = true;
-                            break;
-                        };
-                        on_line(&line);
-                        if tail.len() == STDERR_TAIL_LINES {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    pipe_drained = true;
-                }
-                Err(_) => pipe_drained = true,
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) if pipe_drained => {
-                    if !pending.is_empty()
-                        && let Ok(mut line) = String::from_utf8(std::mem::take(&mut pending))
-                    {
-                        if line.ends_with('\r') {
-                            line.pop();
-                        }
-                        on_line(&line);
-                        if tail.len() == STDERR_TAIL_LINES {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
-                    break status.code().unwrap_or(-1);
-                }
-                Ok(Some(_)) | Ok(None) => {}
-                Err(_) => break -1,
-            }
-
-            if pipe_drained {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        };
-        let tail_joined = tail.into_iter().collect::<Vec<_>>().join("\n");
-        (exit_code, tail_joined)
+        capture_stderr_until_exit(
+            &mut stderr,
+            || {
+                child
+                    .try_wait()
+                    .map(|status| status.map(|s| s.code().unwrap_or(-1)))
+            },
+            on_line,
+        )
     }
 
     /// Minimal JSON string escaper. Only handles the characters
