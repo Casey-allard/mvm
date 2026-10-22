@@ -15,9 +15,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use mvm_agentd::vsock::GuestResponse;
 use mvm_agentd::vsock::{
-    CONSOLE_PORT_BASE, GUEST_AGENT_PORT, GUEST_CID, GuestRequest, GuestResponse,
-    WORKLOAD_EXIT_PORT, connect_to_port, connect_to_port_once, send_request_stream,
+    CONSOLE_PORT_BASE, GUEST_AGENT_PORT, GUEST_CID, WORKLOAD_EXIT_PORT, connect_to_port,
+    connect_to_port_once,
 };
 use mvm_core::config::vm_state_dir;
 use mvm_core::launch_trace::LaunchTraceRecorder;
@@ -44,9 +46,13 @@ use mvm_vmm::host::boot_config::{
 };
 
 mod kernel;
+mod stop;
 #[cfg(all(test, unix))]
 use kernel::fc_descriptor_recipe;
 use kernel::resolve_fc_kernel_path;
+use stop::{bind_process_to_socket, prepare_guest_filesystems_for_stop};
+#[cfg(test)]
+use stop::{require_guest_filesystem_flush, stop_after_guest_flush, stop_firecracker_guest};
 
 /// Host→guest dial timeout (seconds) for `vsock_connect`. The underlying
 /// `connect_to_port` retries the CONNECT handshake internally within this bound.
@@ -1362,77 +1368,6 @@ struct FcRunningVm {
     flush_via_agent: bool,
 }
 
-fn require_guest_filesystem_flush(response: GuestResponse) -> Result<()> {
-    match response {
-        GuestResponse::SleepPrepAck { success: true, .. } => Ok(()),
-        GuestResponse::SleepPrepAck {
-            success: false,
-            detail,
-        } => bail!(
-            "guest refused the stop-time filesystem flush: {}",
-            detail.unwrap_or_else(|| "no detail supplied".to_string())
-        ),
-        other => bail!("guest returned an unexpected stop-time flush response: {other:?}"),
-    }
-}
-
-fn prepare_guest_filesystems_for_stop(vsock_uds: &str) -> Result<()> {
-    let mut stream = connect_to_port(vsock_uds, GUEST_AGENT_PORT, GUEST_STOP_DRAIN_TIMEOUT_SECS)
-        .with_context(|| format!("connect to guest agent for filesystem flush via {vsock_uds}"))?;
-    let response = send_request_stream(
-        &mut stream,
-        &GuestRequest::SleepPrep {
-            drain_timeout_secs: GUEST_STOP_DRAIN_TIMEOUT_SECS,
-        },
-    )
-    .context("request guest filesystem flush before Firecracker stop")?;
-    require_guest_filesystem_flush(response)
-}
-
-/// Two spans, emitted at debug, splitting teardown into the only two things it
-/// does. `stop_transient` is one opaque number to the launch sample, and the
-/// guest flush and the kill-and-wait have unrelated costs and unrelated fixes —
-/// a vsock round-trip the guest controls, versus a signal plus a host-side poll
-/// loop. Without the split, a slow teardown cannot be attributed to either.
-#[cfg(test)]
-fn stop_after_guest_flush(
-    prepare: impl FnOnce() -> Result<()>,
-    terminate: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let flush_started = Instant::now();
-    let prepared = prepare();
-    tracing::debug!(
-        ms = flush_started.elapsed().as_secs_f64() * 1000.0,
-        ok = prepared.is_ok(),
-        "fc stop: guest filesystem flush"
-    );
-    prepared?;
-
-    let terminate_started = Instant::now();
-    let terminated = terminate();
-    tracing::debug!(
-        ms = terminate_started.elapsed().as_secs_f64() * 1000.0,
-        "fc stop: signal + exit wait"
-    );
-    terminated
-}
-
-/// Stop a guest, flushing through its agent only when it has one. Requiring the
-/// flush of an agentless guest would make it unkillable: the connect fails and
-/// the error returns before the process is ever signalled.
-#[cfg(test)]
-fn stop_firecracker_guest(
-    flush_via_agent: bool,
-    prepare: impl FnOnce() -> Result<()>,
-    terminate: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    if flush_via_agent {
-        stop_after_guest_flush(prepare, terminate)
-    } else {
-        terminate()
-    }
-}
-
 impl RunningVm for FcRunningVm {
     fn id(&self) -> &VmId {
         &self.id
@@ -1483,6 +1418,19 @@ impl RunningVm for FcRunningVm {
             return Ok(());
         }
         terminate_firecracker_pid(&self.id.0, pid, &self.pid_file)
+    }
+
+    fn process_identity(&self) -> Result<Option<mvm_vmm::host::process_identity::ProcessIdentity>> {
+        let Some(pid) = self.pid else {
+            return Ok(None);
+        };
+        let socket = crate::fc::fc_api_socket_path(&self.state_dir.to_string_lossy());
+        bind_process_to_socket(
+            &self.id.0,
+            pid,
+            |pid| crate::fc::is_firecracker_for_socket(pid, Path::new(&socket)),
+            mvm_vmm::host::process_identity::ProcessIdentity::capture,
+        )
     }
 
     fn pause(&self) -> Result<()> {
