@@ -860,7 +860,7 @@ impl FcDriver {
                 .with_context(|| format!("Firecracker API PUT {}", put.path))?;
         }
         if let Some(handoff) = handoff.as_ref() {
-            crate::fc::io::FirecrackerIO::new(PathBuf::from(&socket))
+            crate::fc::io::FirecrackerIO::new(PathBuf::from(&socket), state_dir.clone())
                 .verify_writable_writer(handoff)?;
         }
         crate::fc::secure_vsock_socket_for_caller(&vsock_uds)
@@ -1208,8 +1208,11 @@ impl VmmDriver for FcDriver {
         mvm_vmm::agent_debug::phase("fc-resume", started, "phase=channels_armed");
         let devices = crate::fc::host::fork_devices_for(req.child_vm_name, req.child_dir)
             .map_err(|error| StandbyError::ClaimFailed(format!("{error:#}")))?;
-        let io = crate::fc::io::FirecrackerIO::new(req.child_dir.join("fc.socket"))
-            .forking_onto(devices);
+        let io = crate::fc::io::FirecrackerIO::new(
+            req.child_dir.join("fc.socket"),
+            req.child_dir.to_path_buf(),
+        )
+        .forking_onto(devices);
         mvm_vmm::agent_debug::phase("fc-resume", started, "phase=devices_built");
         crate::fc::host::resume_preloaded_fork_child(
             &io,

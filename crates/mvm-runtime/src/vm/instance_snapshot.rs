@@ -1854,7 +1854,7 @@ mod tests {
         boot_live_source_vm(&images, &src_dir, &rootfs_copy).expect("boot source FC VM");
 
         let src_sock = src_dir.join("fc.socket");
-        FirecrackerIO::new(src_sock)
+        FirecrackerIO::new(src_sock, src_dir.clone())
             .create_snapshot(&snap_dir)
             .expect("create_snapshot on source VM");
         assert!(
@@ -1869,7 +1869,7 @@ mod tests {
         kill_live_vm(&src_dir);
 
         // Time the warm restore — this is the number this test exists to produce.
-        let dest_io = FirecrackerIO::new(dest_dir.join("fc.socket"));
+        let dest_io = FirecrackerIO::new(dest_dir.join("fc.socket"), dest_dir.clone());
         let t = std::time::Instant::now();
         guarded_load_resume(&dest_io, &snap_dir).expect("warm restore must resume");
         let ms = t.elapsed().as_millis();
@@ -1942,7 +1942,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         // Capture a full snapshot into the parent dir (the pool's asset).
-        let src_io = FirecrackerIO::new(parent_sock);
+        let src_io = FirecrackerIO::new(parent_sock, parent_dir.clone());
         src_io
             .create_snapshot(&parent_dir)
             .expect("create snapshot on source VM");
@@ -1965,7 +1965,7 @@ mod tests {
         crate::microvm::stop_vm(&parent_id).ok();
 
         // Time the warm-pool claim: fresh Firecracker + snapshot load + resume.
-        let io = FirecrackerIO::new(child_dir.join("fc.socket"));
+        let io = FirecrackerIO::new(child_dir.join("fc.socket"), child_dir.clone());
         let t = std::time::Instant::now();
         guarded_load_resume(&io, &child_dir).expect("warm claim restore must resume");
         let claim_ms = t.elapsed().as_millis();

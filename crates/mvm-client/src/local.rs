@@ -217,7 +217,10 @@ impl LocalBackend {
             .map_err(|e| backend_err(format!("VM {vm_name:?} is not running: {e:#}")))?;
         mvm_runtime::microvm::ensure_fc_sockets_in_state_dir(&vm_dir, "a sealed snapshot")
             .map_err(|e| backend_err(format!("{e:#}")))?;
-        Ok(Box::new(FirecrackerIO::new(firecracker_socket(&vm_dir))))
+        Ok(Box::new(FirecrackerIO::new(
+            firecracker_socket(&vm_dir),
+            std::path::PathBuf::from(&vm_dir),
+        )))
     }
 
     /// Warm-resume through the backend's live-memory `warm_start` path: mint a
@@ -583,7 +586,11 @@ fn signal_within<S: PostRestoreSignal + Send + 'static>(
 fn stop_interrupted_admission(name: &str) {
     let stop = || -> anyhow::Result<()> {
         let vm_dir = mvm_runtime::microvm::resolve_running_vm_dir(name)?;
-        FirecrackerIO::new(firecracker_socket(&vm_dir)).teardown_paused()
+        FirecrackerIO::new(
+            firecracker_socket(&vm_dir),
+            std::path::PathBuf::from(&vm_dir),
+        )
+        .teardown_paused()
     };
     let _ = refuse_resume(
         name,

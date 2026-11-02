@@ -59,11 +59,11 @@ pub fn warm_restore_instance_from_path(
 
     let abs_vms = abs_vms_dir();
     let vm_dir = format!("{}/{name}", abs_vms.trim());
-    // The restore finds the state dir as the socket's parent, so it needs the
-    // socket there rather than in the short fallback namespace.
+    // Preserve the warm-restore endpoint's in-state socket restriction. State
+    // ownership is carried separately rather than inferred from the socket.
     super::ensure_fc_sockets_in_state_dir(&vm_dir, "a Firecracker warm restore")?;
     let socket = std::path::PathBuf::from(format!("{vm_dir}/fc.socket"));
-    let io = FirecrackerIO::new(socket);
+    let io = FirecrackerIO::new(socket, std::path::PathBuf::from(&vm_dir));
 
     guarded_load_resume(&io, std::path::Path::new(snapshot_dir))
         .with_context(|| format!("warm-restore of '{name}' from {snapshot_dir}"))?;

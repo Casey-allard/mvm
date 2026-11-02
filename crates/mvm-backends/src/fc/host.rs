@@ -889,10 +889,12 @@ fn child_io(
     child_dir: &std::path::Path,
     cpu_grant: Option<mvm_contract::grants::CpuGrant>,
 ) -> super::io::FirecrackerIO {
-    super::io::FirecrackerIO::new(child_dir.join("fc.socket")).bounded_by(super::io::RestoreBound {
-        machine_id: child_vm_name.to_string(),
-        cpu_grant,
-    })
+    super::io::FirecrackerIO::new(child_dir.join("fc.socket"), child_dir.to_path_buf()).bounded_by(
+        super::io::RestoreBound {
+            machine_id: child_vm_name.to_string(),
+            cpu_grant,
+        },
+    )
 }
 
 /// Point every late-volume slot a claim uses at its image on a paused child,
@@ -1031,7 +1033,7 @@ mod tests {
             let socket = dir.path().join("fc.socket");
             // No VMM was started: only a marker to observe teardown's cleanup.
             std::fs::write(&socket, b"not a live API socket").unwrap();
-            let io = crate::fc::io::FirecrackerIO::new(socket.clone());
+            let io = crate::fc::io::FirecrackerIO::new(socket.clone(), dir.path().to_path_buf());
             let error = super::resume_preloaded_fork_child(&io, dir.path(), runtime, anchors, &[])
                 .unwrap_err();
             assert!(

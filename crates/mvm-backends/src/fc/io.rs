@@ -20,6 +20,8 @@ use mvm_vmm::snapshot::SnapshotIO;
 pub struct FirecrackerIO {
     /// Absolute path to the live Firecracker control socket.
     pub socket_path: PathBuf,
+    /// Owned VM state directory. Socket relocation never changes PID/scope authority.
+    vm_state_dir: PathBuf,
     /// A captured/started writer requires verified termination on every exit.
     verified_stop_required: std::cell::Cell<bool>,
     /// Who the *fresh* VMM a snapshot load starts is scoped as, and the CPU
@@ -61,9 +63,11 @@ fn paused_capture_needs_relock(handoff_present: bool, config: &RestoreConfig) ->
 }
 
 impl FirecrackerIO {
-    pub fn new(socket_path: PathBuf) -> Self {
+    /// Carry state ownership explicitly; API sockets may live in a short namespace.
+    pub fn new(socket_path: PathBuf, vm_state_dir: PathBuf) -> Self {
         Self {
             socket_path,
+            vm_state_dir,
             verified_stop_required: std::cell::Cell::new(false),
             restore_bound: None,
             fork_devices: None,
@@ -94,10 +98,7 @@ impl FirecrackerIO {
         &self,
         handoff: &mvm_vmm::driver::prepared_disks::SudoWritableHandoff,
     ) -> Result<()> {
-        let vm_dir = self
-            .socket_path
-            .parent()
-            .context("Firecracker socket path has no VM directory")?;
+        let vm_dir = self.vm_state_dir.as_path();
         super::daemon::verify_writable_writer(
             &vm_dir.to_string_lossy(),
             &self.socket_path.to_string_lossy(),
@@ -291,10 +292,7 @@ impl FirecrackerIO {
     /// child's vsock socket instead of the recorded one, and every drive the
     /// parent owned is reopened from the child's copy before this returns.
     fn load_snapshot_inner(&self, dir: &Path, fork: Option<&super::ForkDevices>) -> Result<()> {
-        let vm_dir = self
-            .socket_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Firecracker socket path has no parent directory"))?;
+        let vm_dir = self.vm_state_dir.as_path();
         let memory_mib = snapshot_guest_memory_mib(dir)?;
         let (machine_id, bounds) = self.restore_scope_inputs(vm_dir, memory_mib);
         super::daemon::validate_required_scope(&machine_id, &bounds)?;
@@ -356,10 +354,7 @@ impl FirecrackerIO {
         scope: &str,
         handoff: Option<&mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
     ) -> Result<()> {
-        let vm_dir = self
-            .socket_path
-            .parent()
-            .context("Firecracker socket path has no parent directory")?;
+        let vm_dir = self.vm_state_dir.as_path();
         let socket_str = self.socket_path.to_string_lossy();
         self.verified_stop_required.set(true);
         super::start_vm_firecracker_scoped_with_handoff(
@@ -518,10 +513,7 @@ impl SnapshotIO for FirecrackerIO {
         // resumed guest that did not reseed must not keep running on its
         // snapshot's random state. The result is the stop's own, so a caller
         // that reports "stopped" has a stopped process behind it.
-        let vm_dir = self
-            .socket_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Firecracker socket path has no parent directory"))?;
+        let vm_dir = self.vm_state_dir.as_path();
         if self.verified_stop_required.get() {
             self.stop_own_vmm_after_live_config(vm_dir)?;
         } else {
@@ -604,6 +596,137 @@ fn stop_restored_vmm_inner(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn relocated_writer_probe(state_pid: Option<u32>, socket_pid: Option<u32>) -> Result<()> {
+        use mvm_core::util::writable_image::{LockedWritableImage, sidecar_lock_path};
+        use mvm_vmm::driver::{prepared_disks::PreparedWritableDisks, spec::*};
+        use std::io::{Read, Write};
+        let scratch = crate::driver::socket_tempdir();
+        let state = scratch.path().join("actual-vm-state");
+        let sockets = scratch.path().join("relocated-sockets");
+        std::fs::create_dir(&state)?;
+        std::fs::create_dir(&sockets)?;
+        let backing = state.join("image");
+        std::fs::write(&backing, b"original writable object")?;
+        let image = LockedWritableImage::open(&backing, &sidecar_lock_path(&backing))?;
+        let spec = VmmSpec {
+            name: "relocated-custody-test".into(),
+            kernel: KernelImage::Bundled,
+            initramfs: None,
+            cmdline: String::new(),
+            vcpus: 1,
+            cpu_grant: None,
+            memory_mib: 64,
+            mem_initial_mib: None,
+            blocks: vec![BlockDev {
+                source: backing.clone(),
+                read_only: false,
+                ephemeral: false,
+                slot: 0,
+            }],
+            vsock: Vec::new(),
+            console: ConsoleCapture {
+                log_path: state.join("console"),
+            },
+            shares: Vec::new(),
+            trusted_builder: false,
+            builder_egress_endpoint: None,
+            plan_binding: None,
+        };
+        let handoff =
+            PreparedWritableDisks::bind(&spec, vec![(0, image)])?.into_sudo_handoff(&spec)?;
+        // Simulate the VMM's drive open in addition to its inherited custody.
+        let _actual_drive = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backing)?;
+        // Keep inventory stable while other unit-test threads open/close files.
+        // This owned idle process models only descriptor custody, not a VMM.
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        struct Writer(std::process::Child);
+        impl Drop for Writer {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let first = handoff.first() as i32;
+        let last = handoff.last() as i32;
+        let drive = _actual_drive.as_raw_fd();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf READY; IFS= read -r ignored"])
+            .env_clear()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: only async-signal-safe fcntl calls on known live descriptors;
+        // no allocation, locks, or inherited producer state is touched.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in (first..=last).chain(std::iter::once(drive)) {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut writer = Writer(command.spawn()?);
+        let mut ready = [0; 5];
+        writer.0.stdout.as_mut().unwrap().read_exact(&mut ready)?;
+        anyhow::ensure!(&ready == b"READY", "writer fixture readiness mismatch");
+        let marker_pid = |pid| {
+            if pid == std::process::id() {
+                writer.0.id()
+            } else {
+                pid
+            }
+        };
+        if let Some(pid) = state_pid {
+            std::fs::write(state.join("fc.pid"), marker_pid(pid).to_string())?;
+        }
+        if let Some(pid) = socket_pid {
+            std::fs::write(sockets.join("fc.pid"), marker_pid(pid).to_string())?;
+        }
+        let socket = sockets.join("fc.socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let body = serde_json::json!({"drives":[{"drive_id":"blk0","path_on_host":backing,"is_read_only":false}]}).to_string();
+        let api = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let n = connection.read(&mut request).unwrap();
+            assert!(request[..n].starts_with(b"GET /vm/config "));
+            write!(
+                connection,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let result = FirecrackerIO::new(socket, state).verify_writable_writer(&handoff);
+        api.join().unwrap();
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relocated_socket_writer_uses_actual_vm_state_pid() {
+        relocated_writer_probe(Some(std::process::id()), None).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relocated_socket_missing_state_pid_never_uses_socket_directory_marker() {
+        assert!(relocated_writer_probe(None, Some(std::process::id())).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relocated_socket_wrong_state_pid_never_uses_socket_directory_marker() {
+        assert!(relocated_writer_probe(Some(u32::MAX), Some(std::process::id())).is_err());
+    }
+
     #[test]
     fn required_snapshot_memory_rejects_zero_and_overflow() {
         assert!(snapshot_memory_mib_from_bytes(0).is_err());
@@ -626,7 +749,7 @@ mod tests {
         std::fs::write(&marker, "do-not-read-or-stop").unwrap();
         let scope_record = vm.join("spawn-scope");
         std::fs::write(&scope_record, b"old-generation.scope").unwrap();
-        let io = FirecrackerIO::new(vm.join("fc.socket"));
+        let io = FirecrackerIO::new(vm.join("fc.socket"), vm.clone());
         let snapshot = scratch.path().join("snapshot");
         std::fs::create_dir(&snapshot).unwrap();
         let _guard = mvm_vmm::host::shell::mock::install_handler(|_| {
@@ -695,7 +818,7 @@ mod tests {
             )
             .unwrap();
         });
-        let io = FirecrackerIO::new(socket);
+        let io = FirecrackerIO::new(socket, vm.clone());
         let _guard = mvm_vmm::host::shell::mock::install_handler(|_| {
             panic!("failed old stop must not launch a replacement")
         });
@@ -746,7 +869,7 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let socket = scratch.path().join("fc.socket");
         std::fs::write(&socket, b"live API placeholder").unwrap();
-        let io = FirecrackerIO::new(socket.clone());
+        let io = FirecrackerIO::new(socket.clone(), scratch.path().to_path_buf());
         io.verified_stop_required.set(true);
         assert!(io.teardown_paused().is_err());
         assert!(socket.exists());
@@ -755,7 +878,10 @@ mod tests {
     #[test]
     fn read_only_live_restore_config_needs_no_writable_handoff() {
         let scratch = tempfile::tempdir().unwrap();
-        let io = FirecrackerIO::new(scratch.path().join("fc.socket"));
+        let io = FirecrackerIO::new(
+            scratch.path().join("fc.socket"),
+            scratch.path().to_path_buf(),
+        );
         let config = r#"{"drives":[{"drive_id":"blk0","path_on_host":"/missing/read-only","is_read_only":true}]}"#;
         assert!(io.prepare_restore_handoff(config, None).unwrap().is_none());
         let restored: RestoreConfig = serde_json::from_str(config).unwrap();
@@ -779,7 +905,11 @@ mod tests {
         mvm_core::spawn_scope::pretend_mechanism_present(&mut env, scratch.path()).unwrap();
         let scope = scratch.path().join("spawn-scope");
         std::fs::write(&scope, b"old.scope").unwrap();
-        let io = FirecrackerIO::new(scratch.path().join("fc.socket")).bounded_by(RestoreBound {
+        let io = FirecrackerIO::new(
+            scratch.path().join("fc.socket"),
+            scratch.path().to_path_buf(),
+        )
+        .bounded_by(RestoreBound {
             machine_id: "restored-vm".into(),
             cpu_grant: None,
         });
