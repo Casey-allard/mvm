@@ -88,6 +88,13 @@ struct MailboxFixture {
 }
 
 fn mailbox_fixture() -> MailboxFixture {
+    mailbox_fixture_for(MailboxMessageKind::Cast, &[MailboxOperation::Send])
+}
+
+fn mailbox_fixture_for(
+    kind: MailboxMessageKind,
+    operations: &[MailboxOperation],
+) -> MailboxFixture {
     let content_type = ContentType::parse("application/vnd.mvm.test", 1).expect("content type");
     let header = MailboxEnvelopeHeader {
         protocol_version: ProtocolVersion::V1,
@@ -102,8 +109,13 @@ fn mailbox_fixture() -> MailboxFixture {
         message_id: MessageId::from_bytes(id(14)),
         correlation_id: CorrelationId::from_bytes(id(15)),
         causation_id: CausationId::from_bytes(id(16)),
-        kind: MailboxMessageKind::Cast,
-        reply_to: None,
+        kind,
+        reply_to: (kind == MailboxMessageKind::Call).then_some(
+            mvm_contract::protocol::mailbox::ReplyRoute {
+                address: address(),
+                capability_id: CapabilityId::from_bytes(id(25)),
+            },
+        ),
         ordering_scope: OrderingScope::parse("default").expect("ordering scope"),
         sequence: SequenceNumber::new(1).expect("sequence"),
         issued_at_unix_ms: NOW - 1,
@@ -149,8 +161,8 @@ fn mailbox_fixture() -> MailboxFixture {
         issuer: issuer(),
         subject: sender(),
         address: address(),
-        operations: CapabilityOperations::from_operations(&[MailboxOperation::Send]),
-        message_kinds: vec![MailboxMessageKind::Cast],
+        operations: CapabilityOperations::from_operations(operations),
+        message_kinds: vec![kind],
         content_types: vec![content_type.clone()],
         max_payload_bytes: 64,
         max_messages_per_minute: 60,
@@ -393,6 +405,29 @@ fn authenticated_connection_is_not_mailbox_authority() {
 }
 
 #[test]
+fn external_channels_can_observe_exact_authorized_bytes_and_requested_limits() {
+    let authority = SigningKey::from_bytes(&id(30));
+    let (_, route) = signed_route(TransportPath::Direct, 31, &authority);
+    let fixture = mailbox_fixture();
+    let frame = authorize_outbound(OutboundAuthorization {
+        prepared: &fixture.prepared,
+        capability: &fixture.capability,
+        context: &fixture.context,
+        capability_authority_key: &fixture.capability_authority.verifying_key(),
+        route: &route,
+    })
+    .unwrap();
+    assert_eq!(frame.encoded_bytes().len(), frame.encoded_len());
+    assert_eq!(
+        frame.encoded_bytes(),
+        crate::mailbox::encode_envelope(fixture.prepared.envelope()).unwrap()
+    );
+    let limits = ChannelLimits::new(262_144, 524_288).unwrap();
+    assert_eq!(limits.max_frame_bytes(), 262_144);
+    assert_eq!(limits.max_pending_bytes(), 524_288);
+}
+
+#[test]
 fn direct_delivery_is_pass_by_value_bounded_and_cancelable() {
     let authority = SigningKey::from_bytes(&id(46));
     let (_, route) = signed_route(TransportPath::Direct, 47, &authority);
@@ -465,4 +500,86 @@ fn refused_cancelled_and_shutting_down_connects_are_distinct() {
         transport.connect(&route, limits, &active),
         Err(TransportError::ShuttingDown)
     ));
+}
+
+#[test]
+fn outbound_reply_accepts_reply_only_capability() {
+    let authority = SigningKey::from_bytes(&id(30));
+    let (_, route) = signed_route(TransportPath::Direct, 31, &authority);
+    let mut fixture = mailbox_fixture_for(MailboxMessageKind::Reply, &[MailboxOperation::Reply]);
+    fixture.context.required_operation = MailboxOperation::Reply;
+    let frame = authorize_outbound(OutboundAuthorization {
+        prepared: &fixture.prepared,
+        capability: &fixture.capability,
+        context: &fixture.context,
+        capability_authority_key: &fixture.capability_authority.verifying_key(),
+        route: &route,
+    })
+    .expect("a Reply-only grant authorizes a Reply");
+    assert_eq!(frame.encoded_bytes().len(), frame.encoded_len());
+}
+
+#[test]
+fn outbound_reply_rejects_send_only_capability_under_either_context() {
+    let authority = SigningKey::from_bytes(&id(30));
+    let (_, route) = signed_route(TransportPath::Direct, 31, &authority);
+    let mut fixture = mailbox_fixture_for(MailboxMessageKind::Reply, &[MailboxOperation::Send]);
+    for operation in [MailboxOperation::Send, MailboxOperation::Reply] {
+        fixture.context.required_operation = operation;
+        assert!(
+            authorize_outbound(OutboundAuthorization {
+                prepared: &fixture.prepared,
+                capability: &fixture.capability,
+                context: &fixture.context,
+                capability_authority_key: &fixture.capability_authority.verifying_key(),
+                route: &route,
+            })
+            .is_err(),
+            "Send-only must never authorize Reply"
+        );
+    }
+}
+
+#[test]
+fn outbound_call_and_cast_keep_send_operation() {
+    let authority = SigningKey::from_bytes(&id(30));
+    let (_, route) = signed_route(TransportPath::Direct, 31, &authority);
+    for kind in [MailboxMessageKind::Call, MailboxMessageKind::Cast] {
+        let mut fixture = mailbox_fixture_for(kind, &[MailboxOperation::Send]);
+        authorize_outbound(OutboundAuthorization {
+            prepared: &fixture.prepared,
+            capability: &fixture.capability,
+            context: &fixture.context,
+            capability_authority_key: &fixture.capability_authority.verifying_key(),
+            route: &route,
+        })
+        .expect("Call and Cast still require Send");
+        fixture.context.required_operation = MailboxOperation::Reply;
+        assert!(
+            authorize_outbound(OutboundAuthorization {
+                prepared: &fixture.prepared,
+                capability: &fixture.capability,
+                context: &fixture.context,
+                capability_authority_key: &fixture.capability_authority.verifying_key(),
+                route: &route,
+            })
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn prepared_header_exposes_exact_borrow_without_changing_envelope() {
+    let fixture = mailbox_fixture();
+    let before = crate::mailbox::encode_envelope(fixture.prepared.envelope()).unwrap();
+    let header: &MailboxEnvelopeHeader = fixture.prepared.header();
+    assert_eq!(header.sender_boot, BootId::from_bytes(id(13)));
+    assert_eq!(header.encryption.key_id, id(19));
+    assert_eq!(header.message_id, MessageId::from_bytes(id(14)));
+    assert_eq!(header.kind, MailboxMessageKind::Cast);
+    assert!(std::ptr::eq(header, fixture.prepared.header()));
+    assert_eq!(
+        crate::mailbox::encode_envelope(fixture.prepared.envelope()).unwrap(),
+        before
+    );
 }

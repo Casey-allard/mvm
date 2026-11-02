@@ -14,8 +14,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use mvm_contract::protocol::mailbox::{
     AuthorizationDomainRouteLabel, DestinationRouteToken, ED25519_SIGNATURE_BYTES, ExecutionEpoch,
     MAILBOX_PROTOCOL_VERSION, MAX_ENCODED_ENVELOPE_BYTES, MailboxAddress, MailboxEnvelope,
-    MailboxEnvelopeHeader, MailboxOperation, PrincipalId, ProtocolVersion, SignatureAlgorithm,
-    SignedMailboxCapability, TransportBindingId,
+    MailboxEnvelopeHeader, MailboxMessageKind, MailboxOperation, PrincipalId, ProtocolVersion,
+    SignatureAlgorithm, SignedMailboxCapability, TransportBindingId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -469,6 +469,16 @@ pub struct ChannelLimits {
 }
 
 impl ChannelLimits {
+    #[must_use]
+    pub const fn max_frame_bytes(self) -> usize {
+        self.max_frame_bytes
+    }
+
+    #[must_use]
+    pub const fn max_pending_bytes(self) -> usize {
+        self.max_pending_bytes
+    }
+
     pub fn new(max_frame_bytes: usize, max_pending_bytes: usize) -> Result<Self, TransportError> {
         if max_frame_bytes == 0
             || max_frame_bytes > MAX_ENCODED_ENVELOPE_BYTES
@@ -517,6 +527,13 @@ pub struct PreparedMailboxEnvelope {
 }
 
 impl PreparedMailboxEnvelope {
+    /// Borrow the exact header paired with this prepared outbound envelope.
+    /// Capability and transport authorization are still required before send.
+    #[must_use]
+    pub fn header(&self) -> &MailboxEnvelopeHeader {
+        &self.header
+    }
+
     #[must_use]
     pub fn envelope(&self) -> &MailboxEnvelope {
         &self.envelope
@@ -543,6 +560,12 @@ pub struct AuthorizedMailboxFrame {
 }
 
 impl AuthorizedMailboxFrame {
+    /// Borrow only the canonical ciphertext bytes that passed outbound admission.
+    #[must_use]
+    pub fn encoded_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         self.bytes.len()
@@ -554,7 +577,11 @@ impl AuthorizedMailboxFrame {
 pub fn authorize_outbound(
     request: OutboundAuthorization<'_>,
 ) -> Result<AuthorizedMailboxFrame, OutboundAuthorizationError> {
-    if request.context.required_operation != MailboxOperation::Send {
+    let required_operation = match request.prepared.header.kind {
+        MailboxMessageKind::Reply => MailboxOperation::Reply,
+        MailboxMessageKind::Call | MailboxMessageKind::Cast => MailboxOperation::Send,
+    };
+    if request.context.required_operation != required_operation {
         return Err(OutboundAuthorizationError::SendOperationRequired);
     }
     let envelope = &request.prepared.envelope;
@@ -596,7 +623,9 @@ pub fn authorize_outbound(
 pub enum OutboundAuthorizationError {
     #[error(transparent)]
     Mailbox(#[from] MailboxError),
-    #[error("outbound transport authorization requires the send operation")]
+    /// The operation must be Send for Call/Cast and Reply for Reply messages.
+    /// The variant name is retained for compatibility with existing consumers.
+    #[error("outbound transport authorization requires the operation matching the message kind")]
     SendOperationRequired,
     #[error("mailbox envelope and supplied signed header do not match")]
     EnvelopeHeaderMismatch,

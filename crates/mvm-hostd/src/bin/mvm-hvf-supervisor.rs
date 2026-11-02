@@ -981,6 +981,10 @@ fn run() -> anyhow::Result<()> {
                 broker_socket: cfg.broker_socket.clone(),
                 display_socket: cfg.display_socket.clone(),
                 gpu_socket: cfg.gpu_socket.clone(),
+                // The experimental mailbox binding has an explicit native test
+                // runner; production launch plans do not silently enable it.
+                mailbox_socket: None,
+                mailbox_bandwidth_profile: Default::default(),
                 console_data_sockets: cfg
                     .console_data_sockets
                     .iter()

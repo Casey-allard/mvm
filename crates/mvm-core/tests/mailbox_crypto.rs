@@ -757,3 +757,59 @@ fn deeply_nested_frames_within_the_size_bound_are_refused_without_recursion() {
         );
     }
 }
+
+#[test]
+fn verified_open_exposes_authenticated_header_and_keeps_payload_api_compatible() {
+    let sender_key = SigningKey::from_bytes(&[21; 32]);
+    let authority = SigningKey::from_bytes(&[22; 32]);
+    let encryption = Key::from_bytes([23; 32]);
+    let expected = header();
+    let capability = sign_capability(grant(), &authority).unwrap();
+    let envelope = seal_envelope(
+        SealRequest {
+            routing: routing(),
+            header: expected.clone(),
+            plaintext: b"hello",
+        },
+        &encryption,
+        &sender_key,
+    )
+    .unwrap();
+    let mut replay = InMemoryReplayProtector::default();
+    let opened = mvm_core::mailbox::open_verified_envelope(
+        &envelope,
+        &capability,
+        &context(),
+        &encryption,
+        &sender_key.verifying_key(),
+        &authority.verifying_key(),
+        &mut replay,
+    )
+    .unwrap();
+    assert_eq!(opened.header(), &expected);
+    assert_eq!(opened.payload(), b"hello");
+    assert_eq!(opened.into_payload(), b"hello");
+    assert!(matches!(
+        mvm_core::mailbox::open_verified_envelope(
+            &envelope,
+            &capability,
+            &context(),
+            &encryption,
+            &sender_key.verifying_key(),
+            &authority.verifying_key(),
+            &mut replay,
+        ),
+        Err(MailboxError::Replay)
+    ));
+    let legacy = open_envelope(
+        &envelope,
+        &capability,
+        &context(),
+        &encryption,
+        &sender_key.verifying_key(),
+        &authority.verifying_key(),
+        &mut InMemoryReplayProtector::default(),
+    )
+    .unwrap();
+    assert_eq!(legacy, b"hello");
+}

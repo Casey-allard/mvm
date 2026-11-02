@@ -28,6 +28,10 @@ pub struct HostChannels {
     /// Per-VM host GPU endpoint UDS (`mvm-gpu-endpoint`), present only on
     /// GPU launches.
     pub gpu_socket: Option<PathBuf>,
+    /// Dedicated canonical mailbox endpoint. Absent bindings refuse guest dials.
+    pub mailbox_socket: Option<PathBuf>,
+    /// Explicit bounded mailbox-only rate; defaults to the legacy 4 MiB/s.
+    pub mailbox_bandwidth_profile: mvm_contract::protocol::mailbox::MailboxBandwidthProfile,
     /// Additional host-dial listeners, including telemetry and admitted console
     /// data channels. Telemetry is present independently of console grants.
     pub console_data_sockets: Vec<(u32, PathBuf)>,

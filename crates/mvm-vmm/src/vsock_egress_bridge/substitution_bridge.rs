@@ -125,6 +125,25 @@ impl EgressBudget {
         Self::at(now, EgressLimits::workload())
     }
 
+    pub(crate) fn mailbox(
+        profile: mvm_contract::protocol::mailbox::MailboxBandwidthProfile,
+    ) -> Self {
+        Self::mailbox_at(Instant::now(), profile)
+    }
+
+    fn mailbox_at(
+        now: Instant,
+        profile: mvm_contract::protocol::mailbox::MailboxBandwidthProfile,
+    ) -> Self {
+        Self::at(
+            now,
+            EgressLimits {
+                bytes_per_second: Some(profile.bytes_per_second()),
+                ..EgressLimits::workload()
+            },
+        )
+    }
+
     /// A budget carrying no workload ceiling — see [`EgressLimits::trusted_builder`].
     pub(crate) fn trusted_builder() -> Self {
         Self::trusted_builder_at(Instant::now())
@@ -537,6 +556,32 @@ mod tests {
     use crate::test_support::bind_unix_listener;
     use std::io::Write;
     use std::time::Duration;
+
+    #[test]
+    fn mailbox_profiles_are_bounded_and_preserve_legacy_workload_limits() {
+        use mvm_contract::protocol::mailbox::MailboxBandwidthProfile;
+        let start = Instant::now();
+        let standard = EgressBudget::mailbox_at(start, MailboxBandwidthProfile::default());
+        let experiment =
+            EgressBudget::mailbox_at(start, MailboxBandwidthProfile::Experimental64MiB);
+        let ordinary = EgressBudget::new_at(start);
+        assert_eq!(standard.limits, ordinary.limits);
+        assert_eq!(standard.limits.bytes_per_second, Some(4 << 20));
+        assert_eq!(experiment.limits.bytes_per_second, Some(64 << 20));
+        assert_eq!(experiment.limits.max_streams, standard.limits.max_streams);
+        assert_eq!(experiment.limits.idle_timeout, standard.limits.idle_timeout);
+        for budget in [&standard, &experiment] {
+            assert!(budget.try_consume_at(8 << 20, start));
+            assert!(!budget.try_consume_at(1, start));
+            assert!(!budget.consume_waiting((8 << 20) + 1));
+        }
+        let refilled = start + Duration::from_millis(125);
+        assert!(!standard.try_consume_at(8 << 20, refilled));
+        assert!(experiment.try_consume_at(8 << 20, refilled));
+        assert!(!experiment.try_consume_at(1, refilled));
+        assert!(ordinary.try_consume_at(8 << 20, start));
+        assert!(!ordinary.try_consume_at(8 << 20, refilled));
+    }
 
     /// No endpoint configured → every stream is refused, nothing opened.
     #[test]

@@ -11,6 +11,9 @@
 
 use std::time::Duration;
 
+/// Dedicated mailbox transport, independent of networking and machine control.
+pub use mvm_contract::protocol::mailbox::MAILBOX_PORT;
+
 /// Cold boot allowance for the initial guest listener and authenticated session.
 /// This is not the native stop/control budget and never permits reconnecting.
 pub const COLD_GUEST_AGENT_READY_BUDGET: Duration = Duration::from_secs(30);

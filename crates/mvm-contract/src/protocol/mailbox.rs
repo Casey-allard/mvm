@@ -11,6 +11,45 @@ use serde::{Deserialize, Serialize};
 
 /// Current mailbox protocol version.
 pub const MAILBOX_PROTOCOL_VERSION: u16 = 1;
+/// Dedicated experimental mailbox service for the local native guest binding.
+pub const MAILBOX_PORT: u32 = 5257;
+/// Trusted host launch choice for the experimental mailbox stream only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MailboxBandwidthProfile {
+    /// Existing workload throughput policy.
+    #[default]
+    #[serde(rename = "standard")]
+    Standard,
+    /// Explicit bounded local experiment; never a guest-negotiated privilege.
+    #[serde(rename = "experimental64")]
+    Experimental64MiB,
+}
+
+impl MailboxBandwidthProfile {
+    /// Sustained bytes per second shared by both mailbox stream directions.
+    #[must_use]
+    pub const fn bytes_per_second(self) -> u64 {
+        match self {
+            Self::Standard => 4 * 1024 * 1024,
+            Self::Experimental64MiB => 64 * 1024 * 1024,
+        }
+    }
+
+    /// The burst is unchanged across profiles.
+    #[must_use]
+    pub const fn burst_bytes(self) -> u64 {
+        8 * 1024 * 1024
+    }
+
+    /// Stable CLI and receipt representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Experimental64MiB => "experimental64",
+        }
+    }
+}
 /// Current signature algorithm identifier (Ed25519).
 pub const ED25519_ALGORITHM: u16 = 1;
 /// Current payload-encryption algorithm identifier (AES-256-GCM).

@@ -696,6 +696,8 @@ fn boot_kernel_impl(params: KernelBootUntilParams<'_>) -> Result<KernelBootResul
                 broker_socket: channels.broker_socket,
                 display_socket: channels.display_socket,
                 gpu_socket: channels.gpu_socket,
+                mailbox_socket: channels.mailbox_socket,
+                mailbox_bandwidth_profile: channels.mailbox_bandwidth_profile,
                 console_data_sockets: channels.console_data_sockets,
                 builder_control_sockets: channels.builder_control_sockets,
                 console_log: channels.console_log,
@@ -766,6 +768,9 @@ struct RunInputs {
     /// Per-VM host GPU endpoint UDS. When set, `GPU_PORT` relays here — the
     /// `mvm-gpu-endpoint` process the workload runner spawned for this VM.
     gpu_socket: Option<PathBuf>,
+    /// Explicit canonical mailbox relay; never inferred from another service.
+    mailbox_socket: Option<PathBuf>,
+    mailbox_bandwidth_profile: mvm_contract::protocol::mailbox::MailboxBandwidthProfile,
     /// Additional host-dial listeners, including telemetry and console channels.
     console_data_sockets: Vec<(u32, PathBuf)>,
     builder_control_sockets: Vec<(u32, PathBuf)>,
@@ -1459,6 +1464,8 @@ unsafe fn run(
         broker_socket,
         display_socket,
         gpu_socket,
+        mailbox_socket,
+        mailbox_bandwidth_profile,
         console_data_sockets,
         builder_control_sockets,
         console_log,
@@ -1745,6 +1752,10 @@ unsafe fn run(
             if let Some(gpu) = gpu_socket.as_ref() {
                 v.set_gpu_endpoint(gpu);
             }
+            if let Some(mailbox) = mailbox_socket.as_ref() {
+                v.set_mailbox_endpoint_with_profile(mailbox, mailbox_bandwidth_profile)
+                    .map_err(|_| HvfError::SnapshotState("mailbox profile binding failed"))?;
+            }
             // Bind the explicitly supplied telemetry, console and builder
             // listeners through the shared host-dial bridge. Telemetry does not
             // enable a console or grant network access. The activity counter
@@ -1874,6 +1885,8 @@ unsafe fn run(
                     broker_endpoint: broker_socket.clone(),
                     display_endpoint: display_socket.clone(),
                     gpu_endpoint: gpu_socket.clone(),
+                    mailbox_endpoint: mailbox_socket.clone(),
+                    mailbox_bandwidth_profile,
                     console_sockets: console_data_sockets.clone(),
                 };
                 v.rebind_host_channels(&bindings, Arc::new(GicSpi))

@@ -19,6 +19,10 @@ pub struct VsockHostBindings {
     pub display_endpoint: Option<PathBuf>,
     /// Host GPU endpoint path (the per-VM `mvm-gpu-endpoint` socket).
     pub gpu_endpoint: Option<PathBuf>,
+    /// Dedicated canonical mailbox endpoint, absent unless explicitly admitted.
+    pub mailbox_endpoint: Option<PathBuf>,
+    /// Host-owned bounded mailbox rate; absent configuration remains standard.
+    pub mailbox_bandwidth_profile: mvm_contract::protocol::mailbox::MailboxBandwidthProfile,
     /// Additional host-dial listeners (telemetry and admitted console ports).
     pub console_sockets: Vec<(u32, PathBuf)>,
 }
@@ -44,6 +48,7 @@ impl VsockHostBindings {
             .chain(self.broker_endpoint.iter().map(PathBuf::as_path))
             .chain(self.display_endpoint.iter().map(PathBuf::as_path))
             .chain(self.gpu_endpoint.iter().map(PathBuf::as_path))
+            .chain(self.mailbox_endpoint.iter().map(PathBuf::as_path))
             .chain(self.console_sockets.iter().map(|(_, path)| path.as_path()))
             .collect()
     }
@@ -61,6 +66,8 @@ mod tests {
             broker_endpoint: Some("broker.sock".into()),
             display_endpoint: Some("display.sock".into()),
             gpu_endpoint: Some("gpu.sock".into()),
+            mailbox_endpoint: Some("mailbox.sock".into()),
+            mailbox_bandwidth_profile: Default::default(),
             console_sockets: vec![
                 (6000, "console.sock".into()),
                 (6001, "telemetry.sock".into()),
@@ -74,6 +81,7 @@ mod tests {
                 "broker.sock",
                 "display.sock",
                 "gpu.sock",
+                "mailbox.sock",
                 "console.sock",
                 "telemetry.sock",
             ]

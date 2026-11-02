@@ -35,6 +35,30 @@ pub struct SealRequest<'a> {
     pub plaintext: &'a [u8],
 }
 
+/// A message whose identity, signature, capability, time and replay checks passed.
+/// Its fields cannot be constructed from an unverified header beside a payload.
+pub struct OpenedMailboxEnvelope {
+    header: MailboxEnvelopeHeader,
+    payload: Vec<u8>,
+}
+
+impl OpenedMailboxEnvelope {
+    #[must_use]
+    pub fn header(&self) -> &MailboxEnvelopeHeader {
+        &self.header
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    #[must_use]
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
+}
+
 /// Current state and expected identities used to authorize one open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenContext {
@@ -465,6 +489,30 @@ pub fn open_envelope(
     authority_key: &VerifyingKey,
     replay: &mut impl ReplayProtector,
 ) -> Result<Vec<u8>, MailboxError> {
+    open_verified_envelope(
+        envelope,
+        capability,
+        context,
+        encryption_key,
+        sender_key,
+        authority_key,
+        replay,
+    )
+    .map(OpenedMailboxEnvelope::into_payload)
+}
+
+/// Verify the canonical message once and preserve its authenticated header for
+/// reply correlation and endpoint lifecycle checks. Replay is recorded before
+/// this result is returned; it does not itself claim durable mailbox admission.
+pub fn open_verified_envelope(
+    envelope: &MailboxEnvelope,
+    capability: &SignedMailboxCapability,
+    context: &OpenContext,
+    encryption_key: &Key,
+    sender_key: &VerifyingKey,
+    authority_key: &VerifyingKey,
+    replay: &mut impl ReplayProtector,
+) -> Result<OpenedMailboxEnvelope, MailboxError> {
     envelope.validate_bounds()?;
     validate_outer_versions(envelope)?;
     let actual_commitment: [u8; 32] = Sha256::digest(&envelope.ciphertext).into();
@@ -506,7 +554,10 @@ pub fn open_envelope(
     if !replay.check_and_record(ReplayIdentity::from_header(&message.header)) {
         return Err(MailboxError::Replay);
     }
-    Ok(message.payload)
+    Ok(OpenedMailboxEnvelope {
+        header: message.header,
+        payload: message.payload,
+    })
 }
 
 /// Sign a destination receipt in a domain distinct from envelopes and grants.

@@ -217,6 +217,15 @@ impl VsockHandlerRegistry {
             )),
         );
 
+        // Independent endpoint and budget; missing configuration refuses dials.
+        guest_ports.insert(
+            mvm_agentd::vsock::MAILBOX_PORT,
+            Box::new(StreamRelayHandler::with_budget(
+                mvm_agentd::vsock::MAILBOX_PORT,
+                EgressBudget::new(),
+            )),
+        );
+
         let host_initiated: Vec<Box<dyn HostInitiatedHandler>> = vec![
             Box::new(AgentVsockHandler::new()),
             Box::new(HostDialVsockHandler::new()),
@@ -298,6 +307,35 @@ impl VsockHandlerRegistry {
             .expect("gpu handler present")
             .bridge
             .set_endpoint(path);
+    }
+
+    pub(crate) fn set_mailbox_endpoint(&mut self, path: &Path) {
+        self.guest_handler_mut::<StreamRelayHandler>(mvm_agentd::vsock::MAILBOX_PORT)
+            .expect("mailbox handler present")
+            .bridge
+            .set_endpoint(path);
+    }
+
+    pub(crate) fn set_mailbox_endpoint_with_profile(
+        &mut self,
+        path: &Path,
+        profile: mvm_contract::protocol::mailbox::MailboxBandwidthProfile,
+    ) -> std::io::Result<()> {
+        let handler = self
+            .guest_handler_mut::<StreamRelayHandler>(mvm_agentd::vsock::MAILBOX_PORT)
+            .ok_or_else(|| std::io::Error::other("mailbox handler missing"))?;
+        if handler.bridge.is_active()
+            || !handler.headers.is_empty()
+            || !handler.tx_pending.is_empty()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "mailbox profile requires an idle unbound session",
+            ));
+        }
+        handler.bridge.set_budget(EgressBudget::mailbox(profile));
+        handler.bridge.set_endpoint(path);
+        Ok(())
     }
 
     pub(crate) fn set_display_endpoint(&mut self, path: &Path) {

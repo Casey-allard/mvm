@@ -107,6 +107,9 @@ fn canonical_child_bindings(
         broker_endpoint,
         display_endpoint,
         gpu_endpoint,
+        // Mailbox routes cannot be inherited by the existing handoff mask.
+        mailbox_endpoint: None,
+        mailbox_bandwidth_profile: Default::default(),
         console_sockets,
     })
 }
@@ -292,6 +295,19 @@ impl VsockShared {
 
     pub fn set_gpu_endpoint(&mut self, path: &std::path::Path) {
         self.handlers.set_gpu_endpoint(path);
+    }
+
+    pub fn set_mailbox_endpoint(&mut self, path: &std::path::Path) {
+        self.handlers.set_mailbox_endpoint(path);
+    }
+
+    pub fn set_mailbox_endpoint_with_profile(
+        &mut self,
+        path: &std::path::Path,
+        profile: mvm_contract::protocol::mailbox::MailboxBandwidthProfile,
+    ) -> std::io::Result<()> {
+        self.handlers
+            .set_mailbox_endpoint_with_profile(path, profile)
     }
 
     pub fn set_display_activity(&mut self, counter: Arc<std::sync::atomic::AtomicUsize>) {
@@ -557,6 +573,26 @@ impl VirtioVsock {
         self.notify_io();
     }
 
+    pub fn set_mailbox_endpoint(&mut self, path: &std::path::Path) {
+        self.lock().set_mailbox_endpoint(path);
+        self.host_runtime.bindings.mailbox_endpoint = Some(path.to_path_buf());
+        self.notify_io();
+    }
+
+    /// Configure a bounded mailbox profile before any stream is active.
+    pub fn set_mailbox_endpoint_with_profile(
+        &mut self,
+        path: &std::path::Path,
+        profile: mvm_contract::protocol::mailbox::MailboxBandwidthProfile,
+    ) -> std::io::Result<()> {
+        self.lock()
+            .set_mailbox_endpoint_with_profile(path, profile)?;
+        self.host_runtime.bindings.mailbox_endpoint = Some(path.to_path_buf());
+        self.host_runtime.bindings.mailbox_bandwidth_profile = profile;
+        self.notify_io();
+        Ok(())
+    }
+
     pub fn set_display_activity(&mut self, counter: Arc<std::sync::atomic::AtomicUsize>) {
         self.lock().set_display_activity(Arc::clone(&counter));
         self.host_runtime.display_activity = Some(counter);
@@ -655,6 +691,9 @@ impl VirtioVsock {
             }
             if let Some(path) = &bindings.gpu_endpoint {
                 self.set_gpu_endpoint(path);
+            }
+            if let Some(path) = &bindings.mailbox_endpoint {
+                self.set_mailbox_endpoint_with_profile(path, bindings.mailbox_bandwidth_profile)?;
             }
             if !bindings.console_sockets.is_empty() {
                 self.set_host_dial_sockets(
@@ -2578,6 +2617,93 @@ mod tests {
         d.handle_packet(rw, b"audit v1");
         assert!(d.lifecycle.received.is_empty());
         assert!(d.transport.pending_rx.iter().any(|(h, _)| h.op == OP_RST));
+    }
+
+    #[test]
+    fn mailbox_port_relays_bytes_both_ways_on_its_own_endpoint() {
+        use std::io::{Read, Write};
+        let dir = tempfile::Builder::new()
+            .prefix("vsk")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join("mailbox.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = [0; 13];
+            stream.read_exact(&mut bytes).unwrap();
+            stream.write_all(b"reply\0bytes").unwrap();
+            ready_tx.send(()).unwrap();
+            bytes
+        });
+        let mut device = dev();
+        device.set_mailbox_endpoint(&path);
+        let payload = b"mailbox\0bytes";
+        let packet = VsockHdr {
+            src_cid: GUEST_CID,
+            dst_cid: HOST_CID,
+            src_port: 1700,
+            dst_port: mvm_agentd::vsock::MAILBOX_PORT,
+            len: u32::try_from(payload.len()).unwrap(),
+            op: OP_RW,
+            typ: TYPE_STREAM,
+            buf_alloc: HOST_BUF_ALLOC,
+            ..Default::default()
+        };
+        device.handle_packet(packet, payload);
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        device.service_host_io();
+        assert_eq!(&server.join().unwrap(), payload);
+        assert!(device.lifecycle.received.is_empty());
+        assert!(
+            device
+                .transport
+                .pending_rx
+                .iter()
+                .any(|(header, bytes)| header.op == OP_RW
+                    && header.src_port == mvm_agentd::vsock::MAILBOX_PORT
+                    && header.dst_port == 1700
+                    && bytes == b"reply\0bytes")
+        );
+    }
+
+    #[test]
+    fn mailbox_port_refuses_missing_and_cleared_host_bindings() {
+        for cleared in [false, true] {
+            let mut device = dev();
+            if cleared {
+                device.set_mailbox_endpoint(Path::new("/tmp/mvm-mailbox-no-endpoint.sock"));
+                device.handlers.clear_host_bindings();
+            }
+            let packet = VsockHdr {
+                src_cid: GUEST_CID,
+                dst_cid: HOST_CID,
+                src_port: 1701,
+                dst_port: mvm_agentd::vsock::MAILBOX_PORT,
+                len: 8,
+                op: OP_RW,
+                typ: TYPE_STREAM,
+                ..Default::default()
+            };
+            device.handle_packet(packet, b"mailbox1");
+            assert!(device.lifecycle.received.is_empty());
+            assert!(
+                device
+                    .transport
+                    .pending_rx
+                    .iter()
+                    .any(|(header, _)| header.op == OP_RST)
+            );
+        }
     }
 
     #[test]
