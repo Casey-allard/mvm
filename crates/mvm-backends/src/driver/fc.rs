@@ -46,8 +46,14 @@ use mvm_vmm::host::boot_config::{
 };
 
 mod config;
+#[cfg(target_os = "linux")]
+mod host_lease;
+#[cfg(all(test, target_os = "linux"))]
+mod host_lease_api_tests;
 mod kernel;
 mod stop;
+#[cfg(target_os = "linux")]
+pub use host_lease::{HostLeaseExpectation, PreparedHostLifetimeLease};
 pub use config::FcApiPut;
 use config::fc_drive_puts;
 #[cfg(all(test, unix))]
