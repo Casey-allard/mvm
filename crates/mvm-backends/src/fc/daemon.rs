@@ -303,17 +303,12 @@ fn start_vm_firecracker_inner_custodied(
     // A process started here serves the socket its own command line names, so
     // any record that this dir's VMM came from the idle pool is now stale.
     super::idle_pool::forget_claim_origin(std::path::Path::new(abs_dir));
-    let mut script = firecracker_launch_script(abs_dir, abs_socket, scope);
-    #[cfg(target_os = "linux")]
-    if let Some(lease) = lease {
-        script = reopen_host_lease_script(&script, lease)?;
-    }
-    // Insert the disk prefix last, so those FDs are occupied before bash
-    // dynamically chooses the lifetime holder FD in the privileged script.
-    if let Some(handoff) = handoff {
-        script =
-            reopen_handoff_script(&script, std::process::id(), handoff.first(), handoff.last())?;
-    }
+    let script = resource_handoff_script(
+        firecracker_launch_script(abs_dir, abs_socket, scope),
+        handoff.map(|handoff| (handoff.first(), handoff.last())),
+        #[cfg(target_os = "linux")]
+        lease,
+    )?;
     run_in_vm_visible(&script).context("Firecracker descriptor handoff failed")?;
     await_started_firecracker(abs_dir, abs_socket, scope)?;
     // Every launch, not only a cold boot: the snapshot-restore path starts its
@@ -324,6 +319,24 @@ fn start_vm_firecracker_inner_custodied(
         .context("adopting the Firecracker API socket for the invoking user")?;
     ui::info("Firecracker started.");
     Ok(())
+}
+
+/// Compose the fixed launch recipe once for both production and process tests.
+/// The caller retains the typed disk and lifetime resources through launch.
+fn resource_handoff_script(
+    mut script: String,
+    disk_range: Option<(u32, u32)>,
+    #[cfg(target_os = "linux")] lease: Option<&crate::driver::fc::PreparedHostLifetimeLease>,
+) -> Result<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(lease) = lease {
+        script = reopen_host_lease_script(&script, lease)?;
+    }
+    // Insert last so disk FDs are occupied before dynamic lease allocation.
+    if let Some((first, last)) = disk_range {
+        script = reopen_handoff_script(&script, std::process::id(), first, last)?;
+    }
+    Ok(script)
 }
 
 /// Rewrite the launch script so the privileged launcher re-opens the writer's

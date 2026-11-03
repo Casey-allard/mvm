@@ -39,7 +39,7 @@ pub fn privileged_writer_descriptor_objects(
     parse_fd_inventory(&output.stdout)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn privileged_fd_inventory_command(pid: u32) -> std::process::Command {
     // SAFETY: geteuid reads the current identity without changing credentials.
     privileged_fd_inventory_command_as(pid, unsafe { libc::geteuid() })
