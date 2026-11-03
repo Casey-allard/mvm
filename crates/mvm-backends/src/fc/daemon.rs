@@ -9,6 +9,10 @@ use mvm_vmm::host::ui;
 
 use super::{firecracker_vsock_uds_path, resolve_running_vm_dir};
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "host_lease_launch_tests.rs"]
+mod host_lease_launch_tests;
+
 #[cfg(any(target_os = "linux", test))]
 #[derive(serde::Deserialize)]
 struct WriterConfig {
@@ -137,11 +141,61 @@ pub fn start_vm_firecracker_bounded(
     guard: &mut super::FirecrackerGuard,
     handoff: Option<&mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
 ) -> Result<()> {
+    start_vm_firecracker_bounded_custodied(
+        abs_dir,
+        abs_socket,
+        machine_id,
+        bounds,
+        guard,
+        handoff,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn start_vm_firecracker_bounded_with_host_lease(
+    abs_dir: &str,
+    abs_socket: &str,
+    machine_id: &str,
+    bounds: &mvm_core::spawn_scope::SpawnBounds,
+    guard: &mut super::FirecrackerGuard,
+    handoff: Option<&mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
+    lease: &crate::driver::fc::PreparedHostLifetimeLease,
+) -> Result<()> {
+    start_vm_firecracker_bounded_custodied(
+        abs_dir,
+        abs_socket,
+        machine_id,
+        bounds,
+        guard,
+        handoff,
+        Some(lease),
+    )
+}
+
+fn start_vm_firecracker_bounded_custodied(
+    abs_dir: &str,
+    abs_socket: &str,
+    machine_id: &str,
+    bounds: &mvm_core::spawn_scope::SpawnBounds,
+    guard: &mut super::FirecrackerGuard,
+    handoff: Option<&mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
+    #[cfg(target_os = "linux")] lease: Option<&crate::driver::fc::PreparedHostLifetimeLease>,
+) -> Result<()> {
     validate_required_scope(machine_id, bounds)?;
     ensure_api_socket_fits(abs_socket)?;
     secure_socket_dir(abs_dir)?;
     let prefix = spawn_scope_prefix(machine_id, std::path::Path::new(abs_dir), bounds)?;
-    start_vm_firecracker_inner(abs_dir, abs_socket, &prefix, Some(guard), handoff)
+    start_vm_firecracker_inner_custodied(
+        abs_dir,
+        abs_socket,
+        &prefix,
+        Some(guard),
+        handoff,
+        #[cfg(target_os = "linux")]
+        lease,
+    )
 }
 
 /// Start Firecracker for a snapshot load, inside a scope prefix the caller has
@@ -221,6 +275,25 @@ fn start_vm_firecracker_inner(
     guard: Option<&mut super::FirecrackerGuard>,
     handoff: Option<&mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
 ) -> Result<()> {
+    start_vm_firecracker_inner_custodied(
+        abs_dir,
+        abs_socket,
+        scope,
+        guard,
+        handoff,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+
+fn start_vm_firecracker_inner_custodied(
+    abs_dir: &str,
+    abs_socket: &str,
+    scope: &str,
+    guard: Option<&mut super::FirecrackerGuard>,
+    handoff: Option<&mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
+    #[cfg(target_os = "linux")] lease: Option<&crate::driver::fc::PreparedHostLifetimeLease>,
+) -> Result<()> {
     ui::info("Starting Firecracker...");
     if let Some(guard) = guard {
         guard
@@ -230,14 +303,18 @@ fn start_vm_firecracker_inner(
     // A process started here serves the socket its own command line names, so
     // any record that this dir's VMM came from the idle pool is now stale.
     super::idle_pool::forget_claim_origin(std::path::Path::new(abs_dir));
-    if let Some(handoff) = handoff {
-        run_with_writable_handoff(
-            firecracker_launch_script(abs_dir, abs_socket, scope),
-            handoff,
-        )?;
-    } else {
-        run_in_vm_visible(&firecracker_launch_script(abs_dir, abs_socket, scope))?;
+    let mut script = firecracker_launch_script(abs_dir, abs_socket, scope);
+    #[cfg(target_os = "linux")]
+    if let Some(lease) = lease {
+        script = reopen_host_lease_script(&script, lease)?;
     }
+    // Insert the disk prefix last, so those FDs are occupied before bash
+    // dynamically chooses the lifetime holder FD in the privileged script.
+    if let Some(handoff) = handoff {
+        script =
+            reopen_handoff_script(&script, std::process::id(), handoff.first(), handoff.last())?;
+    }
+    run_in_vm_visible(&script).context("Firecracker descriptor handoff failed")?;
     await_started_firecracker(abs_dir, abs_socket, scope)?;
     // Every launch, not only a cold boot: the snapshot-restore path starts its
     // own fresh VMM through this same function and then speaks to the socket
@@ -281,18 +358,28 @@ fn reopen_handoff_script(script: &str, pid: u32, first: u32, last: u32) -> Resul
         .replacen(runner, "setsid nohup bash ", 1))
 }
 
-/// Start Firecracker holding the writer's original objects.
-fn run_with_writable_handoff(
-    script: String,
-    handoff: &mvm_vmm::driver::prepared_disks::SudoWritableHandoff,
-) -> Result<()> {
-    run_in_vm_visible(&reopen_handoff_script(
-        &script,
-        std::process::id(),
-        handoff.first(),
-        handoff.last(),
-    )?)
-    .context("Firecracker descriptor handoff failed")
+/// Gate both outer-script mutations and privileged exec with the same fixed
+/// lease preflight. Compose the disk prefix afterward so it executes first.
+#[cfg(target_os = "linux")]
+fn reopen_host_lease_script(
+    script: &str,
+    lease: &crate::driver::fc::PreparedHostLifetimeLease,
+) -> Result<String> {
+    let heredoc = "<<'MVM_LAUNCH_SCRIPT_EOF'\n";
+    let runner = "setsid nohup sh ";
+    anyhow::ensure!(
+        script.matches(heredoc).count() == 1,
+        "host lease launch shape changed"
+    );
+    anyhow::ensure!(
+        script.matches(runner).count() + script.matches("setsid nohup bash ").count() == 1,
+        "host lease requires one fixed bash launcher"
+    );
+    let preflight = lease.preflight();
+    let script = script
+        .replacen(heredoc, &format!("{heredoc}{preflight}"), 1)
+        .replacen(runner, "setsid nohup bash ", 1);
+    Ok(format!("{preflight}{script}"))
 }
 
 /// Start an idle Firecracker for the pool: the same launch line as a VM's,

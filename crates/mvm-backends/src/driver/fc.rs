@@ -52,10 +52,10 @@ mod host_lease;
 mod host_lease_api_tests;
 mod kernel;
 mod stop;
-#[cfg(target_os = "linux")]
-pub use host_lease::{HostLeaseExpectation, PreparedHostLifetimeLease};
 pub use config::FcApiPut;
 use config::fc_drive_puts;
+#[cfg(target_os = "linux")]
+pub use host_lease::{HostLeaseExpectation, PreparedHostLifetimeLease};
 #[cfg(all(test, unix))]
 use kernel::fc_descriptor_recipe;
 use kernel::resolve_fc_kernel_path;
@@ -610,6 +610,7 @@ fn validate_pid_marker_for_start(
     Ok(())
 }
 
+#[cfg(test)]
 fn start_or_claim_firecracker(
     spec: &VmmSpec,
     state_dir: &Path,
@@ -617,7 +618,28 @@ fn start_or_claim_firecracker(
     idle_shape: Option<crate::fc::idle_pool::IdleShape>,
     handoff: Option<&mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
 ) -> Result<(FirecrackerGuard, bool)> {
+    start_or_claim_firecracker_custodied(
+        spec,
+        state_dir,
+        socket,
+        idle_shape,
+        handoff,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+
+fn start_or_claim_firecracker_custodied(
+    spec: &VmmSpec,
+    state_dir: &Path,
+    socket: &str,
+    idle_shape: Option<crate::fc::idle_pool::IdleShape>,
+    handoff: Option<&mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
+    #[cfg(target_os = "linux")] host_lease: Option<&PreparedHostLifetimeLease>,
+) -> Result<(FirecrackerGuard, bool)> {
     let mut guard = FirecrackerGuard::pending();
+    #[cfg(target_os = "linux")]
+    let idle_shape = idle_shape.filter(|_| host_lease.is_none());
     let claimed = match idle_shape {
         Some(shape) => {
             crate::fc::idle_pool::claim(shape, state_dir, Path::new(socket), &mut guard)?
@@ -625,6 +647,20 @@ fn start_or_claim_firecracker(
         None => false,
     };
     if !claimed {
+        #[cfg(target_os = "linux")]
+        if let Some(lease) = host_lease {
+            crate::fc::start_vm_firecracker_bounded_with_host_lease(
+                &state_dir.to_string_lossy(),
+                socket,
+                &spec.name,
+                &mvm_core::spawn_scope::SpawnBounds::for_guest_memory(spec.memory_mib)
+                    .with_cpu_grant(spec.cpu_grant),
+                &mut guard,
+                handoff,
+                lease,
+            )?;
+            return Ok((guard, false));
+        }
         start_vm_firecracker_bounded(
             &state_dir.to_string_lossy(),
             socket,
@@ -758,6 +794,30 @@ fn firecracker_status_with(
 }
 
 impl FcDriver {
+    /// Boot with explicit local host-lifetime custody, including diskless roles.
+    /// This does not replace the caller's admission or prepared disk authority.
+    #[cfg(target_os = "linux")]
+    pub fn boot_custodied_with_host_lease(
+        &self,
+        spec: &VmmSpec,
+        kernel: Option<&mvm_vmm::host::restore_image::VerifiedRestoreFile>,
+        disks: mvm_vmm::driver::prepared_disks::PreparedWritableDisks,
+        lease: PreparedHostLifetimeLease,
+    ) -> Result<Box<dyn RunningVm>> {
+        disks.validate_spec(spec)?;
+        let (recipe, handoff) = if disks.is_empty() {
+            (spec.clone(), None)
+        } else {
+            let handoff = disks.into_sudo_handoff(spec)?;
+            (handoff.projected().clone(), Some(handoff))
+        };
+        let recipe = match kernel {
+            Some(kernel) => kernel::fc_descriptor_recipe(&recipe, kernel)?,
+            None => recipe,
+        };
+        self.boot_with_custody(&recipe, handoff, Some(lease))
+    }
+
     #[tracing::instrument(
         name = "fc.boot",
         skip_all,
@@ -767,6 +827,20 @@ impl FcDriver {
         &self,
         spec: &VmmSpec,
         handoff: Option<mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
+    ) -> Result<Box<dyn RunningVm>> {
+        self.boot_with_custody(
+            spec,
+            handoff,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    fn boot_with_custody(
+        &self,
+        spec: &VmmSpec,
+        handoff: Option<mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
+        #[cfg(target_os = "linux")] host_lease: Option<PreparedHostLifetimeLease>,
     ) -> Result<Box<dyn RunningVm>> {
         if !spec.shares.is_empty() {
             bail!(
@@ -831,8 +905,25 @@ impl FcDriver {
         // that process instead of starting one; anything else starts its own.
         let idle_shape = crate::fc::idle_pool::IdleShape::for_launch(spec)
             .filter(|_| handoff.is_none() && crate::fc::idle_pool::enabled());
-        let (mut firecracker_guard, claimed) =
-            start_or_claim_firecracker(spec, &state_dir, &socket, idle_shape, handoff.as_ref())?;
+        let (mut firecracker_guard, claimed) = start_or_claim_firecracker_custodied(
+            spec,
+            &state_dir,
+            &socket,
+            idle_shape,
+            handoff.as_ref(),
+            #[cfg(target_os = "linux")]
+            host_lease.as_ref(),
+        )?;
+        #[cfg(target_os = "linux")]
+        if let Some(lease) = &host_lease {
+            let pid = read_firecracker_pid(&abs_dir)?;
+            let objects =
+                mvm_vmm::driver::prepared_disks::privileged_writer_descriptor_objects(pid)?;
+            anyhow::ensure!(
+                objects.contains_key(&lease.holder_object_id()),
+                "actual Firecracker did not retain the prepared host lifetime holder"
+            );
+        }
         let spawned_at = Instant::now();
         tracing::debug!(
             vm = %spec.name,

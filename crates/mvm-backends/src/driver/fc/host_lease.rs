@@ -48,6 +48,10 @@ fn close_on_exec(file: &File) -> Result<()> {
 }
 
 impl PreparedHostLifetimeLease {
+    pub(crate) fn holder_object_id(&self) -> (u64, u64) {
+        self.holder_id
+    }
+
     pub fn bind(directory: File, holder: File, expected: HostLeaseExpectation) -> Result<Self> {
         ensure!(
             valid_name(&expected.state_name)

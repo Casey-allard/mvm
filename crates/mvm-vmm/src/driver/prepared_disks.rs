@@ -23,7 +23,9 @@ struct PreparedDisk {
 pub type WritableVolumeImages = Vec<(PathBuf, LockedWritableImage)>;
 
 #[cfg(target_os = "linux")]
-fn privileged_writer_descriptor_objects(
+/// Inventory actual process descriptor objects for local custody corroboration.
+/// An object match does not establish flock ownership, exit or kill authority.
+pub fn privileged_writer_descriptor_objects(
     pid: u32,
 ) -> Result<std::collections::BTreeMap<(u64, u64), usize>> {
     let output = privileged_fd_inventory_command(pid)
@@ -727,7 +729,7 @@ mod tests {
 
     #[test]
     fn non_root_writer_inventory_uses_bounded_privileged_object_inspection() {
-        let command = privileged_fd_inventory_command(4242);
+        let command = privileged_fd_inventory_command_as(4242, 1000);
         let args: Vec<_> = command
             .get_args()
             .map(|arg| arg.to_string_lossy())
@@ -757,6 +759,15 @@ mod tests {
         assert_eq!(actual.get(&(7, 11)), Some(&2));
         assert_eq!(actual.get(&(7, 12)), Some(&1));
         assert!(parse_fd_inventory(b"not-an-object").is_err());
+    }
+
+    #[test]
+    fn root_writer_inventory_does_not_require_a_sudo_program() {
+        let command = privileged_fd_inventory_command_as(4242, 0);
+        assert_eq!(command.get_program(), "/usr/bin/find");
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(args[0], "/proc/4242/fd");
+        assert!(!args.iter().any(|arg| arg.contains("sudo")));
     }
 
     #[test]
