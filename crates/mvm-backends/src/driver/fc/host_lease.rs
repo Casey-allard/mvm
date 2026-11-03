@@ -107,25 +107,25 @@ impl PreparedHostLifetimeLease {
             r#"
 set -euo pipefail
 export LC_ALL=C
-exec {{mvm_host_directory}}< /proc/{pid}/fd/{directory}
-exec {{mvm_host_holder}}<> /proc/{pid}/fd/{holder}
-[[ "$mvm_host_directory" -le 65535 && "$mvm_host_holder" -le 65535 ]]
+exec {{mvm_host_directory}}< /proc/{pid}/fd/{directory} || exit 1
+exec {{mvm_host_holder}}<> /proc/{pid}/fd/{holder} || exit 1
+[[ "$mvm_host_directory" -le 65535 && "$mvm_host_holder" -le 65535 ]] || exit 1
 /usr/bin/timeout --signal=KILL 1 /bin/bash -euo pipefail -c '
 d=$1
 h=$2
-[[ -d "/proc/self/fd/$d" && -f "/proc/self/fd/$h" ]]
-[[ "$(/usr/bin/stat -Lc "%d:%i:%u:%a" -- "/proc/self/fd/$d")" == "{dd}:{di}:{uid}:700" ]]
-[[ "$(/usr/bin/stat -Lc "%d:%i:%u:%a:%h" -- "/proc/self/fd/$h")" == "{hd}:{hi}:{uid}:600:1" ]]
-/usr/bin/flock --shared --nonblock "$h"
+[[ -d "/proc/self/fd/$d" && -f "/proc/self/fd/$h" ]] || exit 1
+[[ "$(/usr/bin/stat -Lc "%d:%i:%u:%a" -- "/proc/self/fd/$d")" == "{dd}:{di}:{uid}:700" ]] || exit 1
+[[ "$(/usr/bin/stat -Lc "%d:%i:%u:%a:%h" -- "/proc/self/fd/$h")" == "{hd}:{hi}:{uid}:600:1" ]] || exit 1
+/usr/bin/flock --shared --nonblock "$h" || exit 1
 s="/proc/self/fd/$d/{state}"
-[[ ! -L "$s" && -f "$s" ]]
-[[ "$(/usr/bin/stat -c "%u:%a:%h:%s" -- "$s")" == "{uid}:600:1:{length}" ]]
-[[ ! -e "/proc/self/fd/$d/{absent0}" && ! -L "/proc/self/fd/$d/{absent0}" ]]
-[[ ! -e "/proc/self/fd/$d/{absent1}" && ! -L "/proc/self/fd/$d/{absent1}" ]]
-sum=$(/usr/bin/head -c {read_limit} -- "$s" | /usr/bin/sha256sum)
-[[ "${{sum%% *}}" == "{hash}" ]]
-' mvm-host-lifetime "$mvm_host_directory" "$mvm_host_holder"
-exec {{mvm_host_directory}}<&-
+[[ ! -L "$s" && -f "$s" ]] || exit 1
+[[ "$(/usr/bin/stat -c "%u:%a:%h:%s" -- "$s")" == "{uid}:600:1:{length}" ]] || exit 1
+markers=$(/usr/bin/find -H "/proc/self/fd/$d" -mindepth 1 -maxdepth 1 \( -name "{absent0}" -o -name "{absent1}" \) -print -quit) || exit 1
+[[ -z "$markers" ]] || exit 1
+sum=$(/usr/bin/head -c {read_limit} -- "$s" | /usr/bin/sha256sum) || exit 1
+[[ "${{sum%% *}}" == "{hash}" ]] || exit 1
+' mvm-host-lifetime "$mvm_host_directory" "$mvm_host_holder" || exit 1
+exec {{mvm_host_directory}}<&- || exit 1
 "#,
             pid = std::process::id(),
             directory = self.directory.as_raw_fd(),
