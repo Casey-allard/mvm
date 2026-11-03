@@ -339,7 +339,8 @@ fn reopen_handoff_script(script: &str, pid: u32, first: u32, last: u32) -> Resul
     let heredoc = "<<'MVM_LAUNCH_SCRIPT_EOF'\n";
     let runner = "setsid nohup sh ";
     anyhow::ensure!(
-        script.contains(heredoc) && script.contains(runner),
+        script.matches(heredoc).count() == 1
+            && script.matches(runner).count() + script.matches("setsid nohup bash ").count() == 1,
         "handoff launch shape changed"
     );
     let reopen: String = (first..=last)

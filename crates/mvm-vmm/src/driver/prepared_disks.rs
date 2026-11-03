@@ -41,10 +41,20 @@ pub fn privileged_writer_descriptor_objects(
 
 #[cfg(any(target_os = "linux", test))]
 fn privileged_fd_inventory_command(pid: u32) -> std::process::Command {
-    let mut command = mvm_core::env_hygiene::helper_command("sudo");
+    // SAFETY: geteuid reads the current identity without changing credentials.
+    privileged_fd_inventory_command_as(pid, unsafe { libc::geteuid() })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn privileged_fd_inventory_command_as(pid: u32, euid: u32) -> std::process::Command {
+    let mut command = if euid == 0 {
+        mvm_core::env_hygiene::helper_command("/usr/bin/find")
+    } else {
+        let mut command = mvm_core::env_hygiene::helper_command("sudo");
+        command.args(["--", "/usr/bin/find"]);
+        command
+    };
     command.args([
-        "--",
-        "/usr/bin/find",
         &format!("/proc/{pid}/fd"),
         "-mindepth",
         "1",
@@ -765,7 +775,10 @@ mod tests {
     fn root_writer_inventory_does_not_require_a_sudo_program() {
         let command = privileged_fd_inventory_command_as(4242, 0);
         assert_eq!(command.get_program(), "/usr/bin/find");
-        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy()).collect();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
         assert_eq!(args[0], "/proc/4242/fd");
         assert!(!args.iter().any(|arg| arg.contains("sudo")));
     }

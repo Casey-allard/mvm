@@ -91,8 +91,7 @@ fn leased_launch_accepts_the_existing_writable_disk_reopen_composition() {
     let vm = fixture.root.join("vm");
     let socket = vm.join("fc.socket");
     let base = firecracker_launch_script_as(vm.to_str().unwrap(), socket.to_str().unwrap(), "", 0);
-    let leased = reopen_host_lease_script(&base, &lease).expect("typed lease composition");
-    reopen_handoff_script(&leased, std::process::id(), 1000, 1001)
+    resource_handoff_script(base, Some((1000, 1001)), Some(&lease))
         .expect("the leased bash launcher must still accept writable disk custody");
 }
 
@@ -215,8 +214,7 @@ fn privileged_disk_and_lease_fds_coexist_through_actual_foreground_exec() {
     let pid_path = vm.join("fc.pid");
     let socket = vm.join("fc.socket");
     let base = firecracker_launch_script_as(vm.to_str().unwrap(), socket.to_str().unwrap(), "", 0);
-    let leased = reopen_host_lease_script(&base, &lease).unwrap();
-    let composed = reopen_handoff_script(&leased, std::process::id(), 1000, 1001).unwrap();
+    let composed = resource_handoff_script(base, Some((1000, 1001)), Some(&lease)).unwrap();
     let inner = composed
         .split_once("<<'MVM_LAUNCH_SCRIPT_EOF'\n")
         .unwrap()
@@ -286,7 +284,7 @@ fn stale_outer_lease_refuses_before_mkdir_rm_or_target_exec() {
     fs::write(&socket, b"must-not-remove").unwrap();
     let target = fixture.root.join("must-not-execute");
     let base = firecracker_launch_script_as(vm.to_str().unwrap(), socket.to_str().unwrap(), "", 0);
-    let leased = reopen_host_lease_script(&base, &lease).unwrap();
+    let leased = resource_handoff_script(base, None, Some(&lease)).unwrap();
     // Keep real outer mutations. Replace only eventual exec and detachment so
     // even a broken gate cannot launch a VM or leave a background process.
     let script = leased

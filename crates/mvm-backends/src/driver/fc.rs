@@ -905,6 +905,10 @@ impl FcDriver {
         // that process instead of starting one; anything else starts its own.
         let idle_shape = crate::fc::idle_pool::IdleShape::for_launch(spec)
             .filter(|_| handoff.is_none() && crate::fc::idle_pool::enabled());
+        // The same shape also controls post-readiness refill below. A leased
+        // boot must neither claim nor create an unleased pool process.
+        #[cfg(target_os = "linux")]
+        let idle_shape = idle_shape.filter(|_| host_lease.is_none());
         let (mut firecracker_guard, claimed) = start_or_claim_firecracker_custodied(
             spec,
             &state_dir,
