@@ -164,6 +164,7 @@ pub mod plan;
 pub mod platform;
 pub mod policy;
 pub mod private_fs;
+pub mod runtime_state_protection;
 pub mod protocol;
 #[cfg(feature = "provenance")]
 pub mod provenance;

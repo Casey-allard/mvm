@@ -13,9 +13,9 @@ use std::path::Path;
 
 /// Where the embedded collector keeps its coverage-status snapshot, in the
 /// VM state dir.
-pub const TELEMETRY_COLLECTOR_STATUS_FILE: &str = "telemetry-collector-status.json";
+pub use mvm_core::runtime_state_protection::TELEMETRY_COLLECTOR_STATUS_FILE;
 /// Where the embedded collector appends received records, size-capped.
-pub const TELEMETRY_RECORDS_FILE: &str = "telemetry-records.jsonl";
+pub use mvm_core::runtime_state_protection::TELEMETRY_RECORDS_FILE;
 /// Default byte cap for the records file. Deliberately modest: retention is
 /// its own workstream, and this file exists so collection is observable, not
 /// as a durable store.
@@ -23,7 +23,7 @@ pub const DEFAULT_RECORDS_BYTE_CAP: u64 = 8 * 1024 * 1024;
 /// The records file's data key, wrapped under the host transcript
 /// key-encryption key. Every line of [`TELEMETRY_RECORDS_FILE`] is sealed
 /// under the key this file wraps.
-pub const TELEMETRY_RECORDS_KEY_FILE: &str = "telemetry-records.key";
+pub use mvm_core::runtime_state_protection::TELEMETRY_RECORDS_KEY_FILE;
 /// Marker written only after this boot's telemetry-capable endpoint spawned.
 const TELEMETRY_PROVISIONED_FILE: &str = "telemetry-provisioned";
 

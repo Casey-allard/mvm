@@ -83,6 +83,50 @@ impl EndpointPartitionLimits {
 /// check its original epoch/slot. Implementing this from a quota DTO is invalid.
 pub trait EndpointPartitionGuard: Send + Sync {
     fn check_current(&self, projection: &EndpointPartitionProjection) -> Result<()>;
+
+    /// Bind retained telemetry to this original owner before writer effects.
+    ///
+    /// Implementations must compare the borrowed directory to the original
+    /// registered state pin and retain actual parent storage credit. A path,
+    /// projection or successful callback alone is not deletion authority.
+    ///
+    /// # Errors
+    /// The default refuses unsupported providers without performing effects.
+    fn prepare_retained_telemetry(
+        &self,
+        _projection: &EndpointPartitionProjection,
+        _state_path: &std::path::Path,
+        _state_directory: &File,
+    ) -> Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "original retained telemetry owner unavailable",
+        )
+        .into())
+    }
+
+    /// Retain the actual records/key files under this original preparation.
+    ///
+    /// The provider must verify its existing state pin and creation intent,
+    /// fixed names and file identities, and retain the actual files/credit
+    /// before accepting binding. This callback grants no creation or deletion.
+    ///
+    /// # Errors
+    /// The default refuses unsupported providers without performing effects.
+    fn bind_retained_telemetry_files(
+        &self,
+        _projection: &EndpointPartitionProjection,
+        _state_path: &std::path::Path,
+        _state_directory: &File,
+        _records_file: &File,
+        _wrapped_key_file: &File,
+    ) -> Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "original retained telemetry file owner unavailable",
+        )
+        .into())
+    }
 }
 
 /// Linear partition owner, not serializable or cloneable. Moving it never
@@ -168,6 +212,59 @@ impl PreparedEndpointHandoff {
     pub fn holder(&self) -> &PreparedHostLifetimeLease {
         &self.holder
     }
+
+    /// Ask only the same original guard to bind retained telemetry storage.
+    ///
+    /// Fresh holder, current-parent and partition checks surround a successful
+    /// callback. No descriptor is duplicated and no replacement guard, cap or
+    /// serialized authority is accepted. The provider retains any effects on
+    /// error; callers must not interpret refusal as a no-effects certificate.
+    ///
+    /// # Errors
+    /// Refuses stale original custody, an unsupported provider, or any failure
+    /// from the original storage owner, including a post-callback revocation.
+    pub fn prepare_retained_telemetry(
+        &self,
+        state_path: &std::path::Path,
+        state_directory: &File,
+    ) -> Result<()> {
+        self.check_current()?;
+        self.partition.guard.prepare_retained_telemetry(
+            self.partition.projection(),
+            state_path,
+            state_directory,
+        )?;
+        self.check_current()
+    }
+
+    /// Bind original files through only this handoff's retained owner.
+    ///
+    /// The writer must subsequently consume the same verified records File,
+    /// rather than reopening its path. Fresh original-custody checks surround
+    /// a successful callback; a late refusal does not undo the provider's file
+    /// retention or certify that no effects occurred.
+    ///
+    /// # Errors
+    /// Refuses stale custody, missing original preparation, unsupported file
+    /// binding or any provider failure. No metadata is a replacement authority.
+    pub fn bind_retained_telemetry_files(
+        &self,
+        state_path: &std::path::Path,
+        state_directory: &File,
+        records_file: &File,
+        wrapped_key_file: &File,
+    ) -> Result<()> {
+        self.check_current()?;
+        self.partition.guard.bind_retained_telemetry_files(
+            self.partition.projection(),
+            state_path,
+            state_directory,
+            records_file,
+            wrapped_key_file,
+        )?;
+        self.check_current()
+    }
+
     pub fn check_current(&self) -> Result<()> {
         self.anchor.verify_current()?;
         let parent = self
@@ -190,3 +287,7 @@ impl fmt::Debug for PreparedEndpointHandoff {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+#[path = "endpoint_retained_tests.rs"]
+mod retained_telemetry_tests;
