@@ -55,6 +55,8 @@ pub mod host_agent_idle;
 /// no per-VM supervisor.
 pub mod host_agent_sessions;
 pub mod host_signer;
+#[cfg(unix)]
+pub mod installed_endpoint;
 pub mod jailer;
 /// Secret keyholder — the `SecretRef` → credential boundary: the
 /// [`keyholder::SecretResolver`] trait + the single-host

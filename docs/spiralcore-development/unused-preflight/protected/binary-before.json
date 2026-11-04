@@ -1,0 +1,12 @@
+[
+  {
+    "name": "core",
+    "sha256": "d1ac11d24d0210067c67f36d478a472eb2a76e531158a0b1f8445ba671e0f404",
+    "bytes": 954848
+  },
+  {
+    "name": "client",
+    "sha256": "f692459771e5efe8d2bf1f726e792f8088159ef63e824a96dee79a52443a0918",
+    "bytes": 33129160
+  }
+]

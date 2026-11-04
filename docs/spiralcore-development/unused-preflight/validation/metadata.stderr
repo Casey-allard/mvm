@@ -1,0 +1,51 @@
+     Locking 50 packages to latest compatible versions
+      Adding base16ct v1.0.0
+      Adding cms v0.2.3
+      Adding const-oid v0.9.6
+      Adding crypto-bigint v0.7.10
+      Adding der v0.7.10
+      Adding der_derive v0.7.3
+      Adding ecdsa v0.17.0
+      Adding elliptic-curve v0.14.1
+      Adding ff v0.14.0
+      Adding flagset v0.4.7
+      Adding futures-io v0.3.33
+      Adding globset v0.4.21
+      Adding group v0.14.0
+      Adding mvm-bundler v0.26.0 (/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-bundler)
+      Adding mvm-client v0.26.0 (/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-client)
+      Adding mvm-compiler v0.26.0 (/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-compiler)
+      Adding mvm-host-services v0.26.0 (/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-host-services)
+      Adding mvm-sdk v0.26.0 (/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-sdk)
+      Adding p256 v0.14.0
+      Adding p384 v0.14.0
+      Adding pem-rfc7468 v0.7.0
+      Adding pem-rfc7468 v1.0.0
+      Adding primefield v0.14.0
+      Adding primeorder v0.14.0
+    Updating regex-automata v0.4.14 -> v0.4.18
+      Adding rfc6979 v0.6.0
+      Adding ryu-js v1.0.2
+      Adding sec1 v0.8.1
+      Adding serde_json_canonicalizer v0.4.1
+      Adding serdect v0.4.3
+      Adding sigstore-bundle v0.15.1
+      Adding sigstore-crypto v0.15.1
+      Adding sigstore-merkle v0.15.1
+      Adding sigstore-rekor v0.15.1
+      Adding sigstore-trust-root v0.15.1
+      Adding sigstore-tsa v0.15.1
+      Adding sigstore-types v0.15.1
+      Adding sigstore-verify v0.15.1
+      Adding spki v0.7.3
+      Adding streaming-iterator v0.1.9
+      Adding tls_codec v0.4.2
+      Adding tls_codec_derive v0.4.2
+      Adding tree-sitter v0.26.13
+      Adding tree-sitter-javascript v0.25.0
+      Adding tree-sitter-language v0.1.9
+      Adding tree-sitter-nix v0.0.2
+      Adding tree-sitter-python v0.25.0
+      Adding tree-sitter-typescript v0.23.2
+      Adding wnaf v0.14.1
+      Adding x509-cert v0.2.5

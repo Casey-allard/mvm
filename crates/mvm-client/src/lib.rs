@@ -154,6 +154,8 @@ pub use launch::{
 };
 pub use local::{LocalBackend, auto_selected_backend_name, default_vcpus};
 #[cfg(unix)]
+pub use launch::{HostLifetimeLaunchFailure, UnusedHostLifetimePreparation};
+#[cfg(unix)]
 pub use mvm_runtime::workload_runner::OwnedRetirement;
 #[cfg(unix)]
 pub use mvm_vmm::host::network_endpoint_spawn::EndpointRetirement;

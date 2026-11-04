@@ -1,0 +1,20 @@
+{
+  "command": [
+    "/home/callard/.cargo/bin/rustc",
+    "+1.97.1",
+    "--edition=2024",
+    "--crate-name",
+    "unused_client_probe",
+    "--crate-type",
+    "lib",
+    "--emit=metadata",
+    "-L",
+    "dependency=/var/tmp/spiralcore-resident-parent-20261103/publication-target/release/deps",
+    "--extern",
+    "mvm_client=/var/tmp/spiralcore-resident-parent-20261103/publication-target/release/deps/libmvm_client-0b02729e4e25f409.rlib",
+    "/var/tmp/spiralcore-resident-parent-20261103/unused-client-api-probe.rs",
+    "-o",
+    "/var/tmp/spiralcore-resident-parent-20261103/unused-client-probe.rmeta"
+  ],
+  "library_sha256": "61a5f46f2c4c8aa9281861c1f99b62e7d9c2f4fb8103de0b65e8ad36b327c066"
+}

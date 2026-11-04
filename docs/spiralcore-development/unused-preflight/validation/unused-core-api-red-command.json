@@ -1,0 +1,20 @@
+{
+  "command": [
+    "/home/callard/.cargo/bin/rustc",
+    "+1.97.1",
+    "--edition=2024",
+    "--crate-name",
+    "unused_preparation_probe",
+    "--crate-type",
+    "lib",
+    "--emit=metadata",
+    "-L",
+    "dependency=/var/tmp/spiralcore-resident-parent-20261103/publication-target/release/deps",
+    "--extern",
+    "mvm_core=/var/tmp/spiralcore-resident-parent-20261103/publication-target/release/deps/libmvm_core-e8abcfb53f52974e.rlib",
+    "/var/tmp/spiralcore-resident-parent-20261103/unused-preparation-api-probe.rs",
+    "-o",
+    "/var/tmp/spiralcore-resident-parent-20261103/unused-preparation-probe.rmeta"
+  ],
+  "library_sha256": "1a3f307a226a8d72132a9c6cf21dac51003984f0a6201e2f3d7dff7d4ac8353b"
+}

@@ -1,0 +1,8 @@
+
+running 3 tests
+test conversion_keeps_the_same_original_owner_until_last_anchor_drop ... ok
+test original_arc_identity_is_not_equal_metadata_or_another_erased_type ... ok
+test plain_erased_metadata_cannot_supply_the_original_arc ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

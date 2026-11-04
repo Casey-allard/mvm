@@ -1,0 +1,32 @@
+error[E0425]: cannot find type `HostLifetimeLaunchFailure` in crate `mvm_client`
+ --> /var/tmp/spiralcore-resident-parent-20261103/unused-client-api-probe.rs:1:107
+  |
+1 | ...st_lifetime; let _: Option<mvm_client::HostLifetimeLaunchFailure>=None; let _:Option<mvm_client::UnusedHostLifetimePreparation>=No...
+  |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `mvm_client`
+
+error[E0425]: cannot find type `UnusedHostLifetimePreparation` in crate `mvm_client`
+ --> /var/tmp/spiralcore-resident-parent-20261103/unused-client-api-probe.rs:1:165
+  |
+1 | ...lure>=None; let _:Option<mvm_client::UnusedHostLifetimePreparation>=None; }
+  |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `mvm_client`
+
+error[E0599]: no associated function or constant named `try_launch_with_host_lifetime` found for struct `LocalBackend` in the current scope
+   --> /var/tmp/spiralcore-resident-parent-20261103/unused-client-api-probe.rs:1:50
+    |
+  1 | ...ent::LocalBackend::try_launch_with_host_lifetime; let _: Option<mvm_client::HostLifetimeLaunchFailure>=None; let _:Option<mvm_cl...
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ associated function or constant not found in `LocalBackend`
+    |
+help: there is a method `launch_with_host_lifetime` with a similar name
+   --> /home/callard/.cargo/git/checkouts/mvm-5069ae8682aa590e/8b833ae/crates/mvm-client/src/launch/mod.rs:913:5
+    |
+913 | /     pub async fn launch_with_host_lifetime(
+914 | |         &self,
+915 | |         mut request: LaunchRequest,
+916 | |         lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
+917 | |     ) -> Result<LaunchOutcome> {
+    | |______________________________^
+
+error: aborting due to 3 previous errors
+
+Some errors have detailed explanations: E0425, E0599.
+For more information about an error, try `rustc --explain E0425`.

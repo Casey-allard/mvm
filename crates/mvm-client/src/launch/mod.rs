@@ -30,6 +30,10 @@ pub mod startup_budget;
 mod tests;
 mod transient;
 mod unbooted;
+#[cfg(unix)]
+mod host_lifetime_preflight;
+#[cfg(unix)]
+pub use host_lifetime_preflight::{HostLifetimeLaunchFailure, UnusedHostLifetimePreparation};
 
 use unbooted::DefinitionOrigin;
 
@@ -912,51 +916,84 @@ impl LocalBackend {
     #[cfg(unix)]
     pub async fn launch_with_host_lifetime(
         &self,
-        mut request: LaunchRequest,
+        request: LaunchRequest,
         lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
     ) -> Result<LaunchOutcome> {
+        self.try_launch_with_host_lifetime(request, lifetime)
+            .await
+            .map_err(HostLifetimeLaunchFailure::into_error)
+    }
+
+    /// Preserve the same unused preparation only on the four direct pure
+    /// preflight refusals. Conversion and every later error remain uncertain.
+    #[cfg(unix)]
+    pub async fn try_launch_with_host_lifetime(
+        &self,
+        mut request: LaunchRequest,
+        lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
+    ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
         if request.mode != LifecycleMode::Transient || request.name.is_none() {
-            return Err(MvmError::InvalidSpec {
-                reason: "installed host lifetime requires an explicitly named transient launch"
-                    .into(),
-            });
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "installed host lifetime requires an explicitly named transient launch"
+                        .into(),
+                },
+                lifetime,
+            ));
         }
         if request
             .backend
             .as_deref()
             .is_some_and(|name| name != self.backend.name())
         {
-            return Err(MvmError::InvalidSpec {
-                reason: "installed host lifetime requires the original LocalBackend".into(),
-            });
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "installed host lifetime requires the original LocalBackend".into(),
+                },
+                lifetime,
+            ));
         }
-        mvm_hostd::host_lifetime_parent::require_installed().map_err(crate::local::backend_err)?;
+        if let Err(error) = mvm_hostd::host_lifetime_parent::require_installed() {
+            return Err(HostLifetimeLaunchFailure::unused(
+                crate::local::backend_err(error),
+                lifetime,
+            ));
+        }
         if !self.backend.supports_host_lifetime() {
-            return Err(MvmError::InvalidSpec {
-                reason: "backend has no original installed native lifetime".into(),
-            });
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "backend has no original installed native lifetime".into(),
+                },
+                lifetime,
+            ));
         }
+        let intent = request.host_lifetime_intent();
         let anchor = lifetime.into_anchor();
         let mut shape = mvm_core::vm_backend::VmStartConfig {
-            name: request.name.clone().ok_or_else(|| MvmError::InvalidSpec {
-                reason: "installed name missing".into(),
+            name: intent.name.ok_or_else(|| {
+                HostLifetimeLaunchFailure::converted(MvmError::InvalidSpec {
+                    reason: "installed name missing".into(),
+                })
             })?,
-            cpus: request.cpus,
-            memory_mib: request.memory_mib,
+            cpus: intent.cpus,
+            memory_mib: intent.memory_mib,
             ..Default::default()
         };
         if anchor.binding().backend != self.backend.kind() {
-            return Err(MvmError::InvalidSpec {
-                reason: "installed lifetime backend differs".into(),
-            });
+            return Err(HostLifetimeLaunchFailure::converted(
+                MvmError::InvalidSpec {
+                    reason: "installed lifetime backend differs".into(),
+                },
+            ));
         }
-        anchor
-            .bind_to_config(&mut shape)
-            .map_err(crate::local::backend_err)?;
+        anchor.bind_to_config(&mut shape).map_err(|error| {
+            HostLifetimeLaunchFailure::converted(crate::local::backend_err(error))
+        })?;
         request.host_lifetime = Some(anchor);
-        self.launch(request).await
+        self.launch(request)
+            .await
+            .map_err(HostLifetimeLaunchFailure::converted)
     }
-
     /// Install the original owned host-agent registrar before any installed launch.
     #[cfg(unix)]
     pub fn with_installed_host_agent(

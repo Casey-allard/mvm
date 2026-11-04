@@ -91,8 +91,8 @@ path = "src/bin/mvm-apfs-snapshot-helper.rs"
 required-features = ["trusted-apfs"]
 
 [dependencies]
-spiralcore-mvm-flowmux = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1" }
-spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1" }
+spiralcore-mvm-flowmux = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "467e97aeb9cfc213d5cbd80e1c9ec516f5832df5" }
+spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "467e97aeb9cfc213d5cbd80e1c9ec516f5832df5" }
 # `egress-ca`: the https terminator mints per-SNI leaves
 # under the per-VM intermediate (`mvm_core::crypto::egress_ca`).
 mvm-core = { workspace = true, features = ["egress-ca", "host-state"] }
@@ -236,3 +236,8 @@ trusted-apfs = ["mvm-runtime/trusted-apfs"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "installed_endpoint_confinement"
+path = "tests/installed_endpoint_confinement.rs"
+harness = false

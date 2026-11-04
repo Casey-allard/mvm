@@ -14,6 +14,7 @@ use std::{
 };
 
 const FIXTURE: &str = "MVM_INSTALLED_ENDPOINT_PIPE_FIXTURE";
+const COORD: &str = "MVM_INSTALLED_ENDPOINT_COORD_FD";
 
 #[test]
 fn installed_endpoint_fixture_child() {
@@ -29,6 +30,21 @@ fn installed_endpoint_fixture_child() {
         std::process::exit(0);
     }
     let mut context = context.unwrap();
+    context
+        .with_verification_state(|state| {
+            assert!(state.metadata()?.is_file());
+            Ok(())
+        })
+        .unwrap();
+    let lease = context.lease();
+    let alias = lease.clone();
+    assert_eq!(lease.projection(), context.projection());
+    lease.check_current().unwrap();
+    lease.claim_payload_pool().unwrap();
+    assert!(
+        alias.claim_payload_pool().is_err(),
+        "one pool across aliases"
+    );
     assert_eq!(
         context.take_config().unwrap(),
         serde_json::json!({"fixture":true})
@@ -41,6 +57,21 @@ fn installed_endpoint_fixture_child() {
         )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
+    if mode == "stale-holder" {
+        let fd: i32 = std::env::var(COORD).unwrap().parse().unwrap();
+        // SAFETY: only this fixture's pre_exec inherited its owned Unix socket.
+        let mut coord = unsafe { UnixStream::from_raw_fd(fd) };
+        let mut event = [0; 1];
+        coord.read_exact(&mut event).unwrap();
+        assert!(lease.check_current().is_err());
+        coord.write_all(&[1]).unwrap();
+        coord.read_exact(&mut event).unwrap();
+        assert!(
+            alias.check_current().is_err(),
+            "restored bytes cannot reset fence"
+        );
+        coord.write_all(&[1]).unwrap();
+    }
     while !context.parent_closed().unwrap() {
         assert!(Instant::now() < deadline);
         std::thread::park_timeout(Duration::from_millis(1));
@@ -230,15 +261,33 @@ fn pipe_exchange(mode: &str) {
         module_path!().split_once("::").unwrap().1
     );
     let mut command = Command::new(std::env::current_exe().unwrap());
+    let (mut coord, child_coord) = UnixStream::pair().unwrap();
+    coord
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    coord
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    child_coord
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    child_coord
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     command
         .args(["--exact", &target, "--nocapture", "--test-threads=1"])
         .env(FIXTURE, mode)
+        .env(COORD, child_coord.as_raw_fd().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     crate::host::restore_image::inherit_descriptors(
         &mut command,
-        vec![directory.as_raw_fd(), holder.as_raw_fd()],
+        vec![
+            directory.as_raw_fd(),
+            holder.as_raw_fd(),
+            child_coord.as_raw_fd(),
+        ],
     );
     // SAFETY: only duplicate/redirect fixed descriptors in this owned fixture.
     unsafe {
@@ -250,6 +299,7 @@ fn pipe_exchange(mode: &str) {
         });
     }
     let mut child = ChildGuard(Some(command.spawn().unwrap()));
+    drop(child_coord);
     let original = child.0.as_mut().unwrap();
     let observer = ProcessExitObserver::arm(original.id().try_into().unwrap()).unwrap();
     let mut input = original.stdin.take().unwrap();
@@ -281,6 +331,14 @@ fn pipe_exchange(mode: &str) {
         let ready: Ready = read_frame(&mut output, CONFIG_LIMIT, deadline).unwrap();
         assert_eq!(ready.nonce, challenge.nonce);
         assert_eq!(ready.session, projection().session);
+        if mode == "stale-holder" {
+            std::fs::write(&state, b"b").unwrap();
+            coord.write_all(&[1]).unwrap();
+            coord.read_exact(&mut [0; 1]).unwrap();
+            std::fs::write(&state, b"a").unwrap();
+            coord.write_all(&[1]).unwrap();
+            coord.read_exact(&mut [0; 1]).unwrap();
+        }
         drop(directory);
         drop(holder);
         let probe = OpenOptions::new()
@@ -347,6 +405,11 @@ fn wrong_private_parent_nonce_refuses_before_readiness() {
 #[test]
 fn endpoint_retirement_requires_drained_and_original_child_and_retains_sh() {
     pipe_exchange("retirement");
+}
+
+#[test]
+fn real_child_lease_checks_original_holder_and_never_resets_after_failure() {
+    pipe_exchange("stale-holder");
 }
 
 #[test]
