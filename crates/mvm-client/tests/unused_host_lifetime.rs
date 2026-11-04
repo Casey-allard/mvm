@@ -121,7 +121,8 @@ fn unsupported_backend_process_case() {
             panic!("pure unsupported preflight must never enter admission")
         }
     }
-    mvm_hostd::host_lifetime_parent::install(Arc::new(RejectAdmission)).unwrap();
+    let provider = Arc::new(RejectAdmission);
+    mvm_hostd::host_lifetime_parent::install(provider.clone()).unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut environment = TestEnv::new();
     environment.isolate_mvm_home(home.path());

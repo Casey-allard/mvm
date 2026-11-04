@@ -7,7 +7,7 @@ use mvm_core::{
     host_lifetime::{CoreCurrentParentPermit, HostLaunchBinding},
     vm_backend::{BackendKind, VmStartConfig},
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 pub trait ParentAdmissionProvider: Send + Sync {
     /// Bind one original pre-reserved parent grant to actual opaque admission.
@@ -18,18 +18,24 @@ pub trait ParentAdmissionProvider: Send + Sync {
     ) -> Result<Arc<dyn CoreCurrentParentPermit>>;
 }
 
-static INSTALLED: OnceLock<Arc<dyn ParentAdmissionProvider>> = OnceLock::new();
+// The resident owns the provider. A permanent strong registration would retain
+// its actual managed reservation after shutdown and prevent global drain.
+// Expiry does not reset this OnceLock or permit another installation.
+static INSTALLED: OnceLock<Weak<dyn ParentAdmissionProvider>> = OnceLock::new();
 
 /// One resident process installs its original installation provider prelaunch.
+/// The resident must retain a strong Arc through shutdown; registration is weak
+/// and remains consumed after that original provider expires.
 pub fn install(provider: Arc<dyn ParentAdmissionProvider>) -> Result<()> {
     INSTALLED
-        .set(provider)
+        .set(Arc::downgrade(&provider))
         .map_err(|_| anyhow::anyhow!("installed parent provider already installed"))
 }
 
-pub fn require_installed() -> Result<&'static Arc<dyn ParentAdmissionProvider>> {
+pub fn require_installed() -> Result<Arc<dyn ParentAdmissionProvider>> {
     INSTALLED
         .get()
+        .and_then(Weak::upgrade)
         .context("installed launch requires the original parent admission provider")
 }
 
