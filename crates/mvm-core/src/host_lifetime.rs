@@ -485,6 +485,14 @@ impl HostLifetimeAnchor {
         })
     }
 
+    /// Compare the original erased owner before a current-parent permit exists.
+    /// This exports no owner, descriptor, reservation or admission authority.
+    pub fn retains_parent_owner<T: Send + Sync + 'static>(&self, original: &Arc<T>) -> bool {
+        self._parent_owner
+            .downcast_ref::<Arc<T>>()
+            .is_some_and(|held| Arc::ptr_eq(held, original))
+    }
+
     /// Compare the installed original parent object without exporting it.
     /// This is cleanup identity, not a fresh launch authorization check: a
     /// closed/revoked parent may still need to acknowledge positive retirement.

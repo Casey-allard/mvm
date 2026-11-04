@@ -16,6 +16,23 @@ pub trait ParentAdmissionProvider: Send + Sync {
         admitted: &AdmittedPlan,
         binding: &HostLaunchBinding,
     ) -> Result<Arc<dyn CoreCurrentParentPermit>>;
+
+    /// The same opaque admission with its original verified launch anchor.
+    /// Existing providers retain their prior behavior. Installed helper parents
+    /// override this to bind actual config/anchor facts before registration.
+    fn bind_config(
+        &self,
+        admitted: &AdmittedPlan,
+        config: &VmStartConfig,
+        backend: BackendKind,
+    ) -> Result<Arc<dyn CoreCurrentParentPermit>> {
+        let owner = config
+            .host_lifetime
+            .as_ref()
+            .context("installed launch original anchor missing")?;
+        owner.verify_config(config, backend)?;
+        self.bind(admitted, owner.binding())
+    }
 }
 
 // The resident owns the provider. A permanent strong registration would retain
@@ -49,6 +66,6 @@ pub(crate) fn bind_current(
     };
     let provider = require_installed()?;
     owner.bind_admitted(config, backend, admitted.plan())?;
-    let permit = provider.bind(admitted, owner.binding())?;
+    let permit = provider.bind_config(admitted, config, backend)?;
     owner.bind_parent_permit(config, backend, permit)
 }

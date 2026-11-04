@@ -1000,10 +1000,20 @@ impl LocalBackend {
         self,
         registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
     ) -> Result<Self> {
+        self.install_owned_host_agent(registrar)?;
+        Ok(self)
+    }
+
+    /// Bind the original registrar without moving or replacing this backend.
+    /// The underlying runner retains its install-once and no-active-launch guard.
+    #[cfg(unix)]
+    pub fn install_owned_host_agent(
+        &self,
+        registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
+    ) -> Result<()> {
         self.backend
             .install_owned_host_agent(registrar)
-            .map_err(crate::local::backend_err)?;
-        Ok(self)
+            .map_err(crate::local::backend_err)
     }
 
     /// Stop only the retained original native owner. No backend reconstruction.
