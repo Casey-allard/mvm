@@ -32,6 +32,11 @@ pub struct OwnedHostAgentInputs {
 /// services before VM activation. This is a restriction, never admission.
 pub fn validate_owned_host_agent_services(params: &HostAgentServicesParams<'_>) -> Result<()> {
     ensure!(
+        params.services.len() <= 2
+            && (params.services.len() < 2 || params.services[0] != params.services[1]),
+        "owned unique service profile limit"
+    );
+    ensure!(
         params.capability_bindings.len() <= 16,
         "owned capability profile limit"
     );

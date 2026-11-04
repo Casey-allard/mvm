@@ -285,6 +285,36 @@ fn busy_final_stop_closes_shared_admission_but_allows_owned_cleanup() {
 }
 
 #[test]
+fn original_registrar_query_checks_tenant_holder_parent_and_closed_admission() {
+    let fixture = Fixture::new();
+    let mut agent = OwnedHostAgent::spawn(fixture.inputs()).unwrap();
+    let registrar = agent.registrar();
+    let original = agent.child_id().unwrap();
+    registrar.check_current_for_tenant("local").unwrap();
+    assert!(registrar.check_current_for_tenant("foreign").is_err());
+    std::fs::write(
+        fixture.lease.path().join("state"),
+        b"changed original state",
+    )
+    .unwrap();
+    assert!(registrar.check_current_for_tenant("local").is_err());
+    std::fs::write(
+        fixture.lease.path().join("state"),
+        b"original fixture state",
+    )
+    .unwrap();
+    registrar.check_current_for_tenant("local").unwrap();
+    assert_eq!(agent.child_id().unwrap(), original);
+    fixture.parent.current.store(false, Ordering::Release);
+    assert!(registrar.check_current_for_tenant("local").is_err());
+    // Cleanup has its original owner and must remain possible after revocation.
+    agent.shutdown().unwrap();
+    assert!(registrar.check_current_for_tenant("local").is_err());
+    assert!(!config::host_agent_control_socket("local").exists());
+    assert!(!config::host_agent_signer_helper_socket("local").exists());
+}
+
+#[test]
 fn preexisting_unowned_evidence_and_parent_refusal_have_no_spawn_effects() {
     let fixture = Fixture::new();
     fixture.parent.current.store(false, Ordering::Release);

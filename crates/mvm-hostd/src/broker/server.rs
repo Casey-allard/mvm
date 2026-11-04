@@ -75,6 +75,13 @@ pub async fn serve_on_listener(
     serve(listener, registry, workload_id, tenant_id, max_frame_bytes).await
 }
 
+/// Local workspaces and I/O fence shared by both owned VM queues.
+/// This pair is not a managed parent reservation.
+pub struct OwnedBrokerResources {
+    pub workspaces: crate::owned_resources::WorkspacePool,
+    pub admission: Arc<crate::owned_resources::registered::RegistrationAdmission>,
+}
+
 /// Owned accept loop: stop closes admission and joins every accepted task.
 pub async fn serve_owned_on_listener(
     listener: crate::owned_resources::registered::RegisteredListener,
@@ -82,10 +89,13 @@ pub async fn serve_owned_on_listener(
     workload_id: String,
     tenant_id: String,
     max_frame_bytes: usize,
-    workspaces: crate::owned_resources::WorkspacePool,
-    admission: Arc<crate::owned_resources::registered::RegistrationAdmission>,
+    resources: OwnedBrokerResources,
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
+    let OwnedBrokerResources {
+        workspaces,
+        admission,
+    } = resources;
     let mut calls = tokio::task::JoinSet::new();
     let outcome = loop {
         tokio::select! {

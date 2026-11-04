@@ -1,0 +1,128 @@
+{
+  "parent": "44ba7858679cac66e38a1ba10b4806b170e5a7f7",
+  "helper_source_commit": "38d5bd531cdeb607d3511cd24be1bc3b035f538e",
+  "helper_files": [
+    {
+      "path": "crates/mvm-vmm/src/host/host_agent_spawn.rs",
+      "sha256": "558dfbec54bb6600354d33a91a1531ad25a50c3410c0496d7f0301db886a8ad2",
+      "bytes": 44806
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/host_agent_spawn/owned.rs",
+      "sha256": "618e13f1e120efc60459a34ed30fb6176f99df00ab826376e2644fded690e26f",
+      "bytes": 28702
+    },
+    {
+      "path": "crates/mvm-hostd/src/bin/mvm-host-agent.rs",
+      "sha256": "be7aa739937abc1d4c5d9e59365e882b7df456d2aaf24ce5dcfa4339bcfca3e8",
+      "bytes": 17547
+    },
+    {
+      "path": "crates/mvm-hostd/src/bin/mvm-signer-helper.rs",
+      "sha256": "8ca9a834a7589fa54299de70ef010ffedf815b0b84df7236bfc5e352b3fa6542",
+      "bytes": 4049
+    },
+    {
+      "path": "crates/mvm-hostd/src/parent_death.rs",
+      "sha256": "84f8d5f65a8e5039707374ef13170d184bc1e76f8c879777251de0d824681a42",
+      "bytes": 12264
+    },
+    {
+      "path": "crates/mvm-hostd/src/broker/daemon.rs",
+      "sha256": "4866de872d71231b8d9b79cff2b1e557c53ef270765463eb1aacb64a87b27888",
+      "bytes": 75062
+    },
+    {
+      "path": "crates/mvm-hostd/src/broker/daemon/owned.rs",
+      "sha256": "7bab4f9e907d5cbcb13273fa6af274a6359ae2948e704f8c0da815c43490e2fd",
+      "bytes": 23755
+    },
+    {
+      "path": "crates/mvm-hostd/src/broker/server.rs",
+      "sha256": "518e99c44113136f3ac1b960bb8d1ebfbecb219d0f51836174003fa9c419b0fe",
+      "bytes": 21415
+    },
+    {
+      "path": "crates/mvm-hostd/tests/owned_host_agent.rs",
+      "sha256": "9f9cc3e38bb3bfa00b9142695e4e70c4cb20d7c2292249cb2338455f5b7edc0e",
+      "bytes": 15755
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/hvf_control_transport.rs",
+      "sha256": "e440659246a9a62d0f3d43ab9925ed30dd4154b7b90f84111894b756e609975b",
+      "bytes": 18383
+    },
+    {
+      "path": "crates/mvm-hostd/src/audit_signer/helper_client.rs",
+      "sha256": "455e49f2ee28e90d41ebefccc2770454b786184a28022c5654aabda1a1a85921",
+      "bytes": 10565
+    },
+    {
+      "path": "crates/mvm-hostd/src/audit_signer/helper.rs",
+      "sha256": "324530cf730ef4b2559fde9aad7edb555f9dd18114aea0d984d67e668783f3a7",
+      "bytes": 29910
+    },
+    {
+      "path": "crates/mvm-hostd/src/owned_resources.rs",
+      "sha256": "49aacf0bf072b82ca989940ffbc79c5c74b8e83c4e710144d0a376c48a8af43e",
+      "bytes": 7324
+    },
+    {
+      "path": "crates/mvm-hostd/src/framing.rs",
+      "sha256": "7774dd77143b1cf2d427b12148cfa2bfe00a360381a9954ae6dfcd7f722a40c8",
+      "bytes": 8615
+    },
+    {
+      "path": "crates/mvm-hostd/src/host_signer/keystore.rs",
+      "sha256": "0068342ce4d56eb0d98e4e303e36d6c9f36dac4a23fcebb001bd0e3f884afeb8",
+      "bytes": 7200
+    },
+    {
+      "path": "crates/mvm-hostd/src/audit_signer/chain.rs",
+      "sha256": "d2530b3647e10ab3bd036441e66e4df2a99a94455afb983e0c91026ece6deaba",
+      "bytes": 26049
+    },
+    {
+      "path": "crates/mvm-hostd/src/audit_signer/chain/owned.rs",
+      "sha256": "8a13b4ce0a59919438e52bc771e2de770347b58f477534c4825f08d59e634ad6",
+      "bytes": 3127
+    },
+    {
+      "path": "crates/mvm-hostd/src/broker/registry.rs",
+      "sha256": "b9948b29663ef47a75525255663246d5102519929cbde4a9205858c5edf7c31c",
+      "bytes": 69820
+    },
+    {
+      "path": "crates/mvm-hostd/tests/owned_host_agent_resources.rs",
+      "sha256": "82eb7f90425aef7dd73f58509492d1bc0d765a28474eca4e1acfe9373bc016d0",
+      "bytes": 6219
+    },
+    {
+      "path": "crates/mvm-hostd/src/broker/registry/replay.rs",
+      "sha256": "6cf0f459e53c33b971da8f8ae89fea786d80840b60d485c7dd62bbd8f4982cc2",
+      "bytes": 3641
+    },
+    {
+      "path": "crates/mvm-hostd/src/broker/audit_client.rs",
+      "sha256": "8f48ac3287d8d44db775601d2064916e04822057744a99a001863b41a1a5f734",
+      "bytes": 32196
+    },
+    {
+      "path": "crates/mvm-hostd/src/owned_resources/registered.rs",
+      "sha256": "5e6b3a2ea0184dc933a244cc6514b69ee3c76fa648d848e077993b26c78382fe",
+      "bytes": 6688
+    },
+    {
+      "path": "crates/mvm-hostd/src/owned_resources/registered_tests.rs",
+      "sha256": "600be940e6d6f03c7259abba4dcd6b4114765cc22a91917bb3eff3eeee4c6683",
+      "bytes": 4095
+    }
+  ],
+  "portability_edits": [
+    {
+      "path": "crates/mvm-hostd/Cargo.toml",
+      "change": "Select publishedca5 shared Transfer/FlowMux instead of old467; original intermediate qualification used recorded path overrides."
+    }
+  ],
+  "qualification": "UnusedCore3/Client4 and helper18unique+9resource+7integration scopes are separate recorded component results. Five helper integration cases start children. This new combined/default-current-core graph has not yet been compiled or qualified. Native flags remain false."
+}
