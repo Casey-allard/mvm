@@ -116,6 +116,8 @@ pub mod netinit;
 /// Shared rtnetlink plumbing: kernel ABI constants, request framing, and the
 /// synchronous socket used by `netinit`'s blackhole routes.
 pub mod netlink;
+/// Separately admitted typed application access; independent of mailbox/network queues.
+pub mod owner_access;
 pub mod probes;
 /// Restore-time guest wall-clock synchronization.
 pub mod restore_clock;
@@ -190,3 +192,5 @@ pub mod profile;
 /// Streaming exec core — runs `sh -c <cmd>` and emits `ExecEvent` chunks
 /// via a closure. The guest agent admits calls at runtime.
 pub mod exec_stream;
+#[cfg(feature = "owner-access-object")]
+pub mod owner_access_object;

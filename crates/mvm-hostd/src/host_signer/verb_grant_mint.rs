@@ -8,6 +8,7 @@ use mvm_core::plan::{Nonce, ToolMediationGrant, VerbGrant, VerbId};
 /// Every part is absent by default.
 #[derive(Debug, Clone, Default)]
 pub struct VerbGrantAuthority {
+    pub owner_access: Option<mvm_contract::grants::owner_access::OwnerAccessBinding>,
     pub drive: Option<DriveGrant>,
     pub tool_mediation: Option<ToolMediationGrant>,
     pub application_terminal: Option<ApplicationTerminalBinding>,
@@ -30,6 +31,7 @@ pub fn mint_verb_grant(
         drive: authority.drive,
         tool_mediation: authority.tool_mediation,
         application_terminal: authority.application_terminal,
+        owner_access: authority.owner_access,
         sig: vec![],
     };
     let result = signer.sign(&grant.signing_bytes());

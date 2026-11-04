@@ -252,6 +252,9 @@ pub struct EndpointConfig {
     /// closed when set: an unadmitted destination is refused before any forward.
     #[serde(default)]
     pub network_policy: Option<mvm_core::policy::network_policy::NetworkPolicy>,
+    /// Full actual admitted plan facts, supplied only by the trusted spawn path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_network_plan: Option<mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan>,
     /// Transport-neutral resource ceilings from the admitted execution plan.
     /// Every FlowMux session for this VM draws from one shared owner of these
     /// limits; the default preserves endpoint configs written before the field
@@ -1187,6 +1190,7 @@ mod tests {
             binding_store_dir: Some(dir.join("bindings")),
             tls_intermediate: None,
             network_policy: None,
+            admitted_network_plan: None,
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: Vec::new(),
             egress_mode: EgressMode::Wire,

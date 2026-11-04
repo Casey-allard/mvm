@@ -14,12 +14,21 @@ pub(super) struct BootInputFiles<'a> {
     pub(super) kernel: Option<&'a mvm_vmm::host::restore_image::VerifiedRestoreFile>,
     pub(super) images: Option<&'a mvm_vmm::host::boot_images::FrozenBootImageBytes>,
     pub(super) writable: Option<&'a mvm_vmm::driver::prepared_disks::PreparedWritableDisks>,
+    pub(super) host_lifetime: Option<&'a mvm_core::host_lifetime::PreparedHostLifetimeLease>,
 }
 
 impl BootInputFiles<'_> {
     pub(super) fn project(&self, spec: &VmmSpec, cfg: &mut HvfSupervisorConfig) -> Result<()> {
         use std::os::fd::AsRawFd;
         cfg.kernel_fd = self.kernel.map(|kernel| kernel.file().as_raw_fd());
+        if let Some(lease) = self.host_lifetime {
+            lease.verify_current()?;
+            cfg.host_lifetime_fds = Some(mvm_vmm::host::hvf_supervisor::HostLifetimeFds {
+                directory: lease.directory().as_raw_fd(),
+                holder: lease.holder().as_raw_fd(),
+                expected: lease.expectation().clone(),
+            });
+        }
         cfg.boot_image_fds = self.images.map(|images| {
             use mvm_core::registry_pack_boot::BootImageAsset as Role;
             mvm_vmm::host::hvf_supervisor::BootImageFds {
@@ -68,6 +77,9 @@ impl BootInputFiles<'_> {
         }
         for disk in &cfg.writable_disk_fds {
             inherited.extend([disk.backing, disk.sidecar]);
+        }
+        if let Some(lease) = &cfg.host_lifetime_fds {
+            inherited.extend([lease.directory, lease.holder]);
         }
         anyhow::ensure!(
             inherited.iter().all(|fd| *fd > 2)

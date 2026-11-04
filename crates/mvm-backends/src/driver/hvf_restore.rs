@@ -265,6 +265,7 @@ pub fn hvf_child_restore_config(
         kernel_fd: None,
         boot_image_fds: None,
         writable_disk_fds: Vec::new(),
+        host_lifetime_fds: None,
         cmdline: parent.cmdline.clone(),
         memory_mib: parent.memory_mib,
         // A restored child resumes the parent's saved vCPU state, so it must
@@ -588,6 +589,7 @@ mod tests {
             kernel_fd: None,
             boot_image_fds: None,
             writable_disk_fds: Vec::new(),
+            host_lifetime_fds: None,
             cmdline: Some("console=ttyAMA0 root=/dev/vda ro".into()),
             memory_mib: 512,
             vcpus: 1,

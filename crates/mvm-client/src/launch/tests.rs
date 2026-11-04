@@ -59,6 +59,22 @@ fn mock_client() -> LocalBackend {
     LocalBackend::with_hypervisor("mock")
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn admitted_mock_outcome_cannot_supply_installed_retirement_by_metadata() {
+    let home = Isolated::new();
+    let client = mock_client();
+    let request = transient_request(&home.rootfs()).name("no-retirement-proof")
+        .build().unwrap();
+    let outcome = client.launch(request).await.unwrap();
+    assert!(outcome.take_endpoint_retirement().is_err());
+    let mut invoked = false;
+    assert!(outcome.with_owned_retirement(|_| { invoked = true; }).is_err());
+    assert!(!invoked, "actual admission/outcome metadata is not native exit proof");
+    client.stop_machine(&outcome.machine.id).await.unwrap();
+    client.cleanup_transient("no-retirement-proof").unwrap();
+}
+
 fn client_with_failing_stop() -> (LocalBackend, AnyBackend) {
     let mock = mvm_runtime::MockBackend::new();
     let mut client = mock_client();

@@ -63,6 +63,7 @@ pub struct PreparedCallerStartup {
 
 /// Adopted inputs remain untrusted until the original consumed caller binds them.
 pub struct StartupFiles {
+    host_lifetime: Option<mvm_core::host_lifetime::PreparedHostLifetimeLease>,
     kernel: Option<std::fs::File>,
     images: Option<[std::fs::File; 4]>,
     writable: Vec<(usize, mvm_core::util::writable_image::LockedWritableImage)>,
@@ -170,11 +171,38 @@ pub fn preflight_startup_files(
         .iter()
         .chain(&writable)
         .copied()
+        .chain(
+            cfg.host_lifetime_fds
+                .as_ref()
+                .into_iter()
+                .flat_map(|fds| [fds.directory, fds.holder]),
+        )
         .collect::<Vec<_>>();
     validate_descriptor_namespace(&all)?;
     validate_startup_descriptors(&readonly)?;
     validate_writable_descriptors(&writable)?;
     validate_writable_disk_table(cfg)?;
+    if let Some(fds) = &cfg.host_lifetime_fds {
+        anyhow::ensure!(
+            cfg.restore_fds.is_none()
+                && cfg.restore_ram.is_none()
+                && cfg.restore_frame.is_none()
+                && cfg.handoff_socket.is_none(),
+            "installed holder cannot enter restore or warm handoff"
+        );
+        let (directory, access) = descriptor_role(fds.directory)?;
+        let (holder, write) = descriptor_role(fds.holder)?;
+        anyhow::ensure!(
+            access >= 0
+                && access & libc::O_ACCMODE == libc::O_RDONLY
+                && directory.st_mode & libc::S_IFMT == libc::S_IFDIR
+                && write >= 0
+                && write & libc::O_ACCMODE == libc::O_RDWR
+                && write & libc::O_APPEND == 0
+                && holder.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "invalid installed lifetime descriptor roles"
+        );
+    }
     validate_diagnostics_descriptor(
         &all,
         std::env::var_os("MVM_HVF_STARTUP_DIAGNOSTICS_FD").as_deref(),
@@ -197,6 +225,25 @@ pub fn adopt_startup_files(
     use mvm_vmm::host::restore_image::adopt_inherited;
 
     preflight_startup_files(cfg)?;
+    let host_lifetime = cfg
+        .host_lifetime_fds
+        .as_ref()
+        .map(|fds| {
+            use std::os::fd::FromRawFd;
+            // SAFETY: complete namespace/role preflight precedes first ownership
+            // conversion. Each distinct original descriptor is consumed once.
+            let directory = unsafe { std::fs::File::from_raw_fd(fds.directory) };
+            // SAFETY: the same exclusive inherited-descriptor contract as above.
+            let holder = unsafe { std::fs::File::from_raw_fd(fds.holder) };
+            let lease = mvm_core::host_lifetime::PreparedHostLifetimeLease::bind(
+                directory,
+                holder,
+                fds.expected.clone(),
+            )?;
+            lease.verify_current()?;
+            Ok::<_, anyhow::Error>(lease)
+        })
+        .transpose()?;
     let kernel = cfg.kernel_fd.map(adopt_inherited).transpose()?;
     let images = cfg
         .boot_image_fds
@@ -225,6 +272,7 @@ pub fn adopt_startup_files(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(StartupFiles {
+        host_lifetime,
         kernel,
         images,
         writable,
@@ -372,6 +420,12 @@ impl std::io::Read for BootReader<'_> {
 }
 
 impl StartupFiles {
+    /// Move the single original holder owner out before disk/native allocation.
+    pub fn take_host_lifetime(
+        &mut self,
+    ) -> Option<mvm_core::host_lifetime::PreparedHostLifetimeLease> {
+        self.host_lifetime.take()
+    }
     /// Split writer custody from kernel/caller consumption without reopening anything.
     pub fn take_writable(&mut self) -> WritableStartupFiles {
         WritableStartupFiles {

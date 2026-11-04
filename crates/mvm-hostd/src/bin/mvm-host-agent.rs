@@ -162,7 +162,11 @@ async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<Child> {
         software_chain_key_path: Some(cfg.software_chain_key_path.clone()),
         max_frame_bytes: cfg.max_frame_bytes,
     };
-    let mut child = Command::from(mvm_core::env_hygiene::helper_command(&bin))
+    let mut command = Command::from(mvm_core::env_hygiene::helper_command(&bin));
+    if std::env::args_os().any(|arg| arg == "--installed-owned") {
+        command.arg("--installed-owned");
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -413,16 +417,57 @@ fn main() -> Result<()> {
         .json()
         .init();
 
-    let raw = read_stdin_blocking()?;
-    let cfg: HostAgentConfig =
-        serde_json::from_slice(&raw).context("mvm-host-agent config parse failed")?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let owned = std::env::args_os().any(|arg| arg == "--installed-owned");
+    if owned {
+        mvm_hostd::parent_death::bound_owned_main_stack()
+            .context("bound owned host-agent main stack")?;
+    }
+    let (raw, cfg, owned_nonce) = if owned {
+        let mut stdin = std::io::stdin().lock();
+        let mut length = [0; 4];
+        stdin.read_exact(&mut length)?;
+        let length = usize::try_from(u32::from_be_bytes(length))?;
+        anyhow::ensure!(
+            (1..=65536).contains(&length),
+            "owned host-agent config limit"
+        );
+        let mut bytes = vec![0; length];
+        stdin.read_exact(&mut bytes)?;
+        mvm_hostd::owned_resources::validate_shape(&bytes)?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Startup {
+            config: HostAgentConfig,
+            nonce: [u8; 16],
+        }
+        let startup: Startup =
+            serde_json::from_slice(&bytes).context("owned host-agent config parse failed")?;
+        (Vec::new(), startup.config, Some(startup.nonce))
+    } else {
+        let raw = read_stdin_blocking()?;
+        let cfg: HostAgentConfig =
+            serde_json::from_slice(&raw).context("mvm-host-agent config parse failed")?;
+        (raw, cfg, None)
+    };
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .enable_all()
         .worker_threads(2)
-        .thread_name("mvm-host-agent")
+        .thread_name("mvm-host-agent");
+    if owned {
+        builder.thread_stack_size(2 * 1024 * 1024);
+        builder.max_io_events_per_tick(16);
+        builder.max_blocking_threads(2);
+    }
+    let runtime = builder
         .build()
         .context("mvm-host-agent supervisor tokio runtime build failed")?;
-    if is_worker_mode() {
+    if let Some(nonce) = owned_nonce {
+        runtime.block_on(async move {
+            let signer = spawn_signer_helper(&cfg).await?;
+            HostAgentDaemon::run_owned(cfg, nonce, signer).await
+        })?;
+    } else if is_worker_mode() {
         runtime.block_on(run_worker_once(cfg))?;
     } else {
         runtime.block_on(supervise_worker(cfg, raw))?;

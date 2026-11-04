@@ -157,6 +157,7 @@ fn endpoint_bin_serves_substitution_and_refuses_unbound_destination() {
         // The policy admits the unbound destination, so the refusal below can
         // only be the binding check's. It is a literal address because the
         // endpoint resolves a policy's host names when it starts.
+        admitted_network_plan: None,
         network_policy: Some(mvm_core::policy::network_policy::NetworkPolicy::allow_list(
             vec![mvm_core::policy::network_policy::HostPort::new(
                 UNBOUND_ADDR,
@@ -283,6 +284,7 @@ fn endpoint_bin_claim10_gate_refuses_a_bound_but_unadmitted_destination() {
         binding_store_dir: Some(dir.path().join("bindings")),
         tls_intermediate: None,
         // Deny-all: the endpoint gates every destination — even the bound one.
+        admitted_network_plan: None,
         network_policy: Some(mvm_core::policy::network_policy::NetworkPolicy::deny_all()),
         network_limits: mvm_core::plan::NetworkLimits::default(),
         ingress: Vec::new(),
@@ -372,6 +374,7 @@ fn a_flowmux_endpoint_keeps_serving_sessions_after_one_ends() {
         binding_store_dir: None,
         tls_intermediate: None,
         network_policy: None,
+            admitted_network_plan: None,
         network_limits: mvm_core::plan::NetworkLimits::default(),
         ingress: Vec::new(),
         egress_mode: EgressMode::FlowMux,
@@ -478,6 +481,7 @@ fn a_flowmux_endpoint_enforces_one_admitted_ceiling_across_sessions() {
         tls_intermediate: None,
         // The ceiling is under test, not the policy: admit UDP so the first
         // association opens and the second meets the ceiling.
+        admitted_network_plan: None,
         network_policy: Some(mvm_core::policy::network_policy::NetworkPolicy::unrestricted()),
         network_limits: mvm_core::plan::NetworkLimits::builder()
             .max_udp_associations(1)
@@ -583,6 +587,7 @@ fn a_flowmux_endpoint_refuses_zero_limits_decoded_from_config() {
         binding_store_dir: None,
         tls_intermediate: None,
         network_policy: None,
+            admitted_network_plan: None,
         network_limits: mvm_core::plan::NetworkLimits::default(),
         ingress: Vec::new(),
         egress_mode: EgressMode::FlowMux,
@@ -665,6 +670,7 @@ fn connector_only_config(connector: &std::path::Path, sock: &std::path::Path) ->
         binding_store_dir: None,
         tls_intermediate: None,
         network_policy: None,
+            admitted_network_plan: None,
         network_limits: mvm_core::plan::NetworkLimits::default(),
         ingress: Vec::new(),
         egress_mode: EgressMode::Wire,
@@ -887,6 +893,7 @@ fn every_endpoint_thread_serves_under_confinement() {
         binding_store_dir: None,
         tls_intermediate: None,
         network_policy: None,
+            admitted_network_plan: None,
         network_limits: mvm_core::plan::NetworkLimits::default(),
         ingress: Vec::new(),
         egress_mode: EgressMode::FlowMux,
@@ -1095,6 +1102,7 @@ fn an_endpoint_embedding_the_collector_collects_and_keeps_serving() {
         binding_store_dir: None,
         tls_intermediate: None,
         network_policy: None,
+            admitted_network_plan: None,
         network_limits: mvm_core::plan::NetworkLimits::default(),
         ingress: Vec::new(),
         egress_mode: EgressMode::FlowMux,
@@ -1224,6 +1232,7 @@ fn an_endpoint_whose_collector_cannot_start_keeps_serving() {
         binding_store_dir: None,
         tls_intermediate: None,
         network_policy: None,
+            admitted_network_plan: None,
         network_limits: mvm_core::plan::NetworkLimits::default(),
         ingress: Vec::new(),
         egress_mode: EgressMode::FlowMux,
@@ -1376,6 +1385,7 @@ fn tool_route_and_trace_through_ingress(guest_broker: bool) {
         secret_store_dir: Some(dir.path().join("secrets")),
         binding_store_dir: Some(dir.path().join("bindings")),
         tls_intermediate: None,
+        admitted_network_plan: None,
         network_policy: Some(mvm_core::policy::network_policy::NetworkPolicy::allow_list(
             vec![
                 mvm_core::policy::network_policy::HostPort::new(UNBOUND_ADDR, 443),

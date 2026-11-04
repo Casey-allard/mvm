@@ -70,6 +70,17 @@ impl Keystore {
         })
     }
 
+    /// Owned profile: inspect and read at most33 bytes, never an entire file.
+    pub fn load_from_file_bounded(path: &Path) -> Result<Self> {
+        let bytes = crate::owned_resources::read_key(path)?;
+        let signing_key = SigningKey::from_bytes(&bytes);
+        let pub_key_bytes = signing_key.verifying_key().to_bytes().to_vec();
+        Ok(Self {
+            signing_key,
+            pub_key_bytes,
+        })
+    }
+
     /// Sign opaque bytes. Returns the raw signature + `SIG_ALG_ED25519`.
     /// The caller is responsible for the canonical form of `bytes`
     /// (JCS for credentials, ExecutionPlan's own canonical form for

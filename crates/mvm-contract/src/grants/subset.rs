@@ -22,6 +22,8 @@ use crate::policy::network_policy::HostPort;
 /// The dimension in which a child asked for more than its parent held.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GrantWidening {
+    #[error("child owner access is not contained by the parent's declaration")]
+    OwnerAccessNotAdmitted,
     #[error("child drops the parent's CPU bound, and an absent CPU grant is unbounded")]
     CpuBoundDropped,
     #[error("child CPU share {child} millicores exceeds the parent's {parent}")]
@@ -84,7 +86,53 @@ pub fn grants_are_subset(child: &Grants, parent: &Grants) -> Result<(), GrantWid
     application_terminal_is_subset(
         child.application_terminal.as_ref(),
         parent.application_terminal.as_ref(),
-    )
+    )?;
+    owner_access_is_subset(child.owner_access.as_ref(), parent.owner_access.as_ref())
+}
+
+fn owner_access_is_subset(
+    child: Option<&crate::grants::owner_access::OwnerAccessGrant>,
+    parent: Option<&crate::grants::owner_access::OwnerAccessGrant>,
+) -> Result<(), GrantWidening> {
+    let Some(child) = child else { return Ok(()) };
+    let parent = parent.ok_or(GrantWidening::OwnerAccessNotAdmitted)?;
+    child
+        .validate()
+        .map_err(|_| GrantWidening::OwnerAccessNotAdmitted)?;
+    parent
+        .validate()
+        .map_err(|_| GrantWidening::OwnerAccessNotAdmitted)?;
+    match (&child.object_v1, &parent.object_v1) {
+        (None, None) => {}
+        (Some(child), Some(parent))
+            if child.major == parent.major
+                && child.codec_mask & !parent.codec_mask == 0
+                && (!child.cache_reuse_within_execution || parent.cache_reuse_within_execution) => {
+        }
+        _ => return Err(GrantWidening::OwnerAccessNotAdmitted),
+    }
+    for operation in &child.operations {
+        let admitted = parent
+            .operations
+            .iter()
+            .find(|op| op.name == operation.name)
+            .ok_or(GrantWidening::OwnerAccessNotAdmitted)?;
+        if operation.request != admitted.request
+            || operation.reply != admitted.reply
+            || operation
+                .owners
+                .iter()
+                .any(|owner| !admitted.owners.contains(owner))
+            || operation.max_request_bytes > admitted.max_request_bytes
+            || operation.max_reply_bytes > admitted.max_reply_bytes
+            || operation.max_in_flight > admitted.max_in_flight
+            || operation.max_calls_per_second > admitted.max_calls_per_second
+            || operation.max_deadline_ms > admitted.max_deadline_ms
+        {
+            return Err(GrantWidening::OwnerAccessNotAdmitted);
+        }
+    }
+    Ok(())
 }
 
 /// An application terminal is one exact argv, so a child may drop it or keep
@@ -293,6 +341,7 @@ mod tests {
             egress: egress(&[("api.example.com", 443), ("pypi.org", 443)]),
             drive: drive("/workspace", "agent", 1_000, 2_000, 300),
             display_input: None,
+            owner_access: None,
             application_terminal: None,
         };
         let child = Grants {
@@ -301,6 +350,7 @@ mod tests {
             egress: egress(&[("api.example.com", 443)]),
             drive: drive("/workspace/src", "agent", 500, 1_000, 60),
             display_input: None,
+            owner_access: None,
             application_terminal: None,
         };
         assert_eq!(grants_are_subset(&child, &parent), Ok(()));
@@ -314,6 +364,7 @@ mod tests {
             egress: egress(&[("api.example.com", 443)]),
             drive: drive("/workspace", "agent", 1_000, 2_000, 300),
             display_input: None,
+            owner_access: None,
             application_terminal: None,
         };
         assert_eq!(grants_are_subset(&g, &g), Ok(()));
@@ -556,6 +607,7 @@ mod tests {
             egress: None,
             drive: None,
             display_input: None,
+            owner_access: None,
             application_terminal: None,
         };
         let child = Grants {
@@ -564,6 +616,7 @@ mod tests {
             egress: egress(&[("evil.example.com", 443)]),
             drive: drive("/workspace", "agent", 1, 1, 1),
             display_input: None,
+            owner_access: None,
             application_terminal: None,
         };
         assert_eq!(

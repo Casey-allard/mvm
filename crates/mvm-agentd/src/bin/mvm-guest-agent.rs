@@ -58,9 +58,10 @@ use std::sync::{Arc, Mutex};
 use mvm_agentd::vsock::{
     AuthenticatedSession, GuestRequest, GuestResponse, HOST_SIGNER_PUBKEY_PATH, ToolCheckReply,
     TrafficPlane, TrustDecision, VERB_TRUST_POLICY_PATH, current_uid,
-    enforce_application_terminal_grant, enforce_drive_grant, enforce_verb_grant,
-    is_verb_trust_baseline, launch_requires_grant, load_host_signer_verifying_key,
-    load_pinned_verb_grant, load_verb_trust_policy, trust_decision, workload_privilege_refusal,
+    enforce_application_terminal_grant, enforce_drive_grant, enforce_owner_access_grant,
+    enforce_verb_grant, is_verb_trust_baseline, launch_requires_grant,
+    load_host_signer_verifying_key, load_pinned_verb_grant, load_verb_trust_policy, trust_decision,
+    workload_privilege_refusal,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -119,15 +120,16 @@ use crate::transport::{AgentListener, accept_control, bind_listener};
 
 use handlers::{
     PostRestoreInputs, handle_cancel_extension, handle_checkpoint_integrations,
-    handle_close_stream_input, handle_display_input, handle_drive_file, handle_drive_open,
-    handle_entrypoint_status, handle_fs_diff, handle_fs_list, handle_fs_mkdir, handle_fs_move,
-    handle_fs_read, handle_fs_remove, handle_fs_stat, handle_fs_write, handle_integration_status,
-    handle_mount_volume, handle_ping, handle_post_restore, handle_primed_status,
-    handle_probe_status, handle_proc_kill, handle_proc_list, handle_proc_send_input,
-    handle_proc_signal, handle_proc_start, handle_proc_wait, handle_readiness_status,
-    handle_resource_usage, handle_run_entrypoint_request, handle_run_extension, handle_sleep_prep,
-    handle_start_unix_socket_forward, handle_stream_input, handle_sync_filesystems,
-    handle_unmount_volume, handle_update_idle_timeout, handle_wake, handle_worker_status,
+    handle_close_stream_input, handle_declared_operation, handle_display_input, handle_drive_file,
+    handle_drive_open, handle_entrypoint_status, handle_fs_diff, handle_fs_list, handle_fs_mkdir,
+    handle_fs_move, handle_fs_read, handle_fs_remove, handle_fs_stat, handle_fs_write,
+    handle_integration_status, handle_mount_volume, handle_ping, handle_post_restore,
+    handle_primed_status, handle_probe_status, handle_proc_kill, handle_proc_list,
+    handle_proc_send_input, handle_proc_signal, handle_proc_start, handle_proc_wait,
+    handle_readiness_status, handle_resource_usage, handle_run_entrypoint_request,
+    handle_run_extension, handle_sleep_prep, handle_start_unix_socket_forward, handle_stream_input,
+    handle_sync_filesystems, handle_unmount_volume, handle_update_idle_timeout, handle_wake,
+    handle_worker_status,
 };
 use interactive::{
     handle_console_attach, handle_console_close, handle_console_detach, handle_console_list,
@@ -143,6 +145,8 @@ use interactive::{
 /// response.
 struct HandlerCtx<'a> {
     file: &'a mut dyn Write,
+    control: Option<&'a std::fs::File>,
+    deadline: Option<std::time::Instant>,
     state: &'a Arc<Mutex<AgentState>>,
     integration_state: &'a Arc<Mutex<IntegrationState>>,
     probe_state: &'a Arc<Mutex<ProbeState>>,
@@ -505,6 +509,12 @@ fn handle_client_operations(
             send_authenticated_response(&mut file, &mut session, &resp);
             return;
         }
+        if let Some(resp) =
+            enforce_owner_access_grant(&req, verb_grant.as_ref(), chrono::Utc::now())
+        {
+            send_authenticated_response(&mut file, &mut session, &resp);
+            return;
+        }
         if let Some(resp) = enforce_application_terminal_grant(&req, verb_grant.as_ref()) {
             send_authenticated_response(&mut file, &mut session, &resp);
             return;
@@ -537,6 +547,13 @@ fn handle_client_operations(
         };
 
         let req = match req {
+            #[cfg(feature = "owner-access-object")]
+            GuestRequest::OwnerAccessObject(
+                mvm_contract::protocol::owner_access::OwnerAccessObjectRequest::Begin(begin),
+            ) => {
+                handlers::handle_owner_access_object(&mut file, &mut session, boot_state, *begin);
+                return;
+            }
             GuestRequest::MediatedExec(call) => {
                 let Some(invocation) = call.tool_check() else {
                     send_authenticated_response(
@@ -577,9 +594,12 @@ fn handle_client_operations(
                     }
                 };
                 let resp = {
+                    let control = file.try_clone().ok();
                     let mut sink = AuthenticatedWriter::new(&mut file, &mut session);
                     let mut ctx = HandlerCtx {
                         file: &mut sink,
+                        control: control.as_ref(),
+                        deadline: None,
                         state,
                         integration_state,
                         probe_state,
@@ -602,10 +622,35 @@ fn handle_client_operations(
             other => other,
         };
 
+        let deadline = match &req {
+            GuestRequest::Exec {
+                deadline_unix_ms: Some(deadline),
+                ..
+            } => mvm_agentd::owner_access::received_deadline(
+                *deadline,
+                chrono::Utc::now(),
+                std::time::Instant::now(),
+            )
+            .or_else(|_| Ok::<_, ()>(std::time::Instant::now()))
+            .ok(),
+            GuestRequest::DeliverDeclaredOperation(request) => {
+                mvm_agentd::owner_access::received_deadline(
+                    request.deadline_unix_ms,
+                    chrono::Utc::now(),
+                    std::time::Instant::now(),
+                )
+                .or_else(|_| Ok::<_, ()>(std::time::Instant::now()))
+                .ok()
+            }
+            _ => None,
+        };
         let resp = {
-            let mut sink = AuthenticatedWriter::new(&mut file, &mut session);
+            let control = file.try_clone().ok();
+            let mut sink = AuthenticatedWriter::new(&mut file, &mut session).before(deadline);
             let mut ctx = HandlerCtx {
                 file: &mut sink,
+                control: control.as_ref(),
+                deadline,
                 state,
                 integration_state,
                 probe_state,
@@ -670,7 +715,17 @@ fn handle_client_operations(
                     command,
                     stdin,
                     timeout_secs,
-                } => operations.exec(&mut ctx, command, stdin, timeout_secs),
+                    deadline_unix_ms,
+                } => match deadline_unix_ms {
+                    Some(deadline) => interactive::handle_exec_bounded(
+                        &mut ctx,
+                        command,
+                        stdin,
+                        timeout_secs,
+                        deadline,
+                    ),
+                    None => operations.exec(&mut ctx, command, stdin, timeout_secs),
+                },
 
                 GuestRequest::MediatedExec(_) => {
                     unreachable!("mediated exec reached ordinary dispatch")
@@ -692,6 +747,28 @@ fn handle_client_operations(
                     env,
                     stream_input,
                 } => operations.entrypoint(&mut ctx, stdin, timeout_secs, env, stream_input),
+                GuestRequest::DeliverDeclaredOperation(request) => {
+                    handle_declared_operation(&mut ctx, request)
+                }
+                GuestRequest::OwnerAccessObject(_) => GuestResponse::VerbNotAuthorized {
+                    verb: "owner-access-object".into(),
+                },
+                GuestRequest::CancelDeclaredOperation(cancel) => {
+                    let cancelled = ctx
+                        .boot_state
+                        .owner_access
+                        .lock()
+                        .map_err(|_| ())
+                        .and_then(|mut desk| {
+                            desk.cancel(&cancel, chrono::Utc::now()).map_err(|_| ())
+                        })
+                        .unwrap_or(false);
+                    GuestResponse::OwnerAccessCancelled {
+                        request_id: cancel.request_id,
+                        sequence: cancel.sequence,
+                        cancelled,
+                    }
+                }
 
                 // The resident agent is the boot-validated entrypoint, so a prompt
                 // is served by the same handler, with the prompt as the agent's
@@ -875,6 +952,13 @@ fn handle_client_operations(
         };
         // A successful handler alone is insufficient: the actual protected
         // response must have been written before this session may continue.
+        if let Some(deadline) = deadline {
+            let _ = session.write(
+                &mut mvm_agentd::owner_access::AccessWriter::new(&mut file, deadline),
+                &resp,
+            );
+            return;
+        }
         let Ok(Some(next)) = complete_cold_response(&mut file, &mut session, next, &resp) else {
             return;
         };
@@ -1457,6 +1541,7 @@ mod tests {
             command: "operation-adapter-never-executes-this".into(),
             stdin: None,
             timeout_secs: Some(1),
+            deadline_unix_ms: None,
         }
     }
 
@@ -1815,6 +1900,7 @@ mod tests {
             command: "unused-state-check".into(),
             stdin: None,
             timeout_secs: None,
+            deadline_unix_ms: None,
         };
         assert!(
             ColdContinuation::Exec

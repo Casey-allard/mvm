@@ -67,7 +67,15 @@ pub enum GuestRequest {
         command: String,
         stdin: Option<String>,
         timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_unix_ms: Option<u64>,
     },
+    /// One plan-declared typed operation. No program/argv/path/env selector.
+    DeliverDeclaredOperation(mvm_contract::protocol::owner_access::OwnerAccessRequest),
+    /// Selected, signed object-v1 payload mapping. Never an alternate envelope.
+    OwnerAccessObject(mvm_contract::protocol::owner_access::OwnerAccessObjectRequest),
+    /// Cancel only the exact active typed operation under the current binding.
+    CancelDeclaredOperation(mvm_contract::protocol::owner_access::OwnerAccessCancel),
     /// Run a declared command only after the guest receives a host tool
     /// decision over this authenticated control session. Unlike `Exec`, this
     /// request cannot reach its spawn handler without that exchange.
@@ -643,6 +651,9 @@ impl GuestRequest {
             Self::ProbeStatus => "probe-status",
             Self::PrimedStatus => "primed-status",
             Self::Exec { .. } => "exec",
+            Self::DeliverDeclaredOperation(_) => "deliver-declared-operation",
+            Self::OwnerAccessObject(_) => "owner-access-object",
+            Self::CancelDeclaredOperation(_) => "cancel-declared-operation",
             Self::MediatedExec(_) => "mediated-exec",
             Self::ExecBatch { .. } => "exec-batch",
             Self::RunEntrypoint { .. } => "run-entrypoint",
@@ -820,6 +831,7 @@ mod tests {
                 command: "uname -a".to_string(),
                 stdin: Some("hello".to_string()),
                 timeout_secs: Some(10),
+                deadline_unix_ms: None,
             },
             GuestRequest::MediatedExec(MediatedExecCall {
                 tool: "shell".to_string(),
@@ -1452,6 +1464,7 @@ mod tests {
                     command: String::new(),
                     stdin: None,
                     timeout_secs: None,
+                    deadline_unix_ms: None,
                 },
                 "exec",
             ),

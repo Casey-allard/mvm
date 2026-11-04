@@ -217,7 +217,7 @@ fn failed_wait_forbids_signals_and_preserves_evidence() {
     assert!(endpoint.shutdown().is_err());
     assert_eq!(endpoint.faults.signal_attempts, 0);
     // Test owns the child and knows the injected error did not lose custody.
-    endpoint.child.kill().unwrap();
+    endpoint.child.as_mut().unwrap().kill().unwrap();
     exited(&mut endpoint);
     assert!(endpoint.shutdown().is_err());
     assert!(endpoint.exit_status().is_some());

@@ -50,6 +50,44 @@ fn do_exec_streaming(
     GuestResponse::ExecEvent(terminal)
 }
 
+pub(crate) fn handle_exec_bounded(
+    ctx: &mut HandlerCtx,
+    command: String,
+    stdin: Option<String>,
+    timeout_secs: Option<u64>,
+    _deadline_unix_ms: u64,
+) -> GuestResponse {
+    use mvm_agentd::{
+        entrypoint::CancellationToken, owner_access::AccessDisconnect, vsock::ExecEvent,
+    };
+    let Some(mut deadline) = ctx.deadline else {
+        return GuestResponse::ExecEvent(ExecEvent::TimedOut);
+    };
+    if let Some(seconds) = timeout_secs {
+        deadline = deadline
+            .min(std::time::Instant::now() + std::time::Duration::from_secs(seconds.min(30)));
+    }
+    let Some(control) = ctx.control else {
+        return GuestResponse::ExecEvent(ExecEvent::Exit { code: -1 });
+    };
+    let token = CancellationToken::default();
+    let Ok(_observer) = AccessDisconnect::watch(control, token.clone(), deadline) else {
+        return GuestResponse::ExecEvent(ExecEvent::Exit { code: -1 });
+    };
+    let terminal = mvm_agentd::exec_stream::stream_exec_bounded(
+        &command,
+        stdin.as_deref(),
+        deadline,
+        &token,
+        |event| {
+            if !token.is_requested() && std::time::Instant::now() < deadline {
+                write_response(ctx.file, &GuestResponse::ExecEvent(event));
+            }
+        },
+    );
+    GuestResponse::ExecEvent(terminal)
+}
+
 /// The reporter a detached workload's reaper runs with the exit code. Like
 /// every other helper it comes from the runtime overlay: neither mkGuest nor
 /// OCI injection bakes a copy into the image.

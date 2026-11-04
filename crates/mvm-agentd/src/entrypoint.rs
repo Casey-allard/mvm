@@ -735,6 +735,22 @@ pub fn execute_streaming(
     call: &EntrypointCall<'_>,
     sink: &mut dyn FnMut(EntrypointEvent),
 ) -> RunOutcome {
+    execute_streaming_inner(call, sink, None)
+}
+/// Additive owner-access path: the original absolute cap includes spawn,
+/// blocked stdin and the output pump; phases never renew that cap.
+pub fn execute_streaming_before(
+    call: &EntrypointCall<'_>,
+    deadline: Instant,
+    sink: &mut dyn FnMut(EntrypointEvent),
+) -> RunOutcome {
+    execute_streaming_inner(call, sink, Some(deadline))
+}
+fn execute_streaming_inner(
+    call: &EntrypointCall<'_>,
+    sink: &mut dyn FnMut(EntrypointEvent),
+    absolute: Option<Instant>,
+) -> RunOutcome {
     let EntrypointCall {
         entrypoint,
         cwd,
@@ -746,6 +762,14 @@ pub fn execute_streaming(
         env,
         stream_input,
     } = call;
+    let fixed = absolute.map(|deadline| {
+        Instant::now()
+            .checked_add(*timeout)
+            .map_or(deadline, |relative| relative.min(deadline))
+    });
+    if fixed.is_some_and(|deadline| Instant::now() >= deadline) {
+        return RunOutcome::Timeout;
+    }
     if stdin_data.len() > caps.stdin_max {
         return RunOutcome::StdinCap;
     }
@@ -866,6 +890,16 @@ pub fn execute_streaming(
     // Last, so the hooks above run before the filter can refuse them.
     crate::workload_seccomp::confine(&mut cmd);
 
+    if fixed.is_some_and(|deadline| Instant::now() >= deadline) {
+        return RunOutcome::Timeout;
+    }
+    if cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_requested)
+    {
+        return RunOutcome::Canceled;
+    }
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -891,7 +925,36 @@ pub fn execute_streaming(
     // died or closed its stdin; treat as soft failure and continue to
     // wait/drain for whatever it did emit.
     if let Some(mut pipe) = child.stdin.take() {
-        let _ = pipe.write_all(stdin_data);
+        if let Some(deadline) = fixed {
+            if let Err(error) =
+                write_stdin_before(&mut pipe, stdin_data, deadline, cancellation.as_ref())
+            {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                ) {
+                    kill_and_reap(&mut child, Duration::ZERO);
+                    return if cancellation
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_requested)
+                    {
+                        RunOutcome::Canceled
+                    } else {
+                        RunOutcome::Timeout
+                    };
+                }
+                // Closed stdin is the existing soft-error behavior. Any other
+                // setup/write failure ends the bounded call, never falls back.
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    kill_and_reap(&mut child, Duration::ZERO);
+                    return RunOutcome::SpawnFailed {
+                        message: "bounded stdin refused".into(),
+                    };
+                }
+            }
+        } else {
+            let _ = pipe.write_all(stdin_data);
+        }
         if *stream_input {
             // The host intends to keep writing, so the fd survives this scope
             // and the EOF is the host's to send. `Pump::run` finds no stdin
@@ -907,9 +970,13 @@ pub fn execute_streaming(
 
     // Nothing here waits for the child to die before output moves: the pump
     // hands each read straight to `sink`.
-    let mut pump = Pump::new(caps)
+    let mut bounded_caps = *caps;
+    if fixed.is_some() {
+        bounded_caps.kill_grace_period = Duration::ZERO;
+    }
+    let mut pump = Pump::new(&bounded_caps)
         .control_channel(fd3_read)
-        .deadline(Instant::now() + *timeout);
+        .deadline(fixed.unwrap_or_else(|| Instant::now() + *timeout));
     if let Some(token) = cancellation {
         pump = pump.cancellation(token.clone());
     }
@@ -921,6 +988,77 @@ pub fn execute_streaming(
         crate::stream_input::InputDesk::abandon();
     }
     outcome.into()
+}
+
+/// One owned pipe, no helper thread and no unbounded write before the pump.
+#[cfg(unix)]
+pub(crate) fn write_stdin_before(
+    pipe: &mut std::process::ChildStdin,
+    bytes: &[u8],
+    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+) -> std::io::Result<()> {
+    use std::{
+        io::{Error, ErrorKind},
+        os::fd::AsRawFd,
+    };
+    let fd = pipe.as_raw_fd();
+    // SAFETY: the borrowed ChildStdin remains live throughout this function.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: only this owned pipe's status flags change, restored below.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(Error::last_os_error());
+    }
+    let result = (|| {
+        let mut written = 0;
+        while written < bytes.len() {
+            if cancellation.is_some_and(CancellationToken::is_requested) {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|time| !time.is_zero())
+                .ok_or(ErrorKind::TimedOut)?;
+            match pipe.write(&bytes[written..]) {
+                Ok(0) => return Err(ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    written += n;
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            let millis = remaining.min(Duration::from_millis(50)).as_millis().max(1) as i32;
+            let mut descriptor = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one live stack descriptor; timeout is bounded by the
+            // original cap and cancellation is checked on every iteration.
+            let polled = unsafe { libc::poll(&mut descriptor, 1, millis) };
+            if polled < 0 {
+                let error = Error::last_os_error();
+                if error.kind() != ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(ErrorKind::BrokenPipe.into());
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: same borrowed live pipe, exact original status flags.
+    let restored = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    if restored < 0 && result.is_ok() {
+        return Err(Error::last_os_error());
+    }
+    result
 }
 
 #[cfg(target_os = "linux")]

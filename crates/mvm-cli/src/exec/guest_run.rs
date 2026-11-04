@@ -381,6 +381,7 @@ mod tests {
                 drive: None,
                 tool_mediation,
                 application_terminal: None,
+                owner_access: None,
                 sig: vec![0u8; 64],
             },
         }
@@ -429,6 +430,7 @@ mod tests {
             command: wrapper,
             stdin: None,
             timeout_secs: None,
+            deadline_unix_ms: None,
         };
         assert!(matches!(
             mvm_agentd::vsock::enforce_verb_grant(&plain, Some(&envelope.grant)),

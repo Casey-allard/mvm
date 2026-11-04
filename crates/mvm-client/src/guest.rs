@@ -598,6 +598,7 @@ mod tests {
                 command: "echo hello".to_string(),
                 stdin: None,
                 timeout_secs: Some(30),
+                deadline_unix_ms: None,
             },
         ];
         for request in cases {

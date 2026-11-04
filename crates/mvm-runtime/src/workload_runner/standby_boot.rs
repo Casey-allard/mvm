@@ -120,6 +120,8 @@ pub fn factory_parent_config(
     })?;
 
     let VmStartConfig {
+        #[cfg(unix)]
+        host_lifetime,
         // ── Per-launch identity and workload authority. A factory parent runs
         // no workload: it holds no plan, no tenant, no secrets, no volumes and
         // no ports; it pre-opens no console listeners; and it never replenishes a
@@ -184,6 +186,12 @@ pub fn factory_parent_config(
         mem_initial_mib,
         kernel_read_sha256,
     } = launch;
+    #[cfg(unix)]
+    if host_lifetime.is_some() {
+        return Err(StandbyError::SpawnFailed(
+            "installed host lifetime is cold-only; standby reuse is unsupported".into(),
+        ));
+    }
 
     if canonical_kernel.is_some() || kernel_read_sha256.is_some() {
         return Err(StandbyError::SpawnFailed(
@@ -205,6 +213,8 @@ pub fn factory_parent_config(
     }
 
     let parent = VmStartConfig {
+        #[cfg(unix)]
+        host_lifetime: None,
         name: spec.id.clone(),
         template_id: spec.template_id.clone(),
         rootfs_path: image.to_string(),

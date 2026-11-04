@@ -72,6 +72,7 @@ pub struct GrantProvenance {
     pub drive: Option<GrantSurface>,
     pub display_input: Option<GrantSurface>,
     pub application_terminal: Option<GrantSurface>,
+    pub owner_access: Option<GrantSurface>,
 }
 
 impl GrantProvenance {
@@ -91,6 +92,7 @@ impl GrantProvenance {
             "drive" => self.drive,
             "display_input" => self.display_input,
             "application_terminal" => self.application_terminal,
+            "owner_access" => self.owner_access,
             _ => None,
         }
     }
@@ -180,6 +182,12 @@ pub fn resolve_grants(layers: &[GrantLayer]) -> ResolvedGrants {
         {
             resolved.grants.application_terminal = Some(terminal.clone());
             resolved.provenance.application_terminal = Some(layer.surface);
+        }
+        if resolved.grants.owner_access.is_none()
+            && let Some(access) = layer.grants.owner_access.as_ref()
+        {
+            resolved.grants.owner_access = Some(access.clone());
+            resolved.provenance.owner_access = Some(layer.surface);
         }
     }
     resolved
@@ -327,6 +335,7 @@ mod tests {
             drive: Some(GrantSurface::GrantsFile),
             display_input: Some(GrantSurface::GrantsFile),
             application_terminal: None,
+            owner_access: None,
         };
         assert_eq!(
             provenance.surface_for_dimension("cpu.share_millicores"),
@@ -440,6 +449,78 @@ mod tests {
             grants.egress.as_ref().map(|e| e.allow.as_slice()),
             Some(&[HostPort::new("api.example.com", 443)][..])
         );
+    }
+
+    #[test]
+    fn owner_access_survives_independent_dimensions_and_retains_surface_precedence() {
+        use mvm_contract::grants::owner_access::{OperationGrant, OwnerAccessGrant};
+        let access = |owner: &str| Grants {
+            owner_access: Some(OwnerAccessGrant {
+                operations: vec![OperationGrant {
+                    name: "status".into(),
+                    owners: vec![owner.into()],
+                    request: vec![],
+                    reply: vec![],
+                    max_request_bytes: 1024,
+                    max_reply_bytes: 1024,
+                    max_in_flight: 1,
+                    max_calls_per_second: 2,
+                    max_deadline_ms: 500,
+                }],
+                object_v1: None,
+            }),
+            ..Default::default()
+        };
+        let surfaces = [
+            GrantSurface::Cli,
+            GrantSurface::GrantsFile,
+            GrantSurface::Manifest,
+            GrantSurface::HostConfig,
+        ];
+        for (index, surface) in surfaces.into_iter().enumerate() {
+            let expected = access("selected-owner");
+            let mut layers = vec![GrantLayer::new(GrantSurface::Cli, cpu(1000))];
+            layers.push(GrantLayer::new(surface, expected.clone()));
+            for lower in &surfaces[index + 1..] {
+                layers.push(GrantLayer::new(*lower, access("lower-owner")));
+            }
+            let resolved = resolve_grants(&layers);
+            assert_eq!(resolved.grants().owner_access, expected.owner_access);
+            assert_eq!(
+                resolved
+                    .provenance()
+                    .surface_for_dimension("owner_access.operations"),
+                Some(surface)
+            );
+            assert_eq!(resolved.provenance().cpu, Some(GrantSurface::Cli));
+        }
+        assert!(resolve_grants(&[]).into_plan_grants().is_none());
+        assert!(
+            resolve_grants(&[GrantLayer::new(GrantSurface::Cli, cpu(1))])
+                .grants()
+                .owner_access
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn owner_access_grants_file_retains_strict_declared_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grants.json");
+        let document = serde_json::json!({"owner_access":{"operations":[{
+            "name":"status","owners":["owner-a"],"request":[],"reply":[],
+            "max_request_bytes":1024,"max_reply_bytes":1024,"max_in_flight":1,
+            "max_calls_per_second":2,"max_deadline_ms":500
+        }]}});
+        std::fs::write(&path, document.to_string()).unwrap();
+        let loaded = load_grants_file(&path).expect("canonical access declaration");
+        loaded.owner_access.as_ref().unwrap().validate().unwrap();
+        let resolved = resolve_grants(&[GrantLayer::new(GrantSurface::GrantsFile, loaded.clone())]);
+        assert_eq!(resolved.grants().owner_access, loaded.owner_access);
+        let mut malformed = document;
+        malformed["owner_access"]["operations"][0]["argv"] = serde_json::json!(["/bin/sh"]);
+        std::fs::write(&path, malformed.to_string()).unwrap();
+        assert!(load_grants_file(&path).is_err());
     }
 
     #[test]

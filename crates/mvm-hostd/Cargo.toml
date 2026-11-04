@@ -78,6 +78,10 @@ required-features = ["libkrun-sys"]
 name = "mvm-hvf-supervisor"
 path = "src/bin/mvm-hvf-supervisor.rs"
 
+[[bin]]
+name = "mvm-fc-supervisor"
+path = "src/bin/mvm-fc-supervisor.rs"
+
 # Root-owned macOS APFS snapshot boundary. The client never elevates itself;
 # this binary is installed and launched by the host service manager with an
 # explicit state-root and client UID allowlist.
@@ -87,6 +91,8 @@ path = "src/bin/mvm-apfs-snapshot-helper.rs"
 required-features = ["trusted-apfs"]
 
 [dependencies]
+spiralcore-mvm-flowmux = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1" }
+spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1" }
 # `egress-ca`: the https terminator mints per-SNI leaves
 # under the per-VM intermediate (`mvm_core::crypto::egress_ca`).
 mvm-core = { workspace = true, features = ["egress-ca", "host-state"] }
@@ -119,7 +125,7 @@ async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 # rand_core feature for the signers' Ed25519 keygen.
-ed25519-dalek = { workspace = true, features = ["rand_core"] }
+ed25519-dalek = { workspace = true, features = ["rand_core", "pkcs8", "alloc"] }
 sysinfo = { version = "0.30", default-features = false }
 ipnet.workspace = true
 # Evented readiness for FlowMux UDP relays.

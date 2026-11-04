@@ -282,6 +282,18 @@ fn validate_flowmux_limits(cfg: &EndpointConfig) -> Result<()> {
     } else if !cfg.ingress.is_empty() {
         anyhow::bail!("declared ingress requires the authenticated FlowMux endpoint");
     }
+    if cfg
+        .network_policy
+        .as_ref()
+        .is_some_and(|policy| policy.payload_mapping().is_some())
+    {
+        // A signed selection and serialized plan facts are not a host resource
+        // grant. The canonical parent/provider handoff must be resolved before
+        // binding any endpoint or reporting readiness. None keeps legacy boot.
+        anyhow::bail!(
+            "selected mapping requires admitted parent payload provider before activation"
+        );
+    }
     Ok(())
 }
 
@@ -1056,6 +1068,7 @@ struct DecodedFlowMuxIdentity {
 /// One immutable projection of the admitted endpoint config shared by every
 /// FlowMux opcode and every accepted session for this VM.
 struct FlowMuxEndpointProjection {
+    payload_mapping: Option<std::sync::Arc<mvm_hostd::supervisor::flowmux::PayloadMappingConfig>>,
     identity: std::sync::Arc<DecodedFlowMuxIdentity>,
     gate: std::sync::Arc<mvm_runtime::vmm::egress_gate::EgressGate>,
     recorder: Option<std::sync::Arc<mvm_hostd::supervisor::audit_recorder::Recorder>>,
@@ -1075,6 +1088,23 @@ impl FlowMuxEndpointProjection {
         >,
         network: EndpointNetworkProjection,
     ) -> Result<Self> {
+        let payload_mapping = if let Some(policy) = cfg
+            .network_policy
+            .as_ref()
+            .filter(|policy| policy.payload_mapping().is_some())
+        {
+            let plan = cfg
+                .admitted_network_plan
+                .as_ref()
+                .context("selected payload mapping requires admitted plan facts")?;
+            plan.validate_for(policy, &cfg.tenant_id, &cfg.instance_id)
+                .context("validate selected payload mapping plan binding")?;
+            Some(std::sync::Arc::new(
+                mvm_hostd::supervisor::flowmux::PayloadMappingConfig::new(policy, plan.clone())?,
+            ))
+        } else {
+            None
+        };
         let identity = cfg
             .flowmux_identity
             .as_ref()
@@ -1108,6 +1138,7 @@ impl FlowMuxEndpointProjection {
             })
             .collect::<Vec<_>>();
         Ok(Self {
+            payload_mapping,
             identity,
             gate: network.gate(),
             recorder: network.recorder(),
@@ -1130,6 +1161,7 @@ impl FlowMuxEndpointProjection {
         .with_substitution(self.substitution.as_ref().map(std::sync::Arc::clone))
         .with_vm_resources(std::sync::Arc::clone(&self.resources))
         .with_ingress_transports(self.ingress_transports.iter().copied())
+        .with_payload_mapping(self.payload_mapping.as_ref().map(std::sync::Arc::clone))
     }
 }
 
@@ -1361,6 +1393,37 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn selected_payload_without_parent_provider_refuses_before_endpoint_activation() {
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, NetworkPolicy, PayloadMappingProfile,
+        };
+        let mut cfg = uds_cfg();
+        cfg.egress_mode = EgressMode::FlowMux;
+        assert!(
+            validate_flowmux_limits(&cfg).is_ok(),
+            "unselected legacy config remains valid"
+        );
+        cfg.network_policy = Some(
+            NetworkPolicy::deny_all().with_payload_mapping(Some(
+                CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                    host: "peer.example".into(),
+                    port: 443,
+                    server_name: "peer.example".into(),
+                    spki_sha256: [7; 32],
+                    profile: PayloadMappingProfile::SpiralCoreObjectStreamV1,
+                }])
+                .expect("selected peer"),
+            )),
+        );
+        let refusal = validate_flowmux_limits(&cfg)
+            .expect_err("required mapping cannot activate without admitted parent provider");
+        assert!(
+            refusal.to_string().contains("parent payload provider"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
     fn endpoint_source_has_no_unconfined_escape_hatch() {
         let source = include_str!("mvm-network-endpoint.rs");
         let bypass_name = ["MVM", "ENDPOINT", "NO", "CONFINE"].join("_");
@@ -1389,6 +1452,7 @@ mod tests {
             secret_store_dir: None,
             binding_store_dir: None,
             tls_intermediate: None,
+            admitted_network_plan: None,
             network_policy: Some(mvm_core::policy::network_policy::NetworkPolicy::allow_list(
                 vec![mvm_core::policy::network_policy::HostPort::new(
                     "142.250.72.14",
@@ -1430,6 +1494,7 @@ mod tests {
             binding_store_dir: None,
             tls_intermediate: None,
             network_policy: None,
+            admitted_network_plan: None,
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: Vec::new(),
             egress_mode: EgressMode::Wire,
@@ -1598,6 +1663,102 @@ mod tests {
             assert_eq!(
                 observed, expected,
                 "{surface} diverged from the endpoint projection"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_payload_mapping_requires_full_actual_admitted_plan_binding() {
+        use base64::Engine as _;
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, NetworkPolicy, PayloadMappingProfile,
+        };
+        let directory = tempfile::tempdir().expect("directory");
+        let mut environment = mvm_core::util::test_env::TestEnv::new();
+        environment.set("MVM_HOME", directory.path());
+        let mut cfg = uds_cfg();
+        cfg.instance_id = "actual-test-instance".into();
+        cfg.egress_mode = EgressMode::FlowMux;
+        let host = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let guest = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        cfg.flowmux_identity = Some(mvm_hostd::supervisor::network_endpoint::FlowMuxIdentity {
+            session_id: "actual-authenticated-session".into(),
+            host_signing_key_base64: base64::engine::general_purpose::STANDARD
+                .encode(host.to_bytes()),
+            guest_verifying_key_base64: base64::engine::general_purpose::STANDARD
+                .encode(guest.verifying_key().to_bytes()),
+        });
+        let selected = NetworkPolicy::deny_all().with_payload_mapping(Some(
+            CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                host: "peer.example".into(),
+                port: 443,
+                server_name: "peer.example".into(),
+                spki_sha256: [7; 32],
+                profile: PayloadMappingProfile::SpiralCoreObjectStreamV1,
+            }])
+            .expect("mapping"),
+        ));
+        cfg.network_policy = Some(selected);
+        assert!(
+            FlowMuxEndpointProjection::from_config(
+                &cfg,
+                None,
+                EndpointNetworkProjection::from_config(&cfg)
+            )
+            .is_err(),
+            "selected mapping cannot be projected without actual admitted plan facts"
+        );
+        let binding = mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan {
+            plan_id: mvm_core::plan::PlanId("actual-full-plan".into()),
+            plan_version: 1,
+            plan_nonce: mvm_core::plan::Nonce::from_bytes([9; 16]),
+            bundle_sha256: "b".repeat(64),
+            tenant_id: cfg.tenant_id.clone(),
+            instance_id: cfg.instance_id.clone(),
+            policy_sha256: mvm_core::policy::network_policy::content_sha256(
+                cfg.network_policy.as_ref().expect("policy"),
+            ),
+        };
+        cfg.admitted_network_plan = Some(binding.clone());
+        let projected = FlowMuxEndpointProjection::from_config(
+            &cfg,
+            None,
+            EndpointNetworkProjection::from_config(&cfg),
+        )
+        .expect("materialized binding");
+        assert!(projected.payload_mapping.is_some());
+        for (tenant, instance, policy) in [
+            (
+                "other",
+                binding.instance_id.as_str(),
+                binding.policy_sha256.as_str(),
+            ),
+            (
+                binding.tenant_id.as_str(),
+                "other",
+                binding.policy_sha256.as_str(),
+            ),
+            (
+                binding.tenant_id.as_str(),
+                binding.instance_id.as_str(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ] {
+            cfg.admitted_network_plan =
+                Some(mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan {
+                    tenant_id: tenant.into(),
+                    instance_id: instance.into(),
+                    policy_sha256: policy.into(),
+                    ..binding.clone()
+                });
+            assert!(
+                FlowMuxEndpointProjection::from_config(
+                    &cfg,
+                    None,
+                    EndpointNetworkProjection::from_config(&cfg)
+                )
+                .is_err(),
+                "mismatched endpoint scope refuses"
             );
         }
     }
@@ -1944,6 +2105,7 @@ mod tests {
             binding_store_dir: None,
             tls_intermediate: None,
             network_policy: None,
+            admitted_network_plan: None,
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: Vec::new(),
             egress_mode: EgressMode::FlowMux,

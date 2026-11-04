@@ -60,6 +60,9 @@ pub struct VerbGrant {
     /// only for exactly that argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_terminal: Option<crate::grants::ApplicationTerminalBinding>,
+    /// Exact plan-derived typed application access. Absent admits no access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_access: Option<crate::grants::owner_access::OwnerAccessBinding>,
     /// Raw Ed25519 signature bytes (64) over signing_bytes(), serialized as
     /// base64. A `Vec<u8>` would otherwise render as a JSON array of 64 decimal
     /// numbers — roughly 230 characters against base64's 88 — and this grant
@@ -145,6 +148,8 @@ pub enum VerbGrantError {
     Expired,
     #[error("verb grant signature invalid")]
     BadSignature,
+    #[error("owner access binding invalid or mismatched")]
+    OwnerAccessBinding,
 }
 
 /// Fixed-field-order, map-free struct: `serde_json::to_vec` is
@@ -161,6 +166,8 @@ struct VerbGrantSigned<'a> {
     tool_mediation: Option<&'a ToolMediationGrant>,
     #[serde(skip_serializing_if = "Option::is_none")]
     application_terminal: Option<&'a crate::grants::ApplicationTerminalBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_access: Option<&'a crate::grants::owner_access::OwnerAccessBinding>,
 }
 
 impl VerbGrant {
@@ -173,6 +180,7 @@ impl VerbGrant {
             drive: self.drive.as_ref(),
             tool_mediation: self.tool_mediation.as_ref(),
             application_terminal: self.application_terminal.as_ref(),
+            owner_access: self.owner_access.as_ref(),
         };
         serde_json::to_vec(&body).expect("VerbGrantSigned serializes")
     }
@@ -196,6 +204,16 @@ impl VerbGrant {
         let sig = Signature::from_slice(&self.sig).map_err(|_| VerbGrantError::BadSignature)?;
         key.verify(&self.signing_bytes(), &sig)
             .map_err(|_| VerbGrantError::BadSignature)?;
+        if let Some(binding) = &self.owner_access {
+            binding
+                .validate()
+                .map_err(|_| VerbGrantError::OwnerAccessBinding)?;
+            if binding.execution.instance_id != self.session_id
+                || binding.execution.plan_nonce != self.plan_nonce
+            {
+                return Err(VerbGrantError::OwnerAccessBinding);
+            }
+        }
         Ok(())
     }
 
@@ -206,6 +224,16 @@ impl VerbGrant {
         VERB_GRANT_BASELINE.contains(&verb)
             || (self.drive.is_some() && matches!(verb, "drive-open" | "drive-file"))
             || (self.application_terminal.is_some() && APPLICATION_TERMINAL_VERBS.contains(&verb))
+            || (self.owner_access.is_some()
+                && matches!(
+                    verb,
+                    "deliver-declared-operation" | "cancel-declared-operation"
+                ))
+            || (verb == "owner-access-object"
+                && self
+                    .owner_access
+                    .as_ref()
+                    .is_some_and(|binding| binding.grant.object_v1.is_some()))
             || self.verbs.iter().any(|v| v.as_str() == verb)
     }
 }
@@ -238,6 +266,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         g.sig = k.sign(&g.signing_bytes()).to_bytes().to_vec();

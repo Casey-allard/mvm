@@ -234,6 +234,32 @@ pub fn admit_and_boot_local(
     req: &LocalRunRequest,
     ctx: LocalRunContext<'_>,
 ) -> Result<StartedMachine> {
+    admit_and_boot_local_inner(
+        backend,
+        req,
+        ctx,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+/// Same admission and original nonce, with an in-process installation owner.
+#[cfg(unix)]
+pub fn admit_and_boot_local_with_host_lifetime(
+    backend: &AnyBackend,
+    req: &LocalRunRequest,
+    ctx: LocalRunContext<'_>,
+    owner: std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+) -> Result<StartedMachine> {
+    admit_and_boot_local_inner(backend, req, ctx, Some(owner))
+}
+
+fn admit_and_boot_local_inner(
+    backend: &AnyBackend,
+    req: &LocalRunRequest,
+    ctx: LocalRunContext<'_>,
+    #[cfg(unix)] owner: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
+) -> Result<StartedMachine> {
     anyhow::ensure!(
         req.volumes
             .iter()
@@ -248,7 +274,15 @@ pub fn admit_and_boot_local(
     // against the operator-pinned signer set, never synthesized or re-signed
     // under the host key.
     if let Some(signed) = req.signed_plan.as_ref() {
-        return admit_signed_and_boot_local(backend, req, signed, &sha, ctx);
+        return admit_signed_and_boot_local(
+            backend,
+            req,
+            signed,
+            &sha,
+            ctx,
+            #[cfg(unix)]
+            owner,
+        );
     }
 
     // Pin the kernel into the signed plan. Deliberately the uncached digest: a
@@ -349,6 +383,10 @@ pub fn admit_and_boot_local(
         network_policy,
         ..Default::default()
     };
+    #[cfg(unix)]
+    if let Some(owner) = owner {
+        owner.bind_to_config(&mut config)?;
+    }
     attach_guest_runtime(&mut config, &req.backend_name)?;
 
     admit_and_start(
@@ -391,6 +429,7 @@ fn admit_signed_and_boot_local(
     signed: &mvm_core::plan::SignedExecutionPlan,
     rootfs_sha: &str,
     ctx: LocalRunContext<'_>,
+    #[cfg(unix)] owner: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
 ) -> Result<StartedMachine> {
     use crate::plan_admission::{RunPosture, StartAdmittedParams, start_admitted};
 
@@ -446,6 +485,10 @@ fn admit_signed_and_boot_local(
         },
         ..Default::default()
     };
+    #[cfg(unix)]
+    if let Some(owner) = owner {
+        owner.bind_to_config(&mut config)?;
+    }
     attach_guest_runtime(&mut config, &req.backend_name)?;
 
     crate::audit::durability::record_admission(

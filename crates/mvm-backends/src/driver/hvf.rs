@@ -102,6 +102,7 @@ impl HvfDriver {
                 kernel,
                 images,
                 writable: None,
+                host_lifetime: None,
             },
         )
         .map(ColdHvfOwner::from_fresh)
@@ -325,6 +326,7 @@ fn relay_supervisor_config_with_handoff(
         kernel_fd: None,
         boot_image_fds: None,
         writable_disk_fds: Vec::new(),
+        host_lifetime_fds: None,
         cmdline,
         memory_mib: spec.memory_mib,
         vcpus: spec.vcpus,
@@ -530,6 +532,7 @@ fn boot_with_handoff(
             kernel,
             images: None,
             writable: None,
+            host_lifetime: None,
         },
     )
     .map(|vm| Box::new(vm) as Box<dyn RunningVm>)
@@ -583,7 +586,7 @@ fn boot_retaining_child(
         .map_err(|e| anyhow!("{}", supervisor_unavailable_message(&e)))?;
     // Diagnostics are optional evidence, never a launch or readiness gate.
     let mut diagnostics = StartupDiagnostics::new().ok();
-    let mut command = if cfg.kernel_fd.is_some() || !cfg.writable_disk_fds.is_empty() {
+    let mut command = if cfg.kernel_fd.is_some() || !cfg.writable_disk_fds.is_empty() || cfg.host_lifetime_fds.is_some() {
         let mut command = mvm_core::env_hygiene::helper_command(&supervisor);
         (policy.configure_environment)(&mut command);
         StartupDiagnostics::configure(&mut command, diagnostics.as_ref());
@@ -609,13 +612,16 @@ fn boot_retaining_child(
             policy,
         )
     };
-    let child = command
-        .stdin(std::process::Stdio::piped())
+    command.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(mvm_vmm::host::hvf_supervisor::protected_supervisor_stderr())
-        .spawn()
-        .map_err(|e| anyhow!("spawn {}: {e:#}", supervisor.display()))?;
-    *pending_child = Some(child);
+        .stderr(mvm_vmm::host::hvf_supervisor::protected_supervisor_stderr());
+    if cfg.host_lifetime_fds.is_some() {
+        command.spawn_custodied(pending_child)
+            .with_context(|| format!("spawn installed {}", supervisor.display()))?;
+    } else {
+        *pending_child = Some(command.spawn()
+            .map_err(|e| anyhow!("spawn {}: {e:#}", supervisor.display()))?);
+    }
     let child = pending_child
         .as_mut()
         .context("spawned supervisor missing")?;
@@ -880,10 +886,32 @@ impl VmmDriver for HvfDriver {
                 kernel,
                 images: None,
                 writable: Some(&disks),
+                host_lifetime: None,
             },
         )
         .map(|vm| Box::new(vm) as Box<dyn RunningVm>)
         .map_err(anyhow::Error::new)
+    }
+
+    #[cfg(unix)]
+    fn boot_custodied_with_host_lifetime(
+        &self,
+        spec: &VmmSpec,
+        kernel: Option<&mvm_vmm::host::restore_image::VerifiedRestoreFile>,
+        disks: mvm_vmm::driver::prepared_disks::PreparedWritableDisks,
+        lease: mvm_core::host_lifetime::PreparedHostLifetimeLease,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<Box<dyn RunningVm>> {
+        anyhow::ensure!(binding.backend == BackendKind::Hvf && binding.vm_name == spec.name
+            && spec.vcpus > 0 && spec.vcpus <= binding.cpus
+            && spec.memory_mib > 0 && spec.memory_mib <= binding.memory_mib,
+            "installed HVF recipe differs from original parent binding");
+        disks.validate_spec(spec)?;
+        lease.verify_current()?;
+        let result = boot_with_custody(spec, None, None, SupervisorLaunchPolicy::legacy(),
+            BootInputFiles { kernel, images: None, writable: Some(&disks), host_lifetime: Some(&lease) });
+        result.map(|vm| Box::new(vm) as Box<dyn RunningVm>)
+            .map_err(|failure| anyhow::Error::new(failure.retain_support((disks, lease))))
     }
 
     fn spawn_standby_parent(
@@ -1399,6 +1427,8 @@ impl RunningVm for HvfRunningVm {
                 Err(error) if self.stop_found_nothing_running(&error) => {
                     mvm_vmm::host::ui::info(&format!("machine {} is already stopped", self.id.0));
                     return Ok(mvm_vmm::driver::traits::KernelStopOutcome {
+                        #[cfg(target_os="linux")]
+                        fc_exit:None,
                         timing: None,
                         hvf_exit: None,
                     });
@@ -1414,6 +1444,8 @@ impl RunningVm for HvfRunningVm {
             state_cleanup: std::time::Duration::ZERO,
         });
         Ok(mvm_vmm::driver::traits::KernelStopOutcome {
+            #[cfg(target_os="linux")]
+            fc_exit:None,
             timing,
             hvf_exit: Some(proof),
         })

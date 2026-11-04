@@ -48,6 +48,8 @@ pub(crate) enum ChildGrantError {
     DriveMismatch,
     #[error("child application terminal does not match the admitted plan")]
     ApplicationTerminalMismatch,
+    #[error("child owner access does not match the admitted plan and final identity")]
+    OwnerAccessMismatch,
     #[error("fresh child grant unexpectedly carries predecessor lineage")]
     UnexpectedPredecessor,
     #[error("child grant public key is not a 32-byte lowercase hex key")]
@@ -72,8 +74,9 @@ pub(crate) fn issue_child_grant(
         .as_ref()
         .and_then(|grants| grants.application_terminal.as_ref())
         .map(mvm_contract::grants::ApplicationTerminalBinding::from);
+    let expected_owner=mvm_contract::grants::owner_access::OwnerAccessBinding::from_plan(plan,&config.name).map_err(|_|ChildGrantError::OwnerAccessMismatch)?;
     let grant_required =
-        plan.agent_verbs.is_some() || expected_drive.is_some() || expected_terminal.is_some();
+        plan.agent_verbs.is_some() || expected_drive.is_some() || expected_terminal.is_some() || expected_owner.is_some();
     let Some(issuer) = issuer else {
         return if grant_required {
             Err(ChildGrantError::IssuerRequired)
@@ -113,6 +116,7 @@ pub(crate) fn issue_child_grant(
     if envelope.grant.application_terminal != expected_terminal {
         return Err(ChildGrantError::ApplicationTerminalMismatch);
     }
+    if envelope.grant.owner_access!=expected_owner {return Err(ChildGrantError::OwnerAccessMismatch);}
     if envelope.predecessor_session_id.is_some() || envelope.predecessor_plan_nonce_hex.is_some() {
         return Err(ChildGrantError::UnexpectedPredecessor);
     }
@@ -189,6 +193,7 @@ mod tests {
                     .as_ref()
                     .and_then(|grants| grants.application_terminal.as_ref())
                     .map(mvm_contract::grants::ApplicationTerminalBinding::from),
+                owner_access: None,
                 sig: vec![3u8; 64],
             },
         }

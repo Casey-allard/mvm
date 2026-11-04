@@ -42,6 +42,117 @@ pub enum NetworkPolicyParseError {
     UnknownEgressMode(String),
 }
 
+#[cfg(test)]
+mod payload_mapping_contract_tests {
+    use super::{
+        CooperatingPayloadPolicy, CooperatingTcpPeer, HostPort, NetworkPolicy, NetworkPreset,
+        PayloadMappingProfile,
+    };
+
+    fn peer() -> CooperatingTcpPeer {
+        CooperatingTcpPeer {
+            host: "peer.example".into(),
+            port: 443,
+            server_name: "peer.example".into(),
+            spki_sha256: [7; 32],
+            profile: PayloadMappingProfile::SpiralCoreObjectStreamV1,
+        }
+    }
+    #[test]
+    fn signed_small_payload_profile_is_explicit_and_preserves_general_policy_bytes() {
+        let general = CooperatingPayloadPolicy::new(alloc::vec![peer()]).expect("General peer");
+        let general_json = serde_json::to_string(&general).expect("General canonical bytes");
+        let mut small_peer = peer();
+        small_peer.profile = PayloadMappingProfile::SpiralCoreObjectStreamSmallV1;
+        let small = CooperatingPayloadPolicy::new(alloc::vec![small_peer]).expect("Small peer");
+        let small_json = serde_json::to_string(&small).expect("Small canonical bytes");
+        assert!(general_json.contains("spiral_core_object_stream_v1"));
+        assert!(small_json.contains("spiral_core_object_stream_small_v1"));
+        assert_ne!(general_json, small_json);
+        assert_eq!(
+            serde_json::from_str::<CooperatingPayloadPolicy>(&small_json).expect("Small roundtrip"),
+            small
+        );
+    }
+    #[test]
+    fn payload_mapping_none_preserves_exact_canonical_policy_bytes() {
+        assert_eq!(
+            serde_json::to_string(&NetworkPolicy::preset(NetworkPreset::Dev)).expect("serialize"),
+            r#"{"type":"preset","preset":"dev"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkPolicy::allow_list(alloc::vec![HostPort::new(
+                "peer.example",
+                443
+            )]))
+            .expect("serialize"),
+            r#"{"type":"allowlist","rules":[{"host":"peer.example","port":443}]}"#
+        );
+    }
+    #[test]
+    fn signed_payload_selection_roundtrips_and_does_not_grant_a_route() {
+        let mapping =
+            CooperatingPayloadPolicy::new(alloc::vec![peer()]).expect("valid pinned peer");
+        let policy = NetworkPolicy::deny_all().with_payload_mapping(Some(mapping.clone()));
+        assert!(!policy.admits_outbound());
+        assert_eq!(policy.payload_mapping(), Some(&mapping));
+        let encoded = serde_json::to_vec(&policy).expect("serialize");
+        let decoded: NetworkPolicy = serde_json::from_slice(&encoded).expect("parse");
+        assert_eq!(decoded, policy);
+        assert_eq!(
+            decoded
+                .payload_mapping()
+                .expect("mapping")
+                .select("peer.example", 443),
+            Some(&peer())
+        );
+        assert!(
+            decoded
+                .payload_mapping()
+                .expect("mapping")
+                .select("other.example", 443)
+                .is_none()
+        );
+        assert!(
+            decoded
+                .payload_mapping()
+                .expect("mapping")
+                .select("peer.example", 8443)
+                .is_none()
+        );
+    }
+    #[test]
+    fn malformed_or_ambiguous_payload_policy_refuses_during_decode() {
+        assert!(CooperatingPayloadPolicy::new(alloc::vec![]).is_err());
+        assert!(CooperatingPayloadPolicy::new(alloc::vec![peer();33]).is_err());
+        assert!(CooperatingPayloadPolicy::new(alloc::vec![peer(), peer()]).is_err());
+        for bad in [
+            CooperatingTcpPeer { port: 0, ..peer() },
+            CooperatingTcpPeer {
+                spki_sha256: [0; 32],
+                ..peer()
+            },
+            CooperatingTcpPeer {
+                host: "*.example".into(),
+                ..peer()
+            },
+            CooperatingTcpPeer {
+                server_name: "".into(),
+                ..peer()
+            },
+        ] {
+            assert!(CooperatingPayloadPolicy::new(alloc::vec![bad]).is_err());
+        }
+        let mapping = CooperatingPayloadPolicy::new(alloc::vec![peer()]).expect("valid");
+        let mut wire = serde_json::to_value(mapping).expect("serialize");
+        wire["version"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<CooperatingPayloadPolicy>(wire.clone()).is_err());
+        wire["version"] = serde_json::json!(1);
+        wire["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<CooperatingPayloadPolicy>(wire).is_err());
+    }
+}
+
 /// A host:port pair for network allowlist rules.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -328,6 +439,123 @@ pub struct AiBudget {
     pub max_total_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum PayloadMappingProfile {
+    SpiralCoreObjectStreamV1,
+    SpiralCoreObjectStreamSmallV1,
+}
+
+/// Explicit cooperating application destination; this does not grant a route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CooperatingTcpPeer {
+    pub host: String,
+    pub port: u16,
+    pub server_name: String,
+    pub spki_sha256: [u8; 32],
+    pub profile: PayloadMappingProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PayloadPolicyError {
+    #[error("unsupported payload mapping version")]
+    Version,
+    #[error("payload peer limit")]
+    Limit,
+    #[error("invalid cooperating peer")]
+    Peer,
+    #[error("ambiguous cooperating peer")]
+    Duplicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PayloadPolicyWire", into = "PayloadPolicyWire")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CooperatingPayloadPolicy {
+    version: u16,
+    peers: Vec<CooperatingTcpPeer>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayloadPolicyWire {
+    version: u16,
+    peers: Vec<CooperatingTcpPeer>,
+}
+fn canonical_payload_host(value: &str) -> Result<String, PayloadPolicyError> {
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(ip.to_string());
+    }
+    if value.is_empty() || value.len() > 253 || !value.is_ascii() {
+        return Err(PayloadPolicyError::Peer);
+    }
+    let canonical = value.to_ascii_lowercase();
+    if canonical.split('.').any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    }) {
+        return Err(PayloadPolicyError::Peer);
+    }
+    Ok(canonical)
+}
+impl CooperatingPayloadPolicy {
+    pub fn new(mut peers: Vec<CooperatingTcpPeer>) -> Result<Self, PayloadPolicyError> {
+        if peers.is_empty() || peers.len() > 32 {
+            return Err(PayloadPolicyError::Limit);
+        }
+        for index in 0..peers.len() {
+            let peer = &mut peers[index];
+            peer.host = canonical_payload_host(&peer.host)?;
+            peer.server_name = canonical_payload_host(&peer.server_name)?;
+            if peer.port == 0 || peer.spki_sha256 == [0; 32] {
+                return Err(PayloadPolicyError::Peer);
+            }
+            let host = peer.host.clone();
+            let port = peer.port;
+            if peers[..index]
+                .iter()
+                .any(|earlier| earlier.host == host && earlier.port == port)
+            {
+                return Err(PayloadPolicyError::Duplicate);
+            }
+        }
+        Ok(Self { version: 1, peers })
+    }
+    pub fn peers(&self) -> &[CooperatingTcpPeer] {
+        &self.peers
+    }
+    pub fn select(&self, host: &str, port: u16) -> Option<&CooperatingTcpPeer> {
+        let canonical = canonical_payload_host(host).ok()?;
+        self.peers
+            .iter()
+            .find(|peer| peer.host == canonical && peer.port == port)
+    }
+}
+impl TryFrom<PayloadPolicyWire> for CooperatingPayloadPolicy {
+    type Error = PayloadPolicyError;
+    fn try_from(value: PayloadPolicyWire) -> Result<Self, Self::Error> {
+        if value.version != 1 {
+            return Err(PayloadPolicyError::Version);
+        }
+        Self::new(value.peers)
+    }
+}
+impl From<CooperatingPayloadPolicy> for PayloadPolicyWire {
+    fn from(value: CooperatingPayloadPolicy) -> Self {
+        Self {
+            version: value.version,
+            peers: value.peers,
+        }
+    }
+}
+
 /// Network policy for a microVM, controlling outbound traffic.
 ///
 /// The optional `egress_mode` enrichment is a per-policy override. When
@@ -365,6 +593,8 @@ pub enum NetworkPolicy {
         /// [`crate::policy::routes::RouteSet`] wherever it is decided on.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         routes: Vec<crate::policy::routes::EgressRoute>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_mapping: Option<CooperatingPayloadPolicy>,
     },
     /// Explicit allowlist of host:port pairs.
     AllowList {
@@ -390,10 +620,34 @@ pub enum NetworkPolicy {
         /// [`crate::policy::routes::RouteSet`] wherever it is decided on.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         routes: Vec<crate::policy::routes::EgressRoute>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_mapping: Option<CooperatingPayloadPolicy>,
     },
 }
 
 impl NetworkPolicy {
+    pub fn payload_mapping(&self) -> Option<&CooperatingPayloadPolicy> {
+        match self {
+            Self::Preset {
+                payload_mapping, ..
+            }
+            | Self::AllowList {
+                payload_mapping, ..
+            } => payload_mapping.as_ref(),
+        }
+    }
+    #[must_use]
+    pub fn with_payload_mapping(mut self, mapping: Option<CooperatingPayloadPolicy>) -> Self {
+        match &mut self {
+            Self::Preset {
+                payload_mapping, ..
+            }
+            | Self::AllowList {
+                payload_mapping, ..
+            } => *payload_mapping = mapping,
+        }
+        self
+    }
     /// Peer routes this policy admits. Empty is the default and admits none,
     /// so east-west inherits claim-10's posture rather than having its own.
     pub fn peers(&self) -> &[crate::peer::PeerBinding] {
@@ -446,6 +700,7 @@ impl NetworkPolicy {
             ai: None,
             peers: Vec::new(),
             routes: Vec::new(),
+            payload_mapping: None,
         }
     }
 
@@ -468,6 +723,7 @@ impl NetworkPolicy {
             ai: None,
             peers: Vec::new(),
             routes: Vec::new(),
+            payload_mapping: None,
         }
     }
 
@@ -478,6 +734,7 @@ impl NetworkPolicy {
             ai: None,
             peers: Vec::new(),
             routes: Vec::new(),
+            payload_mapping: None,
         }
     }
 
@@ -488,73 +745,28 @@ impl NetworkPolicy {
             ai: None,
             peers: Vec::new(),
             routes: Vec::new(),
+            payload_mapping: None,
         }
     }
 
     /// Return this policy with the AI attachment replaced.
     #[must_use]
-    pub fn with_ai(self, ai: Option<AiPolicy>) -> Self {
-        match self {
-            Self::Preset {
-                preset,
-                egress_mode,
-                peers,
-                routes,
-                ..
-            } => Self::Preset {
-                preset,
-                egress_mode,
-                ai,
-                peers,
-                routes,
-            },
-            Self::AllowList {
-                rules,
-                egress_mode,
-                peers,
-                routes,
-                ..
-            } => Self::AllowList {
-                rules,
-                egress_mode,
-                ai,
-                peers,
-                routes,
-            },
+    pub fn with_ai(mut self, new_ai: Option<AiPolicy>) -> Self {
+        match &mut self {
+            Self::Preset { ai, .. } | Self::AllowList { ai, .. } => *ai = new_ai,
         }
+        self
     }
 
     /// Return this policy with a baked-in egress-mode override.
     #[must_use]
-    pub fn with_egress_mode(self, mode: EgressMode) -> Self {
-        match self {
-            Self::Preset {
-                preset,
-                ai,
-                peers,
-                routes,
-                ..
-            } => Self::Preset {
-                preset,
-                egress_mode: Some(mode),
-                ai,
-                peers,
-                routes,
-            },
-            Self::AllowList {
-                rules,
-                ai,
-                peers,
-                routes,
-                ..
-            } => Self::AllowList {
-                rules,
-                egress_mode: Some(mode),
-                ai,
-                peers,
-                routes,
-            },
+    pub fn with_egress_mode(mut self, mode: EgressMode) -> Self {
+        match &mut self {
+            Self::Preset { egress_mode, .. } | Self::AllowList { egress_mode, .. } => {
+                *egress_mode = Some(mode)
+            }
         }
+        self
     }
 
     /// The baked-in egress mode override, if any. `None` means "fall
@@ -1582,6 +1794,7 @@ mod tests {
             ai: Some(AiPolicy::metered().with_total_budget(1_000_000)),
             peers: Vec::new(),
             routes: Vec::new(),
+            payload_mapping: None,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: NetworkPolicy = serde_json::from_str(&json).unwrap();

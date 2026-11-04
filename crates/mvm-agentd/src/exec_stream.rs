@@ -49,6 +49,7 @@ fn spawn_drain<R: Read + Send + 'static>(
     mut reader: R,
     buf: Arc<Mutex<Vec<u8>>>,
     stream: mvm_core::protocol::telemetry::StdioStream,
+    bounded: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = [0u8; DRAIN_BUF];
@@ -59,9 +60,13 @@ fn spawn_drain<R: Read + Send + 'static>(
                     // Also to guest capture, so the VM's collector keeps the
                     // output whoever is reading this call.
                     crate::telemetry_capture::offer_stdio(stream, &chunk[..n]);
-                    buf.lock()
-                        .expect("exec drain buf")
-                        .extend_from_slice(&chunk[..n]);
+                    let mut retained = buf.lock().expect("exec drain buf");
+                    let count = if bounded {
+                        n.min((MAX_EXEC_OUTPUT + 1).saturating_sub(retained.len()))
+                    } else {
+                        n
+                    };
+                    retained.extend_from_slice(&chunk[..count]);
                 }
                 Err(_) => break,
             }
@@ -134,6 +139,39 @@ pub fn stream_exec<F: FnMut(ExecEvent)>(
     stream_exec_with_environment(command, stdin_data, timeout_secs, &environment, emit)
 }
 
+/// Admitted owner access uses one absolute cap and an externally revocable
+/// cancellation token across spawn, stdin and output. The legacy API retains
+/// its existing optional relative timeout.
+pub fn stream_exec_bounded<F: FnMut(ExecEvent)>(
+    command: &str,
+    stdin_data: Option<&str>,
+    deadline: Instant,
+    cancellation: &crate::entrypoint::CancellationToken,
+    emit: F,
+) -> ExecEvent {
+    let environment = resolve_exec_environment();
+    let mut builder = Command::new("/bin/sh");
+    builder.arg("-c").arg(command);
+    let control = BoundedExecution {
+        deadline,
+        cancellation,
+    };
+    stream_command_with_environment(
+        builder,
+        Leader::ProcessGroup,
+        stdin_data,
+        None,
+        &environment,
+        emit,
+        Some(&control),
+    )
+}
+
+struct BoundedExecution<'a> {
+    deadline: Instant,
+    cancellation: &'a crate::entrypoint::CancellationToken,
+}
+
 /// Run a declared argv vector directly, without shell parsing or expansion.
 /// The same streaming, output cap, timeout, and process-group teardown as
 /// `stream_exec` apply to the child.
@@ -203,6 +241,7 @@ pub fn stream_exec_mediated<F: FnMut(ExecEvent)>(
         command.timeout_secs,
         &environment,
         emit,
+        None,
     )
 }
 
@@ -251,6 +290,7 @@ fn stream_exec_with_environment<F: FnMut(ExecEvent)>(
         timeout_secs,
         environment,
         emit,
+        None,
     )
 }
 
@@ -284,7 +324,14 @@ fn stream_command_with_environment<F: FnMut(ExecEvent)>(
     timeout_secs: Option<u64>,
     environment: &crate::workload_env::WorkloadEnvironment,
     mut emit: F,
+    control: Option<&BoundedExecution<'_>>,
 ) -> ExecEvent {
+    if control.is_some_and(|control| control.cancellation.is_requested()) {
+        return ExecEvent::Exit { code: -1 };
+    }
+    if control.is_some_and(|control| Instant::now() >= control.deadline) {
+        return ExecEvent::TimedOut;
+    }
     configure_stream_environment(&mut builder, leader, environment);
     builder
         .stdin(if stdin_data.is_some() {
@@ -343,9 +390,34 @@ fn stream_command_with_environment<F: FnMut(ExecEvent)>(
 
     if let Some(data) = stdin_data
         && let Some(ref mut pipe) = child.stdin
-        && let Err(e) = pipe.write_all(data.as_bytes())
     {
-        eprintln!("failed to write exec stdin pipe: {e}");
+        let written = match control {
+            Some(control) => crate::entrypoint::write_stdin_before(
+                pipe,
+                data.as_bytes(),
+                control.deadline,
+                Some(control.cancellation),
+            ),
+            None => pipe.write_all(data.as_bytes()),
+        };
+        if let Err(error) = written {
+            if let Some(control) = control
+                && error.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                kill_pgroup(&child);
+                let _ = crate::child_wait::wait(&mut child);
+                return if control.cancellation.is_requested() {
+                    ExecEvent::Exit { code: -1 }
+                } else if Instant::now() >= control.deadline {
+                    ExecEvent::TimedOut
+                } else {
+                    ExecEvent::Exit { code: -1 }
+                };
+            }
+            if control.is_none() {
+                eprintln!("failed to write exec stdin pipe: {error}");
+            }
+        }
     }
     drop(child.stdin.take());
 
@@ -356,6 +428,7 @@ fn stream_command_with_environment<F: FnMut(ExecEvent)>(
             o,
             out_buf.clone(),
             mvm_core::protocol::telemetry::StdioStream::Stdout,
+            control.is_some(),
         )
     });
     let mut err_handle = child.stderr.take().map(|e| {
@@ -363,12 +436,15 @@ fn stream_command_with_environment<F: FnMut(ExecEvent)>(
             e,
             err_buf.clone(),
             mvm_core::protocol::telemetry::StdioStream::Stderr,
+            control.is_some(),
         )
     });
 
     let mut sent_out = 0usize;
     let mut sent_err = 0usize;
-    let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs(s));
+    let deadline = control
+        .map(|control| control.deadline)
+        .or_else(|| timeout_secs.map(|s| Instant::now() + Duration::from_secs(s)));
     // Consecutive polls that found neither output nor an exit. Reset on any
     // progress so a chatty command keeps draining at the fast end of the
     // backoff instead of decaying to the ceiling and staying there.
@@ -389,7 +465,9 @@ fn stream_command_with_environment<F: FnMut(ExecEvent)>(
             });
             return ExecEvent::Exit { code: -1 };
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if deadline.is_some_and(|d| Instant::now() >= d)
+            || control.is_some_and(|control| control.cancellation.is_requested())
+        {
             kill_pgroup(&child);
             let _ = crate::child_wait::wait(&mut child);
             // Same no-tail-loss discipline as the normal exit path: join the
@@ -402,7 +480,11 @@ fn stream_command_with_environment<F: FnMut(ExecEvent)>(
             }
             let _ = drain_into(&out_buf, &mut sent_out, true, &mut emit);
             let _ = drain_into(&err_buf, &mut sent_err, false, &mut emit);
-            return ExecEvent::TimedOut;
+            return if control.is_some_and(|control| control.cancellation.is_requested()) {
+                ExecEvent::Exit { code: -1 }
+            } else {
+                ExecEvent::TimedOut
+            };
         }
         match crate::child_wait::try_wait(&mut child) {
             Ok(Some(status)) => {

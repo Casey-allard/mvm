@@ -15,6 +15,8 @@ pub mod idle_pool;
 pub mod io;
 pub mod lifecycle;
 pub mod observe;
+#[cfg(target_os="linux")]
+pub(crate) mod owned_launch;
 pub mod runtime_artifacts;
 pub mod snapshot;
 pub mod snapshot_decode;

@@ -3379,6 +3379,7 @@ mod tests {
                 drive: None,
                 display_input: None,
                 application_terminal: None,
+                owner_access: None,
             }),
             Some(mvm_contract::grants::Grants {
                 cpu: share(1000),
@@ -3389,6 +3390,7 @@ mod tests {
                 drive: None,
                 display_input: None,
                 application_terminal: None,
+                owner_access: None,
             }),
         )
         .expect("a narrowing child is admitted");

@@ -164,6 +164,8 @@ test = false
 doctest = false
 
 [features]
+# Opt-in shared object core for the signed owner-access object mapping.
+owner-access-object = ["dep:spiralcore-transfer"]
 # Derive `schemars::JsonSchema` on the host↔guest wire types
 # (`GuestRequest`/`GuestResponse` + their tree) so the `emit_protocol_schema`
 # bin can emit the protocol schema (the SDK-codegen SSOT). Off by default:
@@ -186,6 +188,7 @@ addons = [
 ]
 
 [dependencies]
+spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1", optional = true }
 mvm-core.workspace = true
 # The privilege-drop helper's library half: the descriptor hygiene every spawn
 # here applies, and the capability numbers `guest_mount` retains.

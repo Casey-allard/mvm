@@ -67,9 +67,15 @@ pub fn socket_path(vm: &str) -> Result<PathBuf> {
 }
 
 pub fn connect(vm: &str, deadline: Instant) -> Result<UnixStream> {
-    let address = socket2::SockAddr::unix(socket_path(vm)?)?;
+    connect_path(&socket_path(vm)?, deadline)
+}
+
+/// Bounded connection only; the caller supplies canonical path authority.
+pub fn connect_path(path: &Path, deadline: Instant) -> Result<UnixStream> {
+    let time = remaining(deadline)?;
+    let address = socket2::SockAddr::unix(path)?;
     let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-    socket.connect_timeout(&address, remaining(deadline)?)?;
+    socket.connect_timeout(&address, time)?;
     Ok(socket.into())
 }
 
@@ -190,13 +196,23 @@ pub fn write_all(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -
 }
 
 pub fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream, deadline: Instant) -> Result<T> {
+    read_frame_with_limit(stream, deadline, MAX_FRAME_BYTES)
+}
+
+/// Read the existing frame using one original deadline and a caller-reserved cap.
+pub fn read_frame_with_limit<T: DeserializeOwned>(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    cap: usize,
+) -> Result<T> {
+    ensure!(
+        cap > 0 && u32::try_from(cap).is_ok(),
+        "invalid control frame cap"
+    );
     let mut size = [0; 4];
     read_exact(stream, &mut size, deadline)?;
     let size = usize::try_from(u32::from_be_bytes(size))?;
-    ensure!(
-        size > 0 && size <= MAX_FRAME_BYTES,
-        "invalid HVF control frame size"
-    );
+    ensure!(size > 0 && size <= cap, "invalid HVF control frame size");
     let mut bytes = vec![0; size];
     read_exact(stream, &mut bytes, deadline)?;
     serde_json::from_slice(&bytes).context("invalid HVF control frame")
@@ -207,20 +223,108 @@ pub fn write_frame<T: Serialize>(
     value: &T,
     deadline: Instant,
 ) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
+    write_frame_with_limit(stream, value, deadline, MAX_FRAME_BYTES)
+}
+
+/// Encode into bounded storage before writing any prefix or body byte.
+pub fn write_frame_with_limit<T: Serialize>(
+    stream: &mut UnixStream,
+    value: &T,
+    deadline: Instant,
+    cap: usize,
+) -> Result<()> {
     ensure!(
-        bytes.len() <= MAX_FRAME_BYTES,
-        "HVF control frame exceeds bound"
+        cap > 0 && u32::try_from(cap).is_ok(),
+        "invalid control frame cap"
     );
-    let size = u32::try_from(bytes.len())?.to_be_bytes();
+    let _ = remaining(deadline)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(cap)
+        .context("reserve bounded control frame")?;
+    bytes.resize(cap, 0);
+    let mut writer = io::Cursor::new(bytes.as_mut_slice());
+    serde_json::to_writer(&mut writer, value).context("control frame encode or bound")?;
+    let length = usize::try_from(writer.position())?;
+    let size = u32::try_from(length)?.to_be_bytes();
     write_all(stream, &size, deadline)?;
-    write_all(stream, &bytes, deadline)?;
+    write_all(stream, &bytes[..length], deadline)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_control_keeps_one_deadline_across_partial_prefix_and_body() {
+        for partial in [vec![0, 0], vec![0, 0, 0, 8, b'"', b'x']] {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            writer.write_all(&partial).unwrap();
+            let before = Instant::now();
+            let result = read_frame_with_limit::<String>(
+                &mut reader,
+                before + Duration::from_millis(40),
+                65536,
+            );
+            assert!(result.is_err());
+            assert!(before.elapsed() < Duration::from_secs(1));
+            drop(writer);
+        }
+    }
+
+    #[test]
+    fn generic_control_refuses_expired_connect_and_bad_cap_before_encoding() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(connect_path(&path, Instant::now()).is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        assert!(
+            write_frame_with_limit(
+                &mut sender,
+                &"no bytes",
+                Instant::now() + Duration::from_secs(1),
+                0
+            )
+            .is_err()
+        );
+        receiver.set_nonblocking(true).unwrap();
+        assert_eq!(
+            receiver.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn generic_control_bounds_a_blocked_write_without_refreshing_deadline() {
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        socket2::SockRef::from(&sender)
+            .set_send_buffer_size(1024)
+            .unwrap();
+        let before = Instant::now();
+        assert!(
+            write_frame_with_limit(
+                &mut sender,
+                &"x".repeat(60000),
+                before + Duration::from_millis(40),
+                65536
+            )
+            .is_err()
+        );
+        assert!(before.elapsed() < Duration::from_secs(1));
+        receiver.set_nonblocking(true).unwrap();
+        let mut observed = [0; 128];
+        assert!(
+            receiver.read(&mut observed).unwrap() > 4,
+            "actual prefix and body were written before backpressure"
+        );
+    }
 
     #[test]
     fn read_exact_drains_buffered_bytes_before_reporting_eof() {

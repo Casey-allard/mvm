@@ -36,6 +36,8 @@ pub struct NetworkEndpointSpawnRequest<'a> {
     pub redaction: &'a RedactionPolicy,
     pub tools: &'a mvm_contract::policy::tool_rules::ToolRules,
     pub network_policy: &'a NetworkPolicy,
+    /// Exact JSON from the caller's already-admitted signed plan.
+    pub admitted_plan_json: Option<&'a str>,
     /// Transport-neutral resource ceilings from the admitted plan.
     pub network_limits: mvm_core::plan::NetworkLimits,
     /// Exact signed ingress mappings owned by this endpoint.
@@ -54,12 +56,32 @@ pub struct SpawnedEndpoint {
     pub identity_drive: Option<PathBuf>,
 }
 
+/// Installed helper custody, never a PID/serialized completion receipt.
+/// Construction stays with this runtime's concrete spawner; missing support
+/// must refuse rather than selecting the legacy spawn path.
+#[cfg(unix)]
+pub struct InstalledSpawnedEndpoint {
+    pub(crate) egress_uds: Option<PathBuf>,
+    pub(crate) identity_drive: Option<PathBuf>,
+    pub(crate) owner: Option<mvm_vmm::host::network_endpoint_spawn::OwnedEndpoint>,
+    pub(crate) telemetry: bool,
+}
+
 /// Stand up the per-VM gating endpoint. The one host-side egress bridge
 /// (claim-10 gate + claims 12/13 substitution).
 pub trait NetworkEndpointSpawner: Send + Sync {
     fn spawn(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<SpawnedEndpoint>;
     /// Provision authentication without starting an endpoint or granting egress.
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>>;
+    #[cfg(unix)]
+    fn spawn_installed(
+        &self,
+        _req: &NetworkEndpointSpawnRequest<'_>,
+        _config: &VmStartConfig,
+        _agent: Option<&mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar>,
+    ) -> Result<InstalledSpawnedEndpoint> {
+        anyhow::bail!("installed endpoint requires an original owned helper implementation")
+    }
     /// For a boot with no endpoint, start its VM-lifetime telemetry collector
     /// on its own and record whether the boot is provisioned for it. Never
     /// fails a launch: a collector that cannot start costs telemetry only.
@@ -191,6 +213,7 @@ pub(super) fn prepare_standby_identity(
             redaction: &RedactionPolicy::default(),
             tools: &mvm_contract::policy::tool_rules::ToolRules::default(),
             network_policy: &NetworkPolicy::deny_all(),
+            admitted_plan_json: None,
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
             identity: FlowMuxIdentitySource::Mint,
@@ -282,6 +305,29 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
         };
         use mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig;
 
+        let admitted_network_plan = if req.network_policy.payload_mapping().is_some() {
+            let json = req
+                .admitted_plan_json
+                .context("selected payload mapping has no admitted plan")?;
+            let _: mvm_core::plan::SignedExecutionPlan = serde_json::from_str(json)
+                .context("payload mapping requires the admitted signed-plan envelope")?;
+            let plan = mvm_core::plan::plan_from_admitted_json(json)
+                .context("decode admitted network plan")?;
+            crate::workload_runner::claim::bind_claim_policy_to_plan(
+                &plan.asset_identities,
+                req.network_policy,
+            )
+            .context("bind payload policy to admitted plan")?;
+            Some(
+                mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan::from_plan(
+                    &plan,
+                    req.vm_name,
+                    req.network_policy,
+                )?,
+            )
+        } else {
+            None
+        };
         let uds = vm_network_endpoint_socket(req.vm_name);
         let egress_ca = BootEgressCa::resolve(req)?;
         let (identity, identity_drive) = match req.identity {
@@ -353,6 +399,7 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
             session_marker: None,
             tls_intermediate: egress_ca.endpoint_tls(),
             network_policy: Some(req.network_policy),
+            admitted_network_plan,
             network_limits: req.network_limits,
             ingress: req.ingress,
             resolver_remote: None,
@@ -626,6 +673,7 @@ mod tests {
                 redaction: &RedactionPolicy::default(),
                 tools: &mvm_contract::policy::tool_rules::ToolRules::default(),
                 network_policy: &NetworkPolicy::deny_all(),
+                admitted_plan_json: None,
                 network_limits: mvm_core::plan::NetworkLimits::default(),
                 ingress: &[],
                 identity,

@@ -263,6 +263,7 @@ pub(in crate::commands) fn run_for_exit(_cli: &Cli, args: Args, _cfg: &MvmConfig
                 command: cmd.to_string(),
                 stdin: None,
                 timeout_secs: None,
+                deadline_unix_ms: None,
             },
         );
         // send_exec_streaming does the protocol hello internally.

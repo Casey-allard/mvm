@@ -25,6 +25,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use owned::bind_owned_signer_listener;
+
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::VerifyingKey;
 use mvm_core::protocol::audit_signer::{
@@ -45,6 +47,8 @@ use super::handlers::register_bound_handlers;
 use super::registry::Registry;
 use super::server::{read_frame, serve_on_listener, write_frame};
 use super::service_proxy::ControllerServiceProxy;
+
+mod owned;
 
 /// Audit category for daemon-emitted health entries. Health probing is
 /// mvm-hostd lifecycle activity, so it files under the host-asserted `host`
@@ -124,13 +128,18 @@ impl HostAgentConfig {
 /// teardown) unbind cleanly.
 struct VmHandle {
     listen_socket: PathBuf,
-    serve_task: tokio::task::JoinHandle<()>,
+    serve_task: tokio::task::JoinHandle<Result<()>>,
+    owned_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    owned: bool,
+    joined: Option<bool>,
 }
 
 impl Drop for VmHandle {
     fn drop(&mut self) {
         self.serve_task.abort();
-        let _ = std::fs::remove_file(&self.listen_socket);
+        if !self.owned {
+            let _ = std::fs::remove_file(&self.listen_socket);
+        }
     }
 }
 
@@ -143,6 +152,13 @@ pub struct HostAgentDaemon {
     max_frame_bytes: usize,
     vms: HashMap<String, VmHandle>,
     registrations: HashMap<String, RegisterVm>,
+    owned_journal: Option<owned::OwnedJournal>,
+    owned_signer: Option<u32>,
+    owned_workspaces: Option<crate::owned_resources::WorkspacePool>,
+    owned_admission: Option<Arc<crate::owned_resources::registered::RegistrationAdmission>>,
+    owned_paths: HashMap<String, owned::OwnedEntry>,
+    owned_closing: HashSet<String>,
+    owned_registration_fenced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +319,13 @@ impl HostAgentDaemon {
             max_frame_bytes,
             vms: HashMap::new(),
             registrations: HashMap::new(),
+            owned_journal: None,
+            owned_signer: None,
+            owned_workspaces: None,
+            owned_admission: None,
+            owned_paths: HashMap::new(),
+            owned_closing: HashSet::new(),
+            owned_registration_fenced: false,
         }
     }
 
@@ -422,6 +445,47 @@ impl HostAgentDaemon {
         // is host-signed, validate it as a defense-in-depth path-injection
         // guard before it reaches any filesystem path.
         validate_vm_id(&r.vm_id)?;
+        if self.owned_journal.is_some() {
+            anyhow::ensure!(
+                !self.owned_registration_fenced,
+                "owned registration admission fenced"
+            );
+            anyhow::ensure!(
+                r.capability_bindings.len() <= 16
+                    && r.workload_id.as_ref().is_none_or(|value| value.len() <= 63)
+                    && r.broker_listen_socket.len() <= 4096
+                    && r.workload_chain_path.len() <= 4096
+                    && r.workload_chain_head_path
+                        .as_ref()
+                        .is_none_or(|value| value.len() <= 4096)
+                    && r.tool_decision_socket
+                        .as_ref()
+                        .is_none_or(|value| value.len() <= 4096)
+                    && r.assurance.is_none()
+                    && r.audit_signer_uds_path.is_none(),
+                "owned registration resource shape"
+            );
+            anyhow::ensure!(
+                r.service_proxies.is_empty()
+                    && r.services_bindings.iter().all(|service| {
+                        mvm_vmm::host::host_agent_spawn::owned_host_agent_service(service.as_str())
+                    }),
+                "owned service resource profile unqualified"
+            );
+            anyhow::ensure!(
+                !self.owned_closing.contains(&r.vm_id),
+                "owned registration is closing"
+            );
+            if let Some(existing) = self.registrations.get(&r.vm_id) {
+                anyhow::ensure!(existing == r, "conflicting owned VM registration");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                !self.owned_paths.contains_key(&r.vm_id),
+                "owned registration is uncertain"
+            );
+            anyhow::ensure!(self.owned_paths.len() < 2, "owned registration limit");
+        }
         if r.service_proxies.len() > mvm_contract::protocol::broker_control::MAX_SERVICE_PROXIES {
             bail!("registration has too many controller-backed services");
         }
@@ -448,29 +512,59 @@ impl HostAgentDaemon {
         self.vms.remove(&r.vm_id);
         self.registrations.remove(&r.vm_id);
         if let Err(e) = self.deregister_helper_vm(&r.vm_id) {
+            if self.owned_journal.is_some() {
+                return Err(e).context("owned signer pre-registration cleanup");
+            }
             warn!(vm_id = %r.vm_id, error = %e, "stale signer-helper deregister failed before re-register");
         }
 
         let broker_listen_socket = Path::new(&r.broker_listen_socket);
-        if let Some(parent) = broker_listen_socket.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create broker socket dir {}", parent.display()))?;
+        if self.owned_journal.is_some() {
+            owned::OwnedEntry::prepare_absent(broker_listen_socket)?;
+        } else {
+            if let Some(parent) = broker_listen_socket.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create broker socket dir {}", parent.display()))?;
+            }
+            let _ = std::fs::remove_file(broker_listen_socket);
         }
-        // Clear a stale socket so bind doesn't fail with EADDRINUSE.
-        let _ = std::fs::remove_file(broker_listen_socket);
-        let listener = UnixListener::bind(broker_listen_socket).with_context(|| {
-            format!(
-                "bind broker listen socket {}",
-                broker_listen_socket.display()
+        let (listener, owned_listener) = if self.owned_journal.is_some() {
+            let admission = self
+                .owned_admission
+                .as_ref()
+                .context("owned I/O admission absent")?;
+            (
+                None,
+                Some(admission.listener(|| UnixListener::bind(broker_listen_socket))?),
             )
-        })?;
+        } else {
+            (
+                Some(UnixListener::bind(broker_listen_socket).with_context(|| {
+                    format!(
+                        "bind broker listen socket {}",
+                        broker_listen_socket.display()
+                    )
+                })?),
+                None,
+            )
+        };
+        if self.owned_journal.is_some() {
+            self.owned_paths.insert(
+                r.vm_id.clone(),
+                owned::OwnedEntry::capture(broker_listen_socket)?,
+            );
+        }
 
         self.register_helper_vm(r)?;
 
         // Per-VM registry: in daemon mode its `host.audit.v1` handler points
         // at the resident helper with this server-derived `vm_id`; legacy
         // per-VM broker mode still points at a per-VM audit-signer UDS.
-        let mut registry = Registry::new();
+        let mut registry = if self.owned_journal.is_some() {
+            Registry::new().with_owned_resource_limits()?
+        } else {
+            Registry::new()
+        };
         registry
             .admit_capabilities(r.capability_bindings.clone())
             .context("load host-signed capability bindings")?;
@@ -520,10 +614,19 @@ impl HostAgentDaemon {
             && !proxy_services.contains(&host_audit)
             && let Some(helper) = &self.signer_helper_uds_path
         {
-            let handler = Arc::new(HostAuditV1Handler::new(AuditClient::new_signer_helper(
-                helper.clone(),
-                r.vm_id.clone(),
-            )));
+            let client = if self.owned_journal.is_some() {
+                AuditClient::new_owned_signer_helper(
+                    helper.clone(),
+                    r.vm_id.clone(),
+                    self.owned_signer.context("owned signer absent")?,
+                    self.owned_admission
+                        .clone()
+                        .context("owned I/O admission absent")?,
+                )
+            } else {
+                AuditClient::new_signer_helper(helper.clone(), r.vm_id.clone())
+            };
+            let handler = Arc::new(HostAuditV1Handler::new(client));
             registry.register(handler.clone());
             for descriptor in HostAuditV1Handler::capability_descriptors() {
                 registry
@@ -549,10 +652,42 @@ impl HostAgentDaemon {
         let mfb = self.max_frame_bytes;
         // `workload_id` is server-derived from registration context; the guest
         // frame carries none, and this socket only ever serves this VM.
+        let is_owned = self.owned_journal.is_some();
+        let owned_workspaces = self.owned_workspaces.clone();
+        let admission = self.owned_admission.clone();
+        let (owned_stop, stop) = if is_owned {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
         let serve_task = tokio::spawn(async move {
-            if let Err(e) = serve_on_listener(listener, registry, workload_id, tenant, mfb).await {
+            let result = if let Some(stop) = stop {
+                super::server::serve_owned_on_listener(
+                    owned_listener.context("owned listener absent")?,
+                    registry,
+                    workload_id,
+                    tenant,
+                    mfb,
+                    owned_workspaces.context("owned shared workspaces absent")?,
+                    admission.context("owned I/O admission absent")?,
+                    stop,
+                )
+                .await
+            } else {
+                serve_on_listener(
+                    listener.context("legacy listener absent")?,
+                    registry,
+                    workload_id,
+                    tenant,
+                    mfb,
+                )
+                .await
+            };
+            if let Err(e) = &result {
                 warn!(error = %e, "host-agent per-VM serve loop exited");
             }
+            result
         });
 
         self.vms.insert(
@@ -560,6 +695,9 @@ impl HostAgentDaemon {
             VmHandle {
                 listen_socket: broker_listen_socket.to_path_buf(),
                 serve_task,
+                owned_stop,
+                owned: is_owned,
+                joined: None,
             },
         );
         self.registrations.insert(r.vm_id.clone(), r.clone());
@@ -586,6 +724,9 @@ impl HostAgentDaemon {
     }
 
     fn persist_registrations(&self) -> Result<()> {
+        if let Some(journal) = &self.owned_journal {
+            return journal.store(self.registrations.values());
+        }
         if let Some(journal) = &self.registration_journal {
             journal.store(self.registrations.values())?;
         }
@@ -628,8 +769,21 @@ impl HostAgentDaemon {
                     .into_owned()
             }),
         });
-        match SignerHelperClient::new(path.clone()).send(&req)? {
-            SignerHelperResponse::Registered { .. } => Ok(()),
+        let client = SignerHelperClient::new(path.clone());
+        let response = if let Some(child) = self.owned_signer {
+            client.with_original_child(child).send_until(
+                &req,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )?
+        } else {
+            client.send(&req)?
+        };
+        match response {
+            SignerHelperResponse::Registered { vm_id, .. }
+                if self.owned_signer.is_none() || vm_id == r.vm_id =>
+            {
+                Ok(())
+            }
             SignerHelperResponse::Err { message, .. } => {
                 bail!("signer-helper register refused: {message}")
             }
@@ -645,8 +799,21 @@ impl HostAgentDaemon {
             request_id: format!("deregister-{vm_id}"),
             vm_id: vm_id.to_string(),
         });
-        match SignerHelperClient::new(path.clone()).send(&req)? {
-            SignerHelperResponse::Deregistered { .. } => Ok(()),
+        let client = SignerHelperClient::new(path.clone());
+        let response = if let Some(child) = self.owned_signer {
+            client.with_original_child(child).send_until(
+                &req,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )?
+        } else {
+            client.send(&req)?
+        };
+        match response {
+            SignerHelperResponse::Deregistered { vm_id: actual, .. }
+                if self.owned_signer.is_none() || actual == vm_id =>
+            {
+                Ok(())
+            }
             SignerHelperResponse::Err { message, .. } => {
                 bail!("signer-helper deregister refused: {message}")
             }

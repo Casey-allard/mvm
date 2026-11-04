@@ -9,6 +9,7 @@ pub mod audit_signer;
 pub mod broker;
 pub mod broker_control;
 pub mod capability_negotiation;
+pub mod control;
 pub mod dns;
 pub mod extension_controller;
 pub mod extension_pack;
@@ -29,6 +30,7 @@ pub mod mailbox;
 /// Bounded, flow-aware guest/host networking wire contract: framing,
 /// opcodes, and the session/stream state machine shared by guest and host.
 pub mod network_flow;
+pub mod owner_access;
 pub mod resource_controls;
 pub mod routing;
 pub mod signed_config;

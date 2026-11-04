@@ -318,13 +318,13 @@ fn set_writable_cloexec(
     cfg: &mvm_vmm::host::hvf_supervisor::HvfSupervisorConfig,
     enabled: bool,
 ) -> anyhow::Result<()> {
-    for disk in &cfg.writable_disk_fds {
-        for fd in [disk.backing, disk.sidecar] {
+    let inherited = cfg.writable_disk_fds.iter().flat_map(|disk| [disk.backing, disk.sidecar])
+        .chain(cfg.host_lifetime_fds.as_ref().into_iter().flat_map(|lease| [lease.directory, lease.holder]));
+    for fd in inherited {
             // SAFETY: preflight established these exact live descriptors. Only
             // their close-on-exec flag changes; ownership stays with the caller.
             let result = unsafe { libc::fcntl(fd, libc::F_SETFD, i32::from(enabled)) };
             anyhow::ensure!(result >= 0, "updating writable descriptor inheritance");
-        }
     }
     Ok(())
 }
@@ -664,6 +664,9 @@ fn run() -> anyhow::Result<()> {
     diagnostics.stage(StartupStage::ConfigRead);
     diagnostics.stage(StartupStage::ConfigParse);
     let registered_startup = mvm_hostd::supervisor::caller_registration::prepare_startup(&cfg)?;
+    // Original shared holder remains before all native/disk allocations, and
+    // reverse drop order destroys them before releasing this description.
+    let _host_lifetime = files.take_host_lifetime();
     // Declared before the disk devices so reverse drop order flushes and destroys
     // every disk before either lock description can be released.
     let mut writable_files = files.take_writable();
@@ -1150,6 +1153,7 @@ fn spawn_owned_builder_endpoint(
             egress_proxy: None,
             tls_intermediate: None,
             network_policy: Some(&policy),
+            admitted_network_plan: None,
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
             resolver_remote: None,

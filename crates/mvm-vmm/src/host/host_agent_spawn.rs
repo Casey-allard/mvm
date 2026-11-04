@@ -32,6 +32,13 @@ use crate::host::broker_services_spawn::{
     resolve_subprocess_bin_to_spawn, spawn_detached_with_config,
 };
 
+mod owned;
+pub use owned::{
+    HostAgentParentPermit, OwnedHostAgent, OwnedHostAgentInputs, OwnedHostAgentRegistrar,
+    OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration,
+    owned_host_agent_service, validate_owned_host_agent_services,
+};
+
 /// PID file for the per-tenant host-agent daemon, under `host_agent_dir`.
 pub const DAEMON_PID_FILE: &str = "daemon.pid";
 /// Executable name of the per-tenant host-agent daemon. A PID recorded in

@@ -314,6 +314,7 @@ mod tests {
                     .expect("valid map"),
             }),
             application_terminal: None,
+            owner_access: None,
             sig: Vec::new(),
         }
     }

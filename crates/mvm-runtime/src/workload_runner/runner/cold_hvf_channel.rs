@@ -303,6 +303,7 @@ impl ColdHvfChannel {
             command: command.to_owned(),
             stdin,
             timeout_secs,
+            deadline_unix_ms: None,
         };
         let terminal = custody
             .native

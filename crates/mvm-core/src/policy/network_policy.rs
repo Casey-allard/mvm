@@ -28,6 +28,50 @@ pub fn content_sha256(policy: &NetworkPolicy) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+#[cfg(test)]
+mod payload_mapping_hash_tests {
+    use super::*;
+    use mvm_contract::policy::network_policy::{
+        CooperatingPayloadPolicy, CooperatingTcpPeer, PayloadMappingProfile,
+    };
+    #[test]
+    fn payload_none_keeps_original_policy_asset_hash_and_some_is_committed() {
+        let preset = NetworkPolicy::preset(NetworkPreset::Dev);
+        assert_eq!(
+            content_sha256(&preset),
+            "07772c8b61e1707ca66234cfc94483543c789adf026e4669234a4db6b6457f3d"
+        );
+        let policy = NetworkPolicy::allow_list(vec![HostPort::new("peer.example", 443)]);
+        assert_eq!(
+            content_sha256(&policy),
+            "0a988c4c66b3eb97902117bec9add4a7ead7806db0fd3bd09bd7e2f859bc67ea"
+        );
+        let peer = CooperatingTcpPeer {
+            host: "peer.example".into(),
+            port: 443,
+            server_name: "peer.example".into(),
+            spki_sha256: [3; 32],
+            profile: PayloadMappingProfile::SpiralCoreObjectStreamV1,
+        };
+        let selected = policy.clone().with_payload_mapping(Some(
+            CooperatingPayloadPolicy::new(vec![peer.clone()]).expect("valid"),
+        ));
+        assert_ne!(content_sha256(&selected), content_sha256(&policy));
+        let restored: NetworkPolicy =
+            serde_json::from_slice(&serde_json::to_vec(&selected).expect("encode"))
+                .expect("decode");
+        assert_eq!(content_sha256(&restored), content_sha256(&selected));
+        let tampered = policy.with_payload_mapping(Some(
+            CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                spki_sha256: [4; 32],
+                ..peer
+            }])
+            .expect("valid"),
+        ));
+        assert_ne!(content_sha256(&tampered), content_sha256(&selected));
+    }
+}
+
 /// Generate the iptables shell script fragment for `policy`.
 /// Returns `None` if unrestricted (no rules needed).
 ///

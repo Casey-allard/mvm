@@ -159,6 +159,20 @@ impl KernelBoundLaunch {
     ) -> Result<Box<dyn RunningVm>> {
         self.before_boot(spec)?;
         disks.validate_spec(spec)?;
+        if let Some(owner) = &self.config.host_lifetime {
+            anyhow::ensure!(
+                driver.supports_host_lifetime(),
+                "backend has no original installed native lifetime"
+            );
+            let lease = owner.claim_for_native(&self.config, driver.kind())?;
+            return driver.boot_custodied_with_host_lifetime(
+                spec,
+                self.kernel.as_ref(),
+                disks,
+                lease,
+                owner.binding(),
+            );
+        }
         driver.boot_custodied(spec, self.kernel.as_ref(), disks)
     }
 

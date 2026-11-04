@@ -217,6 +217,7 @@ impl MvmConfig {
     #[must_use]
     pub fn default_grants(&self) -> mvm_contract::grants::Grants {
         mvm_contract::grants::Grants {
+            owner_access: None,
             cpu: self
                 .default_cpu_millicores
                 .map(|millicores| mvm_contract::grants::CpuGrant::Share { millicores }),

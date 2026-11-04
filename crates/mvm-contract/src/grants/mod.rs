@@ -17,6 +17,7 @@ pub mod application_terminal;
 pub mod budget;
 pub mod ceiling;
 pub mod display;
+pub mod owner_access;
 pub mod projection;
 pub mod subset;
 
@@ -36,6 +37,9 @@ pub use display::{
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Grants {
+    /// Separately admitted owner messages; absence is deny-all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_access: Option<owner_access::OwnerAccessGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<CpuGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,6 +370,7 @@ mod tests {
             }),
             drive: Some(drive_grant()),
             display_input: None,
+            owner_access: None,
             application_terminal: None,
         };
         let json = serde_json::to_string(&g).expect("serializes");

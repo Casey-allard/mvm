@@ -39,6 +39,7 @@ pub(super) fn mint_verb_grant_sidecar(
     // only say `VerbNotAuthorized`; refusing here says what actually expired.
     refuse_expired_plan(&plan, chrono::Utc::now())?;
     let tool_mediation = tool_mediation_for(&plan)?;
+    let owner_access=mvm_contract::grants::owner_access::OwnerAccessBinding::from_plan(&plan,vm_name).context("derive admitted owner access identity")?;
     let drive = plan.grants.as_ref().and_then(|grants| grants.drive.clone());
     let application_terminal = plan
         .grants
@@ -46,7 +47,7 @@ pub(super) fn mint_verb_grant_sidecar(
         .and_then(|grants| grants.application_terminal.as_ref())
         .map(mvm_contract::grants::ApplicationTerminalBinding::from);
     let other_authority =
-        drive.is_some() || tool_mediation.is_some() || application_terminal.is_some();
+        drive.is_some() || tool_mediation.is_some() || application_terminal.is_some() || owner_access.is_some();
     let Some(verbs) = granted_verbs(&plan, other_authority) else {
         return Ok(None);
     };
@@ -63,6 +64,7 @@ pub(super) fn mint_verb_grant_sidecar(
         plan.valid_until,
         verbs,
         crate::host_signer::VerbGrantAuthority {
+            owner_access,
             drive,
             tool_mediation,
             application_terminal,

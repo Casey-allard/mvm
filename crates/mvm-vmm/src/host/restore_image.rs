@@ -379,7 +379,11 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RestoreImageError> {
     Ok(file)
 }
 
-fn open_trusted_dir(path: &Path) -> Result<File, RestoreImageError> {
+/// Open a current-user private local directory without following its final
+/// symlink, including the platform ACL check. The returned File pins this
+/// exact directory; callers must retain it and recheck namespace identity for
+/// later pathname operations. This is storage validation, not boot permission.
+pub fn open_trusted_dir(path: &Path) -> Result<File, RestoreImageError> {
     open_trusted_dir_with(path, &host_dir_facts)
 }
 

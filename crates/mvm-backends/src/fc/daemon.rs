@@ -263,7 +263,7 @@ const SCOPE_LAUNCHER_PID_FILE: &str = "scope-launcher.pid";
 /// `chown`s the one Firecracker binds, so a directory someone else created
 /// would let them redirect that `chown`; refuse a directory the invoking user
 /// does not own.
-fn secure_socket_dir(abs_dir: &str) -> Result<()> {
+pub(super) fn secure_socket_dir(abs_dir: &str) -> Result<()> {
     mvm_core::config::secure_fallback_socket_dir_at(std::path::Path::new(abs_dir))
         .context("securing the Firecracker socket directory")
 }
@@ -356,7 +356,15 @@ fn reopen_handoff_script(script: &str, pid: u32, first: u32, last: u32) -> Resul
             && script.matches(runner).count() + script.matches("setsid nohup bash ").count() == 1,
         "handoff launch shape changed"
     );
-    let reopen: String = (first..=last)
+    let reopen = descriptor_reopen_prefix(pid, first, last);
+    // dash cannot redirect descriptors above 9, so the launcher is bash.
+    Ok(script
+        .replacen(heredoc, &format!("{heredoc}{reopen}"), 1)
+        .replacen(runner, "setsid nohup bash ", 1))
+}
+
+pub(super) fn descriptor_reopen_prefix(pid: u32, first: u32, last: u32) -> String {
+    (first..=last)
         .map(|fd| {
             let mode = if (fd - first).is_multiple_of(2) {
                 "<>"
@@ -365,11 +373,7 @@ fn reopen_handoff_script(script: &str, pid: u32, first: u32, last: u32) -> Resul
             };
             format!("exec {fd}{mode}/proc/{pid}/fd/{fd} || exit 1\n")
         })
-        .collect();
-    // dash cannot redirect descriptors above 9, so the launcher is bash.
-    Ok(script
-        .replacen(heredoc, &format!("{heredoc}{reopen}"), 1)
-        .replacen(runner, "setsid nohup bash ", 1))
+        .collect()
 }
 
 /// Gate both outer-script mutations and privileged exec with the same fixed
@@ -389,7 +393,7 @@ fn reopen_host_lease_script(
         script.matches(runner).count() + script.matches("setsid nohup bash ").count() == 1,
         "host lease requires one fixed bash launcher"
     );
-    let preflight = lease.preflight();
+    let preflight = crate::driver::fc::host_lease_preflight(lease);
     let script = script
         .replacen(heredoc, &format!("{heredoc}{preflight}"), 1)
         .replacen(runner, "setsid nohup bash ", 1);
@@ -466,7 +470,7 @@ const STDERR_TAIL_LINES: usize = 20;
 /// Firecracker reports this itself — "path must be shorter than SUN_LEN" — but
 /// only in its own log, after which the host sees nothing but a socket that
 /// never appears.
-fn ensure_api_socket_fits(abs_socket: &str) -> Result<()> {
+pub(super) fn ensure_api_socket_fits(abs_socket: &str) -> Result<()> {
     if !mvm_core::config::fits_unix_socket_path(std::path::Path::new(abs_socket)) {
         anyhow::bail!(
             "Firecracker API socket path {abs_socket} is {} bytes, longer than a Unix socket \
@@ -689,7 +693,10 @@ const API_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// Takes the path and the timeout so the expiry branch is testable without
 /// spawning a VMM. A wait that never fires is the failure mode worth pinning,
 /// and it is unreachable through the launch path.
-fn wait_for_api_socket(socket: &std::path::Path, timeout: std::time::Duration) -> Result<()> {
+pub(super) fn wait_for_api_socket(
+    socket: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     let mut attempt = 0u32;
     loop {

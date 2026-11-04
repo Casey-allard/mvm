@@ -58,6 +58,7 @@ mod tests {
             command: String::new(),
             stdin: None,
             timeout_secs: None,
+            deadline_unix_ms: None,
         }
     }
 

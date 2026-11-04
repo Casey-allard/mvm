@@ -140,6 +140,7 @@ pub(crate) struct AuthenticatedWriter<'a> {
     file: &'a mut std::fs::File,
     session: &'a mut AuthenticatedSession,
     pending: Vec<u8>,
+    deadline: Option<std::time::Instant>,
 }
 
 impl<'a> AuthenticatedWriter<'a> {
@@ -148,7 +149,12 @@ impl<'a> AuthenticatedWriter<'a> {
             file,
             session,
             pending: Vec::new(),
+            deadline: None,
         }
+    }
+    pub(crate) fn before(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
@@ -182,9 +188,14 @@ impl Write for AuthenticatedWriter<'_> {
         let response: GuestResponse = serde_json::from_slice(&self.pending[4..]).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid response")
         })?;
-        self.session
-            .write(self.file, &response)
-            .map_err(std::io::Error::other)?;
+        match self.deadline {
+            Some(deadline) => self.session.write(
+                &mut mvm_agentd::owner_access::AccessWriter::new(self.file, deadline),
+                &response,
+            ),
+            None => self.session.write(self.file, &response),
+        }
+        .map_err(std::io::Error::other)?;
         self.pending.clear();
         Ok(())
     }

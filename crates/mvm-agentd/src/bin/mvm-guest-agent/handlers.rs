@@ -22,6 +22,111 @@ use mvm_agentd::worker_protocol::WorkerOutcome;
 use mvm_contract::stream::input::{CloseInput, InputFrame};
 
 use crate::HandlerCtx;
+
+#[cfg(feature = "owner-access-object")]
+pub(crate) fn handle_owner_access_object(
+    file: &mut std::fs::File,
+    session: &mut mvm_agentd::vsock::AuthenticatedSession,
+    boot: &crate::state::AgentBootState,
+    begin: mvm_contract::protocol::owner_access::OwnerAccessObjectBegin,
+) {
+    let Ok(_execution) = RUN_ENTRYPOINT_LOCK.try_lock() else {
+        return;
+    };
+    let Some(Ok(entrypoint)) = VALIDATED_ENTRYPOINT.get() else {
+        return;
+    };
+    let Ok(tmpdir) = make_call_tmpdir() else {
+        return;
+    };
+    let Ok(control) = file.try_clone() else {
+        return;
+    };
+    let Ok(ticket) = boot.admit_owner_access_object(&begin) else {
+        return;
+    };
+    let mut channel = mvm_agentd::owner_access_object::CanonicalObjectChannel::new(file, session);
+    // The one-shot connection closes after success or failure. The library
+    // closes its active desk on every unfinished transfer; no fallback runs.
+    let _ = mvm_agentd::owner_access_object::serve_admitted_object(
+        &boot.owner_access,
+        ticket,
+        entrypoint,
+        tmpdir.path(),
+        &tmpdir.path().join("objects"),
+        &control,
+        &mut channel,
+    );
+}
+
+/// Dispatch only a signed, schema-checked operation to the one boot-validated
+/// application. No caller-supplied program, argv, cwd, environment or PTY.
+pub(crate) fn handle_declared_operation(
+    ctx: &mut HandlerCtx,
+    request: mvm_contract::protocol::owner_access::OwnerAccessRequest,
+) -> GuestResponse {
+    use mvm_contract::protocol::owner_access::{OwnerAccessReply, OwnerAccessStatus, TypedRecord};
+    let refused = || {
+        GuestResponse::OwnerAccessReply(OwnerAccessReply {
+            request_id: request.request_id,
+            sequence: request.sequence,
+            status: OwnerAccessStatus::Refused,
+            payload: TypedRecord::default(),
+        })
+    };
+    let Ok(_execution) = RUN_ENTRYPOINT_LOCK.try_lock() else {
+        return refused();
+    };
+    let Some(control) = ctx.control else {
+        return refused();
+    };
+    let ticket = match ctx.boot_state.admit_owner_access(&request) {
+        Ok(ticket) => ticket,
+        Err(_) => return refused(),
+    };
+    let Ok(_observer) = mvm_agentd::owner_access::AccessDisconnect::watch(
+        control,
+        ticket.cancellation(),
+        ticket.deadline(),
+    ) else {
+        if let Ok(mut desk) = ctx.boot_state.owner_access.lock() {
+            desk.close();
+        }
+        return refused();
+    };
+    let entrypoint = match VALIDATED_ENTRYPOINT.get() {
+        Some(Ok(entrypoint)) => entrypoint,
+        _ => {
+            if let Ok(mut desk) = ctx.boot_state.owner_access.lock() {
+                desk.close();
+            }
+            return refused();
+        }
+    };
+    let tmpdir = match make_call_tmpdir() {
+        Ok(dir) => dir,
+        Err(_) => {
+            if let Ok(mut desk) = ctx.boot_state.owner_access.lock() {
+                desk.close();
+            }
+            return refused();
+        }
+    };
+    // No desk/boot-state lock is held while the process runs or emits output.
+    let executed = ticket.run(entrypoint, tmpdir.path());
+    match ctx
+        .boot_state
+        .owner_access
+        .lock()
+        .map_err(|_| ())
+        .and_then(|mut desk| {
+            desk.complete_run(executed, chrono::Utc::now(), std::time::Instant::now())
+                .map_err(|_| ())
+        }) {
+        Ok(reply) => GuestResponse::OwnerAccessReply(reply),
+        Err(_) => refused(),
+    }
+}
 use crate::globals::{
     RUN_ENTRYPOINT_LOCK, VALIDATED_ENTRYPOINT, VALIDATED_EXTENSIONS, WARM_POOL,
     reseed_on_post_restore,

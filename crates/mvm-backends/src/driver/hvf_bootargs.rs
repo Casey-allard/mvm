@@ -57,6 +57,7 @@ mod tests {
                 drive: None,
                 tool_mediation: None,
                 application_terminal: None,
+                owner_access: None,
                 sig: vec![0u8; 64],
             },
         };

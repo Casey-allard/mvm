@@ -55,6 +55,8 @@ mod stop;
 pub use config::FcApiPut;
 use config::fc_drive_puts;
 #[cfg(target_os = "linux")]
+pub(crate) use host_lease::preflight as host_lease_preflight;
+#[cfg(target_os = "linux")]
 pub use host_lease::{HostLeaseExpectation, PreparedHostLifetimeLease};
 #[cfg(all(test, unix))]
 use kernel::fc_descriptor_recipe;
@@ -842,6 +844,48 @@ impl FcDriver {
         handoff: Option<mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
         #[cfg(target_os = "linux")] host_lease: Option<PreparedHostLifetimeLease>,
     ) -> Result<Box<dyn RunningVm>> {
+        self.boot_native_inner(
+            spec,
+            handoff,
+            #[cfg(target_os = "linux")]
+            host_lease,
+            #[cfg(target_os = "linux")]
+            None,
+            #[cfg(target_os = "linux")]
+            &mut None,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn boot_with_installed_custody(
+        &self,
+        spec: &VmmSpec,
+        handoff: Option<mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
+        lease: PreparedHostLifetimeLease,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<Box<dyn RunningVm>> {
+        let mut original = None;
+        match self.boot_native_inner(spec, handoff, Some(lease), Some(binding), &mut original) {
+            Ok(vm) => Ok(vm),
+            Err(reason) => match original {
+                Some(owner) => Err(OwnedFcBootFailure { reason, owner }.into()),
+                None => Err(reason),
+            },
+        }
+    }
+
+    fn boot_native_inner(
+        &self,
+        spec: &VmmSpec,
+        handoff: Option<mvm_vmm::driver::prepared_disks::SudoWritableHandoff>,
+        #[cfg(target_os = "linux")] host_lease: Option<PreparedHostLifetimeLease>,
+        #[cfg(target_os = "linux")] host_binding: Option<
+            &mvm_core::host_lifetime::HostLaunchBinding,
+        >,
+        #[cfg(target_os = "linux")] original: &mut Option<
+            mvm_vmm::host::fc_lifetime::OwnedFcLauncher,
+        >,
+    ) -> Result<Box<dyn RunningVm>> {
         if !spec.shares.is_empty() {
             bail!(
                 "Firecracker does not support virtio-fs shares ({} requested);                  use the HVF or libkrun backend",
@@ -909,15 +953,41 @@ impl FcDriver {
         // boot must neither claim nor create an unleased pool process.
         #[cfg(target_os = "linux")]
         let idle_shape = idle_shape.filter(|_| host_lease.is_none());
-        let (mut firecracker_guard, claimed) = start_or_claim_firecracker_custodied(
-            spec,
-            &state_dir,
-            &socket,
-            idle_shape,
-            handoff.as_ref(),
-            #[cfg(target_os = "linux")]
-            host_lease.as_ref(),
-        )?;
+        #[cfg(target_os = "linux")]
+        let owned = if let Some(binding) = host_binding {
+            let lease = host_lease
+                .as_ref()
+                .context("installed Firecracker holder missing")?;
+            crate::fc::owned_launch::start(
+                crate::fc::owned_launch::OwnedStart {
+                    state_dir: &state_dir,
+                    socket: &socket,
+                    vm: &spec.name,
+                    bounds: &bounds,
+                    disks: handoff.as_ref(),
+                    lease,
+                    binding,
+                },
+                original,
+            )?;
+            Some((FirecrackerGuard::pending(), false))
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let owned: Option<(FirecrackerGuard, bool)> = None;
+        let (mut firecracker_guard, claimed) = match owned {
+            Some(result) => result,
+            None => start_or_claim_firecracker_custodied(
+                spec,
+                &state_dir,
+                &socket,
+                idle_shape,
+                handoff.as_ref(),
+                #[cfg(target_os = "linux")]
+                host_lease.as_ref(),
+            )?,
+        };
         #[cfg(target_os = "linux")]
         if let Some(lease) = &host_lease {
             let pid = read_firecracker_pid(&abs_dir)?;
@@ -1062,6 +1132,8 @@ impl FcDriver {
         }
 
         let vm = Box::new(FcRunningVm {
+            #[cfg(target_os = "linux")]
+            owned: original.take().map(std::sync::Mutex::new),
             id: VmId(spec.name.clone()),
             state_dir,
             pid_file,
@@ -1077,6 +1149,39 @@ impl FcDriver {
 }
 
 impl VmmDriver for FcDriver {
+    #[cfg(target_os = "linux")]
+    fn supports_host_lifetime(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn boot_custodied_with_host_lifetime(
+        &self,
+        spec: &VmmSpec,
+        kernel: Option<&mvm_vmm::host::restore_image::VerifiedRestoreFile>,
+        disks: mvm_vmm::driver::prepared_disks::PreparedWritableDisks,
+        lease: PreparedHostLifetimeLease,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<Box<dyn RunningVm>> {
+        anyhow::ensure!(
+            binding.vm_name == spec.name
+                && u32::from(spec.vcpus) <= binding.cpus
+                && spec.memory_mib <= binding.memory_mib,
+            "installed Firecracker physical recipe differs"
+        );
+        disks.validate_spec(spec)?;
+        let (recipe, handoff) = if disks.is_empty() {
+            (spec.clone(), None)
+        } else {
+            let handoff = disks.into_sudo_handoff(spec)?;
+            (handoff.projected().clone(), Some(handoff))
+        };
+        let recipe = match kernel {
+            Some(kernel) => kernel::fc_descriptor_recipe(&recipe, kernel)?,
+            None => recipe,
+        };
+        self.boot_with_installed_custody(&recipe, handoff, lease, binding)
+    }
     fn name(&self) -> &str {
         "firecracker"
     }
@@ -1458,6 +1563,8 @@ impl VmmDriver for FcDriver {
             None
         };
         Ok(Box::new(FcRunningVm {
+            #[cfg(target_os = "linux")]
+            owned: None,
             pid_file,
             pid,
             state_dir,
@@ -1477,7 +1584,35 @@ impl VmmDriver for FcDriver {
 /// A live Firecracker VM: the detached `firecracker` daemon tracked by its PID
 /// file, with the workload's exit code persisted under its state dir and the
 /// vsock mux UDS for host→guest dials.
+#[cfg(target_os = "linux")]
+pub struct OwnedFcBootFailure {
+    reason: anyhow::Error,
+    owner: mvm_vmm::host::fc_lifetime::OwnedFcLauncher,
+}
+#[cfg(target_os = "linux")]
+impl OwnedFcBootFailure {
+    pub fn owner_mut(&mut self) -> &mut mvm_vmm::host::fc_lifetime::OwnedFcLauncher {
+        &mut self.owner
+    }
+}
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for OwnedFcBootFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedFcBootFailure").finish_non_exhaustive()
+    }
+}
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for OwnedFcBootFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "original Firecracker boot failed: {}", self.reason)
+    }
+}
+#[cfg(target_os = "linux")]
+impl std::error::Error for OwnedFcBootFailure {}
+
 struct FcRunningVm {
+    #[cfg(target_os = "linux")]
+    owned: Option<std::sync::Mutex<mvm_vmm::host::fc_lifetime::OwnedFcLauncher>>,
     id: VmId,
     state_dir: PathBuf,
     pid_file: PathBuf,
@@ -1529,6 +1664,17 @@ impl RunningVm for FcRunningVm {
     }
 
     fn kill(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &self.owned {
+            owner
+                .lock()
+                .map_err(|_| anyhow!("original Firecracker custody poisoned"))?
+                .stop(Instant::now() + crate::driver::libkrun_process::STOP_TIMEOUT)?;
+            if let Some(pid) = self.pid {
+                remove_pid_marker_if_matches(&self.pid_file, pid);
+            }
+            return Ok(());
+        }
         // Firecracker is sudo-launched and runs as root, so the libkrun
         // running-VM's plain `libc::kill` would return EPERM from a non-root
         // mvmctl — neither stopping the VM nor reporting the failure. Signal
@@ -1543,6 +1689,36 @@ impl RunningVm for FcRunningVm {
             return Ok(());
         }
         terminate_firecracker_pid(&self.id.0, pid, &self.pid_file)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn terminate_with_kernel_exit(&self) -> Result<mvm_vmm::driver::traits::KernelStopOutcome> {
+        let proof = match &self.owned {
+            Some(owner) => Some(
+                owner
+                    .lock()
+                    .map_err(|_| anyhow!("original Firecracker custody poisoned"))?
+                    .stop(Instant::now() + crate::driver::libkrun_process::STOP_TIMEOUT)?,
+            ),
+            None => {
+                self.kill()?;
+                None
+            }
+        };
+        if let Some(proof) = &proof {
+            anyhow::ensure!(
+                proof.binding().vm_name == self.id.0 && proof.native_pid() == self.pid,
+                "original Firecracker terminal identity differs"
+            );
+            if let Some(pid) = self.pid {
+                remove_pid_marker_if_matches(&self.pid_file, pid);
+            }
+        }
+        Ok(mvm_vmm::driver::traits::KernelStopOutcome {
+            timing: None,
+            hvf_exit: None,
+            fc_exit: proof,
+        })
     }
 
     fn process_identity(&self) -> Result<Option<mvm_vmm::host::process_identity::ProcessIdentity>> {
@@ -2533,6 +2709,8 @@ mod tests {
         let pid_file = dir.path().join("fc.pid");
         std::fs::write(&pid_file, "4242").unwrap();
         let vm = FcRunningVm {
+            #[cfg(target_os = "linux")]
+            owned: None,
             id: VmId("gone-vm".into()),
             state_dir: dir.path().to_path_buf(),
             pid_file: pid_file.clone(),
@@ -2556,6 +2734,8 @@ mod tests {
     fn stop_preparation_skips_guest_flush_without_a_host_process() {
         let dir = tempfile::tempdir().unwrap();
         let vm = FcRunningVm {
+            #[cfg(target_os = "linux")]
+            owned: None,
             id: VmId("never-started-vm".into()),
             state_dir: dir.path().to_path_buf(),
             pid_file: dir.path().join("fc.pid"),
@@ -2569,6 +2749,8 @@ mod tests {
     #[test]
     fn running_vm_exposes_the_captured_host_process() {
         let vm = FcRunningVm {
+            #[cfg(target_os = "linux")]
+            owned: None,
             id: VmId("measured-vm".into()),
             state_dir: PathBuf::from("/state/measured-vm"),
             pid_file: PathBuf::from("/state/measured-vm/fc.pid"),
@@ -2856,6 +3038,8 @@ mod tests {
         // rejected. Proven at the boundary without a live socket, since the
         // reject path returns before connecting.
         let vm = FcRunningVm {
+            #[cfg(target_os = "linux")]
+            owned: None,
             id: VmId("console-vm".into()),
             state_dir: PathBuf::from("/state/console-vm"),
             pid_file: PathBuf::from("/state/console-vm/fc.pid"),
@@ -3136,6 +3320,8 @@ mod tests {
             });
 
             let vm = FcRunningVm {
+                #[cfg(target_os = "linux")]
+                owned: None,
                 id: VmId("agent-vm".into()),
                 state_dir: dir.path().to_path_buf(),
                 pid_file: dir.path().join("fc.pid"),

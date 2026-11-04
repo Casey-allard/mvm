@@ -171,7 +171,9 @@ pub enum GuestResponse {
     /// Activation failed.  The agent is still in the `Awaiting` boot
     /// state and will not serve operational RPCs until a valid
     /// activation arrives.
-    ActivateEnvironmentError { message: String },
+    ActivateEnvironmentError {
+        message: String,
+    },
     /// The agent is running in PID-1 initramfs mode and has not yet
     /// received a valid `ActivateEnvironment`.  Only
     /// `ActivateEnvironment` is accepted until then.
@@ -187,13 +189,19 @@ pub enum GuestResponse {
         detail: Option<String>,
     },
     /// Wake acknowledgement.
-    WakeAck { success: bool },
+    WakeAck {
+        success: bool,
+    },
     /// Pong.
     Pong,
     /// Current guest-agent process resource usage.
-    ResourceUsageReport { rss_bytes: u64 },
+    ResourceUsageReport {
+        rss_bytes: u64,
+    },
     /// Error from guest agent.
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// The dispatcher refused this verb because the active
     /// `AgentProfile` does not allow it. Distinct
     /// from `Error { message }` so SDK callers can branch on
@@ -208,11 +216,16 @@ pub enum GuestResponse {
     },
     /// The pinned verb grant does not authorize this verb for the
     /// workload. Wire-stable. Universal — may answer any request.
-    VerbNotAuthorized { verb: String },
+    VerbNotAuthorized {
+        verb: String,
+    },
     /// The agent refused to spawn workload code because it is still running as
     /// uid 0. Carries the offending verb and the live uid so the refusal is
     /// self-diagnosing rather than needing a console-log hunt.
-    WorkloadPrivilegeRefused { verb: String, uid: u32 },
+    WorkloadPrivilegeRefused {
+        verb: String,
+        uid: u32,
+    },
     /// Per-integration status report.
     IntegrationStatusReport {
         integrations: Vec<crate::integrations::IntegrationStateReport>,
@@ -230,7 +243,9 @@ pub enum GuestResponse {
     },
     /// Whether the workload has signalled "primed" (the primed marker is
     /// present). Answers `PrimedStatus`.
-    PrimedStatusReport { primed: bool },
+    PrimedStatusReport {
+        primed: bool,
+    },
     /// One event in the response stream of a `RunEntrypoint` call.
     ///
     /// The agent emits a sequence of these in response to a single
@@ -244,23 +259,36 @@ pub enum GuestResponse {
     DriveEvent(EntrypointEvent),
     /// Drive authorization failed before any filesystem access or process
     /// spawn. The host records this typed reason in its signed audit chain.
-    DriveRefused { reason: DriveRefusal },
+    DriveRefused {
+        reason: DriveRefusal,
+    },
     /// The exact active extension invocation accepted cancellation.
     ExtensionCancellationAck,
     /// One event in the streaming response of a DevOnly `Exec` call.
     /// Terminated by `ExecEvent::Exit`.
     ExecEvent(ExecEvent),
+    OwnerAccessReply(mvm_contract::protocol::owner_access::OwnerAccessReply),
+    OwnerAccessObject(mvm_contract::protocol::owner_access::OwnerAccessObjectResponse),
+    OwnerAccessCancelled {
+        request_id: [u8; 32],
+        sequence: u64,
+        cancelled: bool,
+    },
     /// A declared command is paused before spawn and needs a decision for
     /// this exact invocation on the authenticated control session.
     ToolCheckRequired(mvm_contract::protocol::network_flow::tool::ToolCheckRequest),
     /// Buffered outcomes of a DevOnly `ExecBatch` call, one per
     /// command in request order (truncated at the first non-zero exit).
-    ExecBatchResult { outcomes: Vec<ExecOutcomeWire> },
+    ExecBatchResult {
+        outcomes: Vec<ExecOutcomeWire>,
+    },
     /// Ack for a `RunDetached` call: the detached workload was spawned
     /// with the given guest PID. The workload runs independently of this
     /// request's connection; its exit is later reported to the host's
     /// workload-exit port by the agent's reaper.
-    DetachedStarted { pid: i32 },
+    DetachedStarted {
+        pid: i32,
+    },
     /// Post-restore acknowledgement.
     PostRestoreAck {
         success: bool,
@@ -293,7 +321,9 @@ pub enum GuestResponse {
         volumes_mounted: Option<u32>,
     },
     /// Filesystem diff result.
-    FsDiffResult { changes: Vec<FsChange> },
+    FsDiffResult {
+        changes: Vec<FsChange>,
+    },
     /// Every dirty page has been handed to the block layer.
     FilesystemsSynced,
     /// Guest Unix socket forward started successfully.
@@ -302,7 +332,10 @@ pub enum GuestResponse {
         host_vsock_port: u32,
     },
     /// Console PTY session opened. Connect to `data_port` for raw I/O.
-    ConsoleOpened { session_id: u32, data_port: u32 },
+    ConsoleOpened {
+        session_id: u32,
+        data_port: u32,
+    },
     /// Attached to a running console session. Connect to `data_port`: the
     /// first `replay_bytes` are scrollback, then live output follows.
     ConsoleAttached {
@@ -312,15 +345,27 @@ pub enum GuestResponse {
         displaced_existing: bool,
     },
     /// Attach refused: another client is attached to `session_id`.
-    ConsoleBusy { session_id: u32 },
+    ConsoleBusy {
+        session_id: u32,
+    },
     /// The attached client, if any, was hung up. The shell keeps running.
-    ConsoleDetached { session_id: u32, was_attached: bool },
+    ConsoleDetached {
+        session_id: u32,
+        was_attached: bool,
+    },
     /// The agent's console sessions: the running one, or the last to exit.
-    ConsoleSessions { sessions: Vec<ConsoleSessionInfo> },
+    ConsoleSessions {
+        sessions: Vec<ConsoleSessionInfo>,
+    },
     /// Console PTY session ended (shell exited).
-    ConsoleExited { session_id: u32, exit_code: i32 },
+    ConsoleExited {
+        session_id: u32,
+        exit_code: i32,
+    },
     /// Console resize acknowledged.
-    ConsoleResized { session_id: u32 },
+    ConsoleResized {
+        session_id: u32,
+    },
     /// Result of an `EntrypointStatus` query.
     ///
     /// `ok = true` means the agent successfully validated
@@ -402,7 +447,7 @@ name_enum! {
     /// lockstep with the wire enum (exhaustive match).
     pub enum Verb {
         ActivateEnvironment, ProtocolHello, WorkerStatus, SleepPrep, Wake, Ping, ResourceUsage,
-        IntegrationStatus,
+        IntegrationStatus, DeliverDeclaredOperation, CancelDeclaredOperation, OwnerAccessObject,
         CheckpointIntegrations, ProbeStatus, PrimedStatus, Exec, MediatedExec, ExecBatch, RunEntrypoint,
         AgentPrompt, DriveOpen, DriveFile, RunExtension,
         CancelExtension,
@@ -421,7 +466,7 @@ name_enum! {
     /// `GuestResponse::variant()` keeps it in lockstep with the wire enum
     /// (exhaustive match).
     pub enum ResponseVariant {
-        ActivateEnvironmentAck, ActivateEnvironmentError, NotActivated,
+        ActivateEnvironmentAck, ActivateEnvironmentError, NotActivated, OwnerAccessReply, OwnerAccessCancelled, OwnerAccessObject,
         ProtocolHelloAck, ProtocolMismatch, WorkerStatus, SleepPrepAck, WakeAck,
         Pong, ResourceUsageReport, Error, UnsupportedInProfile, VerbNotAuthorized, WorkloadPrivilegeRefused, IntegrationStatusReport,
         CheckpointResult, ProbeStatusReport, PrimedStatusReport, EntrypointEvent, DriveEvent, DriveRefused, ExtensionCancellationAck, ExecEvent, ToolCheckRequired,
@@ -523,6 +568,7 @@ impl Verb {
             | Self::StreamInput
             | Self::CloseStreamInput
             | Self::DisplayInput => Data,
+            Self::DeliverDeclaredOperation | Self::OwnerAccessObject => Data,
             Self::ActivateEnvironment
             | Self::ProtocolHello
             | Self::WorkerStatus
@@ -558,6 +604,7 @@ impl Verb {
             | Self::MountVolume
             | Self::UnmountVolume
             | Self::UpdateIdleTimeout => Control,
+            Self::CancelDeclaredOperation => Control,
         }
     }
 
@@ -587,6 +634,7 @@ impl Verb {
             | Self::RunCode
             | Self::ProcStart
             | Self::ConsoleOpen => true,
+            Self::DeliverDeclaredOperation | Self::OwnerAccessObject => true,
 
             // Agent-internal: these answer from agent state, mutate mounts or
             // forwarding, or manage a process the verbs above already created.
@@ -643,6 +691,7 @@ impl Verb {
             // no program and reaches no spawn site.
             | Self::DisplayInput
             | Self::UpdateIdleTimeout => false,
+            Self::CancelDeclaredOperation => false,
         }
     }
 
@@ -694,6 +743,9 @@ impl Verb {
             Verb::ProbeStatus => unary(&[R::ProbeStatusReport]),
             Verb::PrimedStatus => unary(&[R::PrimedStatusReport]),
             Verb::Exec => stream(&[R::ExecEvent]),
+            Verb::DeliverDeclaredOperation => unary(&[R::OwnerAccessReply]),
+            Verb::OwnerAccessObject => stream(&[R::OwnerAccessObject]),
+            Verb::CancelDeclaredOperation => unary(&[R::OwnerAccessCancelled]),
             Verb::MediatedExec => stream(&[R::ToolCheckRequired, R::ExecEvent]),
             Verb::ExecBatch => unary(&[R::ExecBatchResult]),
             Verb::RunEntrypoint => stream(&[R::EntrypointEvent]),
@@ -772,6 +824,9 @@ impl GuestResponse {
             GuestResponse::DriveRefused { .. } => ResponseVariant::DriveRefused,
             GuestResponse::ExtensionCancellationAck => ResponseVariant::ExtensionCancellationAck,
             GuestResponse::ExecEvent(_) => ResponseVariant::ExecEvent,
+            GuestResponse::OwnerAccessReply(_) => ResponseVariant::OwnerAccessReply,
+            GuestResponse::OwnerAccessObject(_) => ResponseVariant::OwnerAccessObject,
+            GuestResponse::OwnerAccessCancelled { .. } => ResponseVariant::OwnerAccessCancelled,
             GuestResponse::ToolCheckRequired(_) => ResponseVariant::ToolCheckRequired,
             GuestResponse::ExecBatchResult { .. } => ResponseVariant::ExecBatchResult,
             GuestResponse::DetachedStarted { .. } => ResponseVariant::DetachedStarted,
@@ -811,6 +866,10 @@ impl GuestResponse {
             GuestResponse::ExecEvent(e) => e.is_terminal(),
             GuestResponse::ToolCheckRequired(_) => false,
             GuestResponse::ProcWaitEvent(e) => e.is_terminal(),
+            GuestResponse::OwnerAccessObject(e) => matches!(
+                e,
+                mvm_contract::protocol::owner_access::OwnerAccessObjectResponse::Completed { .. }
+            ),
             _ => true,
         }
     }
@@ -842,47 +901,7 @@ impl DriveRefusal {
         }
     }
 }
-/// Guest-agent control protocol capability. Closed enum so host and
-/// guest fail loudly on drift instead of accepting arbitrary strings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub enum GuestCapability {
-    Ping,
-    ResourceUsage,
-    IntegrationStatus,
-    EntrypointStatus,
-    RunEntrypoint,
-    /// `AgentPrompt`: one prompt to the image's resident agent.
-    AgentPrompt,
-    Drive,
-    RunExtension,
-    FilesystemRpc,
-    ProcessRpc,
-    /// Authenticated host decision required before a declared command spawn.
-    MediatedExec,
-    Console,
-    /// Unix-domain socket forwarding (`StartUnixSocketForward`). Not an SSH
-    /// session capability — no SSH client/server or key material crosses the
-    /// guest boundary.
-    UnixSocketForward,
-    VolumeMount,
-    UpdateIdleTimeout,
-    /// `ReadinessStatus` returns
-    /// `GuestResponse::ReadinessStatusReport(ReadinessReport)`.
-    /// `mvmctl machine wait` / `mvmctl machine boot-report` require this capability.
-    Readiness,
-}
-
-/// Required remediation for a host/guest protocol mismatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub enum ProtocolUpgradeAction {
-    UpgradeHost,
-    RebuildGuest,
-    DowngradeHost,
-}
+pub use mvm_contract::protocol::control::{GuestCapability, ProtocolUpgradeAction};
 
 /// Protocol negotiation result returned by [`negotiate_protocol`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -897,6 +916,9 @@ pub struct ProtocolNegotiation {
 pub fn supported_capabilities() -> Vec<GuestCapability> {
     vec![
         GuestCapability::Ping,
+        GuestCapability::OwnerAccessV1,
+        #[cfg(feature = "owner-access-object")]
+        GuestCapability::OwnerAccessObjectV1,
         GuestCapability::ResourceUsage,
         GuestCapability::IntegrationStatus,
         GuestCapability::EntrypointStatus,

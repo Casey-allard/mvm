@@ -467,6 +467,7 @@ fn wasm_network_endpoint_spawn_params<'a>(
         egress_proxy: None,
         tls_intermediate: None,
         network_policy: Some(network_policy),
+        admitted_network_plan: None,
         network_limits: plan.network_limits,
         ingress: &[],
         resolver_remote: None,

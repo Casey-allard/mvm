@@ -201,6 +201,8 @@ pub struct EndpointSpawnInputs<'a> {
     pub redaction: &'a RedactionPolicy,
     pub tools: &'a mvm_contract::policy::tool_rules::ToolRules,
     pub network_policy: &'a NetworkPolicy,
+    /// Carried from the existing caller's admitted signed plan.
+    pub admitted_plan_json: Option<&'a str>,
     /// Transport-neutral resource ceilings from the admitted plan.
     pub network_limits: mvm_core::plan::NetworkLimits,
     /// Exact signed ingress mappings owned by this endpoint.
@@ -217,6 +219,8 @@ pub struct EndpointSpawnInputs<'a> {
 /// A deny-all, secret-free workload has no egress channel at all and carries
 /// `None`; the guest-side connect then fails closed without starting a process.
 pub struct EndpointHandle {
+    #[cfg(unix)]
+    owned: Option<mvm_vmm::host::network_endpoint_spawn::OwnedEndpoint>,
     egress_uds: Option<PathBuf>,
     identity_drive: Option<PathBuf>,
     telemetry: TelemetryStart,
@@ -254,6 +258,42 @@ impl EndpointHandle {
         // The collector start stays in flight: joining here would put it on
         // the launch path it was moved off. Dropping the handle joins it.
         self.guard.defuse();
+    }
+
+    /// A compatibility PID guard is never installed-child exit evidence.
+    pub(crate) fn shutdown_owned(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(owner) = self.owned.as_mut() {
+            return owner.shutdown();
+        }
+        anyhow::ensure!(
+            self.egress_uds.is_none()
+                && !self.telemetry.provisioned
+                && self.guard.vm_name.is_none(),
+            "original endpoint child custody unavailable; installed owner retained"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn close_owned_admission(&mut self) -> Result<()> {
+        match self.owned.as_mut() {
+            Some(owner) => owner.close_admission(),
+            None => self.shutdown_owned(),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn take_owned_retirement(
+        &mut self,
+    ) -> Result<Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement>> {
+        match self.owned.as_mut() {
+            Some(owner) => owner.take_retirement().map(Some),
+            None => {
+                self.shutdown_owned()?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -311,6 +351,7 @@ impl<'a> ClaimGuards<'a> {
             redaction: inputs.redaction,
             tools: inputs.tools,
             network_policy: inputs.network_policy,
+            admitted_plan_json: inputs.admitted_plan_json,
             network_limits: inputs.network_limits,
             ingress: inputs.ingress,
             identity: inputs.identity,
@@ -325,6 +366,8 @@ impl<'a> ClaimGuards<'a> {
             // not depend on whether the workload has egress to mediate.
             let telemetry = self.spawner.start_telemetry_without_endpoint(&request);
             return Ok(EndpointHandle {
+                #[cfg(unix)]
+                owned: None,
                 egress_uds: None,
                 identity_drive,
                 guard: if telemetry.provisioned {
@@ -342,10 +385,55 @@ impl<'a> ClaimGuards<'a> {
         // guest and the host disagree.
         let spawned = self.spawner.spawn(&request)?;
         Ok(EndpointHandle {
+            #[cfg(unix)]
+            owned: None,
             egress_uds: Some(spawned.egress_uds),
             identity_drive: spawned.identity_drive,
             telemetry: TelemetryStart::default(),
             guard: EndpointGuard::new(&vm.0),
+        })
+    }
+
+    /// Dispatch only through installed ownership. The concrete spawner receives
+    /// the original anchored config and actual resident signer custody.
+    #[cfg(unix)]
+    pub fn spawn_endpoint_installed(
+        &self,
+        vm: &VmId,
+        inputs: &EndpointSpawnInputs<'_>,
+        config: &mvm_core::vm_backend::VmStartConfig,
+        agent: Option<&mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar>,
+    ) -> Result<EndpointHandle> {
+        let anchor = config
+            .host_lifetime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("installed endpoint original anchor missing"))?;
+        anyhow::ensure!(vm.0 == config.name, "installed endpoint VM differs");
+        anchor.verify_config(config, anchor.binding().backend)?;
+        let request = NetworkEndpointSpawnRequest {
+            vm_name: &vm.0,
+            state_dir: inputs.state_dir,
+            tenant: inputs.tenant,
+            secrets: inputs.secrets,
+            redaction: inputs.redaction,
+            tools: inputs.tools,
+            network_policy: inputs.network_policy,
+            admitted_plan_json: inputs.admitted_plan_json,
+            network_limits: inputs.network_limits,
+            ingress: inputs.ingress,
+            identity: inputs.identity,
+        };
+        let spawned = self.spawner.spawn_installed(&request, config, agent)?;
+        anyhow::ensure!(
+            spawned.owner.is_some() || (spawned.egress_uds.is_none() && !spawned.telemetry),
+            "installed helper effects have no original child"
+        );
+        Ok(EndpointHandle {
+            owned: spawned.owner,
+            egress_uds: spawned.egress_uds,
+            identity_drive: spawned.identity_drive,
+            telemetry: TelemetryStart::provisioned(spawned.telemetry),
+            guard: EndpointGuard::defused(),
         })
     }
 }
@@ -524,6 +612,7 @@ mod tests {
             redaction,
             tools: &EMPTY_TOOLS,
             network_policy: policy,
+            admitted_plan_json: None,
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
         }

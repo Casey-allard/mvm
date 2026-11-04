@@ -61,6 +61,8 @@ pub mod input_gate;
 pub mod input_route;
 mod journal;
 pub(crate) use journal::SEED_FILENAME as CAPTURE_SEED_FILENAME;
+/// Canonical policy/known-secret seam for separately admitted owner access.
+pub mod access_guard;
 pub mod plane;
 pub mod protected;
 mod protected_budget;

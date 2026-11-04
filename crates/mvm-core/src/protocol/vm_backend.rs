@@ -92,6 +92,9 @@ pub struct BundleBootAssetsPin {
 
 #[derive(Debug, Clone, Default)]
 pub struct VmStartConfig {
+    /// Original in-process installed lifetime. No serialized field grants it.
+    #[cfg(unix)]
+    pub host_lifetime: Option<std::sync::Arc<crate::host_lifetime::HostLifetimeAnchor>>,
     /// VM name (user-provided or auto-generated).
     pub name: String,
     /// Stable registered-template identity for warm-parent compatibility.
@@ -947,6 +950,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         grant.sig = k.sign(&grant.signing_bytes()).to_bytes().to_vec();
@@ -980,6 +984,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         grant.sig = k.sign(&grant.signing_bytes()).to_bytes().to_vec();

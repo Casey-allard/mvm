@@ -282,6 +282,7 @@ fn make_exec_request(
         command: shell_join(argv),
         stdin,
         timeout_secs: timeout.map(|d| d.as_secs()),
+        deadline_unix_ms: None,
     }
 }
 

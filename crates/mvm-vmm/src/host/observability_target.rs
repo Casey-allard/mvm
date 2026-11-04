@@ -208,6 +208,8 @@ mod tests {
 
     fn minimal_start_config(name: &str) -> mvm_core::vm_backend::VmStartConfig {
         mvm_core::vm_backend::VmStartConfig {
+            #[cfg(unix)]
+            host_lifetime: None,
             name: name.to_string(),
             template_id: None,
             rootfs_path: "/tmp/rootfs.ext4".to_string(),

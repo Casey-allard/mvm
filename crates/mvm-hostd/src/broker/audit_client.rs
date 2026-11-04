@@ -12,6 +12,8 @@
 //! `DEFAULT_MAX_FRAME_BYTES` (64 KiB).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use mvm_core::protocol::audit_signer::{
     AppendEntryRequest, AppendEntryResponse, SignerHelperAppendEntry, SignerHelperRequest,
@@ -73,8 +75,26 @@ pub struct AuditClient {
 
 #[derive(Debug, Clone)]
 enum AuditClientTarget {
-    PerVmSigner { uds_path: PathBuf },
-    SignerHelper { uds_path: PathBuf, vm_id: String },
+    PerVmSigner {
+        uds_path: PathBuf,
+    },
+    SignerHelper {
+        uds_path: PathBuf,
+        vm_id: String,
+    },
+    OwnedSignerHelper {
+        uds_path: PathBuf,
+        vm_id: String,
+        original_child: u32,
+        admission: OwnedAuditAdmission,
+    },
+}
+#[derive(Clone)]
+struct OwnedAuditAdmission(Arc<crate::owned_resources::registered::RegistrationAdmission>);
+impl std::fmt::Debug for OwnedAuditAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RegistrationAdmission(..)")
+    }
 }
 
 impl AuditClient {
@@ -95,6 +115,23 @@ impl AuditClient {
             target: AuditClientTarget::SignerHelper {
                 uds_path: uds_path.into(),
                 vm_id: vm_id.into(),
+            },
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+        }
+    }
+
+    pub(crate) fn new_owned_signer_helper(
+        uds_path: PathBuf,
+        vm_id: String,
+        original_child: u32,
+        admission: Arc<crate::owned_resources::registered::RegistrationAdmission>,
+    ) -> Self {
+        Self {
+            target: AuditClientTarget::OwnedSignerHelper {
+                uds_path,
+                vm_id,
+                original_child,
+                admission: OwnedAuditAdmission(admission),
             },
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
         }
@@ -134,7 +171,108 @@ impl AuditClient {
                 let _ = stream.shutdown().await;
                 helper_response_to_append_response(resp, uds_path)
             }
+            AuditClientTarget::OwnedSignerHelper { uds_path, .. } => {
+                let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+                    AuditClientError::Protocol {
+                        path: uds_path.clone(),
+                        message: "owned audit runtime absent".into(),
+                    }
+                })?;
+                if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+                    return Err(AuditClientError::Protocol {
+                        path: uds_path.clone(),
+                        message: "owned audit requires multi-thread runtime".into(),
+                    });
+                }
+                let deadline = Instant::now()
+                    .checked_add(Duration::from_secs(5))
+                    .ok_or_else(|| AuditClientError::Protocol {
+                        path: uds_path.clone(),
+                        message: "owned deadline overflow".into(),
+                    })?;
+                // No detached blocking job: the current handler and workspace
+                // remain live until this bounded closure actually returns.
+                tokio::task::block_in_place(|| self.append_owned_until(req, deadline))
+            }
         }
+    }
+
+    fn append_owned_until(
+        &self,
+        req: &AppendEntryRequest,
+        deadline: Instant,
+    ) -> Result<AppendEntryResponse, AuditClientError> {
+        let AuditClientTarget::OwnedSignerHelper {
+            uds_path,
+            vm_id,
+            original_child,
+            admission,
+        } = &self.target
+        else {
+            return Err(AuditClientError::Protocol {
+                path: PathBuf::new(),
+                message: "not an owned signer target".into(),
+            });
+        };
+        admission.0.check().map_err(|source| AuditClientError::Io {
+            path: uds_path.clone(),
+            source,
+        })?;
+        if Instant::now() >= deadline {
+            return Err(AuditClientError::Io {
+                path: uds_path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "owned append deadline elapsed",
+                ),
+            });
+        }
+        if self.max_frame_bytes == 0 || self.max_frame_bytes > DEFAULT_MAX_FRAME_BYTES {
+            return Err(AuditClientError::Protocol {
+                path: uds_path.clone(),
+                message: "owned frame cap".into(),
+            });
+        }
+        if let AppendEntryRequest::AppendEntry { fields, .. } = req {
+            crate::owned_resources::validate_value(fields)
+                .map_err(|source| AuditClientError::Encode { source })?;
+        }
+        crate::owned_resources::encoded_len(req, DEFAULT_MAX_FRAME_BYTES)
+            .map_err(|source| AuditClientError::Encode { source })?;
+        let helper_req = helper_request_from_append(req, vm_id);
+        let client = crate::audit_signer::helper_client::SignerHelperClient::new(uds_path)
+            .with_max_frame_bytes(self.max_frame_bytes)
+            .with_original_child(*original_child);
+        let response = client
+            .send_until_current(&helper_req, deadline, &admission.0)
+            .map_err(|error| {
+                admission.0.fence();
+                match error.downcast::<std::io::Error>() {
+                    Ok(source) => AuditClientError::Io {
+                        path: uds_path.clone(),
+                        source,
+                    },
+                    Err(error) => match error.downcast::<serde_json::Error>() {
+                        Ok(source) => AuditClientError::Decode {
+                            path: uds_path.clone(),
+                            source,
+                        },
+                        Err(_) => AuditClientError::Protocol {
+                            path: uds_path.clone(),
+                            message: "owned signer response rejected".into(),
+                        },
+                    },
+                }
+            })?;
+        admission.0.check().map_err(|source| AuditClientError::Io {
+            path: uds_path.clone(),
+            source,
+        })?;
+        let response = helper_response_to_append_response(response, uds_path);
+        if response.is_err() {
+            admission.0.fence();
+        }
+        response
     }
 }
 
@@ -376,5 +514,304 @@ mod tests {
         let client = AuditClient::new(&path);
         let err = client.append(&sample_req()).await.unwrap_err();
         assert!(matches!(err, AuditClientError::Connect { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_std_exchange_preserves_exact_canonical_request_and_response() {
+        use std::io::Read;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("owned.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let request = sample_req();
+        let expected =
+            serde_json::to_vec(&helper_request_from_append(&request, "vm-owned")).unwrap();
+        let request_id = request.request_id().to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).unwrap();
+            let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+            let response = SignerHelperResponse::Ok {
+                request_id,
+                chain_head: "head".into(),
+                entry_hash: "entry".into(),
+                sig_alg: SIG_ALG_ED25519,
+            };
+            mvm_vmm::host::hvf_control_transport::write_frame_with_limit(
+                &mut stream,
+                &response,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+                65536,
+            )
+            .unwrap();
+        });
+        let admission = Arc::new(crate::owned_resources::registered::RegistrationAdmission::new());
+        // Transport fixture corroborates this process; actual original Child
+        // authority is exercised by the separate process tests, not this mock.
+        let client = AuditClient::new_owned_signer_helper(
+            path,
+            "vm-owned".into(),
+            std::process::id(),
+            admission,
+        );
+        let response = client.append(&request).await.unwrap();
+        assert!(
+            matches!(response, AppendEntryResponse::Ok { chain_head, entry_hash, .. }
+            if chain_head == "head" && entry_hash == "entry")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_blocked_owned_calls_retain_workspaces_and_leave_control_schedulable() {
+        use std::io::Read;
+        struct Release(Vec<std::sync::mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                for sender in &self.0 {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let directory = tempdir().unwrap();
+        let pool = crate::owned_resources::WorkspacePool::new(2).unwrap();
+        let admission = Arc::new(crate::owned_resources::registered::RegistrationAdmission::new());
+        let (entered, received) = std::sync::mpsc::channel();
+        let mut release = Release(Vec::new());
+        let mut servers = Vec::new();
+        let mut calls = Vec::new();
+        for index in 0..2 {
+            let path = directory.path().join(format!("blocked-{index}.sock"));
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let (finish, wait) = std::sync::mpsc::channel();
+            release.0.push(finish);
+            let entered = entered.clone();
+            servers.push(std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                stream.read_exact(&mut body).unwrap();
+                let request: SignerHelperRequest = serde_json::from_slice(&body).unwrap();
+                entered.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+                mvm_vmm::host::hvf_control_transport::write_frame_with_limit(
+                    &mut stream,
+                    &SignerHelperResponse::Pong {
+                        request_id: request.request_id().into(),
+                    },
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    65536,
+                )
+                .unwrap();
+            }));
+            let client = AuditClient::new_owned_signer_helper(
+                path,
+                "vm-owned".into(),
+                std::process::id(),
+                admission.clone(),
+            );
+            let held = pool.try_acquire().unwrap();
+            calls.push(tokio::spawn(async move {
+                let _held = held;
+                client
+                    .append(&AppendEntryRequest::Probe {
+                        request_id: "held".into(),
+                    })
+                    .await
+            }));
+        }
+        for _ in 0..2 {
+            received
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        }
+        for call in &calls {
+            call.abort();
+        }
+        for call in &mut calls {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), call)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            pool.try_acquire().is_err(),
+            "running STD exchanges still own both workspaces"
+        );
+        let (mut first, mut second) = tokio::net::UnixStream::pair().unwrap();
+        let control = tokio::spawn(async move {
+            let value: serde_json::Value = crate::framing::read_json_frame(&mut second, 65536)
+                .await
+                .unwrap();
+            crate::framing::write_json_frame(&mut second, &value)
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let expected = serde_json::json!({"control":"still-schedulable"});
+            crate::framing::write_json_frame(&mut first, &expected)
+                .await
+                .unwrap();
+            let actual: serde_json::Value = crate::framing::read_json_frame(&mut first, 65536)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        })
+        .await
+        .unwrap();
+        control.await.unwrap();
+        drop(release);
+        for call in calls {
+            match call.await {
+                Ok(response) => assert!(matches!(
+                    response.unwrap(),
+                    AppendEntryResponse::Pong { .. }
+                )),
+                Err(error) => assert!(error.is_cancelled()),
+            }
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        let first = pool.try_acquire().unwrap();
+        let second = pool.try_acquire().unwrap();
+        drop((first, second));
+    }
+
+    #[test]
+    fn owned_wrong_reply_identity_fences_following_connections() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wrong-id.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let _: SignerHelperRequest =
+                mvm_vmm::host::hvf_control_transport::read_frame_with_limit(
+                    &mut stream,
+                    deadline,
+                    65536,
+                )
+                .unwrap();
+            mvm_vmm::host::hvf_control_transport::write_frame_with_limit(
+                &mut stream,
+                &SignerHelperResponse::Pong {
+                    request_id: "different-request".into(),
+                },
+                deadline,
+                65536,
+            )
+            .unwrap();
+            listener
+        });
+        let admission = Arc::new(crate::owned_resources::registered::RegistrationAdmission::new());
+        let client = AuditClient::new_owned_signer_helper(
+            path,
+            "vm-owned".into(),
+            std::process::id(),
+            admission.clone(),
+        );
+        assert!(matches!(
+            client.append_owned_until(&sample_req(), Instant::now() + Duration::from_secs(3)),
+            Err(AuditClientError::Protocol { .. })
+        ));
+        assert!(admission.check().is_err());
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            client
+                .append_owned_until(&sample_req(), Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn owned_partial_reply_uses_original_deadline_and_fences() {
+        use std::io::Write;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("partial.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _: SignerHelperRequest =
+                mvm_vmm::host::hvf_control_transport::read_frame_with_limit(
+                    &mut stream,
+                    Instant::now() + Duration::from_secs(3),
+                    65536,
+                )
+                .unwrap();
+            stream.write_all(&[0, 0]).unwrap();
+            // Keep the original connection alive until the caller observes its
+            // deadline. EOF must not substitute for the partial-prefix proof.
+            wait.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        let admission = Arc::new(crate::owned_resources::registered::RegistrationAdmission::new());
+        let client = AuditClient::new_owned_signer_helper(
+            path,
+            "vm-owned".into(),
+            std::process::id(),
+            admission.clone(),
+        );
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let result = client.append_owned_until(&sample_req(), deadline);
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert!(matches!(result, Err(AuditClientError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::TimedOut));
+        assert!(Instant::now() >= deadline);
+        assert!(admission.check().is_err());
+    }
+
+    #[test]
+    fn owned_closed_or_expired_exchange_refuses_before_connection() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("owned.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let admission = Arc::new(crate::owned_resources::registered::RegistrationAdmission::new());
+        let client = AuditClient::new_owned_signer_helper(
+            path,
+            "vm-owned".into(),
+            std::process::id(),
+            admission.clone(),
+        );
+        assert!(
+            client
+                .append_owned_until(&sample_req(), std::time::Instant::now())
+                .is_err()
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        admission.fence();
+        assert!(
+            client
+                .append_owned_until(
+                    &sample_req(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

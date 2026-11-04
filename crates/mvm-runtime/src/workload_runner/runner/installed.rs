@@ -1,0 +1,459 @@
+//! Original in-process native custody. The table is only an index; every
+//! operation uses one original slot, never a driver attachment reconstructed
+//! from a persisted VM name. Unknown custody is retained on owner drop.
+
+use super::*;
+use mvm_core::host_lifetime::{HostLaunchBinding, HostLifetimeAnchor};
+use std::sync::{Mutex, MutexGuard, TryLockError};
+
+#[derive(Default)]
+pub(super) struct InstalledSlots(Mutex<Vec<Arc<InstalledSlot>>>);
+
+pub(super) struct InstalledSlot {
+    id: VmId,
+    owner: Arc<HostLifetimeAnchor>,
+    state: Mutex<Option<Custody>>,
+}
+
+/// Linear local evidence of completed original native and supporting cleanup.
+/// Retain this receipt through release of the actual parent resource grant.
+/// It cannot be serialized, cloned, or reconstructed from a binding or PID.
+#[must_use = "retain completed ownership through actual parent grant release"]
+pub struct OwnedRetirement {
+    owner: Arc<HostLifetimeAnchor>,
+    endpoint: Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement>,
+}
+impl OwnedRetirement {
+    pub fn binding(&self) -> &HostLaunchBinding {
+        self.owner.binding()
+    }
+    /// Move the original helper partition once for parent disk cleanup.
+    /// None is not evidence that an expected helper/store has retired.
+    pub fn take_endpoint_retirement(
+        &mut self,
+    ) -> Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement> {
+        self.endpoint.take()
+    }
+    /// Exact retained reservation identity; copied fields confer no ownership.
+    pub fn retains_parent_permit(
+        &self,
+        permit: &Arc<dyn mvm_core::host_lifetime::CoreCurrentParentPermit>,
+    ) -> bool {
+        self.owner.retains_parent_permit(permit)
+    }
+}
+impl std::fmt::Debug for OwnedRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedRetirement")
+            .field("vm_name", &self.binding().vm_name)
+            .finish_non_exhaustive()
+    }
+}
+
+struct Custody {
+    vm: Option<Box<dyn RunningVm>>,
+    failure: Option<anyhow::Error>,
+    endpoint: Option<crate::workload_runner::claim::EndpointHandle>,
+    endpoint_retirement: Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement>,
+    broker: Option<BrokerGuard>,
+    launch: Option<(
+        crate::runtime_evidence::RuntimeLifecycleLease,
+        crate::kernel_custody::KernelBoundLaunch,
+    )>,
+    retired: bool,
+    exit: Option<mvm_vmm::driver::traits::KernelStopOutcome>,
+}
+
+impl InstalledSlots {
+    pub(super) fn has_any(&self) -> Result<bool> {
+        Ok(!self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("installed index poisoned"))?
+            .is_empty())
+    }
+    pub(super) fn reserve(&self, owner: &Arc<HostLifetimeAnchor>) -> Result<Arc<InstalledSlot>> {
+        let mut slots = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("installed index poisoned"))?;
+        anyhow::ensure!(slots.len() < 2, "installed native slots full");
+        anyhow::ensure!(
+            !slots
+                .iter()
+                .any(|slot| slot.id.0 == owner.binding().vm_name),
+            "installed VM identity already retained"
+        );
+        let slot = Arc::new(InstalledSlot {
+            id: VmId(owner.binding().vm_name.clone()),
+            owner: Arc::clone(owner),
+            state: Mutex::new(Some(Custody {
+                vm: None,
+                failure: None,
+                endpoint: None,
+                endpoint_retirement: None,
+                broker: None,
+                launch: None,
+                retired: false,
+                exit: None,
+            })),
+        });
+        slots.push(Arc::clone(&slot));
+        Ok(slot)
+    }
+
+    pub(super) fn find(&self, id: &VmId) -> Result<Option<Arc<InstalledSlot>>> {
+        let slots = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("installed index poisoned"))?;
+        Ok(slots.iter().find(|slot| slot.id == *id).cloned())
+    }
+
+    pub(super) fn take_retired(&self, slot: &Arc<InstalledSlot>) -> Result<OwnedRetirement> {
+        let mut state = slot.access()?;
+        let state = state.as_mut().context("installed custody unavailable")?;
+        anyhow::ensure!(state.retired, "installed native custody has not retired");
+        let mut slots = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("installed index poisoned"))?;
+        let index = slots
+            .iter()
+            .position(|held| Arc::ptr_eq(held, slot))
+            .context("original retirement record unavailable or already consumed")?;
+        // All refusal paths precede removal. The receipt retains the same
+        // original parent owner; no release/reacquire or history eviction.
+        let receipt = OwnedRetirement {
+            owner: Arc::clone(&slot.owner),
+            endpoint: state.endpoint_retirement.take(),
+        };
+        slots.remove(index);
+        Ok(receipt)
+    }
+}
+
+impl InstalledSlot {
+    fn retain_guard<T: Send + 'static>(
+        &self,
+        value: T,
+    ) -> Result<(MutexGuard<'_, Option<Custody>>, T)> {
+        match self.access() {
+            Ok(guard) if guard.as_ref().is_some_and(|state| !state.retired) => Ok((guard, value)),
+            result => {
+                // Never let contention/poison destroy an original native or
+                // supporting owner passed across a fallible phase boundary.
+                std::mem::forget((Arc::clone(&self.owner), value));
+                match result {
+                    Err(error) => Err(error),
+                    Ok(_) => anyhow::bail!("installed retention unavailable; custody quarantined"),
+                }
+            }
+        }
+    }
+    fn access(&self) -> Result<MutexGuard<'_, Option<Custody>>> {
+        self.state.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => anyhow::anyhow!("installed VM operation in progress"),
+            TryLockError::Poisoned(_) => anyhow::anyhow!("installed VM custody poisoned"),
+        })
+    }
+
+    pub(super) fn matches(&self, owner: &Arc<HostLifetimeAnchor>) -> bool {
+        Arc::ptr_eq(&self.owner, owner)
+    }
+
+    pub(super) fn binding(&self) -> &HostLaunchBinding {
+        self.owner.binding()
+    }
+
+    pub(super) fn view(self: &Arc<Self>) -> Box<dyn RunningVm> {
+        Box::new(InstalledVmView(Arc::clone(self)))
+    }
+
+    pub(super) fn retain_launch(
+        &self,
+        lifecycle: crate::runtime_evidence::RuntimeLifecycleLease,
+        kernel: crate::kernel_custody::KernelBoundLaunch,
+    ) -> Result<()> {
+        let (mut guard, (lifecycle, kernel)) = self.retain_guard((lifecycle, kernel))?;
+        let state = guard.as_mut().context("installed custody unavailable")?;
+        anyhow::ensure!(state.launch.is_none(), "installed launch already retained");
+        state.launch = Some((lifecycle, kernel));
+        Ok(())
+    }
+
+    pub(super) fn retain_failure(&self, error: anyhow::Error) -> Result<()> {
+        let (mut guard, error) = self.retain_guard(error)?;
+        guard
+            .as_mut()
+            .context("installed custody unavailable")?
+            .failure = Some(error);
+        Ok(())
+    }
+
+    pub(super) fn retain_endpoint(
+        &self,
+        endpoint: crate::workload_runner::claim::EndpointHandle,
+    ) -> Result<()> {
+        let (mut guard, endpoint) = self.retain_guard(endpoint)?;
+        let state = guard.as_mut().context("installed custody unavailable")?;
+        anyhow::ensure!(
+            state.endpoint.is_none(),
+            "installed endpoint already retained"
+        );
+        state.endpoint = Some(endpoint);
+        Ok(())
+    }
+
+    pub(super) fn retain_broker(&self, broker: BrokerGuard) -> Result<()> {
+        let (mut guard, broker) = self.retain_guard(broker)?;
+        guard
+            .as_mut()
+            .context("installed custody unavailable")?
+            .broker = Some(broker);
+        Ok(())
+    }
+
+    pub(super) fn retain_vm(
+        self: &Arc<Self>,
+        vm: Box<dyn RunningVm>,
+    ) -> Result<Box<dyn RunningVm>> {
+        let (mut guard, vm) = self.retain_guard(vm)?;
+        let state = guard.as_mut().context("installed custody unavailable")?;
+        anyhow::ensure!(state.vm.is_none(), "installed native VM already retained");
+        state.vm = Some(vm);
+        anyhow::ensure!(
+            state.vm.as_ref().is_some_and(|vm| vm.id() == &self.id),
+            "native VM identity substitution; original retained"
+        );
+        Ok(Box::new(InstalledVmView(Arc::clone(self))))
+    }
+
+    pub(super) fn stop(&self, streamer: &dyn ConsoleStreamer) -> Result<()> {
+        let mut guard = self.access()?;
+        let state = guard.as_mut().context("installed custody unavailable")?;
+        if state.retired {
+            return Ok(());
+        }
+        if state.endpoint_retirement.is_none()
+            && let Some(endpoint) = state.endpoint.as_mut()
+        {
+            endpoint.close_owned_admission()?;
+        }
+        if state.exit.is_none() {
+            let stopped = if let Some(vm) = state.vm.as_deref() {
+                vm.terminate_with_kernel_exit()?
+            } else {
+                let failure = state
+                    .failure
+                    .as_mut()
+                    .context("installed startup still in progress")?;
+                #[cfg(target_os = "linux")]
+                if let Some(failed) =
+                    failure.downcast_mut::<mvm_backends::driver::fc::OwnedFcBootFailure>()
+                {
+                    let proof = failed
+                        .owner_mut()
+                        .stop(Instant::now() + Duration::from_secs(2))?;
+                    mvm_vmm::driver::traits::KernelStopOutcome {
+                        fc_exit: Some(proof),
+                        hvf_exit: None,
+                        timing: None,
+                    }
+                } else {
+                    failed_hvf_exit(failure)?
+                }
+                #[cfg(not(target_os = "linux"))]
+                failed_hvf_exit(failure)?
+            };
+            match self.binding().backend {
+                #[cfg(target_os = "linux")]
+                BackendKind::Firecracker => anyhow::ensure!(
+                    stopped
+                        .fc_exit
+                        .as_ref()
+                        .is_some_and(|proof| proof.binding() == self.binding()),
+                    "original Firecracker exit proof unavailable; custody retained"
+                ),
+                BackendKind::Hvf => {
+                    let proof =
+                        match stopped.hvf_exit.as_ref() {
+                            Some(proof) => proof,
+                            None => failed_hvf_proof(state.failure.as_mut().context(
+                                "original HVF exit proof unavailable; custody retained",
+                            )?)?,
+                        };
+                    anyhow::ensure!(
+                        proof.instance().vm_id == self.id.0,
+                        "HVF exit belongs to another instance"
+                    );
+                    proof.verify_current()?;
+                }
+                _ => anyhow::bail!("installed backend has no native exit proof"),
+            }
+            state.exit = Some(stopped);
+        }
+        if state.endpoint_retirement.is_none()
+            && let Some(endpoint) = state.endpoint.as_mut()
+        {
+            endpoint.shutdown_owned()?;
+            state.endpoint_retirement = endpoint.take_owned_retirement()?;
+        }
+        if let Some(broker) = state.broker.as_mut() {
+            broker.shutdown_owned()?;
+        }
+        streamer.stop(&self.id.0);
+        let (lifecycle, _) = state
+            .launch
+            .as_ref()
+            .context("original installed launch missing")?;
+        if crate::kernel_custody::has_retained_kernel(lifecycle)? {
+            let stopped = state
+                .exit
+                .as_ref()
+                .context("original native exit missing")?;
+            if let Some(proof) = stopped.hvf_exit.as_ref() {
+                crate::kernel_custody::release_after_confirmed_exit(lifecycle, proof)?;
+            } else if self.binding().backend == BackendKind::Hvf {
+                let proof = failed_hvf_proof(
+                    state
+                        .failure
+                        .as_mut()
+                        .context("original HVF rollback missing")?,
+                )?;
+                crate::kernel_custody::release_after_confirmed_exit(lifecycle, proof)?;
+            } else {
+                #[cfg(target_os = "linux")]
+                anyhow::ensure!(stopped.fc_exit.is_some(), "original native exit missing");
+                crate::kernel_custody::release_after_process_exit(lifecycle)?;
+            }
+        }
+        match std::fs::remove_file(marker(&self.id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove installed refusal marker after exit"),
+        }
+        mvm_core::util::atomic_io::sync_dir(&vm_state_dir(&self.id.0))?;
+        state.endpoint = None;
+        state.broker = None;
+        state.vm = None;
+        state.failure = None;
+        state.launch = None;
+        state.retired = true;
+        Ok(())
+    }
+
+    fn with_vm<T>(&self, action: impl FnOnce(&dyn RunningVm) -> Result<T>) -> Result<T> {
+        let guard = self.access()?;
+        let state = guard.as_ref().context("installed custody unavailable")?;
+        anyhow::ensure!(!state.retired, "installed VM has retired");
+        action(
+            state
+                .vm
+                .as_deref()
+                .context("installed native startup incomplete")?,
+        )
+    }
+}
+
+fn failed_hvf_exit(
+    error: &mut anyhow::Error,
+) -> Result<mvm_vmm::driver::traits::KernelStopOutcome> {
+    let failed = error
+        .downcast_mut::<mvm_backends::driver::hvf::ColdHvfBootFailure>()
+        .context("installed failed-start custody is not recoverable through a native owner")?;
+    failed.retry_stop()?;
+    failed
+        .confirmed_exit()
+        .context("native rollback unconfirmed")?
+        .verify_current()?;
+    Ok(mvm_vmm::driver::traits::KernelStopOutcome {
+        #[cfg(target_os = "linux")]
+        fc_exit: None,
+        // Its non-Clone proof stays inside the original failed native owner.
+        hvf_exit: None,
+        timing: None,
+    })
+}
+
+fn failed_hvf_proof(error: &mut anyhow::Error) -> Result<&mvm_vmm::host::hvf_stop::ConfirmedExit> {
+    error
+        .downcast_mut::<mvm_backends::driver::hvf::ColdHvfBootFailure>()
+        .context("original failed HVF owner missing")?
+        .confirmed_exit()
+        .context("native rollback unconfirmed")
+}
+
+pub(super) fn marker(id: &VmId) -> PathBuf {
+    vm_state_dir(&id.0).join(mvm_core::host_lifetime::INSTALLED_NATIVE_CUSTODY_MARKER)
+}
+
+pub(super) fn refuse_unowned(id: &VmId) -> Result<()> {
+    mvm_core::host_lifetime::require_no_installed_native(&id.0)
+}
+
+impl Drop for InstalledSlot {
+    fn drop(&mut self) {
+        // A dropped controller is not evidence that a native process or any
+        // helper exited. Retain the exact owner, resources, and native handle
+        // until process exit. This bounded quarantine never marks Clean.
+        let guard = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(state) = guard.take() {
+            if !state.retired {
+                std::mem::forget((state, Arc::clone(&self.owner)));
+            }
+        }
+    }
+}
+
+struct InstalledVmView(Arc<InstalledSlot>);
+
+#[cfg(test)]
+#[path = "installed/retirement_tests.rs"]
+mod retirement_tests;
+
+impl RunningVm for InstalledVmView {
+    fn id(&self) -> &VmId {
+        &self.0.id
+    }
+    fn host_process_id(&self) -> Option<u32> {
+        self.0.with_vm(|vm| Ok(vm.host_process_id())).ok().flatten()
+    }
+    fn wait(&self) -> Result<VmExitStatus> {
+        // The compatibility trait has no cancellation/deadline. Holding the
+        // original slot in an unbounded wait would prevent its owner stopping
+        // it. Resident callers use application completion and explicit stop.
+        anyhow::bail!(
+            "installed blocking wait is unsupported; retain the original resident lifecycle"
+        )
+    }
+    fn prepare_stop(&self) -> Result<()> {
+        self.0.with_vm(|vm| vm.prepare_stop())
+    }
+    fn kill(&self) -> Result<()> {
+        anyhow::bail!("installed VM must stop through its original runner custody")
+    }
+    fn authenticated_hvf_instance(
+        &self,
+    ) -> Result<Option<mvm_core::protocol::hvf_control::HvfInstance>> {
+        self.0.with_vm(|vm| vm.authenticated_hvf_instance())
+    }
+    fn process_identity(&self) -> Result<Option<mvm_vmm::host::process_identity::ProcessIdentity>> {
+        self.0.with_vm(|vm| vm.process_identity())
+    }
+    fn pause(&self) -> Result<()> {
+        self.0.with_vm(|vm| vm.pause())
+    }
+    fn resume(&self) -> Result<()> {
+        self.0.with_vm(|vm| vm.resume())
+    }
+    fn status(&self) -> Result<VmStatus> {
+        self.0.with_vm(|vm| vm.status())
+    }
+    fn vsock_connect(&self, port: u32) -> Result<Box<dyn crate::driver::DuplexStream>> {
+        self.0.with_vm(|vm| vm.vsock_connect(port))
+    }
+}

@@ -15,6 +15,26 @@ const HANDSHAKE_LIMIT: usize = 1024 * 1024;
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const DROP_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Original partition custody after matched Drained and positive Child exit.
+/// This is not a disk-cleanup receipt; the parent keeps it through that barrier.
+#[derive(Debug)]
+#[must_use = "retain the original partition through parent disk cleanup"]
+pub struct EndpointRetirement {
+    handoff: mvm_core::host_lifetime::PreparedEndpointHandoff,
+}
+impl EndpointRetirement {
+    pub fn projection(&self) -> &mvm_core::host_lifetime::EndpointPartitionProjection {
+        self.handoff.partition().projection()
+    }
+
+    pub fn retains_partition_guard(
+        &self,
+        guard: &std::sync::Arc<dyn mvm_core::host_lifetime::EndpointPartitionGuard>,
+    ) -> bool {
+        self.handoff.partition().retains_guard(guard)
+    }
+}
+
 /// Exclusive custody of the endpoint child, including its collected exit status.
 ///
 /// No other thread may reap this child or change SIGCHLD disposition while this
@@ -23,7 +43,9 @@ const DROP_TIMEOUT: Duration = Duration::from_millis(100);
 #[derive(Debug)]
 #[must_use = "retain the endpoint until explicit shutdown confirms its exit"]
 pub struct OwnedEndpoint {
-    child: Child,
+    pub(super) child: Option<Child>,
+    child_id: u32,
+    pub(super) installed: Option<super::installed::InstalledCustody>,
     observer: Option<ProcessExitObserver>,
     exit_observed: bool,
     status: Option<ExitStatus>,
@@ -34,9 +56,12 @@ pub struct OwnedEndpoint {
 }
 
 impl OwnedEndpoint {
-    fn new(child: Child) -> Self {
+    pub(super) fn new(child: Child) -> Self {
+        let child_id = child.id();
         Self {
-            child,
+            child: Some(child),
+            child_id,
+            installed: None,
             observer: None,
             exit_observed: false,
             status: None,
@@ -49,12 +74,30 @@ impl OwnedEndpoint {
 
     /// The original child ID; never reconstructed from a sidecar.
     pub fn id(&self) -> u32 {
-        self.child.id()
+        self.child_id
     }
 
     /// The exact status collected by `Child::try_wait`, if already reaped.
     pub fn exit_status(&self) -> Option<ExitStatus> {
         self.status
+    }
+
+    /// Transfer the original handoff once, after actual child and local drain
+    /// barriers. No status/metadata argument can construct this receipt.
+    pub fn take_retirement(&mut self) -> Result<EndpointRetirement> {
+        if !self.exit_observed || !self.status.is_some_and(|status| status.success()) {
+            bail!("original installed endpoint exit not confirmed")
+        }
+        if !self.installed.as_ref().is_some_and(|owner| owner.drained) {
+            bail!("original installed endpoint drain unavailable or already consumed")
+        }
+        let installed = self
+            .installed
+            .take()
+            .context("original installed endpoint custody unavailable")?;
+        Ok(EndpointRetirement {
+            handoff: installed.handoff,
+        })
     }
 
     fn collect(&mut self) -> Result<Option<ExitStatus>> {
@@ -66,7 +109,12 @@ impl OwnedEndpoint {
             self.signals_forbidden = true;
             bail!("injected owned child wait failure");
         }
-        match self.child.try_wait() {
+        match self
+            .child
+            .as_mut()
+            .context("original endpoint child unavailable")?
+            .try_wait()
+        {
             Ok(status) => {
                 self.status = status;
                 self.exit_observed |= status.is_some();
@@ -81,16 +129,16 @@ impl OwnedEndpoint {
         }
     }
 
-    fn arm(&mut self) -> Result<()> {
+    pub(super) fn arm(&mut self) -> Result<()> {
         if self.observer.is_none() && self.collect()?.is_none() {
-            let pid = libc::pid_t::try_from(self.child.id())
+            let pid = libc::pid_t::try_from(self.child_id)
                 .context("endpoint child ID does not fit process ID")?;
             self.observer = Some(ProcessExitObserver::arm(pid)?);
         }
         Ok(())
     }
 
-    fn ensure_running(&mut self) -> Result<()> {
+    pub(super) fn ensure_running(&mut self) -> Result<()> {
         if let Some(status) = self.collect()? {
             bail!("owned endpoint exited during startup: {status}");
         }
@@ -101,7 +149,46 @@ impl OwnedEndpoint {
     /// and all evidence on failure. A previously collected nonzero exit is an
     /// error, not a successful shutdown. A kill requested here is intentional.
     pub fn shutdown(&mut self) -> Result<()> {
+        if self.installed.is_some() {
+            return self.shutdown_installed(Instant::now() + STOP_TIMEOUT);
+        }
         self.stop(Instant::now() + STOP_TIMEOUT)
+    }
+
+    /// Fence new installed child work without refunding any retained resources.
+    pub fn close_admission(&mut self) -> Result<()> {
+        let installed = self
+            .installed
+            .as_mut()
+            .context("endpoint has no installed control owner")?;
+        installed.input.take();
+        Ok(())
+    }
+
+    fn shutdown_installed(&mut self, deadline: Instant) -> Result<()> {
+        self.close_admission()?;
+        self.installed
+            .as_mut()
+            .context("installed custody unavailable")?
+            .read_drained(deadline)?;
+        self.arm()?;
+        if self.collect()?.is_none() {
+            let observer = self
+                .observer
+                .as_ref()
+                .context("original endpoint observer missing")?;
+            if observer.wait_event(deadline)? != ProcessExitWait::Exited {
+                bail!("installed endpoint child exit unconfirmed")
+            }
+            let status = collect_after_exit_event(deadline, || self.collect())?
+                .context("installed endpoint exit not collected")?;
+            self.check_status(status)?;
+        }
+        let status = self.status.context("installed endpoint exit missing")?;
+        if !status.success() {
+            bail!("installed endpoint did not exit cleanly")
+        }
+        Ok(())
     }
 
     fn stop(&mut self, deadline: Instant) -> Result<()> {
@@ -129,7 +216,11 @@ impl OwnedEndpoint {
                     bail!("injected owned child kill failure");
                 }
             }
-            self.child.kill().context("kill owned endpoint")?;
+            self.child
+                .as_mut()
+                .context("original endpoint child unavailable")?
+                .kill()
+                .context("kill owned endpoint")?;
             self.kill_requested = true;
         }
         armed?;
@@ -166,6 +257,14 @@ impl Drop for OwnedEndpoint {
         if self.status.is_none() {
             let _ = self.stop(Instant::now() + DROP_TIMEOUT);
         }
+        if self.installed.as_ref().is_some_and(|owner| {
+            !owner.drained || self.status.is_none_or(|status| !status.success())
+        }) {
+            // Actual child death alone does not prove owned stores cleaned.
+            // Keep one original partition/holder/child quarantine until process
+            // exit; neither partial startup nor Drop publishes retirement.
+            std::mem::forget((self.installed.take(), self.child.take()));
+        }
     }
 }
 
@@ -174,8 +273,8 @@ impl Drop for OwnedEndpoint {
 /// do not finalize runtime state while cleanup remains unconfirmed.
 #[derive(Debug)]
 pub struct OwnedEndpointSpawnError {
-    reason: anyhow::Error,
-    endpoint: OwnedEndpoint,
+    pub(super) reason: anyhow::Error,
+    pub(super) endpoint: OwnedEndpoint,
 }
 
 impl OwnedEndpointSpawnError {
@@ -287,7 +386,7 @@ pub(super) fn endpoint_command(
     cmd
 }
 
-fn create_evidence(path: &Path) -> Result<std::fs::File> {
+pub(super) fn create_evidence(path: &Path) -> Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -297,7 +396,10 @@ fn create_evidence(path: &Path) -> Result<std::fs::File> {
         .context("create owned endpoint evidence without replacing existing state")
 }
 
-fn refuse_existing_evidence(params: &SubstitutionSpawnParams<'_>, env: &Path) -> Result<()> {
+pub(super) fn refuse_existing_evidence(
+    params: &SubstitutionSpawnParams<'_>,
+    env: &Path,
+) -> Result<()> {
     let mut paths = vec![
         params.state_dir.join(SUBST_PID_FILE),
         params.state_dir.join(SUBST_SESSION_FILE),
@@ -319,13 +421,13 @@ fn refuse_existing_evidence(params: &SubstitutionSpawnParams<'_>, env: &Path) ->
     Ok(())
 }
 
-fn require_child_custody() -> Result<()> {
+pub(super) fn require_child_custody() -> Result<()> {
     crate::host::process_exit::require_owned_child_custody()
         .context("query endpoint child custody")?;
     Ok(())
 }
 
-fn nonblocking(fd: libc::c_int) -> Result<()> {
+pub(crate) fn nonblocking(fd: libc::c_int) -> Result<()> {
     // SAFETY: fd is borrowed from an owned live pipe.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     // SAFETY: the same pipe remains owned while its status flags are changed.
@@ -335,7 +437,7 @@ fn nonblocking(fd: libc::c_int) -> Result<()> {
     Ok(())
 }
 
-fn ready(fd: libc::c_int, events: libc::c_short, deadline: Instant) -> Result<()> {
+pub(crate) fn ready(fd: libc::c_int, events: libc::c_short, deadline: Instant) -> Result<()> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -375,11 +477,15 @@ fn exchange_until(
 ) -> Result<EndpointHandshake> {
     let mut stdin = endpoint
         .child
+        .as_mut()
+        .context("original endpoint child unavailable")?
         .stdin
         .take()
         .ok_or_else(|| anyhow!("endpoint stdin missing"))?;
     let mut stdout = endpoint
         .child
+        .as_mut()
+        .context("original endpoint child unavailable")?
         .stdout
         .take()
         .ok_or_else(|| anyhow!("endpoint stdout missing"))?;

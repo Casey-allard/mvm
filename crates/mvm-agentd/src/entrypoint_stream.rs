@@ -49,13 +49,35 @@ pub fn stream_call(
     call: EntrypointCall<'_>,
     consume: &mut dyn FnMut(EntrypointEvent),
 ) -> EntrypointEvent {
+    stream_call_inner(call, consume, None)
+}
+/// Same handoff/consumer, with one original cap propagated into the executor.
+pub fn stream_call_before(
+    call: EntrypointCall<'_>,
+    deadline: std::time::Instant,
+    consume: &mut dyn FnMut(EntrypointEvent),
+) -> EntrypointEvent {
+    stream_call_inner(call, consume, Some(deadline))
+}
+fn stream_call_inner(
+    call: EntrypointCall<'_>,
+    consume: &mut dyn FnMut(EntrypointEvent),
+    deadline: Option<std::time::Instant>,
+) -> EntrypointEvent {
     let timeout = call.timeout;
     let caps = call.caps;
     let (tx, rx) = mpsc::sync_channel(HANDOFF_CAPACITY);
     std::thread::scope(|scope| {
         let pumping = scope.spawn(move || {
             let mut handoff = Handoff::new(tx, &caps);
-            let outcome = execute_streaming(&call, &mut |event| handoff.offer(event));
+            let outcome = match deadline {
+                Some(deadline) => {
+                    crate::entrypoint::execute_streaming_before(&call, deadline, &mut |event| {
+                        handoff.offer(event)
+                    })
+                }
+                None => execute_streaming(&call, &mut |event| handoff.offer(event)),
+            };
             (outcome, handoff.finish())
         });
 

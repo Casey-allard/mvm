@@ -24,6 +24,9 @@ pub(super) struct UndoLaunch<'a> {
 /// never established would mean the only record of the run claims it was
 /// bounded when it was not.
 pub(super) fn undo_launch(undo: UndoLaunch<'_>) -> anyhow::Error {
+    if let Some(registry) = crate::owner_access::installed() {
+        let _ = registry.revoke(&undo.vm_id.0);
+    }
     let backend = undo.backend;
     let vm_id = undo.vm_id;
     undo_launch_with(

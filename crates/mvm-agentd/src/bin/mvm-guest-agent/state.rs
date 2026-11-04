@@ -80,6 +80,7 @@ pub(crate) struct AgentBootState {
     pub(crate) inner: Mutex<BootStateInner>,
     pub(crate) profile: AgentProfile,
     pub(crate) boot_at: Instant,
+    pub(crate) owner_access: Mutex<mvm_agentd::owner_access::AccessDesk>,
 }
 
 #[derive(Default)]
@@ -139,6 +140,7 @@ impl AgentBootState {
             }),
             profile,
             boot_at,
+            owner_access: Mutex::new(mvm_agentd::owner_access::AccessDesk::default()),
         }
     }
 
@@ -297,9 +299,59 @@ impl AgentBootState {
     /// the `PostRestore` handler after `re_pin_verb_grant` succeeds.
     pub(crate) fn set_verb_grant(&self, grant: mvm_core::plan::VerbGrant) {
         if let Ok(mut s) = self.inner.lock() {
+            if let Ok(mut desk) = self.owner_access.lock() {
+                desk.close();
+            }
             s.verb_grant = Some(grant);
             s.trust_denied = false;
         }
+    }
+    pub(crate) fn admit_owner_access(
+        &self,
+        request: &mvm_contract::protocol::owner_access::OwnerAccessRequest,
+    ) -> Result<
+        mvm_agentd::owner_access::AccessTicket,
+        mvm_contract::grants::owner_access::AccessRefusal,
+    > {
+        self.with_owner_access(|desk, now| desk.admit(request, now, Instant::now()))
+    }
+    #[cfg(feature = "owner-access-object")]
+    pub(crate) fn admit_owner_access_object(
+        &self,
+        begin: &mvm_contract::protocol::owner_access::OwnerAccessObjectBegin,
+    ) -> Result<
+        mvm_agentd::owner_access::AccessObjectTicket,
+        mvm_contract::grants::owner_access::AccessRefusal,
+    > {
+        self.with_owner_access(|desk, now| desk.admit_object(begin, now, Instant::now()))
+    }
+    fn with_owner_access<T>(
+        &self,
+        admit: impl FnOnce(
+            &mut mvm_agentd::owner_access::AccessDesk,
+            chrono::DateTime<chrono::Utc>,
+        ) -> Result<T, mvm_contract::grants::owner_access::AccessRefusal>,
+    ) -> Result<T, mvm_contract::grants::owner_access::AccessRefusal> {
+        use mvm_contract::grants::owner_access::AccessRefusal;
+        let inner = self.inner.lock().map_err(|_| AccessRefusal::Unavailable)?;
+        if inner.trust_denied {
+            return Err(AccessRefusal::Unavailable);
+        }
+        let grant = inner
+            .verb_grant
+            .as_ref()
+            .ok_or(AccessRefusal::Unavailable)?;
+        let key = inner
+            .host_signer_key
+            .as_ref()
+            .ok_or(AccessRefusal::Unavailable)?;
+        let mut desk = self
+            .owner_access
+            .lock()
+            .map_err(|_| AccessRefusal::Unavailable)?;
+        let now = chrono::Utc::now();
+        desk.install_verified(grant, key, &grant.session_id, &grant.plan_nonce, now)?;
+        admit(&mut desk, now)
     }
 }
 
@@ -477,6 +529,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         g.sig = signer.sign(&g.signing_bytes()).to_bytes().to_vec();
@@ -593,6 +646,7 @@ mod tests {
                 command: "id".into(),
                 stdin: None,
                 timeout_secs: Some(1),
+                deadline_unix_ms: None,
             },
             GuestRequest::ConsoleOpen {
                 cols: 80,
@@ -662,6 +716,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         g.sig = signer.sign(&g.signing_bytes()).to_bytes().to_vec();

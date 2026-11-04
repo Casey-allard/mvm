@@ -61,6 +61,11 @@ pub mod jailer;
 /// [`keyholder::LocalResolver`].
 pub mod keyholder;
 pub mod operator_admitted_trial_booter;
+pub mod owner_access;
+/// Local bounded workspace subdivisions; never parent admission authority.
+pub mod owned_resources;
+#[cfg(unix)]
+pub mod host_lifetime_parent;
 /// Redacting panic hook for the daemon bins. A panic payload is the one
 /// string the no-`Display`-on-secret-types gate cannot reach.
 pub mod panic_hook;

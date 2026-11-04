@@ -10,6 +10,18 @@
 mod http_flow;
 mod ingress;
 mod open_flow;
+mod payload_mapping;
+mod spiralcore_payload;
+pub use payload_mapping::{
+    AdmittedTcpPayload, AuthenticatedTcpPayloadFactory, AuthenticatedTcpPayloadIo,
+    PayloadMappingConfig,
+};
+pub use spiralcore_payload::{
+    EnrolledPayloadStream, ParentPayloadReservation, PayloadArtifact, PayloadPoolSnapshot,
+    PayloadResourceCharge, PayloadResourceLimits, PayloadResourcePermit, PayloadResourcePool,
+    PayloadScopeController, PreparedPayloadSession, SpiralCorePayloadFactory,
+    accept_enrolled_payload,
+};
 pub mod registry;
 mod resources;
 mod socket;
@@ -154,6 +166,7 @@ pub struct FlowMuxSession {
     /// down at the guest's next frame for it, so a connection does not outlive
     /// the invocation that was allowed to open it.
     bound_streams: BTreeMap<u32, tool_binding::BoundStream>,
+    payload_mapping: Option<Arc<PayloadMappingConfig>>,
 }
 
 impl std::fmt::Debug for FlowMuxSession {
@@ -197,6 +210,7 @@ pub struct FlowMuxAccept {
     substitution: Option<Arc<crate::supervisor::network_endpoint_proxy::SubstitutionService>>,
     vm_resources: Option<Arc<FlowMuxVmResources>>,
     ingress_mappings: Vec<(u16, IngressFlowKind)>,
+    payload_mapping: Option<Arc<PayloadMappingConfig>>,
 }
 
 impl FlowMuxAccept {
@@ -232,6 +246,7 @@ impl FlowMuxAccept {
             substitution: None,
             vm_resources: None,
             ingress_mappings: Vec::new(),
+            payload_mapping: None,
         }
     }
 
@@ -239,6 +254,12 @@ impl FlowMuxAccept {
     #[must_use]
     pub fn with_recorder(mut self, recorder: Option<Arc<Recorder>>) -> Self {
         self.recorder = recorder;
+        self
+    }
+
+    #[must_use]
+    pub fn with_payload_mapping(mut self, mapping: Option<Arc<PayloadMappingConfig>>) -> Self {
+        self.payload_mapping = mapping;
         self
     }
 
@@ -287,6 +308,23 @@ impl FlowMuxAccept {
 
 impl Drop for FlowMuxSession {
     fn drop(&mut self) {
+        if self.payload_mapping.is_some() {
+            let mapped = {
+                let mut streams = lock_tcp_streams(&self.streams);
+                let ids: Vec<_> = streams
+                    .iter()
+                    .filter(|(_, handle)| handle.upstream.is_mapped())
+                    .map(|(id, _)| *id)
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| streams.remove(&id))
+                    .collect::<Vec<_>>()
+            };
+            for handle in mapped {
+                handle.retired.store(true, Ordering::Release);
+                let _ = handle.upstream.shutdown(std::net::Shutdown::Both);
+            }
+        }
         let mut cancellations = self
             .http_cancellations
             .lock()
@@ -361,6 +399,7 @@ impl FlowMuxSession {
             substitution,
             vm_resources,
             ingress_mappings,
+            payload_mapping,
         } = params;
         let session_id = session_id.as_str();
         // Split the socket into independent read/write descriptors so the
@@ -406,6 +445,7 @@ impl FlowMuxSession {
             terminated_flows: Arc::clone(&resources.terminated_flows),
             leaves: Arc::clone(&resources.leaves),
             bound_streams: BTreeMap::new(),
+            payload_mapping,
         })
     }
 
@@ -1001,14 +1041,30 @@ impl FlowMuxSession {
             }
         }
 
-        if let Err(e) = handle
-            .upstream
-            .write_all(&payload)
-            .and_then(|_| handle.upstream.flush())
-        {
-            warn!(error = %e, stream_id, "write to upstream failed");
-            drop(streams);
-            return self.reset_host_stream(stream_id, "upstream write failed");
+        match handle.upstream.mapped_clone() {
+            Ok(Some(mut mapped)) => {
+                drop(streams);
+                if let Err(error) = mapped.write_all(&payload).and_then(|_| mapped.flush()) {
+                    warn!(error=%error,stream_id,"mapped upstream write failed");
+                    return self.reset_host_stream(stream_id, "upstream write failed");
+                }
+            }
+            Ok(None) => {
+                if let Err(e) = handle
+                    .upstream
+                    .write_all(&payload)
+                    .and_then(|_| handle.upstream.flush())
+                {
+                    warn!(error=%e,stream_id,"write to upstream failed");
+                    drop(streams);
+                    return self.reset_host_stream(stream_id, "upstream write failed");
+                }
+            }
+            Err(error) => {
+                warn!(error=%error,stream_id,"mapped upstream clone failed");
+                drop(streams);
+                return self.reset_host_stream(stream_id, "upstream unavailable");
+            }
         }
 
         // Replenish the consumed credit so the guest can keep sending.
@@ -1038,6 +1094,25 @@ impl FlowMuxSession {
             return Ok(());
         };
 
+        match handle.upstream.mapped_clone() {
+            Ok(Some(mapped)) => {
+                let closed = Arc::clone(&handle.host_half_closed);
+                drop(streams);
+                if mapped.shutdown(std::net::Shutdown::Write).is_err() {
+                    return self.reset_host_stream(stream_id, "upstream half-close failed");
+                }
+                if closed.load(Ordering::Relaxed) {
+                    return self.reset_host_stream(stream_id, "stream complete");
+                }
+                let _ = lock_registry(&self.registry).half_close(stream_id);
+                return Ok(());
+            }
+            Err(_) => {
+                drop(streams);
+                return self.reset_host_stream(stream_id, "upstream unavailable");
+            }
+            Ok(None) => {}
+        }
         let _ = handle.upstream.shutdown(std::net::Shutdown::Write);
 
         if handle.host_half_closed.load(Ordering::Relaxed) {
@@ -1149,6 +1224,21 @@ impl FlowMuxSession {
             let request = flow
                 .accept_head(&payload)
                 .map_err(|e| FlowMuxError::FrameRefused(e.to_string()))?;
+            if let Some(mapping) = self.payload_mapping.as_ref() {
+                let url = url::Url::parse(&request.head.url).map_err(|_| {
+                    FlowMuxError::FrameRefused("invalid typed HTTP destination".into())
+                })?;
+                if url
+                    .host_str()
+                    .zip(url.port_or_known_default())
+                    .is_some_and(|(host, port)| mapping.selects(host, port))
+                {
+                    return Err(FlowMuxError::FrameRefused(
+                        "selected payload profile does not support this typed transform path"
+                            .into(),
+                    ));
+                }
+            }
             let (Some(service), Some(handle)) = (&self.substitution, &self.runtime_handle) else {
                 return Err(FlowMuxError::FrameRefused(
                     "no runtime to forward the http flow on".to_string(),
@@ -1287,7 +1377,8 @@ impl FlowMuxSession {
 
     fn remove_stream(&mut self, stream_id: u32) {
         self.bound_streams.remove(&stream_id);
-        if let Some(handle) = lock_tcp_streams(&self.streams).remove(&stream_id) {
+        let handle = lock_tcp_streams(&self.streams).remove(&stream_id);
+        if let Some(handle) = handle {
             handle.retired.store(true, Ordering::Relaxed);
             let _ = handle.upstream.shutdown(std::net::Shutdown::Both);
         }

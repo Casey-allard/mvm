@@ -243,6 +243,76 @@ impl Drop for AuditEmitter {
 }
 
 impl AuditEmitter {
+    /// Payload-free, signed owner-access event. A chain failure propagates to
+    /// the access gate and prevents forwarding; this is not best-effort audit.
+    pub fn emit_owner_access(
+        &self,
+        plan: &ExecutionPlan,
+        record: &mvm_contract::protocol::owner_access::OwnerAccessAudit,
+    ) -> Result<()> {
+        use mvm_contract::protocol::owner_access::OwnerAccessAuditKind as K;
+        anyhow::ensure!(
+            record.policy.plan_id == plan.plan_id
+                && record.policy.plan_version == plan.plan_version
+                && record.execution.plan_nonce == plan.nonce
+                && record.execution.bundle_sha256
+                    == plan
+                        .bundle
+                        .as_ref()
+                        .map(|bundle| bundle.bundle_sha256.clone()),
+            "access audit identity mismatch"
+        );
+        anyhow::ensure!(
+            record.execution.instance_id.len() <= 128
+                && !record.execution.instance_id.is_empty()
+                && record.operation.len() <= 64
+                && record
+                    .operation
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "access audit metadata invalid"
+        );
+        let event = match record.kind {
+            K::Granted => "access.granted",
+            K::Request => "access.request",
+            K::Refused => "access.refused",
+            K::Completed => "access.completed",
+            K::Revoked => "access.revoked",
+            K::Cancelled => "access.cancelled",
+            K::Forward => "access.forward",
+            K::Shutdown => "access.shutdown",
+        };
+        let request = record
+            .request_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut extras = vec![
+            (
+                "access_instance".into(),
+                record.execution.instance_id.clone(),
+            ),
+            ("access_request_digest".into(), request),
+            ("access_sequence".into(), record.sequence.to_string()),
+            ("access_operation".into(), record.operation.clone()),
+            (
+                "access_request_bytes".into(),
+                record.request_bytes.to_string(),
+            ),
+            ("access_reply_bytes".into(), record.reply_bytes.to_string()),
+            (
+                "access_reason".into(),
+                record
+                    .reason
+                    .map(|reason| reason.to_string())
+                    .unwrap_or_default(),
+            ),
+        ];
+        if let Some(bundle) = &record.execution.bundle_sha256 {
+            extras.push(("access_bundle".into(), bundle.clone()));
+        }
+        self.emit(plan, event, extras)
+    }
     /// Construct with the default `~/.mvm/audit/` directory.
     pub fn new(signing_key: SigningKey) -> Result<Self> {
         Self::with_dir(signing_key, &default_audit_dir()?)

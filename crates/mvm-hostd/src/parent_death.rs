@@ -69,7 +69,60 @@ pub fn exit_when_orphaned() {
     #[cfg(target_os = "linux")]
     arm_pdeathsig();
     #[cfg(not(target_os = "linux"))]
-    spawn_parent_watcher(parent);
+    let _ = spawn_parent_watcher(parent, None);
+}
+
+/// Bound the installed child main stack before starting any runtime threads.
+pub fn bound_owned_main_stack() -> std::io::Result<()> {
+    let expected = libc::rlimit {
+        rlim_cur: 8 * 1024 * 1024,
+        rlim_max: 8 * 1024 * 1024,
+    };
+    // SAFETY: one initialized rlimit for this process; no pointers are retained.
+    if unsafe { libc::setrlimit(libc::RLIMIT_STACK, &expected) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut actual = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit writes one rlimit into this valid output buffer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, actual.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful getrlimit initialized the output.
+    let actual = unsafe { actual.assume_init() };
+    if actual.rlim_cur != expected.rlim_cur || actual.rlim_max != expected.rlim_max {
+        return Err(std::io::Error::other(
+            "owned main stack bound was not established",
+        ));
+    }
+    Ok(())
+}
+
+/// Required orphan protection with an explicitly bounded watcher stack.
+pub fn exit_when_orphaned_with_stack(stack_bytes: usize) -> std::io::Result<()> {
+    if stack_bytes != 2 * 1024 * 1024 {
+        return Err(std::io::Error::other(
+            "unsupported owned parent watcher stack",
+        ));
+    }
+    // SAFETY: getppid is an infallible process query.
+    let parent = unsafe { libc::getppid() };
+    if orphaned(parent) {
+        orphan_exit();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: only the calling process's parent-death signal is changed.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: close the parent-exit race after arming the kernel signal.
+        if unsafe { libc::getppid() } != parent {
+            orphan_exit();
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    spawn_parent_watcher(parent, Some(stack_bytes))
 }
 
 /// Linux: ask the kernel to signal us the instant our parent dies, then close
@@ -90,10 +143,15 @@ fn arm_pdeathsig() {
 /// runtime is untouched. If the thread cannot spawn, the reaper is the
 /// backstop.
 #[cfg(not(target_os = "linux"))]
-fn spawn_parent_watcher(parent_pid: libc::pid_t) {
-    let _ = std::thread::Builder::new()
-        .name("parent-death".into())
-        .spawn(move || watch_parent(parent_pid));
+fn spawn_parent_watcher(
+    parent_pid: libc::pid_t,
+    stack_bytes: Option<usize>,
+) -> std::io::Result<()> {
+    let mut builder = std::thread::Builder::new().name("parent-death".into());
+    if let Some(bytes) = stack_bytes {
+        builder = builder.stack_size(bytes);
+    }
+    builder.spawn(move || watch_parent(parent_pid)).map(|_| ())
 }
 
 /// Block until the parent dies, then exit. Prefers `kqueue` `NOTE_EXIT` (no

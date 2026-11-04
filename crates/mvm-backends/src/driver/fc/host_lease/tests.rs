@@ -203,7 +203,7 @@ impl Target {
         );
         let script = format!(
             "set -euo pipefail\n{}\nexec \"$1\" --exact \"$2\" --nocapture --test-threads=1\n",
-            lease.preflight()
+            preflight(lease)
         );
         let mut child = Command::new("/bin/bash")
             .args(["-c", &script, "host-lease-test"])

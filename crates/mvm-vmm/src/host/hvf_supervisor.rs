@@ -223,6 +223,16 @@ impl ProtectedSupervisorStatus {
 }
 
 /// Everything the supervisor needs to boot one guest.
+/// Resource continuity projection only; original admission remains mandatory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostLifetimeFds {
+    pub directory: i32,
+    pub holder: i32,
+    pub expected: mvm_core::host_lifetime::HostLeaseExpectation,
+}
+
+/// Everything the supervisor needs to boot one guest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HvfSupervisorConfig {
@@ -242,6 +252,9 @@ pub struct HvfSupervisorConfig {
     /// disk table remain diagnostic; the writer consumes these exact objects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writable_disk_fds: Vec<HvfWritableDiskFds>,
+    /// Original holder description, retained until the native VM is destroyed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_lifetime_fds: Option<HostLifetimeFds>,
     /// Full kernel cmdline. `None` ⇒ the supervisor's built-in default (workload
     /// contract: `init=/init`). Set it to boot an image whose PID 1 differs — e.g.
     /// the builder rootfs, which boots the static `/sbin/mvm-host-vm-init`. The
@@ -605,6 +618,16 @@ mod tests {
             kernel_fd: None,
             boot_image_fds: None,
             writable_disk_fds: Vec::new(),
+            host_lifetime_fds: Some(HostLifetimeFds {
+                directory: 31,
+                holder: 32,
+                expected: mvm_core::host_lifetime::HostLeaseExpectation {
+                    state_name: ".state".into(),
+                    state_bytes: 176,
+                    state_sha256: [9; 32],
+                    absent_names: [".state.intent".into(), ".state.next".into()],
+                },
+            }),
             cmdline: Some("console=ttyAMA0 root=/dev/vda ro init=/sbin/mvm-host-vm-init".into()),
             memory_mib: 8192,
             vcpus: 1,
@@ -780,6 +803,7 @@ mod tests {
             kernel_fd: None,
             boot_image_fds: None,
             writable_disk_fds: Vec::new(),
+            host_lifetime_fds: None,
             cmdline: None,
             memory_mib: 0,
             vcpus: 1,

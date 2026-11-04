@@ -332,6 +332,7 @@ pub fn admit_plan_for_run(
     extension_ctx: Option<&ExtensionAdmissionContext<'_>>,
     posture: RunPosture,
 ) -> Result<AdmittedPlan> {
+    crate::owner_access::require_selected(plan)?;
     posture.verify_runtime()?;
     let assurance_runtime = posture.assurance_runtime(plan)?;
     validate_extension_bindings(plan)?;
@@ -492,6 +493,7 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
     // refuse a plan whose stored id doesn't match, so a run is only ever
     // admitted under an id that genuinely addresses its content.
     verify_plan_id(&verified).context("plan_id content-address check")?;
+    crate::owner_access::require_selected(&verified)?;
 
     verified
         .validate_ingress()
@@ -2063,8 +2065,16 @@ pub struct StartAdmittedParams<'a> {
 /// including the in-memory mock in tests).
 #[tracing::instrument(skip_all)]
 pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine> {
+    #[cfg(unix)]
+    if params.config.host_lifetime.is_some() {
+        crate::host_lifetime_parent::require_installed()?;
+    }
     let backend = params.backend;
     let admitted = params.admitted;
+    crate::owner_access::require_selected(admitted.plan())?;
+    if let Some(registry) = crate::owner_access::installed() {
+        registry.preflight(&admitted, &params.config)?;
+    }
 
     // A refusal in any post-admission gate must still terminate the chain:
     // `plan.admitted` already fired, so a gate refusal emits `plan.failed`
@@ -2102,6 +2112,8 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
 
     let backend_name = backend.name().to_string();
     let vm_name = config.name.clone();
+    #[cfg(unix)]
+    crate::host_lifetime_parent::bind_current(&admitted,&config,backend.kind())?;
     registry_pack::verify_runtime_at_dispatch(
         _built_runtime.as_ref(),
         &config,
@@ -2125,6 +2137,19 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
             // budget exists to prevent — so this is fatal, and rolls the
             // launch back the same way an unapplied grant does.
             record_charge_or_undo_launch(backend, &vm_id, &vm_name, &admitted, params.emitter)?;
+            if let Some(registry) = crate::owner_access::installed()
+                && let Err(err) = registry.activate(&admitted, &config, backend.kind())
+            {
+                return Err(undo_launch(UndoLaunch {
+                    backend,
+                    vm_id: &vm_id,
+                    admitted: &admitted,
+                    emitter: params.emitter,
+                    stage: "owner-access",
+                    reason: "the declared owner access endpoint could not be opened",
+                    err,
+                }));
+            }
             if let Some(emitter) = params.emitter {
                 if let Err(e) = emitter.emit_launched(admitted.plan(), &backend_name) {
                     tracing::warn!(error = %e, "audit emit_launched failed (non-fatal)");

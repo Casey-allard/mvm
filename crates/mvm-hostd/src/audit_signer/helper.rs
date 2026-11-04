@@ -40,6 +40,7 @@ pub struct SignerHelper {
     tenant_id: String,
     software_chain_key_path: Option<PathBuf>,
     chains: HashMap<String, VmChain>,
+    owned: bool,
 }
 
 impl SignerHelper {
@@ -50,7 +51,13 @@ impl SignerHelper {
             tenant_id: tenant_id.into(),
             software_chain_key_path,
             chains: HashMap::new(),
+            owned: false,
         }
+    }
+
+    pub fn with_owned_resource_limits(mut self) -> Self {
+        self.owned = true;
+        self
     }
 
     /// Number of currently registered VM chains.
@@ -76,6 +83,17 @@ impl SignerHelper {
 
     fn register(&mut self, req: SignerHelperRegisterVm) -> SignerHelperResponse {
         let request_id = req.request_id.clone();
+        if self.owned
+            && (req.tenant_id != self.tenant_id
+                || validate_vm_id(&req.vm_id).is_err()
+                || self.chains.contains_key(&req.vm_id))
+        {
+            return SignerHelperResponse::Err {
+                request_id,
+                code: AuditSignerErrorCode::InvalidRequest,
+                message: "owned signer registration identity/conflict".into(),
+            };
+        }
         // Drop any chain already registered under this vm_id before opening
         // the replacement: the open takes the file's sole-writer lock, and the
         // old handle still holds it. Re-registering is a supervisor restart,
@@ -115,11 +133,25 @@ impl SignerHelper {
             );
         }
         validate_vm_id(&req.vm_id)?;
+        if self.owned {
+            anyhow::ensure!(
+                self.chains.len() < 2
+                    && req.workload_id.len() <= 128
+                    && req.workload_chain_path.len() <= 4096
+                    && req.chain_head_secondary_path.len() <= 4096,
+                "owned signer registration resource limit"
+            );
+        }
         let workload_chain_path = Path::new(&req.workload_chain_path);
         let chain_head_secondary_path = Path::new(&req.chain_head_secondary_path);
         ensure_parent(workload_chain_path)?;
         ensure_parent(chain_head_secondary_path)?;
-        Chain::open(
+        let open = if self.owned {
+            Chain::open_owned
+        } else {
+            Chain::open
+        };
+        open(
             workload_chain_path,
             chain_head_secondary_path,
             self.software_chain_key_path.as_deref(),
@@ -228,7 +260,15 @@ impl SignerHelper {
         let Some(path) = self.software_chain_key_path.as_deref() else {
             return Err("signer helper has no host signing key path".into());
         };
-        let keystore = Keystore::load_from_file(path).map_err(|e| e.to_string())?;
+        if self.owned && !matches!(req, SignRequest::SignTelemetryHandshake { .. }) {
+            return Err("owned host-signing operation resource profile unqualified".into());
+        }
+        let load = if self.owned {
+            Keystore::load_from_file_bounded
+        } else {
+            Keystore::load_from_file
+        };
+        let keystore = load(path).map_err(|e| e.to_string())?;
         Ok(crate::host_signer::server::dispatch_local(req, &keystore))
     }
 }
@@ -260,6 +300,87 @@ pub async fn serve_on_listener(
     max_frame_bytes: usize,
 ) -> Result<()> {
     serve(listener, helper, max_frame_bytes).await
+}
+
+/// Installed profile: at most two bounded broker queues feed this helper.
+pub async fn serve_owned_on_listener(
+    listener: crate::owned_resources::registered::RegisteredListener,
+    helper: SharedSignerHelper,
+    max_frame_bytes: usize,
+    admission: Arc<crate::owned_resources::registered::RegistrationAdmission>,
+) -> Result<()> {
+    anyhow::ensure!(
+        (1..=65536).contains(&max_frame_bytes),
+        "owned signer frame limit"
+    );
+    anyhow::ensure!(
+        helper.lock().await.owned,
+        "owned signer resource profile absent"
+    );
+    let mut requests = tokio::task::JoinSet::new();
+    let workspaces =
+        crate::owned_resources::WorkspacePool::new(crate::owned_resources::SIGNER_WORKSPACES)?;
+    let outcome: Result<()> = loop {
+        tokio::select! {
+            _ = admission.closed() => break Err(anyhow::anyhow!("owned signer I/O fenced")),
+            Some(result) = requests.join_next(), if !requests.is_empty() => {
+                if let Err(error) = result { break Err(error).context("owned signer request task failed"); }
+            }
+            accepted = listener.accept(), if requests.len() < 64 => {
+                let stream = match accepted { Ok(stream) => stream,
+                    Err(error) => break Err(error).context("owned signer accept") };
+                let helper = helper.clone();
+                let workspaces = workspaces.clone();
+                let future = async move {
+                    if let Err(error) = handle_owned_connection(stream, helper, max_frame_bytes, workspaces).await {
+                        warn!(error = %error, "owned signer request terminated");
+                    }
+                };
+                if let Err(error) = crate::owned_resources::task_size(&future) { break Err(error); }
+                requests.spawn(future);
+            }
+        }
+    };
+    drop(listener);
+    requests.abort_all();
+    let mut joined = Ok(());
+    while let Some(result) = requests.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            joined = Err(error).context("join owned signer request");
+        }
+    }
+    outcome
+        .and(joined)
+        .and(admission.check().map_err(anyhow::Error::from))
+}
+
+async fn handle_owned_connection(
+    mut stream: crate::owned_resources::registered::RegisteredStream,
+    helper: SharedSignerHelper,
+    max_frame_bytes: usize,
+    workspaces: crate::owned_resources::WorkspacePool,
+) -> Result<()> {
+    let _workspace = workspaces.acquire().await?;
+    let request = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        crate::framing::read_json_frame_checked::<_, SignerHelperRequest>(
+            &mut stream,
+            max_frame_bytes,
+            crate::owned_resources::validate_shape,
+        ),
+    )
+    .await
+    .context("owned signer parse deadline")??;
+    anyhow::ensure!(
+        request.request_id().len() <= 256,
+        "owned signer request identity limit"
+    );
+    let response = helper.lock().await.dispatch(request);
+    crate::framing::write_json_frame_bounded(&mut stream, &response, max_frame_bytes).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 async fn handle_connection(

@@ -647,6 +647,9 @@ pub enum ApprovalChainMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestGrants {
+    /// Explicit typed owner operations. Host defaults never add this authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_access: Option<mvm_contract::grants::owner_access::OwnerAccessGrant>,
     /// CPU share in thousandths of one host core (`1500` = 1.5 cores). This is
     /// a share of host CPU *time*, not the `cpus` count the guest sees — the
     /// two are independent and a workload may hold four vCPUs bounded to half
@@ -678,7 +681,8 @@ pub struct ManifestGrants {
 
 impl ManifestGrants {
     fn is_empty(&self) -> bool {
-        self.cpu_millicores.is_none()
+        self.owner_access.is_none()
+            && self.cpu_millicores.is_none()
             && self.cpu_fuel.is_none()
             && self.wall_clock_secs.is_none()
             && self.allow_hosts.is_empty()
@@ -738,7 +742,13 @@ impl ManifestGrants {
             })
         };
 
+        if let Some(access) = &self.owner_access {
+            access
+                .validate()
+                .context("invalid typed owner access declaration")?;
+        }
         Ok(Grants {
+            owner_access: self.owner_access.clone(),
             cpu,
             wall_clock,
             egress,

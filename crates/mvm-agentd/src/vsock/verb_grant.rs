@@ -5,6 +5,75 @@
 
 use super::*;
 
+/// Typed owner access is always deny-all without its own signed declaration,
+/// including legacy grant-less development boots. This gate runs before work.
+pub fn enforce_owner_access_grant(
+    req: &GuestRequest,
+    grant: Option<&mvm_core::plan::VerbGrant>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<GuestResponse> {
+    if !matches!(
+        req,
+        GuestRequest::DeliverDeclaredOperation(_)
+            | GuestRequest::CancelDeclaredOperation(_)
+            | GuestRequest::OwnerAccessObject(_)
+    ) {
+        return None;
+    }
+    let refused = || {
+        Some(GuestResponse::VerbNotAuthorized {
+            verb: req.kind_name().into(),
+        })
+    };
+    let Some(grant) = grant else { return refused() };
+    let Some(binding) = grant.owner_access.as_ref() else {
+        return refused();
+    };
+    if now >= grant.not_after || binding.validate().is_err() {
+        return refused();
+    }
+    let valid = match req {
+        GuestRequest::DeliverDeclaredOperation(request) => {
+            binding.grant.object_v1.is_none()
+                && u64::try_from(now.timestamp_millis())
+                    .ok()
+                    .is_some_and(|now| request.validate(binding, now).is_ok())
+        }
+        GuestRequest::CancelDeclaredOperation(cancel) => {
+            cancel.policy == binding.policy
+                && cancel.execution == binding.execution
+                && cancel.request_id != [0; 32]
+                && cancel.sequence != 0
+        }
+        GuestRequest::OwnerAccessObject(request) => {
+            use mvm_contract::protocol::owner_access::OwnerAccessObjectRequest;
+            // Subsequent messages are additionally tied to the active ticket by
+            // the object handler. Possession of these fields is not authority.
+            cfg!(feature = "owner-access-object")
+                && binding.grant.object_v1.is_some()
+                && match request {
+                    OwnerAccessObjectRequest::Begin(begin) => u64::try_from(now.timestamp_millis())
+                        .ok()
+                        .is_some_and(|now| begin.validate(binding, now).is_ok()),
+                    OwnerAccessObjectRequest::Frames(frames)
+                    | OwnerAccessObjectRequest::Receipt(frames) => {
+                        frames.request_id != [0; 32] && frames.sequence != 0
+                    }
+                    OwnerAccessObjectRequest::Commit {
+                        request_id,
+                        sequence,
+                    }
+                    | OwnerAccessObjectRequest::ReplyReady {
+                        request_id,
+                        sequence,
+                    } => *request_id != [0; 32] && *sequence != 0,
+                }
+        }
+        _ => false,
+    };
+    if valid { None } else { refused() }
+}
+
 /// Grant intersection, applied AFTER `allowed_in`. `None` grant => no
 /// restriction (class gate only). Baseline/listed verbs pass.
 pub fn enforce_verb_grant(
@@ -545,6 +614,7 @@ mod tests {
             drive: Some(drive_grant()),
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: Vec::new(),
         }
     }
@@ -698,6 +768,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         // listed => allowed
@@ -731,6 +802,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         let request = GuestRequest::RunEntrypoint {
@@ -771,6 +843,7 @@ mod tests {
                 class_gate_only: true,
                 command_map_digest: None,
             }),
+            owner_access: None,
             sig: vec![],
             application_terminal: None,
         };
@@ -779,6 +852,7 @@ mod tests {
                 command: "echo bypass".into(),
                 stdin: None,
                 timeout_secs: None,
+                deadline_unix_ms: None,
             },
             GuestRequest::ExecBatch {
                 stages: vec![],
@@ -866,6 +940,7 @@ mod tests {
                 class_gate_only: false,
                 command_map_digest: None,
             }),
+            owner_access: None,
             sig: vec![],
             application_terminal: None,
         };
@@ -897,6 +972,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         let requests = [
@@ -904,6 +980,7 @@ mod tests {
                 command: "id".into(),
                 stdin: None,
                 timeout_secs: Some(1),
+                deadline_unix_ms: None,
             },
             GuestRequest::ConsoleOpen {
                 cols: 80,
@@ -1080,6 +1157,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         good.sig = {
@@ -1168,6 +1246,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         grant.sig = {
@@ -1228,6 +1307,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         grant.sig = {
@@ -1822,6 +1902,7 @@ mod tests {
             drive: None,
             tool_mediation: None,
             application_terminal: None,
+            owner_access: None,
             sig: vec![],
         };
         grant.sig = signer.sign(&grant.signing_bytes()).to_bytes().to_vec();
@@ -2310,6 +2391,7 @@ mod tests {
             command: "id".into(),
             stdin: None,
             timeout_secs: None,
+            deadline_unix_ms: None,
         };
         assert!(matches!(
             enforce_verb_grant(&exec, Some(&grant)),

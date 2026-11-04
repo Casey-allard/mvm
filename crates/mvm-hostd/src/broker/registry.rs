@@ -23,6 +23,9 @@ use mvm_core::protocol::handler::{
     ServiceCallCtx, ServiceDispatchResult, ServiceError, ServiceHandler,
 };
 
+mod replay;
+use replay::ReplaySet;
+
 /// How many times one unbound name may be refused with a teaching message
 /// before further attempts are answered tersely.
 ///
@@ -96,7 +99,8 @@ pub struct Registry {
     capability_only_services: HashSet<ServiceId>,
     capabilities: HashMap<CapabilityId, CapabilityRegistration>,
     admitted: HashMap<CapabilityId, [u8; 32]>,
-    consumed_invocations: std::sync::Mutex<HashSet<(CapabilityId, AgentRequestId)>>,
+    consumed_invocations: std::sync::Mutex<ReplaySet>,
+    owned_replay_limit: Option<usize>,
     refusal_counts: std::sync::Mutex<HashMap<String, u32>>,
     audit: Arc<dyn CapabilityAuditSink>,
 }
@@ -108,10 +112,21 @@ impl Registry {
             capability_only_services: HashSet::new(),
             capabilities: HashMap::new(),
             admitted: HashMap::new(),
-            consumed_invocations: std::sync::Mutex::new(HashSet::new()),
+            consumed_invocations: std::sync::Mutex::new(ReplaySet::general()),
+            owned_replay_limit: None,
             refusal_counts: std::sync::Mutex::new(HashMap::new()),
             audit: Arc::new(NoopCapabilityAuditSink),
         }
+    }
+
+    /// Installed profile only; exhaustion refuses rather than forgetting replay proof.
+    pub fn with_owned_resource_limits(self) -> anyhow::Result<Self> {
+        self.with_owned_replay_capacity(8192)
+    }
+    fn with_owned_replay_capacity(mut self, limit: usize) -> anyhow::Result<Self> {
+        self.consumed_invocations = std::sync::Mutex::new(ReplaySet::owned(limit)?);
+        self.owned_replay_limit = Some(limit);
+        Ok(self)
     }
 
     /// Install the host-signed exact bindings for this workload.
@@ -278,6 +293,12 @@ impl Registry {
         verb: &str,
         payload: serde_json::Value,
     ) -> ServiceDispatchResult {
+        if self.owned_replay_limit.is_some() && (service.as_str().len() > 256 || verb.len() > 256) {
+            return Err(ServiceError::new(
+                ServiceErrorCode::BadRequest,
+                "owned service key limit",
+            ));
+        }
         if self.capability_only_services.contains(service) {
             return Err(ServiceError::new(
                 ServiceErrorCode::CapabilityDenied,
@@ -309,6 +330,12 @@ impl Registry {
         payload: serde_json::Value,
         cancellation: &CancellationToken,
     ) -> ServiceDispatchResult {
+        if self.owned_replay_limit.is_some() && (service.as_str().len() > 256 || verb.len() > 256) {
+            return Err(ServiceError::new(
+                ServiceErrorCode::BadRequest,
+                "owned capability key limit",
+            ));
+        }
         let capability = match CapabilityId::new(service.clone(), verb.to_string()) {
             Ok(capability) => capability,
             Err(_) => return Err(capability_error(CapabilityFailureCode::ProtocolMismatch)),
@@ -385,12 +412,13 @@ impl Registry {
                 ),
             ));
         }
-        let replay_key = (capability.clone(), invocation.invocation_id.clone());
-        let inserted = self
-            .consumed_invocations
-            .lock()
-            .expect("capability replay mutex is not poisoned")
-            .insert(replay_key);
+        let inserted = {
+            let mut consumed = self
+                .consumed_invocations
+                .lock()
+                .expect("capability replay mutex is not poisoned");
+            consumed.insert(&capability, &invocation.invocation_id)?
+        };
         if !inserted {
             self.record_refusal(&capability, invocation, CapabilityFailureCode::Replay);
             return Err(capability_error(CapabilityFailureCode::Replay));
@@ -786,6 +814,117 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, CapabilityAuditEvent::Completed { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn owned_replay_capacity_refuses_new_without_evicting_old_identity() {
+        let descriptor = descriptor();
+        let binding = descriptor.binding();
+        let mut registry = Registry::new().with_owned_replay_capacity(1024).unwrap();
+        registry
+            .register_capability(Arc::new(EchoHandler), descriptor)
+            .unwrap();
+        registry.admit_capabilities([binding.clone()]).unwrap();
+        let payload = serde_json::json!({"bounded":"value"});
+        let service = ServiceId::parse("host.dev.echo.v1").unwrap();
+        let cancel = CancellationToken::new();
+        for index in 0..=1024 {
+            let invocation = CapabilityInvocation::from_payload(
+                binding.clone(),
+                AgentRequestId::parse(format!("owned-{index}")).unwrap(),
+                &payload,
+            )
+            .unwrap();
+            let outcome = registry
+                .dispatch_capability(
+                    &ctx(),
+                    &service,
+                    "echo",
+                    &invocation,
+                    payload.clone(),
+                    &cancel,
+                )
+                .await;
+            if index < 1024 {
+                assert_eq!(outcome.unwrap(), payload);
+            } else {
+                assert_eq!(outcome.unwrap_err().code, ServiceErrorCode::Unavailable);
+            }
+        }
+        assert_eq!(registry.consumed_invocations.lock().unwrap().len(), 1024);
+        let original = CapabilityInvocation::from_payload(
+            binding,
+            AgentRequestId::parse("owned-0").unwrap(),
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(
+            registry
+                .dispatch_capability(&ctx(), &service, "echo", &original, payload, &cancel)
+                .await
+                .unwrap_err()
+                .code,
+            ServiceErrorCode::CapabilityReplay
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_selected_profile_admits_8192_and_retains_replay_at_saturation() {
+        let descriptor = descriptor();
+        let binding = descriptor.binding();
+        let mut registry = Registry::new().with_owned_resource_limits().unwrap();
+        registry
+            .register_capability(Arc::new(EchoHandler), descriptor)
+            .unwrap();
+        registry.admit_capabilities([binding.clone()]).unwrap();
+        let payload = serde_json::json!({"exact":"bounded"});
+        let service = ServiceId::parse("host.dev.echo.v1").unwrap();
+        let cancel = CancellationToken::new();
+        for index in 0..=8192 {
+            let invocation = CapabilityInvocation::from_payload(
+                binding.clone(),
+                AgentRequestId::parse(format!("profile-{index}")).unwrap(),
+                &payload,
+            )
+            .unwrap();
+            let outcome = registry
+                .dispatch_capability(
+                    &ctx(),
+                    &service,
+                    "echo",
+                    &invocation,
+                    payload.clone(),
+                    &cancel,
+                )
+                .await;
+            if index < 8192 {
+                assert_eq!(outcome.unwrap(), payload);
+            } else {
+                assert_eq!(outcome.unwrap_err().code, ServiceErrorCode::Unavailable);
+            }
+        }
+        let (tuple, backing, strings) =
+            registry.consumed_invocations.lock().unwrap().owned_layout();
+        assert_eq!((tuple, backing), (48, 8192));
+        assert!(strings <= 8192 * 256);
+        eprintln!(
+            "OWNED_REPLAY tuple_bytes={tuple} backing_capacity={backing} string_bytes={strings}"
+        );
+        let original = CapabilityInvocation::from_payload(
+            binding,
+            AgentRequestId::parse("profile-0").unwrap(),
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(
+            registry
+                .dispatch_capability(&ctx(), &service, "echo", &original, payload, &cancel)
+                .await
+                .unwrap_err()
+                .code,
+            ServiceErrorCode::CapabilityReplay
+        );
+        assert_eq!(registry.consumed_invocations.lock().unwrap().len(), 8192);
     }
 
     #[tokio::test]

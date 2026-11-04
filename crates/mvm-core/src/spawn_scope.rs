@@ -64,6 +64,9 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(all(test, target_os = "linux"))]
+#[path = "spawn_scope/custody_tests.rs"]
+mod custody_tests;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
@@ -609,6 +612,40 @@ impl BoundCommand {
             ));
         }
         Ok(child)
+    }
+
+    /// Preserve the exact child on every error after spawn. The caller owns
+    /// cleanup; no native Prepare may be sent before scope confirmation.
+    pub fn spawn_custodied(&mut self, pending: &mut Option<Child>) -> Result<()> {
+        anyhow::ensure!(pending.is_none(), "scope child custody already occupied");
+        let program = self.command.get_program().to_string_lossy().into_owned();
+        let proc_root = Path::new(PROC_ROOT);
+        let mut names = LauncherComm::before_spawn(proc_root);
+        *pending = Some(
+            self.command
+                .spawn()
+                .with_context(|| format!("spawning {program}"))?,
+        );
+        let Some(unit) = self.unit.as_deref() else {
+            return Ok(());
+        };
+        let child = pending.as_mut().context("original scope child missing")?;
+        let pid = child.id();
+        let outcome = watch_launcher(self.creation_timeout, || {
+            if child.try_wait()?.is_some() {
+                return Ok(LauncherProbe::Exited);
+            }
+            probe_launcher_comm(proc_root, pid, &mut names)
+        })
+        .with_context(|| format!("watching original scope launcher for '{}'", self.machine_id))?;
+        if outcome == LaunchWatch::TimedOut {
+            return Err(scope_creation_timeout(
+                &self.machine_id,
+                unit,
+                self.creation_timeout,
+            ));
+        }
+        Ok(())
     }
 
     /// Run the launch to completion and return its status.

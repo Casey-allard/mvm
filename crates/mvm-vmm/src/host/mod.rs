@@ -18,6 +18,8 @@ pub mod egress_shared;
 #[cfg(target_os = "linux")]
 pub mod fc_cgroup;
 pub mod fc_kernel;
+#[cfg(target_os = "linux")]
+pub mod fc_lifetime;
 pub mod flowmux_identity;
 pub mod gpu_endpoint_spawn;
 pub mod helper_contract;

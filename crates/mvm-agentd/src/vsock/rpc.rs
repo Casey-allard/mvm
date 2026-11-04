@@ -840,6 +840,7 @@ where
         command: command.to_string(),
         stdin,
         timeout_secs,
+        deadline_unix_ms: None,
     };
     let mut session = RpcSession::open(stream)?;
     session.write(stream, &req)?;

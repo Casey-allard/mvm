@@ -54,6 +54,9 @@ impl GuestRequest {
             GuestRequest::ProbeStatus => Verb::ProbeStatus,
             GuestRequest::PrimedStatus => Verb::PrimedStatus,
             GuestRequest::Exec { .. } => Verb::Exec,
+            GuestRequest::DeliverDeclaredOperation(_) => Verb::DeliverDeclaredOperation,
+            GuestRequest::OwnerAccessObject(_) => Verb::OwnerAccessObject,
+            GuestRequest::CancelDeclaredOperation(_) => Verb::CancelDeclaredOperation,
             GuestRequest::MediatedExec(_) => Verb::MediatedExec,
             GuestRequest::ExecBatch { .. } => Verb::ExecBatch,
             GuestRequest::RunEntrypoint { .. } => Verb::RunEntrypoint,
@@ -128,6 +131,9 @@ impl GuestRequest {
             | GuestRequest::ProbeStatus
             | GuestRequest::PrimedStatus
             | GuestRequest::RunEntrypoint { .. }
+            | GuestRequest::DeliverDeclaredOperation(_)
+            | GuestRequest::OwnerAccessObject(_)
+            | GuestRequest::CancelDeclaredOperation(_)
             // A prompt runs the same boot-validated program `RunEntrypoint`
             // does, with the prompt as its one-shot stdin. It names no program
             // and opens no shell or PTY, so it is production surface; the
@@ -234,6 +240,8 @@ impl GuestRequest {
             "post-restore",
             "entrypoint-status",
             "run-entrypoint",
+            "deliver-declared-operation",
+            "cancel-declared-operation",
             "agent-prompt",
             "drive-open",
             "drive-file",
@@ -298,6 +306,7 @@ mod tests {
                 command: "x".into(),
                 stdin: None,
                 timeout_secs: None,
+                deadline_unix_ms: None,
             },
             GuestRequest::MediatedExec(MediatedExecCall {
                 tool: "shell".into(),
@@ -554,6 +563,7 @@ mod tests {
                 command: "x".into(),
                 stdin: None,
                 timeout_secs: None,
+                deadline_unix_ms: None,
             },
             GuestRequest::MediatedExec(MediatedExecCall {
                 tool: "shell".into(),
