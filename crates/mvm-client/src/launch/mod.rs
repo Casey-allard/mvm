@@ -46,12 +46,16 @@ pub use request::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use mvm_contract::policy::network_policy::CooperatingPayloadPolicy;
 use mvm_core::client::dto::{MachineId, MachineState, MachineStatus};
 use mvm_core::client::{MvmError, Result};
 use mvm_core::config::{machine_spec_path, machine_state_dir, machine_state_root, vm_state_dir};
 use mvm_core::domain::instance::InstanceReadiness;
 use mvm_core::plan::ExecutionPlan;
 use mvm_core::protocol::vm_backend::{VmId, VmStatus};
+#[cfg(unix)]
+use mvm_core::rootfs_source::RootfsSource;
 use mvm_hostd::audit::emitter::{AuditEmitter, ExitRecord};
 pub(crate) use mvm_hostd::audit::unsealed::{UnsealedEnd, UnsealedReason, record_unsealed_end};
 use mvm_hostd::plan_admission::{AdmittedPlan, InMemoryNonceLedger, StartedMachine, SystemClock};
@@ -504,6 +508,8 @@ impl std::ops::Deref for BackendHandle<'_> {
 pub(crate) struct BootParams {
     #[cfg(unix)]
     pub(crate) host_lifetime: Option<Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
+    #[cfg(unix)]
+    pub(crate) installed_payload_mapping: Option<CooperatingPayloadPolicy>,
     pub(crate) name: String,
     pub(crate) source: LaunchSource,
     pub(crate) profile: String,
@@ -555,11 +561,23 @@ impl LocalBackend {
         let installed = params.host_lifetime.is_some();
         #[cfg(not(unix))]
         let installed = false;
+        #[cfg(unix)]
+        if !installed && params.installed_payload_mapping.is_some() {
+            return Err(MvmError::InvalidSpec {
+                reason: "installed payload mapping requires its original host lifetime".into(),
+            });
+        }
         if !installed && !self.machine_running(&params.name) {
             remove_vm_runtime_dirs(&params.name)?;
         }
         let (rootfs, kernel_path, verity_path, roothash, registry_pack_image) = match &params.source
         {
+            #[cfg(unix)]
+            LaunchSource::Image(RootfsSource::LocalPath(path))
+                if params.installed_payload_mapping.is_some() =>
+            {
+                (path.clone(), None, None, None, None)
+            }
             LaunchSource::Image(image) => {
                 let rootfs = crate::local::resolve_local_rootfs(image, &params.name).await?;
                 let (verity, hash) = crate::local::host_verity_sidecars(&rootfs);
@@ -647,19 +665,23 @@ impl LocalBackend {
 
         #[cfg(unix)]
         if let Some(owner) = params.host_lifetime {
-            return mvm_hostd::run::admit_and_boot_local_with_host_lifetime(
-                &backend,
-                &req,
-                LocalRunContext {
-                    clock: &clock,
-                    ledger: &ledger,
-                    host_signer_keys_dir: None,
-                    emitter: emitter.as_deref(),
-                    assurance: campaign.as_ref(),
-                },
-                owner,
-            )
-            .map_err(|e| crate::local::backend_err(format!("{e:#}")));
+            let context = LocalRunContext {
+                clock: &clock,
+                ledger: &ledger,
+                host_signer_keys_dir: None,
+                emitter: emitter.as_deref(),
+                assurance: campaign.as_ref(),
+            };
+            let started = if let Some(mapping) = &params.installed_payload_mapping {
+                mvm_hostd::run::admit_and_boot_local_with_installed_mapping(
+                    &backend, &req, context, owner, mapping,
+                )
+            } else {
+                mvm_hostd::run::admit_and_boot_local_with_host_lifetime(
+                    &backend, &req, context, owner,
+                )
+            };
+            return started.map_err(|e| crate::local::backend_err(format!("{e:#}")));
         }
         admit_and_boot_local(
             &backend,
@@ -891,6 +913,33 @@ impl LocalBackend {
         self.try_launch_with_host_lifetime(request, lifetime)
             .await
             .map_err(HostLifetimeLaunchFailure::into_error)
+    }
+
+    /// Launch an installed portable bundle with the FlowMux mapping bound by
+    /// its signed plan and the original prepared host lifetime.
+    #[cfg(unix)]
+    pub async fn try_launch_with_host_lifetime_and_mapping(
+        &self,
+        mut request: LaunchRequest,
+        lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
+        mapping: CooperatingPayloadPolicy,
+    ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
+        if request.signed_plan.is_none()
+            || !matches!(
+                &request.source,
+                LaunchSource::Image(RootfsSource::LocalPath(_))
+            )
+        {
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "installed payload mapping requires a signed local bundle launch"
+                        .into(),
+                },
+                lifetime,
+            ));
+        }
+        request.installed_payload_mapping = Some(mapping);
+        self.try_launch_with_host_lifetime(request, lifetime).await
     }
 
     /// Preserve the same unused preparation only on the four direct pure
@@ -1312,6 +1361,8 @@ impl LocalBackend {
             .boot_admitted(BootParams {
                 #[cfg(unix)]
                 host_lifetime: request.host_lifetime.clone(),
+                #[cfg(unix)]
+                installed_payload_mapping: request.installed_payload_mapping.clone(),
                 name: name.to_string(),
                 source: request.source.clone(),
                 profile: request.profile.clone(),

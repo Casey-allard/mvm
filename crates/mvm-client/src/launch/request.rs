@@ -160,6 +160,9 @@ impl std::fmt::Display for LaunchSource {
 pub struct LaunchRequest {
     #[cfg(unix)]
     pub(crate) host_lifetime: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
+    #[cfg(unix)]
+    pub(crate) installed_payload_mapping:
+        Option<mvm_contract::policy::network_policy::CooperatingPayloadPolicy>,
     pub(crate) name: Option<String>,
     pub(crate) mode: LifecycleMode,
     pub(crate) source: LaunchSource,
@@ -648,6 +651,8 @@ impl LaunchRequestBuilder {
         Ok(LaunchRequest {
             #[cfg(unix)]
             host_lifetime: None,
+            #[cfg(unix)]
+            installed_payload_mapping: None,
             name: self.name,
             mode: self.mode,
             source: self.source,

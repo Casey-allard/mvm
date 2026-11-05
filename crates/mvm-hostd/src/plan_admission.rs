@@ -169,7 +169,7 @@ pub struct AdmittedExtension {
     pub root: std::path::PathBuf,
 }
 
-fn local_network_policy(plan: &ExecutionPlan) -> NetworkPolicy {
+pub(crate) fn local_network_policy(plan: &ExecutionPlan) -> NetworkPolicy {
     plan.grants.as_ref().map_or_else(
         NetworkPolicy::deny_all,
         mvm_contract::grants::projection::network_policy_from_grants,

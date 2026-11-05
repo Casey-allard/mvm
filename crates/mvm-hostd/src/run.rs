@@ -26,6 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use mvm_contract::policy::network_policy::CooperatingPayloadPolicy;
 use mvm_core::plan::{PlanSeccompTier, SecretBinding, SecretReleasePolicy, SynthesisInput};
 use mvm_core::vm_backend::{VmStartConfig, VmVolume};
 use mvm_runtime::AnyBackend;
@@ -238,6 +239,7 @@ pub fn admit_and_boot_local(
         backend,
         req,
         ctx,
+        None,
         #[cfg(unix)]
         None,
     )
@@ -251,13 +253,36 @@ pub fn admit_and_boot_local_with_host_lifetime(
     ctx: LocalRunContext<'_>,
     owner: std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
 ) -> Result<StartedMachine> {
-    admit_and_boot_local_inner(backend, req, ctx, Some(owner))
+    admit_and_boot_local_inner(backend, req, ctx, None, Some(owner))
+}
+
+/// Launch a named, installed portable workload under its original signed
+/// bundle and the operator-selected FlowMux policy.
+#[cfg(unix)]
+pub fn admit_and_boot_local_with_installed_mapping(
+    backend: &AnyBackend,
+    req: &LocalRunRequest,
+    ctx: LocalRunContext<'_>,
+    owner: std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    mapping: &CooperatingPayloadPolicy,
+) -> Result<StartedMachine> {
+    anyhow::ensure!(
+        req.signed_plan.is_some() && req.destroy_on_exit && req.registry_pack_image.is_none(),
+        "installed payload mapping requires a signed transient bundle launch"
+    );
+    anyhow::ensure!(
+        backend.supports_host_lifetime() && owner.binding().backend == backend.kind(),
+        "installed payload mapping requires its original native backend"
+    );
+    crate::host_lifetime_parent::require_installed()?;
+    admit_and_boot_local_inner(backend, req, ctx, Some(mapping), Some(owner))
 }
 
 fn admit_and_boot_local_inner(
     backend: &AnyBackend,
     req: &LocalRunRequest,
     ctx: LocalRunContext<'_>,
+    mapping: Option<&CooperatingPayloadPolicy>,
     #[cfg(unix)] owner: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
 ) -> Result<StartedMachine> {
     anyhow::ensure!(
@@ -280,6 +305,7 @@ fn admit_and_boot_local_inner(
             signed,
             &sha,
             ctx,
+            mapping,
             #[cfg(unix)]
             owner,
         );
@@ -429,16 +455,21 @@ fn admit_signed_and_boot_local(
     signed: &mvm_core::plan::SignedExecutionPlan,
     rootfs_sha: &str,
     ctx: LocalRunContext<'_>,
+    mapping: Option<&CooperatingPayloadPolicy>,
     #[cfg(unix)] owner: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
 ) -> Result<StartedMachine> {
     use crate::plan_admission::{
         BundleAdmissionContext, BundleImageAdmissionContext, RunPosture, StartAdmittedParams,
-        start_admitted, verify_external_plan,
+        local_network_policy, start_admitted, verify_external_plan,
     };
     use mvm_core::plan::bundle::{FsBundleResolver, FsTrustStore};
 
     let verified = verify_external_plan(signed)?;
     let plan = verified.plan();
+    anyhow::ensure!(
+        mapping.is_none() || plan.post_run.destroy_on_exit,
+        "installed payload mapping requires signed transient teardown"
+    );
     if let Some(pin) = &req.registry_pack_image {
         anyhow::ensure!(
             plan.asset_identities.iter().any(|asset| {
@@ -478,19 +509,27 @@ fn admit_signed_and_boot_local(
         // The plan's egress grant projects onto the launch config's policy,
         // exactly as a synthesized plan's does: what the gate enforces is what
         // the plan was signed for. No grant means deny-all.
-        network_policy: match plan.grants.as_ref() {
-            Some(grants) if grants.egress.is_some() => {
-                mvm_contract::grants::projection::network_policy_from_grants(grants)
-            }
-            _ => mvm_core::network_policy::NetworkPolicy::deny_all(),
-        },
+        network_policy: local_network_policy(plan).with_payload_mapping(mapping.cloned()),
         ..Default::default()
     };
     #[cfg(unix)]
     if let Some(owner) = owner {
         owner.bind_to_config(&mut config)?;
+        owner.verify_config(&config, backend.kind())?;
     }
-    attach_guest_runtime(&mut config, backend.name())?;
+    if mapping.is_some() {
+        let pin = plan
+            .bundle
+            .as_ref()
+            .context("installed payload mapping requires a signed bundle pin")?;
+        mvm_runtime::bundle_runtime::attach_pinned_legacy_runtime(
+            &mut config,
+            backend.name(),
+            pin,
+        )?;
+    } else {
+        attach_guest_runtime(&mut config, backend.name())?;
+    }
 
     let bundle_inputs = plan
         .bundle
@@ -517,8 +556,14 @@ fn admit_signed_and_boot_local(
                 }),
             },
         );
-    let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind())
-        .with_raw_local_runtime(&config);
+    let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind());
+    let posture = if let Some(mapping) = mapping {
+        posture
+            .with_runtime(Some(&config))
+            .with_installed_payload_mapping(mapping)
+    } else {
+        posture.with_raw_local_runtime(&config)
+    };
     let admitted = verified.admit(ctx.clock, ctx.ledger, bundle.as_ref(), posture)?;
 
     crate::audit::durability::record_admission(
