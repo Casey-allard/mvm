@@ -756,6 +756,28 @@ mod tests {
         let mut attached = config.clone();
         assert!(attach_if_installed_bundle(&mut attached, "qemu").unwrap());
         assert!(attached.legacy_portable_runtime.is_some());
+        let pin = &attached.legacy_portable_runtime.as_ref().unwrap().pin;
+        let mut selected = config.clone();
+        selected.kernel_path = None;
+        mvm_runtime::bundle_runtime::attach_pinned_legacy_runtime(&mut selected, "qemu", pin)
+            .expect("installed signed launch resolves its original bundle kernel and runtime");
+        assert_eq!(selected.kernel_path, attached.kernel_path);
+        assert_eq!(
+            selected.legacy_portable_runtime,
+            attached.legacy_portable_runtime
+        );
+        let mut wrong_pin = pin.clone();
+        wrong_pin.bundle_sha256 = "0".repeat(64);
+        let mut refused = config.clone();
+        assert!(
+            mvm_runtime::bundle_runtime::attach_pinned_legacy_runtime(
+                &mut refused,
+                "qemu",
+                &wrong_pin
+            )
+            .is_err()
+        );
+        assert!(refused.legacy_portable_runtime.is_none());
         assert_retained_portable_reentry(&attached);
         let mut dispatched = config.clone();
         super::super::runtime_source::attach_runtime_overlay_if_cached_version(
