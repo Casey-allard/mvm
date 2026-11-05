@@ -24,6 +24,34 @@ non-directory entries and directories without metadata are ignored.
 This is the same data as `mvmctl machine checkpoint ls --json`. Listing neither
 opens checkpoint content nor authenticates lineage or grants restore authority.
 
+## Verify checkpoint lineage
+
+`mvm.checkpoint.verifyLineage(id)` calls the host-local
+`checkpoint.verify_lineage` method (ABI 1.12), returning `undefined` on success.
+It uses the same client-owned signed-audit ancestry verification as
+`mvmctl machine checkpoint verify`. Missing, altered or unaudited ancestry
+throws a nonretryable host error; invalid IDs are refused before anchor access.
+No root or trust-key override, VM boot, HTTP server or subprocess is involved.
+
+This verifies metadata lineage, not snapshot blob bytes, runtime compatibility
+or permission to restore. Loading the existing host anchor may initialize its
+identity when an audit directory exists.
+
+## Prompt-step checkpoints (Linux/Firecracker)
+
+On a running machine with a plan that grants prompts, call
+`new Machine(name).prompt("first", { checkpoint: true })` to request an opt-in
+`vm_full` step checkpoint. The reply carries the agent's answer even if
+checkpoint capture fails: check `checkpoint_failed` before using
+`checkpoint_id`. A duplicate idempotency key does not send another prompt. An
+ID alone does not verify lineage or authorize restore; use
+`mvm.checkpoint.verifyLineage(id)` and restore under current admission.
+
+The host-library path to an **existing HVF machine is currently refused**
+before prompt delivery. This SDK operation is live-witnessed on
+Linux/Firecracker, not yet supported through hostlib on macOS/HVF. The CLI's
+native workflow is a different call path; it does not establish SDK parity.
+
 ## Quick start
 
 ```ts

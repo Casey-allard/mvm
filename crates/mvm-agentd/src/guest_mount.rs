@@ -691,22 +691,28 @@ fn assume_identity_with_saved_gid(
     saved_gid: u32,
     keep: u64,
 ) -> std::io::Result<()> {
+    // SAFETY: prctl(PR_SET_KEEPCAPS) takes only integer arguments and touches no memory.
     if unsafe { libc::prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     narrow_bounding_set_where_enforceable(keep)?;
+    // SAFETY: a zero-length group list with a null pointer is the documented way to
+    // clear supplementary groups; the pointer is never read.
     if unsafe { libc::setgroups(0, std::ptr::null::<libc::gid_t>()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: setresgid takes only integer ids and touches no memory.
     if unsafe { libc::setresgid(gid, gid, saved_gid) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: setuid takes an integer id and touches no memory.
     if unsafe { libc::setuid(uid) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     set_capabilities(keep)?;
     raise_ambient_capabilities(keep)?;
     set_no_new_privileges()?;
+    // SAFETY: getuid has no arguments and cannot fail.
     if unsafe { libc::getuid() } == 0 {
         return Err(std::io::Error::from_raw_os_error(libc::EPERM));
     }
@@ -760,6 +766,8 @@ fn drop_capability_bounding_set_to(keep: u64) -> std::io::Result<()> {
         if bounding_set_retains(keep, cap) {
             continue;
         }
+        // SAFETY: prctl(PR_CAPBSET_DROP) takes only integer arguments; EINVAL for
+        // an unimplemented slot is handled below.
         let rc = unsafe { libc::prctl(PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
@@ -849,6 +857,7 @@ fn bounding_drop_is_unenforceable(err: &std::io::Error) -> bool {
 
 #[cfg(target_os = "linux")]
 fn set_no_new_privileges() -> std::io::Result<()> {
+    // SAFETY: prctl(PR_SET_NO_NEW_PRIVS) takes only integer arguments and touches no memory.
     if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -874,31 +883,31 @@ const PR_CAPBSET_DROP: libc::c_int = 24;
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    pub use std::os::fd::AsRawFd;
+    pub(crate) use std::os::fd::AsRawFd;
 
     // DM ioctl constants and structs (mirror /usr/include/linux/dm-ioctl.h).
-    pub const DM_VERSION_MAJOR: u32 = 4;
-    pub const DM_VERSION_MINOR: u32 = 0;
-    pub const DM_VERSION_PATCH: u32 = 0;
-    pub const DM_NAME_LEN: usize = 128;
-    pub const DM_UUID_LEN: usize = 129;
-    pub const DM_DATA_LEN: usize = 7;
-    pub const DM_READONLY_FLAG: u32 = 1 << 0;
-    pub const DM_EXISTS_FLAG: u32 = 1 << 2;
-    pub const DM_VERSION_CMD: u32 = 0;
-    pub const DM_DEV_CREATE_CMD: u32 = 3;
-    pub const DM_DEV_SUSPEND_CMD: u32 = 6;
-    pub const DM_TABLE_LOAD_CMD: u32 = 9;
-    pub const DM_IOCTL: u32 = 0xfd;
-    pub const DM_IOCTL_STRUCT_SIZE: u32 = 312;
+    pub(crate) const DM_VERSION_MAJOR: u32 = 4;
+    pub(crate) const DM_VERSION_MINOR: u32 = 0;
+    pub(crate) const DM_VERSION_PATCH: u32 = 0;
+    pub(crate) const DM_NAME_LEN: usize = 128;
+    pub(crate) const DM_UUID_LEN: usize = 129;
+    pub(crate) const DM_DATA_LEN: usize = 7;
+    pub(crate) const DM_READONLY_FLAG: u32 = 1 << 0;
+    pub(crate) const DM_EXISTS_FLAG: u32 = 1 << 2;
+    pub(crate) const DM_VERSION_CMD: u32 = 0;
+    pub(crate) const DM_DEV_CREATE_CMD: u32 = 3;
+    pub(crate) const DM_DEV_SUSPEND_CMD: u32 = 6;
+    pub(crate) const DM_TABLE_LOAD_CMD: u32 = 9;
+    pub(crate) const DM_IOCTL: u32 = 0xfd;
+    pub(crate) const DM_IOCTL_STRUCT_SIZE: u32 = 312;
 
-    pub fn iowr(nr: u32) -> u64 {
+    pub(crate) fn iowr(nr: u32) -> u64 {
         ((3u32 << 30) | (DM_IOCTL_STRUCT_SIZE << 16) | (DM_IOCTL << 8) | nr) as u64
     }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    pub struct DmIoctl {
+    pub(crate) struct DmIoctl {
         pub version: [u32; 3],
         pub data_size: u32,
         pub data_start: u32,
@@ -958,7 +967,7 @@ mod linux_impl {
     };
 
     #[repr(C)]
-    pub struct DmTargetSpec {
+    pub(crate) struct DmTargetSpec {
         pub sector_start: u64,
         pub length: u64,
         pub status: i32,
@@ -1215,6 +1224,8 @@ fn setup_verity_target(
     let mut buf = vec![0u8; payload.len()];
     buf.copy_from_slice(&payload);
     let header_ptr = buf.as_mut_ptr().cast::<DmIoctl>();
+    // SAFETY: `header_ptr` points at `buf`, which holds a complete dm-ioctl header
+    // followed by its table payload and stays alive and unmoved for the whole call.
     unsafe {
         do_ioctl(fd, iowr(DM_TABLE_LOAD_CMD), header_ptr)
             .map_err(|e| MountError::syscall(format!("DM_TABLE_LOAD({device_name})"), e))?;
@@ -2343,8 +2354,7 @@ mod privilege_tests {
     /// Live witness. Mutates the calling process's privilege state
     /// irreversibly, so it is gated behind an explicit environment variable
     /// and root; ordinary CI and developer laptops skip it. The
-    /// backend-level witness is the adversarial probe run under
-    /// `specs/research/no-root-workload-live-witness.md`.
+    /// backend-level witness is the adversarial probe run on a live host.
     #[test]
     #[cfg(target_os = "linux")]
     fn harden_init_process_narrows_bounding_set_and_sets_no_new_privs() {

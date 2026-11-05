@@ -49,7 +49,7 @@ pub struct OwnedEndpoint {
     observer: Option<ProcessExitObserver>,
     exit_observed: bool,
     status: Option<ExitStatus>,
-    signals_forbidden: bool,
+    custody_uncertain: bool,
     kill_requested: bool,
     #[cfg(test)]
     faults: Faults,
@@ -65,7 +65,7 @@ impl OwnedEndpoint {
             observer: None,
             exit_observed: false,
             status: None,
-            signals_forbidden: false,
+            custody_uncertain: false,
             kill_requested: false,
             #[cfg(test)]
             faults: Faults::default(),
@@ -101,12 +101,16 @@ impl OwnedEndpoint {
     }
 
     fn collect(&mut self) -> Result<Option<ExitStatus>> {
+        // A later numeric wait cannot restore identity after custody was lost.
+        if self.custody_uncertain {
+            bail!("endpoint child custody is uncertain; refusing further waits");
+        }
         if let Some(status) = self.status {
             return Ok(Some(status));
         }
         #[cfg(test)]
         if self.faults.wait_error {
-            self.signals_forbidden = true;
+            self.custody_uncertain = true;
             bail!("injected owned child wait failure");
         }
         match self
@@ -123,7 +127,7 @@ impl OwnedEndpoint {
             Err(error) => {
                 // A failed wait cannot authorize a numeric signal, even if the
                 // error is transient: another reaper may have released the PID.
-                self.signals_forbidden = true;
+                self.custody_uncertain = true;
                 Err(error).context("collect owned endpoint exit status")
             }
         }
@@ -148,6 +152,7 @@ impl OwnedEndpoint {
     /// Confirm the endpoint has exited and collect its status, or retain custody
     /// and all evidence on failure. A previously collected nonzero exit is an
     /// error, not a successful shutdown. A kill requested here is intentional.
+    /// A failed child wait permanently refuses further waits and shutdown proof.
     pub fn shutdown(&mut self) -> Result<()> {
         if self.installed.is_some() {
             return self.shutdown_installed(Instant::now() + STOP_TIMEOUT);
@@ -205,9 +210,6 @@ impl OwnedEndpoint {
         // try_wait immediately precedes signaling. With exclusive reaping and
         // default SIGCHLD, even a concurrently exited child retains its PID.
         if !self.exit_observed && !self.kill_requested {
-            if self.signals_forbidden {
-                bail!("endpoint child custody is uncertain; refusing further signals");
-            }
             require_child_custody()?;
             #[cfg(test)]
             {

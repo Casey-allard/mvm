@@ -102,6 +102,9 @@ jobs:
       # apart once already.
       MVM_E2E_TIMEOUT_SECS: "10800"
       MVM_BDD_SHARD: ${{ matrix.shard }}
+      # Stop this shard on the first failed scenario; don't burn the remaining
+      # budget once the docs lane is already red.
+      MVM_BDD_FAIL_FAST: "1"
       # Must track `FC_VERSION_DEFAULT` in mvm-core. The workload launch path
       # passes flags older Firecracker releases reject before opening the API
       # socket, which otherwise surfaces as an unhelpful socket timeout.
@@ -276,7 +279,7 @@ jobs:
   #
   # Until issue #3011 lands there is no hosted macOS runner that can boot an mvm
   # guest, so the run happens on a maintainer's Apple Silicon machine and gets
-  # committed as `specs/evidence/e2e/macos-hvf.json`. This job is what stops
+  # committed as `xtask/data/evidence/e2e/macos-hvf.json`. This job is what stops
   # that from being a promise: `check-release-evidence` recomputes a digest over
   # every path that could change what the suite proves — `crates/`, `features/`,
   # `examples/`, `nix/`, `src/`, `scripts/`, the README, the manifests — and
@@ -355,6 +358,9 @@ jobs:
       # Keep release-docs binaries optimized. Warm-claim coverage belongs to
       # the separately privileged Linux lane, not these cold-launch scenarios.
       MVM_E2E_PROFILE: release-witness
+      # Stop this shard on the first failed scenario; don't burn the remaining
+      # budget once the docs lane is already red.
+      MVM_BDD_FAIL_FAST: "1"
     steps:
       - uses: actions/checkout@v6
 
@@ -456,6 +462,9 @@ jobs:
             ${{ runner.temp }}/e2e-docs.log
             ${{ github.workspace }}/.mvm-e2e-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}/vms/*/console.log
             ${{ github.workspace }}/.mvm-e2e-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}/vms/*/supervisor.log
+            ${{ github.workspace }}/.mvm-e2e-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}/vm-diagnostics/*/*
+          # The home dir is dot-prefixed; v4+ skips hidden paths by default.
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 

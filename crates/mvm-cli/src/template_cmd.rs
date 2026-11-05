@@ -11,10 +11,6 @@ fn now_iso() -> String {
 /// Initialize a project: scaffold `mvm.toml` + `flake.nix` (+ NixOS
 /// config) in the given directory. Called from the `mvmctl init <DIR>`
 /// smart-dispatch in `commands/env/init.rs`.
-///
-/// Project scaffolding is always local. The `--vm` mode that initialised a
-/// directory inside the Lima VM went with the rest of the `template *`
-/// namespace, so there is no longer a second mode to select between.
 pub fn init(name: &str, base_dir: &str, preset: Option<&str>, prompt: Option<&str>) -> Result<()> {
     let selected_preset = resolve_scaffold_preset(preset, prompt);
     let dir = std::path::Path::new(base_dir).join(name);
@@ -1234,7 +1230,9 @@ fn copy_cached_template_files_recursive(
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let src = entry.path();
-        let rel = src.strip_prefix(root).expect("entries are under root");
+        let rel = src
+            .strip_prefix(root)
+            .with_context(|| format!("{} is outside {}", src.display(), root.display()))?;
         if src.is_dir() {
             copy_cached_template_files_recursive(root, &src, dest, skip)?;
         } else if src.is_file() {

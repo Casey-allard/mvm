@@ -84,19 +84,17 @@ pub fn ensure_qemu_runtime_source_supported(config: &VmStartConfig) -> Result<()
 }
 
 pub fn qemu_drive_args(config: &VmStartConfig) -> Vec<String> {
-    if qemu_verity_enabled(config) {
+    if let Some(verity_path) = config
+        .verity_path
+        .as_deref()
+        .filter(|_| qemu_verity_enabled(config))
+    {
         let mut drives = vec![
             format!(
                 "file={},if=virtio,format=raw,readonly=on",
                 config.rootfs_path
             ),
-            format!(
-                "file={},if=virtio,format=raw,readonly=on",
-                config
-                    .verity_path
-                    .as_deref()
-                    .expect("verity-enabled qemu boot must carry a verity sidecar")
-            ),
+            format!("file={},if=virtio,format=raw,readonly=on", verity_path),
         ];
         if let Some((overlay_path, overlay_verity_path, _)) = qemu_runtime_overlay(config) {
             drives.push(format!(
@@ -396,6 +394,8 @@ pub(crate) fn spawn_vsock_bridges(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     // Detach into its own session so it survives this process.
+    // SAFETY: the pre_exec closure runs in the forked child and only calls setsid,
+    // which is async-signal-safe.
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
@@ -758,6 +758,7 @@ pub(crate) fn pid_alive(pid: libc::pid_t) -> bool {
 }
 
 pub(crate) fn send_signal(pid: libc::pid_t, sig: libc::c_int) {
+    // SAFETY: kill takes integer arguments and touches no memory.
     unsafe {
         libc::kill(pid, sig);
     }

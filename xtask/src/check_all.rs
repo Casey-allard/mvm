@@ -16,7 +16,7 @@ use anyhow::{Result, bail};
 use std::path::Path;
 
 /// A gate: the subcommand name, and the function behind it.
-pub type Gate = (&'static str, fn(&Path) -> Result<()>);
+pub(crate) type Gate = (&'static str, fn(&Path) -> Result<()>);
 
 /// Read-only: `--write` regenerates the model and is a developer action.
 fn conformance_read_only(workspace: &Path) -> Result<()> {
@@ -35,7 +35,7 @@ fn ir_fixtures_match_schemas(workspace: &Path) -> Result<()> {
 ///
 /// Order is presentation only — each gate reads the tree and writes
 /// nothing — but keeping it makes a diff against the old workflow legible.
-pub const GATES: &[Gate] = &[
+pub(crate) const GATES: &[Gate] = &[
     (
         "check-telemetry-inventory",
         crate::check_telemetry_inventory::run,
@@ -100,7 +100,6 @@ pub const GATES: &[Gate] = &[
     ),
     ("check-abi-layout", crate::check_abi_layout::run),
     ("check-claim-catalog", crate::check_claim_catalog::run),
-    ("check-plan-names", crate::check_plan_names::run),
     ("check-sdk-cdylib-deps", crate::check_sdk_cdylib_deps::run),
     ("check-doc-links", crate::check_doc_links::run),
     (
@@ -204,6 +203,7 @@ pub const GATES: &[Gate] = &[
     ),
     ("check-duplicate-majors", crate::check_duplicate_majors::run),
     ("check-spec-hygiene", crate::check_spec_hygiene::run),
+    ("check-root-layout", crate::check_root_layout::run),
     ("check-workflow-paths", crate::check_workflow_paths::run),
     (
         "check-guest-agent-runtime-free",
@@ -263,7 +263,7 @@ pub const GATES: &[Gate] = &[
 /// Deliberately not fail-fast. The point of the change that introduced this
 /// is that a contributor should learn about all four broken gates in one
 /// run, not one per push.
-pub fn run_all(workspace: &Path) -> Result<()> {
+pub(crate) fn run_all(workspace: &Path) -> Result<()> {
     let mut failed: Vec<(&str, String)> = Vec::new();
 
     for (name, gate) in GATES {

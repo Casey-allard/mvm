@@ -173,9 +173,14 @@ reap() {
     while read -r name; do
       [[ -z "$name" ]] && continue
       echo "    - $name"
-      if ! MVM_HOME="$E2E_HOME" "$MVMCTL" machine stop "$name" --yes >/dev/null 2>&1; then
-        cleanup_failure "$phase cleanup could not confirm stop; removal refused"
-        return 1
+      # stop is best-effort: a machine that already exited (its scenario ended)
+      # makes stop fail, and rm below is the correct next step for that — it
+      # refuses a genuinely running machine, and "does not exist" is accepted
+      # as the goal met. Surface the stop output either way; /dev/null is not
+      # a diagnostic.
+      local stop_out=""
+      if ! stop_out="$(MVM_HOME="$E2E_HOME" "$MVMCTL" machine stop "$name" --yes 2>&1)"; then
+        printf '    machine stop reported: %s\n' "$stop_out" >&2
       fi
       # stop is a request, not an event: teardown (a supervisor exiting, state
       # flushing) lands after the CLI returns, and rm refuses a machine still
@@ -246,10 +251,33 @@ stop_watcher() {
   WATCHER_PID=""
 }
 
+# Copy the small diagnostic files out of each VM state dir before `reap`
+# removes the machines; a failed stop is otherwise undiagnosable. Allowlist
+# only (no keys, no disk images) and logs are tailed to stay bounded.
+save_vm_diagnostics() {
+  local d name f out="$E2E_HOME/vm-diagnostics"
+  for d in "$E2E_HOME"/vms/*/; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    mkdir -p "$out/$name" || continue
+    for f in supervisor-status.json shutdown-timing.json hvf-finalized.json hvf-instance.json; do
+      [[ -f "$d$f" ]] && cp "$d$f" "$out/$name/$f"
+    done
+    for f in console.log supervisor.log; do
+      [[ -f "$d$f" ]] && tail -c 65536 "$d$f" > "$out/$name/$f"
+    done
+    if [[ -f "$d/shutdown-timing.json" ]]; then
+      echo "--- $name shutdown-timing.json ---"
+      head -c 4096 "$d/shutdown-timing.json"; echo
+    fi
+  done 2>/dev/null || true
+}
+
 on_exit() {
   local status=$?
   trap - EXIT
   stop_watcher
+  [[ "$status" == 0 ]] || save_vm_diagnostics
   echo
   e2e_phase_summary "Documented surface phase timings ($(uname -s))" || {
     [[ "$status" != 0 ]] || status=1
@@ -872,6 +900,12 @@ fi
 # refuses to start against a stale `mvmctl`, and that refusal prints no
 # scenarios at all — which reads as a clean run to anyone counting failures.
 SUITE_LOG="$(mktemp "$E2E_HOME/.e2e-suite.XXXXXX")"
+BDD_ARGS=()
+if [[ "${MVM_BDD_FAIL_FAST:-0}" == "1" ]]; then
+  # Stop this shard at the first failed scenario instead of spending the
+  # remaining budget on a known-red run.
+  BDD_ARGS+=(-- --fail-fast)
+fi
 CARGO_BIN_EXE_mvmctl="$MVMCTL" \
 MVM_BDD_LIVE=1 \
 MVM_BDD_DIR_SHARE=1 \
@@ -884,7 +918,7 @@ MVM_HOME="$E2E_HOME" \
     --timeout "$E2E_TIMEOUT_SECS" \
     --grace 5 \
     --log "$SUITE_LOG" \
-    -- ./scripts/cargo.sh test -p mvm-conformance --test conformance --features bdd
+    -- ./scripts/cargo.sh test -p mvm-conformance --test conformance --features bdd "${BDD_ARGS[@]}"
 SUITE_STATUS=$?
 set -e
 e2e_phase_end

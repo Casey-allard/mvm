@@ -21,6 +21,7 @@ pub mod offline_attachment;
 pub mod offline_revocation;
 pub mod persistent;
 mod request;
+mod session;
 pub(crate) use request::persisted_spec_from_request;
 pub mod runtime_overlay;
 pub mod runtime_source;
@@ -153,6 +154,13 @@ pub struct RemoveOptions {
 struct CommandStartFailure {
     command: anyhow::Error,
     stop: Result<()>,
+}
+
+/// The name a persistent request must carry.
+fn persistent_name(request: &LaunchRequest) -> Result<String> {
+    request.name.clone().ok_or_else(|| MvmError::InvalidSpec {
+        reason: "a persistent machine request must carry a name".into(),
+    })
 }
 
 impl CommandStartFailure {
@@ -704,15 +712,9 @@ impl LocalBackend {
     /// declares references; a machine with any invalid reference must not
     /// boot (and nothing is recorded for it).
     fn validate_and_record_secret_refs(&self, name: &str, refs: &[MachineSecretRef]) -> Result<()> {
-        if refs.is_empty() {
+        let Some(service) = self.admit_secret_refs(refs)? else {
             return Ok(());
-        }
-        let service = self.secrets()?;
-        service
-            .validate_for_admission(LOCAL_TENANT, refs)
-            .map_err(|e| MvmError::Rejected {
-                reason: format!("secret reference admission refused: {e}"),
-            })?;
+        };
         service
             .record_machine_references(name, refs)
             .map_err(|e| crate::local::backend_err(format!("recording secret refs: {e}")))
@@ -727,43 +729,10 @@ impl LocalBackend {
         volumes: &[LaunchVolumeSpec],
         profile: AdmittedProfile,
     ) -> Result<()> {
-        if volumes.is_empty() {
-            return Ok(());
-        }
         let service = launch_volume_service();
-        let existing = service
-            .list_attachments(name)
-            .map_err(|e| crate::local::backend_err(format!("listing attachments: {e:#}")))?;
-        for spec in volumes {
-            let identical = existing.iter().any(|a| {
-                a.guest_path == spec.guest_path
-                    && a.volume == spec.volume
-                    && a.access == spec.access
-            });
-            if identical {
-                continue;
-            }
-            if existing.iter().any(|a| a.guest_path == spec.guest_path) {
-                return Err(MvmError::Conflict {
-                    reason: format!(
-                        "guest path {:?} is already attached with a different volume or \
-                         access mode; detach it first",
-                        spec.guest_path
-                    ),
-                });
-            }
-            let request = AttachmentRequest::builder(name, &spec.volume)
-                .and_then(|b| {
-                    b.guest_path(&spec.guest_path)
-                        .access(spec.access)
-                        .profile(profile)
-                        .build()
-                })
-                .map_err(|e| MvmError::InvalidSpec {
-                    reason: format!("volume attachment {:?}: {e:#}", spec.volume),
-                })?;
+        for request in Self::unregistered_attachments(&service, name, volumes, profile)? {
             service.prepare_attachment(&request).map_err(|e| {
-                crate::local::backend_err(format!("attaching {:?}: {e:#}", spec.volume))
+                crate::local::backend_err(format!("attaching {:?}: {e:#}", request.volume))
             })?;
         }
         Ok(())
@@ -1026,10 +995,7 @@ impl LocalBackend {
         match request.mode {
             LifecycleMode::Transient => self.launch_transient(request).await,
             LifecycleMode::Persistent => {
-                let name = request
-                    .name
-                    .clone()
-                    .expect("validated: persistent requests carry a name");
+                let name = persistent_name(&request)?;
                 let (_, origin) = self.create_definition(&request, &name)?;
                 let booted = self.boot_persistent(&name, &request).await;
                 let outcome = self.discard_definition_on_failure(&name, origin, booted)?;
@@ -1062,10 +1028,7 @@ impl LocalBackend {
                     .into(),
             });
         }
-        let name = request
-            .name
-            .clone()
-            .expect("validated: persistent requests carry a name");
+        let name = persistent_name(request)?;
         let (spec, _) = self.create_definition(request, &name)?;
         Ok(MachineState {
             id: MachineId(name.clone()),
@@ -1262,6 +1225,14 @@ impl LocalBackend {
         let launched_at = std::time::Instant::now();
         let profile = AdmittedProfile::from_profile_name(&request.profile);
         let mut preparation = self.acquire_leases(name, profile)?;
+        if transient {
+            crate::volume::ownership::note_leases(
+                &self.session_root(),
+                name,
+                preparation.lease_keys(),
+            )
+            .map_err(|e| crate::local::backend_err(format!("recording volume leases: {e:#}")))?;
+        }
         let volumes: Vec<mvm_core::vm_backend::VmVolume> = preparation
             .volumes
             .iter()
@@ -1532,6 +1503,10 @@ impl LocalBackend {
     /// session-owned resource, and drop the per-VM state dirs. Safe to call
     /// repeatedly and on names that never launched. An attempted stop error
     /// returns before any session resource is released.
+    ///
+    /// A transient session releases only what its receipt names and only
+    /// while the receipt still describes the resources; otherwise they are
+    /// retained, with the state that records them.
     pub fn cleanup_transient(&self, name: &str) -> Result<()> {
         #[cfg(unix)]
         mvm_core::host_lifetime::require_no_installed_native(name)
@@ -1539,11 +1514,16 @@ impl LocalBackend {
         if self.machine_running(name) {
             self.stop_for_recreate(name)?;
         }
-        self.release_session_resources(name)?;
+        let retained = if machine_spec_path(name).exists() {
+            self.release_session_resources(name)?;
+            false
+        } else {
+            self.release_transient_resources(name)?
+        };
         remove_vm_runtime_dirs(name)?;
         // The state dir under machines/ only carries session sidecars for a
         // transient (no machine.json); never touch a persistent definition.
-        if !machine_spec_path(name).exists() {
+        if !retained && !machine_spec_path(name).exists() {
             remove_dir_if_present(&machine_state_dir(name))?;
         }
         Ok(())

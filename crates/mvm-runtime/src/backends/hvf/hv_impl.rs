@@ -6,6 +6,7 @@
 //! live arm64 Linux guest through exactly this path.
 
 use std::cell::Cell;
+use std::sync::{Arc, Mutex};
 
 use super::HvfError;
 use super::snapshot::{
@@ -21,17 +22,97 @@ use crate::vmm::hv::{CoreReg, HypervisorVcpu, HypervisorVm, SysReg, VcpuExit, Vc
 /// zero-sized marker; `create` performs the global setup.
 pub struct HvfVm;
 
-/// A cross-thread token to force a vCPU out of `step()` (HVF `hv_vcpus_exit`).
-#[derive(Clone, Copy)]
-pub struct HvfHandle(hv_vcpu_t);
+/// A cross-thread token to force a live vCPU out of `step()`.
+///
+/// The shared slot is invalidated under the same lock as exit requests, so no
+/// caller can pass a destroyed vCPU ID to HVF.
+#[derive(Clone)]
+pub struct HvfHandle(Arc<Mutex<HvfHandleState>>);
+
+struct HvfHandleState {
+    vcpu: Option<hv_vcpu_t>,
+    exit_generation: u64,
+}
+
+impl HvfHandle {
+    fn new(vcpu: hv_vcpu_t) -> Self {
+        Self(Arc::new(Mutex::new(HvfHandleState {
+            vcpu: Some(vcpu),
+            exit_generation: 0,
+        })))
+    }
+
+    fn request_exit<R>(handles: &[Self], call: impl FnOnce(&[hv_vcpu_t]) -> R) -> R {
+        let mut unique: Vec<_> = handles.iter().collect();
+        unique.sort_unstable_by_key(|handle| Arc::as_ptr(&handle.0) as usize);
+        unique.dedup_by(|left, right| Arc::ptr_eq(&left.0, &right.0));
+
+        let mut slots: Vec<_> = unique
+            .iter()
+            .map(|handle| {
+                handle
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect();
+        // Record the request before entering HVF: a vCPU may be between runs,
+        // where the next `hv_vcpu_run` consumes the pending cancellation.
+        let ids: Vec<_> = slots
+            .iter_mut()
+            .filter_map(|slot| {
+                let vcpu = slot.vcpu?;
+                slot.exit_generation = slot.exit_generation.wrapping_add(1);
+                Some(vcpu)
+            })
+            .collect();
+        call(&ids)
+    }
+
+    fn exit_generation(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .exit_generation
+    }
+
+    fn retire_with(&self, destroy: impl FnOnce(hv_vcpu_t) -> hv_return_t) -> hv_return_t {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(vcpu) = slot.vcpu else {
+            return HV_SUCCESS;
+        };
+        let status = destroy(vcpu);
+        if status == HV_SUCCESS {
+            slot.vcpu = None;
+        }
+        status
+    }
+
+    fn destroy(&self) -> hv_return_t {
+        self.retire_with(|vcpu| {
+            // SAFETY: this handle serializes destruction against cross-thread
+            // exit requests, and the vCPU is destroyed only once.
+            unsafe { hv_vcpu_destroy(vcpu) }
+        })
+    }
+}
 
 impl VcpuHandle for HvfHandle {
     fn force_exit(handles: &[Self]) {
-        let ids: Vec<hv_vcpu_t> = handles.iter().map(|h| h.0).collect();
-        // SAFETY: documented cross-thread cancel over valid vCPU ids.
-        unsafe {
-            let _ = hv_vcpus_exit(ids.as_ptr(), ids.len() as u32);
-        }
+        Self::request_exit(handles, |ids| {
+            if ids.is_empty() {
+                return;
+            }
+            // SAFETY: `request_exit` holds every token's lifetime lock across
+            // the call, so each id is live for the duration of the request.
+            let status = unsafe { hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) };
+            if status != HV_SUCCESS {
+                tracing::warn!(status, "HVF cross-thread vCPU exit request failed");
+            }
+        });
     }
 }
 
@@ -42,16 +123,28 @@ pub struct HvfVcpu {
     vcpu: hv_vcpu_t,
     exit: *mut hv_vcpu_exit_t,
     pending_read: Cell<Option<(u8, u8)>>,
+    seen_exit_generation: Cell<u64>,
+    exit_token: HvfHandle,
 }
 
 impl HvfVcpu {
     /// Wrap a raw vCPU created via `sys` (the kernel-boot path owns VM creation
     /// directly). The caller owns the vCPU's lifetime (`hv_vcpu_destroy`).
     pub(super) fn from_raw(vcpu: hv_vcpu_t, exit: *mut hv_vcpu_exit_t) -> Self {
+        let exit_token = HvfHandle::new(vcpu);
         Self {
             vcpu,
             exit,
             pending_read: Cell::new(None),
+            seen_exit_generation: Cell::new(0),
+            exit_token,
+        }
+    }
+
+    pub(super) fn destroy(&self, cpu: u32) {
+        let status = self.exit_token.destroy();
+        if status != HV_SUCCESS {
+            tracing::warn!(cpu, status, "HVF vCPU destroy failed");
         }
     }
 
@@ -235,7 +328,7 @@ impl HypervisorVcpu for HvfVcpu {
     type Handle = HvfHandle;
 
     fn exit_token(&self) -> HvfHandle {
-        HvfHandle(self.vcpu)
+        self.exit_token.clone()
     }
 
     fn get_core(&self, reg: CoreReg) -> Result<u64, HvfError> {
@@ -279,14 +372,26 @@ impl HypervisorVcpu for HvfVcpu {
     fn step(&self) -> Result<VcpuExit, HvfError> {
         loop {
             self.pending_read.set(None);
-            // SAFETY: live vCPU; `exit` is the kernel-owned struct for it.
-            let e = unsafe {
-                let rc = hv_vcpu_run(self.vcpu);
-                if rc != HV_SUCCESS {
-                    return Err(HvfError::Run(rc));
-                }
-                *self.exit
-            };
+            let exit_generation = self.exit_token.exit_generation();
+            if exit_generation != self.seen_exit_generation.get() {
+                // Consume a request made while this vCPU was outside HVF.
+                self.seen_exit_generation.set(exit_generation);
+                return Ok(VcpuExit::Canceled);
+            }
+            // SAFETY: live vCPU bound to this thread.
+            let rc = unsafe { hv_vcpu_run(self.vcpu) };
+            if rc != HV_SUCCESS {
+                return Err(HvfError::Run(rc));
+            }
+            let exit_generation = self.exit_token.exit_generation();
+            if exit_generation != self.seen_exit_generation.get() {
+                // Preserve a request that raced a normal exit (for example a
+                // timer trap) so the run loop checks stop before re-entering.
+                self.seen_exit_generation.set(exit_generation);
+                return Ok(VcpuExit::Canceled);
+            }
+            // SAFETY: `exit` is the kernel-owned struct for this live vCPU.
+            let e = unsafe { *self.exit };
             match e.reason {
                 HV_EXIT_REASON_VTIMER_ACTIVATED => return Ok(VcpuExit::VTimer),
                 HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
@@ -424,11 +529,7 @@ impl HypervisorVm for HvfVm {
         if rc != HV_SUCCESS {
             return Err(HvfError::VcpuCreate(rc));
         }
-        Ok(HvfVcpu {
-            vcpu,
-            exit,
-            pending_read: Cell::new(None),
-        })
+        Ok(HvfVcpu::from_raw(vcpu, exit))
     }
 
     fn set_irq(&self, intid: u32, level: bool) -> Result<(), HvfError> {
@@ -480,5 +581,64 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn force_exit_and_destroy_are_serialized_by_the_shared_handle() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let handle = HvfHandle::new(7);
+        let forcing_handle = handle.clone();
+        let (force_entered_tx, force_entered_rx) = mpsc::channel();
+        let (release_force_tx, release_force_rx) = mpsc::channel();
+        let forcing = std::thread::spawn(move || {
+            HvfHandle::request_exit(&[forcing_handle], |ids| {
+                assert_eq!(ids, [7]);
+                force_entered_tx.send(()).unwrap();
+                release_force_rx.recv().unwrap();
+            });
+        });
+        force_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("force exit acquired the live handle");
+
+        assert!(
+            matches!(
+                handle.0.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "the in-flight force exit must hold the vCPU lifetime lock"
+        );
+        let synchronizing_handle = handle.clone();
+        let (synchronized_tx, synchronized_rx) = mpsc::channel();
+        let synchronizing = std::thread::spawn(move || {
+            synchronized_tx
+                .send(synchronizing_handle.exit_generation())
+                .unwrap();
+        });
+        assert!(
+            synchronized_rx
+                .recv_timeout(Duration::from_millis(25))
+                .is_err(),
+            "the vCPU must not re-enter while an exit request is in flight"
+        );
+        release_force_tx.send(()).unwrap();
+        forcing.join().unwrap();
+        let synchronized_generation = synchronized_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("run-loop synchronization follows the exit request");
+        assert_eq!(synchronized_generation, 1);
+        synchronizing.join().unwrap();
+
+        let status = handle.retire_with(|vcpu| {
+            assert_eq!(vcpu, 7);
+            HV_SUCCESS
+        });
+        assert_eq!(status, HV_SUCCESS);
+        assert!(
+            HvfHandle::request_exit(&[handle], |ids| ids.is_empty()),
+            "retired handles must not be sent to hv_vcpus_exit"
+        );
     }
 }

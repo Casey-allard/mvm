@@ -8,7 +8,7 @@
 //!
 //! Deliberately NOT a `check-all` gate: the numbers are hardware-dependent.
 //! Committed baselines, the exact commands, run-to-run variance and derived
-//! budgets live in `specs/telemetry/baselines.md`. Allocation counts are not
+//! budgets live in `xtask/data/telemetry/baselines.md`. Allocation counts are not
 //! re-measured here — the admission path's zero-allocation property is
 //! already witnessed natively and under Miri by the outbox allocation
 //! regressions in `mvm-core`.
@@ -360,7 +360,7 @@ struct NoisyRun {
 /// Entry point: `cargo xtask telemetry-baseline [--samples N] [--rounds N]
 /// [--noisy]`. `--noisy` replaces the baseline report with the drop-newest
 /// versus drop-oldest comparison under a noisy producer.
-pub fn run(args: &[String]) -> Result<()> {
+pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut samples = 100_000;
     let mut rounds = 50;
     let mut noisy = false;

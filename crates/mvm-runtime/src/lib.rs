@@ -1,10 +1,9 @@
 // mvm-runtime — VM lifecycle orchestration + concrete `VmBackend` implementations.
 //
 // The leaf substrate (`config`, `shell`, `linux_env`, `ui`, `runtime_meta`,
-// `cow`) lives under `base` (folded in from the former Lima-era `mvm-base`
-// crate). The `pub use base::*` re-exports below preserve the old
-// `mvm::{config, shell, linux_env, ui, shell_mock}` paths so the mvmd
-// contract surface (consumed via `mvmctl::runtime::*`) keeps resolving.
+// `cow`) lives under `base`. The `pub use base::*` re-exports below keep the
+// `{config, shell, linux_env, ui, shell_mock}` paths resolving for the mvmd
+// contract surface (consumed via `mvmctl::runtime::*`).
 //
 // Concrete `VmBackend` implementations:
 //
@@ -23,11 +22,13 @@
 // Machine product abstraction (`machine`) — the
 // construction + capability-gate seam the CLI, mvmd, and the SDKs share.
 
+#![deny(unreachable_pub)]
+
 pub mod build_env;
 mod host_shell;
 mod legacy_bundle_runtime;
 mod legacy_portable_runtime;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub use legacy_bundle_runtime::fixtures::signed_legacy_runtime_fixture;
 #[cfg(any(test, feature = "test-support"))]
 pub use legacy_portable_runtime::fixtures::signed_legacy_portable_runtime_fixture;

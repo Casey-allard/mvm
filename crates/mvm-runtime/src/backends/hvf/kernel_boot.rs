@@ -36,6 +36,7 @@ use super::mmio_layout::{
 };
 use super::smp::{CreationOrder, Release, SecondaryGates, VcpuStart, psci};
 use super::snapshot::{HVF_SNAPSHOT_BACKEND_KIND, HvfVcpuState};
+use super::stop_wake::{RunOver, wake_until_done};
 use super::sys::*;
 use super::vcpu::esr_ec;
 use super::{BootFault, default_bootargs};
@@ -937,7 +938,7 @@ struct MachineShared<'a> {
 impl MachineShared<'_> {
     /// True once this run is over, for any reason.
     fn stopping(&self) -> bool {
-        self.stop.load(Ordering::Relaxed) || self.machine_over.load(Ordering::Relaxed)
+        self.stop.load(Ordering::Acquire) || self.machine_over.load(Ordering::Acquire)
     }
 
     /// Record what `cpu` consumed, as read on `cpu`'s own thread.
@@ -1013,13 +1014,18 @@ impl MachineShared<'_> {
     /// End the machine: release every parked secondary and force every running
     /// one out of the guest.
     ///
-    /// Called by each vCPU as it leaves its run loop, and on a failed bring-up.
-    /// Idempotent, and it must stay that way — every CPU calls it, and the
-    /// scope joining them afterwards would otherwise wait forever on a CPU the
-    /// guest never onlined.
+    /// Called by every vCPU as it leaves its run loop, and on a failed bring-up.
+    /// Only the first caller releases parked CPUs or submits an exit batch.
     fn end(&self) {
-        self.machine_over.store(true, Ordering::Relaxed);
+        if self.machine_over.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.gates.shutdown();
+        // The watchdog owns an explicit stop and submits the final wake. Avoid
+        // a second exit batch from the first vCPU that returns in response.
+        if self.stop.load(Ordering::Acquire) {
+            return;
+        }
         let handles = self
             .roster
             .lock()
@@ -1219,10 +1225,7 @@ fn verify_redistributor_frame(vcpu_id: hv_vcpu_t, cpu: u32) -> Result<(), HvfErr
 /// ordering cannot be separated from the call it exists to order — it was a
 /// pair of statements at the call site once, and deleting them was a one-line
 /// change that reintroduced the race with nothing in CI to notice.
-fn create_secondary_vcpu(
-    cpu: u32,
-    order: &CreationOrder,
-) -> Result<(HvfVcpu, hv_vcpu_t), HvfError> {
+fn create_secondary_vcpu(cpu: u32, order: &CreationOrder) -> Result<HvfVcpu, HvfError> {
     // Held until this function returns, by any path.
     let _turn = order.take_turn(cpu);
     let mut vcpu_id: hv_vcpu_t = 0;
@@ -1241,11 +1244,10 @@ fn create_secondary_vcpu(
         .set_sys(SysReg::MpidrEl1, fdt::mpidr_for_cpu(cpu))
         .and_then(|()| verify_redistributor_frame(vcpu_id, cpu));
     if let Err(e) = identified {
-        // SAFETY: created on this thread and not used again.
-        unsafe { hv_vcpu_destroy(vcpu_id) };
+        vcpu.destroy(cpu);
         return Err(e);
     }
-    Ok((vcpu, vcpu_id))
+    Ok(vcpu)
 }
 
 /// What the machine consumed, from what each of its vCPUs reported.
@@ -1309,8 +1311,8 @@ fn run_secondary<B: run::DeviceBus>(
     // `hv_vcpu_create` order and the device tree tells the guest CPU n owns the
     // nth, so the nth vCPU created has to be CPU n whatever order the scheduler
     // started these threads in.
-    let (vcpu, vcpu_id) = match create_secondary_vcpu(cpu, shared.creation_order) {
-        Ok(created_vcpu) => created_vcpu,
+    let vcpu = match create_secondary_vcpu(cpu, shared.creation_order) {
+        Ok(vcpu) => vcpu,
         Err(e) => {
             let _ = created.send(Err(e));
             return Err(e);
@@ -1436,12 +1438,14 @@ fn run_secondary<B: run::DeviceBus>(
     // This CPU is done, so the machine is: release every other CPU rather than
     // leaving them in a guest that has nothing left to run.
     shared.end();
-    // SAFETY: created on this thread, never used after this point, and the VM
-    // outlives the thread.
-    unsafe { hv_vcpu_destroy(vcpu_id) };
+    vcpu.destroy(cpu);
     result.map(|(_, diagnostics)| diagnostics)
 }
 
+/// # Safety
+///
+/// A VM created in this process must stay alive until return; `ram` must
+/// point to the base of `guest_ram`'s valid, full-length mapping.
 unsafe fn run(
     guest_ram: &mut GuestRam,
     ram: *mut u8,
@@ -1490,6 +1494,8 @@ unsafe fn run(
             "protected handoff controller missing",
         ));
     }
+    // SAFETY: the VM exists (see the function's contract); the GIC is configured
+    // before any vCPU is created, and the HVF calls here only read values passed by value.
     unsafe {
         // In-kernel GICv3 — created after the VM, before any vCPU. Base
         // addresses must match the DTB's intc node, or the kernel's IRQ/timer
@@ -1526,21 +1532,15 @@ unsafe fn run(
         // loop (crate::vmm::run) — the same body the KVM backend uses.
         let vcpu = HvfVcpu::from_raw(vcpu_id, exit);
 
-        // MPIDR_EL1 must match this CPU's `cpu@<addr>` node and hence its GIC
-        // redistributor frame (else gic_populate_rdist walks off the region and
-        // faults). arm64 boot protocol: x0 per `VcpuStart`, x1..x3=0, PC=entry,
-        // EL1h with DAIF masked. Routed through `VcpuStart` so a secondary
-        // released by PSCI takes this same path with different data rather than
-        // a second copy of it.
-        // The start state sets MPIDR_EL1, which is what HVF places the GIC
-        // redistributor frame by — so the frame can only be checked afterwards.
-        // Checked for the boot CPU too: a machine whose CPU 0 cannot find its
-        // redistributor hangs in IRQ init with an empty console, and that is
-        // worth naming whether it happens on one CPU or four.
+        // MPIDR_EL1 must match this CPU's DTB node and GIC redistributor frame,
+        // or IRQ init faults/hangs without console. `VcpuStart` sets it before
+        // we can verify the frame, for the primary and PSCI-released secondaries.
+        // arm64 boot: x0 per `VcpuStart`, x1..x3=0, PC=entry, EL1h, DAIF masked.
+        // Sharing `VcpuStart` avoids duplicating the secondary boot path.
         let started = apply_vcpu_start(&vcpu, VcpuStart::primary(entry, dtb_addr))
             .and_then(|()| verify_redistributor_frame(vcpu_id, 0));
         if let Err(e) = started {
-            hv_vcpu_destroy(vcpu_id);
+            vcpu.destroy(0);
             return Err(e);
         }
 
@@ -1604,12 +1604,12 @@ unsafe fn run(
                     }
                     return None; // run already ended; don't poke a finishing vCPU
                 }
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Acquire) {
                     break Instant::now(); // requested stop / workload-exit
                 }
                 waited += step;
                 if waited >= timeout {
-                    stop.store(true, Ordering::Relaxed); // timeout → end the run
+                    stop.store(true, Ordering::Release); // timeout → end the run
                     break Instant::now();
                 }
                 // Break the guest out of `hv_vcpu_run` when: a pause was requested
@@ -1638,14 +1638,17 @@ unsafe fn run(
             if let Some(path) = &pause_state_w {
                 let _ = std::fs::remove_file(path);
             }
-            // Final wake, every CPU → each loop sees the stop and returns.
-            let handles = roster_w
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            HvfHandle::force_exit(&handles);
+            // Keep cancellation alive until every vCPU thread has returned.
+            wake_until_done(&done_w, step, || {
+                let handles = roster_w
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                HvfHandle::force_exit(&handles);
+            });
             Some(stop_observed_at)
         });
+        let run_over = RunOver::new(done.clone(), watchdog.thread().clone());
 
         let mut uart = Pl011::new(UART_BASE);
         // Mirror guest output to the host log as it arrives. Write-only, and
@@ -2124,7 +2127,7 @@ unsafe fn run(
         };
 
         let vcpu_exited_at = Instant::now();
-        done.store(true, Ordering::Relaxed);
+        run_over.complete();
         let watchdog_join_started = Instant::now();
         let stop_observed_at = watchdog.join().ok().flatten();
         let watchdog_join = watchdog_join_started.elapsed();
@@ -2160,7 +2163,7 @@ unsafe fn run(
         let io_thread_join = io_thread_join_started.elapsed();
         let final_pc = vcpu.get_core(CoreReg::Pc).unwrap_or(0);
         let vcpu_destroy_started = Instant::now();
-        hv_vcpu_destroy(vcpu_id);
+        vcpu.destroy(0);
         let vcpu_destroy = vcpu_destroy_started.elapsed();
 
         let mut r = KernelBootResult {

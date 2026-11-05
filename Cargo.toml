@@ -30,17 +30,10 @@ members = [
     "crates/mvm-builder-guest",
     # GPU compute by API remoting: the per-VM host endpoint that serves
     # guest CUDA/NVML shim RPCs over vsock against the real driver or a
-    # deterministic stub. Host-only (std); the guest side of the wire is
-    # the mvm-gpu-*-shim cdylibs + mvm-contract::protocol::gpu.
+    # deterministic stub. The guest side of the wire — the drop-in
+    # libcuda/libcudart/libnvidia-ml shim cdylibs mvm-images composes into
+    # the overlay image — lives in the same crate as cdylib examples.
     "crates/mvm-gpu",
-    # Guest GPU shim libraries (drop-in libcuda/libcudart/libnvidia-ml
-    # replacements forwarding over vsock) and their shared client core.
-    # cdylibs linked into the guest runtime overlay; mvm-images composes
-    # them into the overlay image.
-    "crates/mvm-gpu-shim-core",
-    "crates/mvm-gpu-cuda-shim",
-    "crates/mvm-gpu-cudart-shim",
-    "crates/mvm-gpu-nvml-shim",
     # The in-guest host-services C ABI. Its own crate so the object compiled
     # into every guest carries no host-side toolchain: `mvm-sdk` holds the
     # decorator parser (tree-sitter) and the deploy record (blake3), both C,
@@ -126,7 +119,7 @@ exclude = [
 resolver = "3"
 
 [workspace.package]
-version = "0.26.0"
+version = "0.27.0-rc.1"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -307,29 +300,29 @@ tree-sitter-typescript = "0.23.2"
 # here because member crates can't override that on a workspace-inherited
 # dependency unless the workspace entry already carries it. The root binary
 # opts back into user-facing defaults through its own `[features]` block.
-mvm-contract = { path = "crates/mvm-contract", version = "0.26.0", default-features = false, features = ["protocol"] }
-mvm-core = { path = "crates/mvm-core", version = "0.26.0" }
-mvm-bundler = { path = "crates/mvm-bundler", version = "0.26.0" }
-mvm-compiler = { path = "crates/mvm-compiler", version = "0.26.0" }
-mvm-client ={ path = "crates/mvm-client", version = "0.26.0" }
-mvm-agentd = { path = "crates/mvm-agentd", version = "0.26.0" }
-mvm-setpriv = { path = "crates/mvm-setpriv", version = "0.26.0" }
-mvm-builder-guest = { path = "crates/mvm-builder-guest", version = "0.26.0" }
-mvm-host-services = { path = "crates/mvm-host-services", version = "0.26.0" }
-mvm-build = { path = "crates/mvm-build", version = "0.26.0", default-features = false }
-mvm-runtime = { path = "crates/mvm-runtime", version = "0.26.0", default-features = false }
-mvm-vmm = { path = "crates/mvm-vmm", version = "0.26.0" }
-mvm-backends = { path = "crates/mvm-backends", version = "0.26.0" }
-mvm-fs = { path = "crates/mvm-fs", version = "0.26.0" }
-mvm-http = { path = "crates/mvm-http", version = "0.26.0" }
-mvm-net = { path = "crates/mvm-net", version = "0.26.0" }
-mvm-cli = { path = "crates/mvm-cli", version = "0.26.0", default-features = false }
-mvm-hostd = { path = "crates/mvm-hostd", version = "0.26.0", default-features = false }
+mvm-contract = { path = "crates/mvm-contract", version = "0.27.0-rc.1", default-features = false, features = ["protocol"] }
+mvm-core = { path = "crates/mvm-core", version = "0.27.0-rc.1" }
+mvm-bundler = { path = "crates/mvm-bundler", version = "0.27.0-rc.1" }
+mvm-compiler = { path = "crates/mvm-compiler", version = "0.27.0-rc.1" }
+mvm-client ={ path = "crates/mvm-client", version = "0.27.0-rc.1" }
+mvm-agentd = { path = "crates/mvm-agentd", version = "0.27.0-rc.1" }
+mvm-setpriv = { path = "crates/mvm-setpriv", version = "0.27.0-rc.1" }
+mvm-builder-guest = { path = "crates/mvm-builder-guest", version = "0.27.0-rc.1" }
+mvm-host-services = { path = "crates/mvm-host-services", version = "0.27.0-rc.1" }
+mvm-build = { path = "crates/mvm-build", version = "0.27.0-rc.1", default-features = false }
+mvm-runtime = { path = "crates/mvm-runtime", version = "0.27.0-rc.1", default-features = false }
+mvm-vmm = { path = "crates/mvm-vmm", version = "0.27.0-rc.1" }
+mvm-backends = { path = "crates/mvm-backends", version = "0.27.0-rc.1" }
+mvm-fs = { path = "crates/mvm-fs", version = "0.27.0-rc.1" }
+mvm-http = { path = "crates/mvm-http", version = "0.27.0-rc.1" }
+mvm-net = { path = "crates/mvm-net", version = "0.27.0-rc.1" }
+mvm-cli = { path = "crates/mvm-cli", version = "0.27.0-rc.1", default-features = false }
+mvm-hostd = { path = "crates/mvm-hostd", version = "0.27.0-rc.1", default-features = false }
 
-mvm-sdk = { path = "crates/mvm-sdk", version = "0.26.0" }
-mvm-capture = { path = "crates/mvm-capture", version = "0.26.0" }
+mvm-sdk = { path = "crates/mvm-sdk", version = "0.27.0-rc.1" }
+mvm-capture = { path = "crates/mvm-capture", version = "0.27.0-rc.1" }
 # Keep bindgen/libclang opt-in; real FFI requires libkrun on the host.
-libkrun-sys = { path = "crates/deps/libkrun-sys", version = "0.26.0" }
+libkrun-sys = { path = "crates/deps/libkrun-sys", version = "0.27.0-rc.1" }
 
 # Dev dependencies
 assert_cmd = "2"
@@ -707,6 +700,12 @@ debug = "line-tables-only"
 # its caller (AES-GCM's, for one) stays at the caller's level.
 [profile.dev.package."*"]
 opt-level = 0
+
+# The local-volume service encrypts whole ext4 images through mvm-core.
+# Optimise the caller where AES-GCM's generic loop is instantiated: 42
+# volume tests took 80s at level 0 and 10s at level 2 on the same host.
+[profile.dev.package.mvm-core]
+opt-level = 2
 
 [profile.dev.package.syn]
 opt-level = 3

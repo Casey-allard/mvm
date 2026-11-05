@@ -58,6 +58,8 @@
 //! environment; that's where the size budget (≤ 1.5 MiB) and
 //! static-link requirement get enforced.
 
+#![deny(unreachable_pub)]
+
 use std::process::ExitCode;
 
 // Cross-platform modules. The install-spec parser and install
@@ -180,8 +182,7 @@ fn main() -> ExitCode {
             "mvm-host-vm-init is Linux-only (PID 1 for the libkrun \
              builder VM). On a developer host this binary is a no-op; \
              mkGuest cross-compiles the real init for \
-             <arch>-unknown-linux-musl. See \
-             specs/plans/72-builder-vm-via-libkrun.md §W3."
+             <arch>-unknown-linux-musl."
         );
         ExitCode::FAILURE
     }
@@ -1730,7 +1731,7 @@ mod linux {
         }
     }
 
-    pub fn run(pseudo_fs: crate::boot_stage::PseudoFs) -> ExitCode {
+    pub(crate) fn run(pseudo_fs: crate::boot_stage::PseudoFs) -> ExitCode {
         eprintln!("mvm-host-vm-init: pid 1 starting ({pseudo_fs:?})");
         append_init_breadcrumb("run_enter", "pid1");
 

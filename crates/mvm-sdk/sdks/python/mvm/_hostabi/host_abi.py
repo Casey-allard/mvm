@@ -176,6 +176,16 @@ class CheckpointRemoveRequest:
 
 
 @dataclass
+class CheckpointVerifyLineageReply:
+    pass
+
+
+@dataclass
+class CheckpointVerifyLineageRequest:
+    id: str
+
+
+@dataclass
 class ContentBlob:
     name: str
     sha256: str
@@ -647,6 +657,7 @@ class MachinePauseRequest:
 class MachinePromptRequest:
     id: str
     prompt_b64: str
+    checkpoint: Optional[bool] = False
     idempotency_key: Optional[str] = None
     request_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -1091,6 +1102,12 @@ class CheckpointRemove:
 
 
 @dataclass
+class CheckpointVerifyLineage:
+    reply: CheckpointVerifyLineageReply
+    request: CheckpointVerifyLineageRequest
+
+
+@dataclass
 class GuestCp:
     reply: GuestCpReply
     request: GuestCpRequest
@@ -1467,6 +1484,8 @@ class MachinePromptReply:
     delivered: bool
     journal_cursor: int
     agent_error: Optional[AgentErrorReply] = None
+    checkpoint_failed: Optional[bool] = None
+    checkpoint_id: Optional[str] = None
     error: Optional[RemoteErrorReply] = None
     exit_code: Optional[int] = None
     output_truncated: Optional[bool] = None
@@ -1775,6 +1794,7 @@ class HostAbi:
     backend_capabilities: BackendCapabilities
     checkpoint_list: CheckpointList
     checkpoint_remove: CheckpointRemove
+    checkpoint_verify_lineage: CheckpointVerifyLineage
     entrypoint_call: EntrypointCall
     guest_cp: GuestCp
     guest_fs_list: GuestFsList

@@ -59,7 +59,7 @@ pub(super) fn run_in_guest(
     phase.finish();
     // Agent reachable over vsock: the command is about to be dispatched.
     let vsock_ready = std::time::Instant::now();
-    let req = &with_provisioned_egress_env(req, vm_name);
+    let req = &with_provisioned_egress_env(req, vm_name)?;
     let wrapper = build_guest_wrapper(req);
 
     let dispatch = command_dispatch(
@@ -337,24 +337,38 @@ fn pty_console_request(req: &ExecRequest, wrapper: String) -> PtyConsoleRequest 
 ///
 /// Read here, after the endpoint has a session, because that is when the
 /// placeholders exist: they are minted at boot, so no request built before
-/// boot can carry them. The caller's explicit `--env` comes last and wins.
-fn with_provisioned_egress_env(req: &ExecRequest, vm_name: &str) -> ExecRequest {
+/// boot can carry them. An explicit `--env` cannot replace a provisioned value.
+fn with_provisioned_egress_env(req: &ExecRequest, vm_name: &str) -> Result<ExecRequest> {
     let mut provisioned = req.clone();
     provisioned.env = compose_egress_env(
         mvm_hostd::workload_env::workload_egress_env(vm_name),
         &req.env,
-    );
-    provisioned
+    )?;
+    Ok(provisioned)
 }
 
-/// The provisioned egress variables, then the caller's.
+/// The provisioned egress variables, then the caller's own.
+///
+/// A caller variable that repeats a provisioned name with the very same value
+/// replaces nothing: the CLI puts the OCI proxy variables on the request before
+/// boot, and the host provisions the same ones after it. That repeat is dropped
+/// so the variable appears once. A different value is a replacement and is
+/// refused, without echoing the value.
 fn compose_egress_env(
     provisioned: Vec<(String, String)>,
     caller: &[(String, String)],
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>> {
     let mut env = provisioned;
-    env.extend(caller.iter().cloned());
-    env
+    for (name, value) in caller {
+        match env.iter().find(|(bound, _)| bound == name) {
+            Some((_, bound)) if bound == value => {}
+            Some(_) => anyhow::bail!(
+                "cannot override host-provisioned egress variable {name:?} with --env"
+            ),
+            None => env.push((name.clone(), value.clone())),
+        }
+    }
+    Ok(env)
 }
 
 fn direct_pty_inline_argv(req_argv: &[String]) -> bool {
@@ -580,14 +594,72 @@ mod tests {
                 ("API_TOKEN".into(), placeholder.clone()),
             ],
             &[("TERM".into(), "xterm-256color".into())],
-        );
+        )
+        .unwrap();
         assert_eq!(env.len(), 3);
         assert_eq!(env[1], ("API_TOKEN".to_string(), placeholder));
         assert_eq!(
             env.last().map(|(k, _)| k.as_str()),
             Some("TERM"),
-            "the caller's explicit env comes last"
+            "non-conflicting caller env follows the host-provisioned values"
         );
+    }
+
+    #[test]
+    fn a_caller_cannot_override_a_secret_placeholder_or_egress_proxy() {
+        for name in ["API_TOKEN", "HTTPS_PROXY"] {
+            let error = compose_egress_env(
+                vec![
+                    ("API_TOKEN".into(), "mvm-secret-placeholder".into()),
+                    ("HTTPS_PROXY".into(), "http://127.0.0.1:1080".into()),
+                ],
+                &[(name.into(), "raw-private-value".into())],
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(name),
+                "the collision must name the variable: {error}"
+            );
+            assert!(
+                !error.to_string().contains("raw-private-value"),
+                "the refusal must not echo the caller's value: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clis_own_oci_proxy_variables_are_not_an_override() {
+        // Both sides come from the same producer the real paths use: the CLI
+        // injects it on an OCI boot, the host provisions it after boot.
+        let proxy =
+            mvm_core::guest_netd::proxy_env_vars(mvm_core::guest_netd::DEFAULT_EGRESS_PROXY_LISTEN);
+        let mut provisioned = proxy.clone();
+        provisioned.push(("API_TOKEN".into(), "mvm-secret-placeholder".into()));
+
+        let mut caller = proxy.clone();
+        caller.push(("TERM".into(), "xterm-256color".into()));
+
+        let env = compose_egress_env(provisioned.clone(), &caller).unwrap();
+        for (name, _) in &proxy {
+            assert_eq!(
+                env.iter().filter(|(bound, _)| bound == name).count(),
+                1,
+                "{name} must appear exactly once"
+            );
+        }
+        assert_eq!(env.len(), provisioned.len() + 1, "only TERM is added");
+        assert!(env.contains(&("TERM".to_string(), "xterm-256color".to_string())));
+    }
+
+    #[test]
+    fn a_caller_value_that_differs_from_the_provisioned_one_is_still_refused() {
+        let proxy =
+            mvm_core::guest_netd::proxy_env_vars(mvm_core::guest_netd::DEFAULT_EGRESS_PROXY_LISTEN);
+        let (name, _) = proxy[0].clone();
+        let error =
+            compose_egress_env(proxy, &[(name.clone(), "http://evil.example".into())]).unwrap_err();
+        assert!(error.to_string().contains(&name), "{error}");
+        assert!(!error.to_string().contains("evil.example"), "{error}");
     }
 
     #[test]
@@ -621,7 +693,7 @@ mod tests {
             sdk_host_services: Vec::new(),
             declared_libc: mvm_contract::guest_libc::GuestLibc::Unknown,
         };
-        let provisioned = with_provisioned_egress_env(&req, "no-egress-vm");
+        let provisioned = with_provisioned_egress_env(&req, "no-egress-vm").unwrap();
         assert_eq!(provisioned.env, req.env);
     }
 

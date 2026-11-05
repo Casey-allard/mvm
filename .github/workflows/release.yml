@@ -57,7 +57,8 @@ jobs:
       # Manual validation runs cannot mint a tag-bound candidate (the producer
       # gate stays tag-only), so they must tolerate the portable-creation
       # scenarios skipping; a real tag push keeps this false and fails on the
-      # skip instead.
+      # skip instead. To run strict candidate parity without publishing, use
+      # `release-prepublish-parity.yml` with an explicit signed candidate quartet.
       allow_runtime_candidate_skip: ${{ github.event_name == 'workflow_dispatch' }}
       # Stated rather than inherited: a macOS host that cannot boot a guest
       # fails this workflow, so promotion never goes ahead without live macOS
@@ -144,8 +145,8 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      # Fetch separately. Neither the checker artifact nor an earlier attempt
-      # can replace the original producer subjects.
+      # Fetch separately. The checker artifact cannot replace the original
+      # producer subjects; failed-job reruns may reuse a pinned prior attempt.
       - name: Fetch original and checked inputs into isolated directories
         env:
           GH_TOKEN: ${{ github.token }}
@@ -789,7 +790,7 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Collect exact current-attempt release inputs without overlays
+      - name: Collect exact same-run release inputs without overlays
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_ID: ${{ needs.runtime-proof-candidate.outputs.candidate_artifact_id }}

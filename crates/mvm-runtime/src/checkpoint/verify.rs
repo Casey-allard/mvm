@@ -312,7 +312,14 @@ impl LineageGraph for CheckpointGraph<'_> {
     type Record = CheckpointMeta;
     type Id = CheckpointId;
     fn read(&self, id: &CheckpointId) -> Result<CheckpointMeta> {
-        self.0.read_meta(id)
+        let meta = self.0.read_meta(id)?;
+        anyhow::ensure!(
+            meta.id == *id,
+            "checkpoint metadata id {:?} does not match requested id {:?}",
+            meta.id.as_str(),
+            id.as_str()
+        );
+        Ok(meta)
     }
     fn by_digest(&self, digest: &CheckpointDigest) -> Result<Option<CheckpointMeta>> {
         self.0.by_digest(digest)
@@ -400,7 +407,7 @@ pub(super) mod tests {
 
     /// Anchor that echoes each record's own recomputed digest: the signed audit
     /// chain agrees with what's on disk — the honest case.
-    pub struct AgreeingAnchor;
+    pub(crate) struct AgreeingAnchor;
     impl CheckpointChainAnchor for AgreeingAnchor {
         fn recorded_creation_tenant(&self, _meta: &CheckpointMeta) -> Result<Option<String>> {
             Ok(Some("local".to_string()))
@@ -416,7 +423,7 @@ pub(super) mod tests {
 
     /// Anchor that reports a fixed, unrelated digest for every record: models a
     /// signed chain that disagrees with the on-disk record (post-audit edit).
-    pub struct DisagreeingAnchor(pub CheckpointDigest);
+    pub(crate) struct DisagreeingAnchor(pub CheckpointDigest);
     impl CheckpointChainAnchor for DisagreeingAnchor {
         fn recorded_creation_tenant(&self, _meta: &CheckpointMeta) -> Result<Option<String>> {
             Ok(Some("local".to_string()))
@@ -432,7 +439,7 @@ pub(super) mod tests {
 
     /// Anchor with no signed creation entry for anything: models an un-audited
     /// checkpoint, which chain-anchored verification must refuse.
-    pub struct UnauditedAnchor;
+    pub(crate) struct UnauditedAnchor;
     impl CheckpointChainAnchor for UnauditedAnchor {
         fn recorded_creation_tenant(&self, _meta: &CheckpointMeta) -> Result<Option<String>> {
             Ok(None)
@@ -448,7 +455,7 @@ pub(super) mod tests {
 
     /// Anchor that agrees on every digest but records the checkpoint's
     /// creation under `self.0`'s tenant (or under none).
-    pub struct TenantAnchor(pub Option<&'static str>);
+    pub(crate) struct TenantAnchor(pub Option<&'static str>);
     impl CheckpointChainAnchor for TenantAnchor {
         fn recorded_creation_tenant(&self, _meta: &CheckpointMeta) -> Result<Option<String>> {
             Ok(self.0.map(str::to_string))
@@ -462,7 +469,7 @@ pub(super) mod tests {
         }
     }
 
-    pub fn unrelated_digest() -> CheckpointDigest {
+    pub(crate) fn unrelated_digest() -> CheckpointDigest {
         CheckpointDigest::parse(format!("sha256:{}", "f".repeat(64))).unwrap()
     }
 
@@ -536,6 +543,26 @@ pub(super) mod tests {
         let store = CheckpointStore::at(tmp.path().join("store"));
         let root = seed_linked_meta(&store, "g0", None, "aa");
         assert!(root.parent.is_none());
+        verify_lineage(&store, &root.id, &AgreeingAnchor).unwrap();
+    }
+
+    #[test]
+    fn verify_lineage_refuses_a_valid_record_copied_under_another_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::at(tmp.path().join("store"));
+        let root = seed_linked_meta(&store, "signed-id", None, "aa");
+        let alias = CheckpointId::new("different-id");
+        std::fs::create_dir_all(store.dir_for(&alias)).unwrap();
+        std::fs::copy(
+            store.dir_for(&root.id).join("meta.json"),
+            store.dir_for(&alias).join("meta.json"),
+        )
+        .unwrap();
+        let error = verify_lineage(&store, &alias, &AgreeingAnchor).unwrap_err();
+        assert!(
+            error.to_string().contains("does not match requested id"),
+            "{error:#}"
+        );
         verify_lineage(&store, &root.id, &AgreeingAnchor).unwrap();
     }
 

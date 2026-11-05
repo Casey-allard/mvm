@@ -36,8 +36,6 @@ pub mod audit_dedup;
 pub mod audit_file;
 pub mod audit_mirror;
 pub mod audit_recorder;
-pub mod audit_segment;
-pub mod audit_set;
 pub mod backend;
 pub mod balloon;
 pub mod balloon_runtime;
@@ -51,14 +49,11 @@ pub mod dns_resolver;
 pub mod ebpf_telemetry;
 pub mod egress;
 pub mod entropy_scanner;
-pub mod event_bus;
 pub mod firewall;
 pub mod runtime_approval;
 pub mod tool_decision;
-// Per-VM gateway flow-event subscriber sink. Lives next to
-// `event_bus` and `firewall` as a peer fan-out substrate; the gateway
-// bridge emits each FlowEvent through here in parallel with the signer
-// mpsc.
+// Per-VM gateway flow-event subscriber sink: the gateway bridge emits each
+// FlowEvent through here in parallel with the signer mpsc.
 pub mod gateway_audit;
 // Per-VM gateway audit bridge. Splices guest virtio-net <-> host
 // gateway, emits FlowOpened/FlowClosed
@@ -77,9 +72,7 @@ pub mod inspector;
 pub mod instance_sampler;
 pub mod keystore;
 pub mod l7_proxy;
-pub mod lifecycle_hooks;
 pub mod name_scanner;
-pub mod names_gazetteer;
 // Observer trait + Pipeline builder for the gateway audit substrate.
 // Observers consume `&FlowEvent` references inside `signer_task`
 // (fan-out before chain signing). Host-allowlisted via
@@ -99,12 +92,10 @@ pub mod network_endpoint_proxy;
 pub mod pii_redactor;
 pub mod proxy;
 pub mod reaper;
-pub mod redaction_resolve;
 /// Undeclared secret/PII redaction shared by the egress endpoint and the
 /// declared-ingress transform.
 pub mod redactor;
 pub mod reversible_replacement;
-pub mod reversible_replacement_resolve;
 /// Chain-signed `secret.substituted` / `secret.placeholder_dropped`
 /// audit events (claim 13: metadata only, never the secret value).
 pub mod secret_audit;
@@ -140,6 +131,13 @@ pub mod tools;
 /// `WallClockControl::SupervisorTimer`.
 pub mod wall_clock;
 
+/// First index of `needle` in `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 pub use aggregate::{
     AuditPolicyValidationError, EgressPolicyValidationError, KNOWN_AUDIT_STREAM_SCHEMES,
     KNOWN_INSPECTOR_NAMES, Supervisor, SupervisorError, build_inspector_chain,
@@ -163,13 +161,6 @@ pub use audit_recorder::{
     EventCategory, Recorder, RecorderError, UNBOUND_IMAGE_NAME, UNBOUND_IMAGE_SHA256,
     UNBOUND_PLAN_ID,
 };
-pub use audit_segment::{
-    CHAIN_CONTINUED, CHAIN_PRUNED, CHAIN_SEALED, Continuation, Pruned, Sealed,
-};
-pub use audit_set::{
-    SegmentContent, SegmentReport, SegmentSetError, SetVerification, read_verified_set,
-    verify_segment_entries, verify_segment_set, verify_segment_topology,
-};
 pub use backend::{BackendError, BackendLaunchSpec, BackendLauncher, NoopBackendLauncher};
 #[cfg(target_os = "macos")]
 pub use balloon::VmPressureLevelSource;
@@ -184,7 +175,6 @@ pub use circuit_breaker::{
 };
 pub use destination::DestinationPolicy;
 pub use egress::{EgressDecision, EgressError, NoopEgressProxy, SupervisorEgressProxy};
-pub use event_bus::{DEFAULT_CAPACITY as EVENT_BUS_DEFAULT_CAPACITY, EventBus, LifecycleEvent};
 #[cfg(any(target_os = "linux", test))]
 pub use firewall::linux_nft::{CommandNftApplier, LinuxNftFirewall, NftApplier, NftError};
 pub use firewall::{FirewallEnforcer, FirewallError, FirewallSpec, NoopFirewallEnforcer};
@@ -201,7 +191,6 @@ pub use l7_proxy::{
     EgressAuditSink, EgressOutcome, EvaluationResult, L7EgressProxy, NoopEgressAuditSink,
     TokioDnsResolver, parse_connect,
 };
-pub use lifecycle_hooks::{LifecycleHooks, standard_hooks};
 pub use pii_redactor::{
     Mode as PiiMode, PII_CATEGORY_NAMES, PiiPolicyError, PiiRedactor, PiiRule, PiiValidator,
 };

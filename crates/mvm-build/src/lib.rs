@@ -1,3 +1,4 @@
+#![deny(unreachable_pub)]
 //! Image identity and production primitives, with Unix-only VM orchestration.
 //!
 //! Non-Unix hosts can observe repositories and produce/verify local manifests.
@@ -18,6 +19,9 @@ pub mod image_source;
 pub mod source_closure;
 mod source_copy;
 pub mod workspace_graph;
+
+#[cfg(all(test, unix))]
+mod test_support;
 
 /// Portable image-contract verification; acquisition requires a Unix host.
 #[cfg(not(unix))]

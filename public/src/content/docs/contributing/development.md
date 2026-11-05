@@ -5,8 +5,36 @@ description: Getting started as a contributor to mvm.
 
 Working with an AI coding agent on this repo? Read the
 [AI Coding Workflow](/contributing/ai-coding-workflow/) guide alongside this one —
-it covers claiming issues, the mandatory worktree flow, the Graft/Serena tooling
+it covers claiming issues, the mandatory worktree flow, the Trail/Serena tooling
 split, the fast feedback ladder, and what CI does and does not gate.
+
+## Repository layout
+
+The full map, with consumers and the `third_party/` / `crates/deps/` / `nix/`
+boundaries, is [Repository Layout](/contributing/repository-layout/).
+
+- `src/` and `crates/` contain the CLI entry point and Rust workspace crates.
+  `crates/deps/` contains workspace dependencies, including the libkrun
+  bindings and the locally adapted Mach-O signing crate.
+- `third_party/` contains vendored upstream sources used by the root
+  `[patch.crates-io]` overrides. Check each dependency's provenance and
+  license before changing or removing it; `crates/deps/mvm-macho-sign` also
+  contains adapted upstream code with its own provenance and license.
+- `specs/` holds the PRD, architectural decisions and durable contracts.
+  `schema/` holds machine-readable interfaces used by SDK generation.
+  `model/` holds the conformance claims, authorities and ledger; its generated
+  `CONFORMANCE.md` connects claims to scenarios and witnesses.
+- `assets/` holds the macOS signing entitlement profiles used in builds and
+  installation. `features/` and `tests/` hold behavioral and integration tests.
+- `Justfile` provides common commands; `just/` contains its recipe modules.
+  `scripts/` contains supporting scripts and `xtask/` contains Rust maintenance
+  and validation commands.
+- `nix/` contains Nix build definitions as well as packaging, operational
+  tooling and tests. The Linux image layer belongs to `mvm-images`, but not
+  every file under `nix/` is an image definition: the staged boundary is
+  documented in [ADR-054](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/054-image-boundary-linux-layer.md).
+- `public/` contains the documentation site; `web/` contains web components.
+  `examples/` contains example workloads and `bin/` contains executable tools.
 
 ## macOS documented-surface evidence
 
@@ -288,9 +316,11 @@ home isolation or increasing the lane timeout.
 ### Kernel builds
 
 The builder-VM and workload microVM kernels are slim custom Linux
-builds: one shared config in `nix/images/kernel/base.nix` plus a
-per-variant delta (`workload.nix` adds dm-verity; `builder.nix` adds
-the nix-build sandbox + egress-lockdown bits). Because the config is
+builds: one shared config plus a per-variant delta (the workload kernel
+adds dm-verity; the builder kernel adds the nix-build sandbox and
+egress-lockdown bits). The kernel flake lives in `mvm-images`, not in this
+repository, so a compile needs a selected or sibling `mvm-images` checkout.
+Because the config is
 custom, `cache.nixos.org` has no substitute, so the first build on a
 fresh machine compiles the kernel from source. It can take several minutes
 depending on the host and is memory-heavy; later builds reuse the persistent
@@ -325,16 +355,15 @@ Notes:
 
 - **Host-arch only for `--source compile`.** Stage 0 builds your host's
   architecture (aarch64 *or* x86_64).
-  The other arch is published by the `kernel-build` GitHub workflow,
-  which builds both on native runners — fetch it with `--source
-  download` once a release ships it.
-- Editing `base.nix` or a variant delta? Just re-run the command — a
+  The other arch is published in the signed `mvm-images` image set,
+  which builds both — fetch it with `--source download`.
+- Editing `kernel/base.nix` or a variant delta in your `mvm-images` checkout? Just re-run the command — a
   custom config always compiles locally; downloads only ever return the
   kernel that shipped with that exact `mvmctl` release.
 
 #### Iterating on the kernel config (slimming, adding a driver)
 
-Changing `base.nix` / `workload.nix` / `builder.nix` and want to see the
+Changing `kernel/base.nix` / `workload.nix` / `builder.nix` in `mvm-images` and want to see the
 effect? The loop is build → boot-smoke → measure:
 
 ```bash
@@ -361,13 +390,11 @@ Two sharp edges worth knowing:
   symbol (or only the builder needs one), put it in that variant's
   delta. (The builder kernel, for example, keeps netfilter for its
   egress lockdown while the workload drops it.)
-- **You can't read the resolved `.config` locally** — Stage 0 hands the
-  host a `vmlinux`, not the config. The `=y` symbol count + byte size
-  come from the `kernel-build` CI lane, which uploads
-  `workload-config-<arch>` and `kernel-metrics-<arch>.json`. Trigger it
-  without a release via `gh workflow run kernel-build.yml`. The
-  `check-kernel-config-budget` xtask gate fails CI if the `=y` count
-  regresses past `KERNEL_Y_BUDGET`.
+- **Reading the resolved `.config`.** Stage 0 hands the host a `vmlinux`,
+  not the config. In the `mvm-images` checkout,
+  `nix build .#workload-configfile` (see `kernel/README.md` there) produces
+  it; the `=y` count and size metrics are produced by that repository's
+  kernel build, not by this one.
 
 ## Testing
 
@@ -399,19 +426,9 @@ just ci
 - CLI binary tests go in root `tests/cli.rs`
 - Use `#[serde(default)]` when adding fields to structs used in test fixtures
 
-### Gated E2E: the core-demo regression guard
+### Gated E2E
 
-`crates/mvm-cli/tests/core_demo_e2e.rs` exercises the whole `bootstrap → compile → machine run → vsock ping` spine end-to-end. It boots the persistent builder VM, lowers `examples/python/hello-app/app.py` to a flake, builds + boots the workload microVM, and waits for the guest agent to answer over vsock. Default-skips so it doesn't fire on routine `cargo test` runs; gate is `MVM_E2E_SMOKE=1`:
-
-```bash
-# Local run — requires libkrun + libkrunfw on pre-26 macOS, or
-# native /dev/kvm on Linux. Threads `--hypervisor` per host.
-MVM_E2E_SMOKE=1 cargo test -p mvm-cli --test core_demo_e2e -- --nocapture
-```
-
-The lane mirrored at `.github/workflows/ci.yml::core-demo-e2e` runs the same command on a self-hosted runner labelled `[self-hosted, macOS, ARM64, libkrun]`, gated on the `MACOS_LIBKRUN_AVAILABLE` repo variable. GitHub-hosted macOS runners cannot serve this lane (no nested HVF, no libkrun) — it stays opt-in until a self-hosted runner is wired.
-
-The same gated convention covers `crates/mvm-sdk/sdks/python/tests/test_sandbox_exec.py`, which exercises `Sandbox.exec(*argv) -> ExecResult` against a real microVM. Default-skips on `pytest`; opt-in with `MVM_E2E_SMOKE=1 python -m pytest crates/mvm-sdk/sdks/python/tests/test_sandbox_exec.py`.
+The `MVM_E2E_SMOKE=1` gate covers `crates/mvm-sdk/sdks/python/tests/test_sandbox_exec.py`, which exercises `Sandbox.exec(*argv) -> ExecResult` against a real microVM. Default-skips on `pytest`; opt-in with `MVM_E2E_SMOKE=1 python -m pytest crates/mvm-sdk/sdks/python/tests/test_sandbox_exec.py`.
 
 ### Running on the shared KVM box
 

@@ -804,6 +804,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "cpubits"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1472,6 +1482,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
+ "pkcs8",
  "signature",
 ]
 
@@ -1484,6 +1495,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519",
  "rand_core",
+ "serde",
  "sha2 0.11.0",
  "signature",
  "subtle",
@@ -3498,7 +3510,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libkrun-sys"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "libc",
  "mvm-agentd",
@@ -3695,7 +3707,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-agentd"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3714,6 +3726,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+ "spiralcore-transfer",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3726,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-backends"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -3747,7 +3760,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-build"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3785,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-builder-guest"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -3805,7 +3818,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-bundler"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3819,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-capture"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "chrono",
  "hex",
@@ -3836,7 +3849,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-cli"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3890,7 +3903,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-client"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3933,7 +3946,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-compiler"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "flate2",
  "globset",
@@ -3954,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-conformance"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3988,7 +4001,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-contract"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4008,7 +4021,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-core"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -4062,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-fs"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "am-fs-ext4",
  "async-trait",
@@ -4092,53 +4105,17 @@ dependencies = [
 
 [[package]]
 name = "mvm-gpu"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "libc",
  "mvm-contract",
- "mvm-gpu-shim-core",
  "mvm-vmm",
  "tempfile",
 ]
 
 [[package]]
-name = "mvm-gpu-cuda-shim"
-version = "0.26.0"
-dependencies = [
- "libc",
- "mvm-contract",
- "mvm-gpu-shim-core",
-]
-
-[[package]]
-name = "mvm-gpu-cudart-shim"
-version = "0.26.0"
-dependencies = [
- "libc",
- "mvm-contract",
- "mvm-gpu-shim-core",
-]
-
-[[package]]
-name = "mvm-gpu-nvml-shim"
-version = "0.26.0"
-dependencies = [
- "libc",
- "mvm-contract",
- "mvm-gpu-shim-core",
-]
-
-[[package]]
-name = "mvm-gpu-shim-core"
-version = "0.26.0"
-dependencies = [
- "libc",
- "mvm-contract",
-]
-
-[[package]]
 name = "mvm-host-services"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "mvm-agentd",
  "mvm-core",
@@ -4148,7 +4125,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-hostd"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4190,6 +4167,8 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
+ "spiralcore-mvm-flowmux",
+ "spiralcore-transfer",
  "sysinfo",
  "tar",
  "tempfile",
@@ -4205,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-hostlib"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4225,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-http"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4246,7 +4225,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-macho-sign"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "plist",
  "sha1",
@@ -4255,7 +4234,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-net"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "mvm-contract",
  "mvm-core",
@@ -4264,7 +4243,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-runtime"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4308,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-sdk"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -4334,14 +4313,14 @@ dependencies = [
 
 [[package]]
 name = "mvm-setpriv"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "mvm-vmm"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4374,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "mvmctl"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -5472,7 +5451,7 @@ checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
 
 [[package]]
 name = "runmvm-client"
-version = "0.26.0"
+version = "0.27.0-rc.1"
 dependencies = [
  "libloading",
  "serde_json",
@@ -5541,6 +5520,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -6195,6 +6175,46 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+
+[[package]]
+name = "spiralcore-mvm-flowmux"
+version = "0.1.0"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1#ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1"
+dependencies = [
+ "mio",
+ "rustls",
+ "sha2 0.10.9",
+ "spiralcore-transfer",
+]
+
+[[package]]
+name = "spiralcore-storage-windows"
+version = "0.1.0"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1#ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spiralcore-transfer"
+version = "0.1.0"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1#ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1"
+dependencies = [
+ "cpu-time",
+ "httparse",
+ "libm",
+ "memchr",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "spiralcore-storage-windows",
+ "subtle",
+ "uor-r4-object-store",
+ "ureq",
+ "url",
+ "zstd",
+ "zstd-sys",
+]
 
 [[package]]
 name = "spki"
@@ -6964,6 +6984,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "uor-r4-object-store"
+version = "0.1.0"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1#ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "ureq"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7be76686bdf7198002062423ca0d8cf9b75a27c8e1de804513b97e97b555d9d"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622dce33c252115466d83f63e9744a18f12b4406aae51a01c15ad8fcf1185eb3"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6974,6 +7030,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -7600,6 +7662,15 @@ name = "webpki-root-certs"
 version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8255,3 +8326,31 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdb02c3132d251ab1606e9fc913a7da6c6ed08cc263df15edf082e1dc497d157"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c8ea04668f5de8d8d51051714ba560c9536519cadcdb8829bba4fe2ad159b03"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.2+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

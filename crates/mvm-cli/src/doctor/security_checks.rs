@@ -183,15 +183,18 @@ fn scan_audit_chains() -> AuditChainScan {
         // First the structure across segments: every handoff's signature and
         // every claimed predecessor hash, at O(segments) rather than O(entire
         // history). This is what catches a segment that was removed.
-        let verified =
-            match mvm_hostd::supervisor::verify_segment_topology(&dir, base, &signer.verifying) {
-                Ok(verified) => verified,
-                Err(e) => {
-                    scan.broken
-                        .push((active.display().to_string(), format!("{e:#}")));
-                    continue;
-                }
-            };
+        let verified = match mvm_core::audit_verify::set::verify_segment_topology(
+            &dir,
+            base,
+            &signer.verifying,
+        ) {
+            Ok(verified) => verified,
+            Err(e) => {
+                scan.broken
+                    .push((active.display().to_string(), format!("{e:#}")));
+                continue;
+            }
+        };
         scan.sealed_segments += verified.segments.iter().filter(|r| !r.active).count();
         // A pruned chain verifies, and is also missing history on purpose. Both
         // are true, and reporting only the first would make "verifies" mean
@@ -1060,8 +1063,7 @@ mod tests {
     // ── audit_chain_check_from_scan unit tests ──────────────────────
 
     /// The point of the check: a damaged chain is a posture *failure*, not an
-    /// informational line. It used to surface only as an unrelated verb
-    /// refusing a record, which reads as a problem with that record.
+    /// informational line.
     #[test]
     fn a_fully_walked_scan_does_not_mention_incremental_verification() {
         let scan = AuditChainScan {

@@ -59,13 +59,13 @@ use mvm_build::persistent_builder::{
 use crate::commands::Cli;
 
 #[derive(ClapArgs, Debug, Clone)]
-pub struct Args {
+pub(crate) struct Args {
     #[command(subcommand)]
     pub command: Sub,
 }
 
 #[derive(Subcommand, Debug, Clone)]
-pub enum Sub {
+pub(crate) enum Sub {
     /// Spawn the persistent builder VM and record the session.
     /// The VM keeps running after this command returns; `submit`
     /// dispatches jobs into it and `stop` brings it down.
@@ -81,7 +81,7 @@ pub enum Sub {
 }
 
 #[derive(ClapArgs, Debug, Clone)]
-pub struct StartArgs {
+pub(crate) struct StartArgs {
     /// Host directory bound at `/work` inside the persistent VM.
     /// Defaults to the current working directory.
     #[arg(long)]
@@ -97,7 +97,7 @@ pub struct StartArgs {
 const DEFAULT_MEMORY_MIB: u32 = 4096;
 
 #[derive(ClapArgs, Debug, Clone)]
-pub struct SubmitArgs {
+pub(crate) struct SubmitArgs {
     /// Flake reference to build (e.g. `path:/work#packages.default`).
     #[arg(long)]
     pub flake: String,
@@ -107,7 +107,7 @@ pub struct SubmitArgs {
 }
 
 #[derive(ClapArgs, Debug, Clone)]
-pub struct StopArgs {}
+pub(crate) struct StopArgs {}
 
 /// Persisted at `~/.mvm/run/persistent-builder.json` — single
 /// source of truth for `submit` / `stop` to locate a running
@@ -186,7 +186,7 @@ fn remove_session_record() -> Result<()> {
     Ok(())
 }
 
-pub fn run(_cli: &Cli, args: Args) -> Result<()> {
+pub(crate) fn run(_cli: &Cli, args: Args) -> Result<()> {
     match args.command {
         Sub::Start(a) => run_start(a),
         Sub::Submit(a) => run_submit(a),
@@ -870,6 +870,7 @@ fn print_outcome(outcome: &DispatchOutcome) {
 fn supervisor_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
+        // SAFETY: kill(pid, 0) only probes for existence and delivers no signal.
         let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
         rc == 0
     }
@@ -883,6 +884,7 @@ fn supervisor_alive(pid: u32) -> bool {
 fn send_sigterm(pid: u32) {
     #[cfg(unix)]
     {
+        // SAFETY: kill takes integer arguments and touches no memory.
         unsafe {
             let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
