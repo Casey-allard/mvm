@@ -78,6 +78,45 @@ fn inputs(root: &std::path::Path) -> HostLifetimeInputs {
 }
 
 #[test]
+fn confinement_callback_borrows_only_readonly_current_state() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let root = tempfile::tempdir().unwrap();
+    let input = inputs(root.path());
+    let lease = mvm_core::host_lifetime::PreparedHostLifetimeLease::bind(
+        input.directory,
+        input.holder,
+        input.expected,
+    )
+    .unwrap();
+    lease
+        .with_verification_state(|state| {
+            assert!(state.metadata()?.is_file());
+            let mut observed = state.try_clone()?;
+            observed.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            observed.read_to_end(&mut bytes)?;
+            assert_eq!(bytes, b"bounded original active state");
+            assert!(
+                observed.write_all(b"x").is_err(),
+                "the borrowed file is readonly"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let calls = AtomicUsize::new(0);
+    std::fs::write(root.path().join(".state"), b"changed").unwrap();
+    assert!(
+        lease
+            .with_verification_state(|_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn config_clones_retain_same_parent_and_refuse_substitution() {
     let root = tempfile::tempdir().unwrap();
     let dropped = Arc::new(AtomicUsize::new(0));

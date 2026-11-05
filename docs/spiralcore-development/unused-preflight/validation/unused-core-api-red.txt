@@ -1,0 +1,15 @@
+error[E0599]: no method named `binding` found for reference `&PreparedHostLifetime` in the current scope
+ --> /var/tmp/spiralcore-resident-parent-20261103/unused-preparation-api-probe.rs:2:71
+  |
+2 | pub fn probe(p:&PreparedHostLifetime,a:&std::sync::Arc<()>) { let _=p.binding(); let _=p.retains_parent_owner(a); }
+  |                                                                       ^^^^^^^ private field, not a method
+
+error[E0599]: no method named `retains_parent_owner` found for reference `&PreparedHostLifetime` in the current scope
+ --> /var/tmp/spiralcore-resident-parent-20261103/unused-preparation-api-probe.rs:2:90
+  |
+2 | pub fn probe(p:&PreparedHostLifetime,a:&std::sync::Arc<()>) { let _=p.binding(); let _=p.retains_parent_owner(a); }
+  |                                                                                          ^^^^^^^^^^^^^^^^^^^^ method not found in `&PreparedHostLifetime`
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `rustc --explain E0599`.

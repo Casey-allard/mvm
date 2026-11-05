@@ -1,0 +1,41 @@
+[package]
+name = "unused-preflight-qualification"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[workspace]
+resolver = "2"
+
+[features]
+default = ["test-support"]
+test-support = ["mvm-client/test-support", "mvm-core/test-support"]
+
+[dependencies]
+mvm-client = { path = "../.." }
+mvm-core = { path = "../../../mvm-core" }
+mvm-hostd = { path = "../../../mvm-hostd" }
+anyhow = "1"
+sha2 = "0.11"
+tempfile = "3"
+tokio = { version = "=1.53.3", features = ["rt", "time", "net"] }
+mio = "=1.2.1"
+
+[[test]]
+name = "unused_preparation"
+path = "../../../mvm-core/tests/unused_preparation.rs"
+
+[[test]]
+name = "unused_host_lifetime"
+path = "../unused_host_lifetime.rs"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "thin"
+codegen-units = 16
+overflow-checks = true
+
+[profile.release.build-override]
+strip = false

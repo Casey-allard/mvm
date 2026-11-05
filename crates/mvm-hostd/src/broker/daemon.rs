@@ -453,6 +453,16 @@ impl HostAgentDaemon {
                 "owned registration admission fenced"
             );
             anyhow::ensure!(
+                r.services_bindings.len() <= 2
+                    && (r.services_bindings.len() < 2
+                        || r.services_bindings[0] != r.services_bindings[1])
+                    && r.capability_bindings.iter().all(|binding| {
+                        binding.capability.service.as_str().len() + binding.capability.verb.len()
+                            <= 128
+                    }),
+                "owned service/capability identity resource limit"
+            );
+            anyhow::ensure!(
                 r.capability_bindings.len() <= 16
                     && r.workload_id.as_ref().is_none_or(|value| value.len() <= 63)
                     && r.broker_listen_socket.len() <= 4096
@@ -663,7 +673,7 @@ impl HostAgentDaemon {
         } else {
             (None, None)
         };
-        let serve_task = tokio::spawn(async move {
+        let serve = async move {
             let result = if let Some(stop) = stop {
                 super::server::serve_owned_on_listener(
                     owned_listener.context("owned listener absent")?,
@@ -671,8 +681,10 @@ impl HostAgentDaemon {
                     workload_id,
                     tenant,
                     mfb,
-                    owned_workspaces.context("owned shared workspaces absent")?,
-                    admission.context("owned I/O admission absent")?,
+                    super::server::OwnedBrokerResources {
+                        workspaces: owned_workspaces.context("owned shared workspaces absent")?,
+                        admission: admission.context("owned I/O admission absent")?,
+                    },
                     stop,
                 )
                 .await
@@ -690,7 +702,11 @@ impl HostAgentDaemon {
                 warn!(error = %e, "host-agent per-VM serve loop exited");
             }
             result
-        });
+        };
+        if self.owned_journal.is_some() {
+            crate::owned_resources::task_size(&serve)?;
+        }
+        let serve_task = tokio::spawn(serve);
 
         self.vms.insert(
             r.vm_id.clone(),
@@ -1106,7 +1122,12 @@ mod tests {
         );
     }
 
-    fn register(dir: &Path, vm: &str, tenant: &str, signer: Option<PathBuf>) -> RegisterVm {
+    pub(super) fn register(
+        dir: &Path,
+        vm: &str,
+        tenant: &str,
+        signer: Option<PathBuf>,
+    ) -> RegisterVm {
         RegisterVm {
             vm_id: vm.into(),
             workload_id: Some(format!("wl-{vm}")),

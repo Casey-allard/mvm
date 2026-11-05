@@ -14,7 +14,10 @@ use std::{
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd},
     process::{ChildStdin, ChildStdout},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use zeroize::Zeroizing;
@@ -256,16 +259,65 @@ impl InstalledCustody {
 
 /// Child-side private capability. Only fixed original pipe stdio is accepted;
 /// no path, PID, arbitrary reader or decoded quota constructor exists.
-pub struct InstalledEndpointChild {
+struct ChildAuthority {
     input: File,
-    output: File,
-    _holder: PreparedHostLifetimeLease,
+    holder: PreparedHostLifetimeLease,
     parent: ProcessExitObserver,
     projection: EndpointPartitionProjection,
+    fenced: AtomicBool,
+    pool_claimed: AtomicBool,
+}
+
+/// Original child authority retained by its one local pool and bounded workers.
+/// Cloning this lease shares its single claim; it never creates a new quota.
+#[derive(Clone)]
+pub struct InstalledEndpointLease {
+    authority: Arc<ChildAuthority>,
+}
+impl std::fmt::Debug for InstalledEndpointLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstalledEndpointLease")
+            .field("projection", &self.authority.projection)
+            .finish_non_exhaustive()
+    }
+}
+impl InstalledEndpointLease {
+    pub fn projection(&self) -> &EndpointPartitionProjection {
+        &self.authority.projection
+    }
+    /// One monotonic claim, including any later authorization failure.
+    pub fn claim_payload_pool(&self) -> Result<()> {
+        if self.authority.pool_claimed.swap(true, Ordering::AcqRel) {
+            bail!("installed endpoint local pool already claimed")
+        }
+        self.check_current()
+    }
+    pub fn check_current(&self) -> Result<()> {
+        if self.authority.fenced.load(Ordering::Acquire) {
+            bail!("installed endpoint authority fenced")
+        }
+        let result = (|| {
+            self.authority.holder.verify_current()?;
+            if self.authority.parent.wait_event(Instant::now())? != ProcessExitWait::TimedOut
+                || parent_closed(&self.authority.input)?
+            {
+                bail!("installed endpoint parent admission closed")
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.authority.fenced.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
+pub struct InstalledEndpointChild {
+    lease: InstalledEndpointLease,
+    output: File,
     config: Option<serde_json::Value>,
     nonce: [u8; 32],
     phase: u8,
-    fenced: AtomicBool,
     startup_deadline: Instant,
 }
 impl InstalledEndpointChild {
@@ -331,20 +383,28 @@ impl InstalledEndpointChild {
         let holder = PreparedHostLifetimeLease::bind(directory, holder, prepared.expected)?;
         holder.verify_current()?;
         Ok(Self {
-            input,
+            lease: InstalledEndpointLease {
+                authority: Arc::new(ChildAuthority {
+                    input,
+                    holder,
+                    parent,
+                    projection: prepared.projection,
+                    fenced: AtomicBool::new(false),
+                    pool_claimed: AtomicBool::new(false),
+                }),
+            },
             output,
-            _holder: holder,
-            parent,
-            projection: prepared.projection,
             config: Some(prepared.config),
             nonce,
             phase: 0,
-            fenced: AtomicBool::new(false),
             startup_deadline: deadline,
         })
     }
+    pub fn lease(&self) -> InstalledEndpointLease {
+        self.lease.clone()
+    }
     pub fn projection(&self) -> &EndpointPartitionProjection {
-        &self.projection
+        self.lease.projection()
     }
     pub fn take_config(&mut self) -> Result<serde_json::Value> {
         self.config
@@ -352,20 +412,33 @@ impl InstalledEndpointChild {
             .context("installed endpoint config already consumed")
     }
     pub fn control_fd(&self) -> i32 {
-        self.input.as_raw_fd()
+        self.lease.authority.input.as_raw_fd()
     }
     pub fn check_parent(&self) -> Result<()> {
-        if self.fenced.load(Ordering::Acquire)
-            || self.parent.wait_event(Instant::now())? != ProcessExitWait::TimedOut
-            || parent_closed(&self.input)?
-        {
-            self.fenced.store(true, Ordering::Release);
-            bail!("installed endpoint parent admission closed")
+        self.lease.check_current()
+    }
+    /// Borrow only the verified readonly state file through the sole controller.
+    pub fn with_verification_state<T>(
+        &mut self,
+        operation: impl FnOnce(&File) -> Result<T>,
+    ) -> Result<T> {
+        let result = (|| {
+            self.check_parent()?;
+            let value = self
+                .lease
+                .authority
+                .holder
+                .with_verification_state(operation)?;
+            self.check_parent()?;
+            Ok(value)
+        })();
+        if result.is_err() {
+            self.lease.authority.fenced.store(true, Ordering::Release);
         }
-        Ok(())
+        result
     }
     pub fn parent_closed(&self) -> Result<bool> {
-        parent_closed(&self.input)
+        parent_closed(&self.lease.authority.input)
     }
     pub fn send_ready(&mut self, handshake: EndpointHandshake, deadline: Instant) -> Result<()> {
         let deadline = deadline.min(self.startup_deadline);
@@ -373,13 +446,15 @@ impl InstalledEndpointChild {
             bail!("installed endpoint readiness phase differs")
         }
         self.check_parent()?;
+        let session = self.projection().session;
+        let serial = self.projection().partition_serial;
         write_frame(
             &mut self.output,
             &Ready {
                 version: 1,
                 nonce: self.nonce,
-                session: self.projection.session,
-                serial: self.projection.partition_serial,
+                session,
+                serial,
                 handshake,
             },
             CONFIG_LIMIT,
@@ -394,14 +469,16 @@ impl InstalledEndpointChild {
         if self.phase != 1 || !self.parent_closed()? {
             bail!("installed endpoint drain phase differs")
         }
-        self.fenced.store(true, Ordering::Release);
+        self.lease.authority.fenced.store(true, Ordering::Release);
+        let session = self.projection().session;
+        let serial = self.projection().partition_serial;
         write_frame(
             &mut self.output,
             &Drained {
                 version: 1,
                 nonce: self.nonce,
-                session: self.projection.session,
-                serial: self.projection.partition_serial,
+                session,
+                serial,
             },
             CONTROL_LIMIT,
             deadline,

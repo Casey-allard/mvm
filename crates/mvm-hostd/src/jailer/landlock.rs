@@ -62,6 +62,14 @@ fn rw_file_access() -> BitFlags<AccessFs> {
 /// unless the process has exactly one thread. That makes the restriction
 /// process-wide by construction rather than by the caller's care.
 pub fn apply(spec: &ConfinementSpec) -> Result<(), JailerError> {
+    apply_with_owned_files(spec, None, None)
+}
+
+pub(crate) fn apply_with_owned_files(
+    spec: &ConfinementSpec,
+    state: Option<&std::fs::File>,
+    store: Option<&std::fs::File>,
+) -> Result<(), JailerError> {
     crate::jailer::require_single_threaded()?;
     let abi = ABI::V2;
     let mut ruleset = Ruleset::default()
@@ -107,6 +115,19 @@ pub fn apply(spec: &ConfinementSpec) -> Result<(), JailerError> {
         };
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, access))
+            .map_err(|e| JailerError::LandlockApply(format!("{e:?}")))?;
+    }
+    if let Some(state) = state {
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(state, AccessFs::ReadFile))
+            .map_err(|e| JailerError::LandlockApply(format!("{e:?}")))?;
+    }
+    if let Some(store) = store {
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(
+                store,
+                rw_access | AccessFs::MakeDir | AccessFs::RemoveDir,
+            ))
             .map_err(|e| JailerError::LandlockApply(format!("{e:?}")))?;
     }
     let status: RestrictionStatus = ruleset

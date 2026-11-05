@@ -1,4 +1,6 @@
 //! Canonical post-admission mapping onto the single shared object core.
+mod installed;
+
 use super::{AdmittedTcpPayload, AuthenticatedTcpPayloadFactory, AuthenticatedTcpPayloadIo};
 use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
 use mvm_contract::policy::network_policy::PayloadMappingProfile;
@@ -132,13 +134,16 @@ impl SpiralCorePayloadFactory {
         key: &SigningKey,
         controller: Arc<dyn PayloadScopeController>,
     ) -> io::Result<Self> {
-        let encoded = key.to_pkcs8_der().map_err(invalid)?;
-        let identity = PinnedIdentity::from_pkcs8(encoded.as_bytes().to_vec())?;
+        let identity = pinned_identity(key)?;
         Ok(Self {
             identity,
             controller,
         })
     }
+}
+fn pinned_identity(key: &SigningKey) -> io::Result<PinnedIdentity> {
+    let encoded = key.to_pkcs8_der().map_err(invalid)?;
+    PinnedIdentity::from_pkcs8(encoded.as_bytes().to_vec())
 }
 impl AuthenticatedTcpPayloadFactory for SpiralCorePayloadFactory {
     fn map(
@@ -527,6 +532,15 @@ impl OwnedPayloadStore {
             return Err(invalid("payload store is not private directory"));
         }
         let directory = std::fs::File::open(&path)?;
+        Self::capture_directory(path, directory)
+    }
+    fn capture_directory(path: std::path::PathBuf, directory: std::fs::File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let before = std::fs::symlink_metadata(&path)?;
+        mvm_core::private_fs::require_current_owner(&before)?;
+        if !before.is_dir() || before.file_type().is_symlink() || before.mode() & 0o077 != 0 {
+            return Err(invalid("payload store is not private directory"));
+        }
         let opened = directory.metadata()?;
         if before.dev() != opened.dev() || before.ino() != opened.ino() {
             return Err(invalid("payload store identity changed"));
@@ -569,6 +583,26 @@ pub struct PayloadResourcePermit {
     profile: Option<spiralcore_transfer::resource_profile::ResourceProfile>,
 }
 impl PayloadResourcePermit {
+    fn with_owned_directory(
+        mut self,
+        path: std::path::PathBuf,
+        directory: std::fs::File,
+    ) -> io::Result<Self> {
+        if self.store.is_some() {
+            self.uncertain = true;
+            return Err(invalid("payload store already attached"));
+        }
+        match OwnedPayloadStore::capture_directory(path, directory) {
+            Ok(store) => {
+                self.store = Some(store);
+                Ok(self)
+            }
+            Err(error) => {
+                self.uncertain = true;
+                Err(error)
+            }
+        }
+    }
     pub fn with_owned_store(mut self, path: std::path::PathBuf) -> io::Result<Self> {
         if self.store.is_some() {
             self.uncertain = true;

@@ -184,12 +184,14 @@ impl AuditClient {
                         message: "owned audit requires multi-thread runtime".into(),
                     });
                 }
-                let deadline = Instant::now()
+                let single_append = Instant::now()
                     .checked_add(Duration::from_secs(5))
                     .ok_or_else(|| AuditClientError::Protocol {
                         path: uds_path.clone(),
                         message: "owned deadline overflow".into(),
                     })?;
+                let deadline = crate::broker::registry::owned_call_deadline()
+                    .map_or(single_append, |original| original.min(single_append));
                 // No detached blocking job: the current handler and workspace
                 // remain live until this bounded closure actually returns.
                 tokio::task::block_in_place(|| self.append_owned_until(req, deadline))
@@ -567,126 +569,139 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn two_blocked_owned_calls_retain_workspaces_and_leave_control_schedulable() {
-        use std::io::Read;
-        struct Release(Vec<std::sync::mpsc::Sender<()>>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                for sender in &self.0 {
-                    let _ = sender.send(());
+    #[test]
+    fn two_blocked_owned_calls_retain_workspaces_and_leave_control_schedulable() {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .max_io_events_per_tick(16)
+            .thread_stack_size(2 * 1024 * 1024)
+            .build()
+            .unwrap()
+            .block_on(async {
+                use std::io::Read;
+                struct Release(Vec<std::sync::mpsc::Sender<()>>);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        for sender in &self.0 {
+                            let _ = sender.send(());
+                        }
+                    }
                 }
-            }
-        }
-        let directory = tempdir().unwrap();
-        let pool = crate::owned_resources::WorkspacePool::new(2).unwrap();
-        let admission = Arc::new(crate::owned_resources::registered::RegistrationAdmission::new());
-        let (entered, received) = std::sync::mpsc::channel();
-        let mut release = Release(Vec::new());
-        let mut servers = Vec::new();
-        let mut calls = Vec::new();
-        for index in 0..2 {
-            let path = directory.path().join(format!("blocked-{index}.sock"));
-            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            let (finish, wait) = std::sync::mpsc::channel();
-            release.0.push(finish);
-            let entered = entered.clone();
-            servers.push(std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-                    .unwrap();
-                let mut header = [0; 4];
-                stream.read_exact(&mut header).unwrap();
-                let mut body = vec![0; u32::from_be_bytes(header) as usize];
-                stream.read_exact(&mut body).unwrap();
-                let request: SignerHelperRequest = serde_json::from_slice(&body).unwrap();
-                entered.send(()).unwrap();
-                wait.recv_timeout(std::time::Duration::from_secs(3))
-                    .unwrap();
-                mvm_vmm::host::hvf_control_transport::write_frame_with_limit(
-                    &mut stream,
-                    &SignerHelperResponse::Pong {
-                        request_id: request.request_id().into(),
-                    },
-                    std::time::Instant::now() + std::time::Duration::from_secs(1),
-                    65536,
-                )
-                .unwrap();
-            }));
-            let client = AuditClient::new_owned_signer_helper(
-                path,
-                "vm-owned".into(),
-                std::process::id(),
-                admission.clone(),
-            );
-            let held = pool.try_acquire().unwrap();
-            calls.push(tokio::spawn(async move {
-                let _held = held;
-                client
-                    .append(&AppendEntryRequest::Probe {
-                        request_id: "held".into(),
-                    })
-                    .await
-            }));
-        }
-        for _ in 0..2 {
-            received
-                .recv_timeout(std::time::Duration::from_secs(3))
-                .unwrap();
-        }
-        for call in &calls {
-            call.abort();
-        }
-        for call in &mut calls {
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), call)
-                    .await
-                    .is_err()
-            );
-        }
-        assert!(
-            pool.try_acquire().is_err(),
-            "running STD exchanges still own both workspaces"
-        );
-        let (mut first, mut second) = tokio::net::UnixStream::pair().unwrap();
-        let control = tokio::spawn(async move {
-            let value: serde_json::Value = crate::framing::read_json_frame(&mut second, 65536)
+                let directory = tempdir().unwrap();
+                let pool = crate::owned_resources::WorkspacePool::new(2).unwrap();
+                let admission =
+                    Arc::new(crate::owned_resources::registered::RegistrationAdmission::new());
+                let (entered, received) = std::sync::mpsc::channel();
+                let mut release = Release(Vec::new());
+                let mut servers = Vec::new();
+                let mut calls = Vec::new();
+                for index in 0..2 {
+                    let path = directory.path().join(format!("blocked-{index}.sock"));
+                    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                    let (finish, wait) = std::sync::mpsc::channel();
+                    release.0.push(finish);
+                    let entered = entered.clone();
+                    servers.push(std::thread::spawn(move || {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                            .unwrap();
+                        let mut header = [0; 4];
+                        stream.read_exact(&mut header).unwrap();
+                        let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                        stream.read_exact(&mut body).unwrap();
+                        let request: SignerHelperRequest = serde_json::from_slice(&body).unwrap();
+                        entered.send(()).unwrap();
+                        wait.recv_timeout(std::time::Duration::from_secs(3))
+                            .unwrap();
+                        mvm_vmm::host::hvf_control_transport::write_frame_with_limit(
+                            &mut stream,
+                            &SignerHelperResponse::Pong {
+                                request_id: request.request_id().into(),
+                            },
+                            std::time::Instant::now() + std::time::Duration::from_secs(1),
+                            65536,
+                        )
+                        .unwrap();
+                    }));
+                    let client = AuditClient::new_owned_signer_helper(
+                        path,
+                        "vm-owned".into(),
+                        std::process::id(),
+                        admission.clone(),
+                    );
+                    let held = pool.try_acquire().unwrap();
+                    calls.push(tokio::spawn(async move {
+                        let _held = held;
+                        client
+                            .append(&AppendEntryRequest::Probe {
+                                request_id: "held".into(),
+                            })
+                            .await
+                    }));
+                }
+                for _ in 0..2 {
+                    received
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap();
+                }
+                for call in &calls {
+                    call.abort();
+                }
+                for call in &mut calls {
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(50), call)
+                            .await
+                            .is_err()
+                    );
+                }
+                assert!(
+                    pool.try_acquire().is_err(),
+                    "running STD exchanges still own both workspaces"
+                );
+                let (mut first, mut second) = tokio::net::UnixStream::pair().unwrap();
+                let control = tokio::spawn(async move {
+                    let value: serde_json::Value =
+                        crate::framing::read_json_frame(&mut second, 65536)
+                            .await
+                            .unwrap();
+                    crate::framing::write_json_frame(&mut second, &value)
+                        .await
+                        .unwrap();
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    let expected = serde_json::json!({"control":"still-schedulable"});
+                    crate::framing::write_json_frame(&mut first, &expected)
+                        .await
+                        .unwrap();
+                    let actual: serde_json::Value =
+                        crate::framing::read_json_frame(&mut first, 65536)
+                            .await
+                            .unwrap();
+                    assert_eq!(actual, expected);
+                })
                 .await
                 .unwrap();
-            crate::framing::write_json_frame(&mut second, &value)
-                .await
-                .unwrap();
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            let expected = serde_json::json!({"control":"still-schedulable"});
-            crate::framing::write_json_frame(&mut first, &expected)
-                .await
-                .unwrap();
-            let actual: serde_json::Value = crate::framing::read_json_frame(&mut first, 65536)
-                .await
-                .unwrap();
-            assert_eq!(actual, expected);
-        })
-        .await
-        .unwrap();
-        control.await.unwrap();
-        drop(release);
-        for call in calls {
-            match call.await {
-                Ok(response) => assert!(matches!(
-                    response.unwrap(),
-                    AppendEntryResponse::Pong { .. }
-                )),
-                Err(error) => assert!(error.is_cancelled()),
-            }
-        }
-        for server in servers {
-            server.join().unwrap();
-        }
-        let first = pool.try_acquire().unwrap();
-        let second = pool.try_acquire().unwrap();
-        drop((first, second));
+                control.await.unwrap();
+                drop(release);
+                for call in calls {
+                    match call.await {
+                        Ok(response) => assert!(matches!(
+                            response.unwrap(),
+                            AppendEntryResponse::Pong { .. }
+                        )),
+                        Err(error) => assert!(error.is_cancelled()),
+                    }
+                }
+                for server in servers {
+                    server.join().unwrap();
+                }
+                let first = pool.try_acquire().unwrap();
+                let second = pool.try_acquire().unwrap();
+                drop((first, second));
+            });
     }
 
     #[test]
@@ -772,9 +787,15 @@ mod tests {
         let result = client.append_owned_until(&sample_req(), deadline);
         release.send(()).unwrap();
         server.join().unwrap();
-        assert!(matches!(result, Err(AuditClientError::Io { source, .. })
-            if source.kind() == std::io::ErrorKind::TimedOut));
         assert!(Instant::now() >= deadline);
+        // The canonical framer preserves the socket's native timeout class:
+        // Linux SO_RCVTIMEO commonly reports EAGAIN/WouldBlock. Require the
+        // original deadline as well; an early WouldBlock cannot pass.
+        assert!(
+            matches!(&result, Err(AuditClientError::Io { source, .. })
+            if matches!(source.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)),
+            "{result:?}"
+        );
         assert!(admission.check().is_err());
     }
 

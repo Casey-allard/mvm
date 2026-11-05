@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mvm_contract::protocol::agent_capability::{
     CapabilityAuditEvent, CapabilityBinding, CapabilityDescriptor, CapabilityFailureCode,
@@ -25,6 +25,30 @@ use mvm_core::protocol::handler::{
 
 mod replay;
 use replay::ReplaySet;
+
+tokio::task_local! {
+    // A server-owned restriction, never serialized deadline authority.
+    static OWNED_CALL_DEADLINE: Instant;
+}
+
+pub(crate) fn owned_call_deadline() -> Option<Instant> {
+    OWNED_CALL_DEADLINE.try_with(|deadline| *deadline).ok()
+}
+
+fn original_owned_deadline(timeout: Duration) -> Option<Instant> {
+    let deadline = Instant::now().checked_add(timeout)?;
+    Some(owned_call_deadline().map_or(deadline, |outer| outer.min(deadline)))
+}
+
+async fn scoped_dispatch<F: std::future::Future>(
+    deadline: Option<Instant>,
+    dispatch: F,
+) -> F::Output {
+    match deadline {
+        Some(deadline) => OWNED_CALL_DEADLINE.scope(deadline, dispatch).await,
+        None => dispatch.await,
+    }
+}
 
 /// How many times one unbound name may be refused with a teaching message
 /// before further attempts are answered tersely.
@@ -315,7 +339,25 @@ impl Registry {
                 ),
             ));
         };
-        handler.dispatch(ctx, verb, payload).await
+        if self.owned_replay_limit.is_none() {
+            return handler.dispatch(ctx, verb, payload).await;
+        }
+        let timeout = handler.call_timeout();
+        let deadline = original_owned_deadline(timeout).ok_or_else(|| {
+            ServiceError::new(ServiceErrorCode::Timeout, "owned call deadline overflow")
+        })?;
+        let result = tokio::time::timeout(
+            timeout,
+            scoped_dispatch(Some(deadline), handler.dispatch(ctx, verb, payload)),
+        )
+        .await;
+        if Instant::now() >= deadline {
+            return Err(ServiceError::new(
+                ServiceErrorCode::Timeout,
+                "owned call deadline elapsed",
+            ));
+        }
+        result.map_err(|_| ServiceError::new(ServiceErrorCode::Timeout, "owned call timed out"))?
     }
 
     /// Dispatch a typed capability call after every admission and resource
@@ -435,7 +477,18 @@ impl Registry {
             input_digest: invocation.input_digest,
         });
         let timeout = Duration::from_millis(u64::from(registration.descriptor.limits.timeout_ms));
-        let dispatch = registration.handler.dispatch(ctx, verb, payload);
+        let owned_deadline = if self.owned_replay_limit.is_some() {
+            Some(
+                original_owned_deadline(timeout)
+                    .ok_or_else(|| capability_error(CapabilityFailureCode::Timeout))?,
+            )
+        } else {
+            None
+        };
+        let dispatch = scoped_dispatch(
+            owned_deadline,
+            registration.handler.dispatch(ctx, verb, payload),
+        );
         tokio::pin!(dispatch);
         let result = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -444,6 +497,7 @@ impl Registry {
             }
             result = tokio::time::timeout(timeout, &mut dispatch) => result,
         };
+        self.check_owned_completion(owned_deadline, cancellation, &capability, invocation)?;
         let output = match result {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
@@ -486,12 +540,37 @@ impl Registry {
             });
             return Err(capability_error(CapabilityFailureCode::OutputTooLarge));
         }
+        self.check_owned_completion(owned_deadline, cancellation, &capability, invocation)?;
         self.audit.record(CapabilityAuditEvent::Completed {
             capability,
             invocation_id: invocation.invocation_id.clone(),
             output_digest: payload_digest(&output),
         });
         Ok(output)
+    }
+
+    fn check_owned_completion(
+        &self,
+        deadline: Option<Instant>,
+        cancellation: &CancellationToken,
+        capability: &CapabilityId,
+        invocation: &CapabilityInvocation,
+    ) -> Result<(), ServiceError> {
+        let Some(deadline) = deadline else {
+            return Ok(());
+        };
+        if cancellation.is_cancelled() {
+            self.record_canceled(capability, invocation);
+            return Err(capability_error(CapabilityFailureCode::Canceled));
+        }
+        if Instant::now() >= deadline {
+            self.audit.record(CapabilityAuditEvent::TimedOut {
+                capability: capability.clone(),
+                invocation_id: invocation.invocation_id.clone(),
+            });
+            return Err(capability_error(CapabilityFailureCode::Timeout));
+        }
+        Ok(())
     }
 
     fn record_refusal(
@@ -1642,5 +1721,167 @@ mod tests {
             .await
             .expect_err("direct calls must not bypass typed capability gates");
         assert_eq!(error.code, ServiceErrorCode::CapabilityDenied);
+    }
+
+    #[test]
+    fn owned_audit_batch_keeps_one_descriptor_deadline_and_spends_identity() {
+        use crate::broker::audit_client::AuditClient;
+        use crate::broker::handlers::host_audit_v1::HostAuditV1Handler;
+        use mvm_core::protocol::audit_signer::{SignerHelperRequest, SignerHelperResponse};
+        use std::time::Instant;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("batch.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        let server = std::thread::spawn(move || {
+            let watchdog = Instant::now() + Duration::from_secs(3);
+            let mut accepted = 0;
+            for index in 0..3 {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if finished.load(Ordering::Acquire) {
+                                return accepted;
+                            }
+                            assert!(Instant::now() < watchdog, "batch fixture accept watchdog");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("batch fixture accept: {error}"),
+                    }
+                };
+                let request: SignerHelperRequest =
+                    mvm_vmm::host::hvf_control_transport::read_frame_with_limit(
+                        &mut stream,
+                        watchdog,
+                        65536,
+                    )
+                    .unwrap();
+                accepted += 1;
+                if index == 1 {
+                    // The second valid append outlives the ORIGINAL admitted
+                    // 100ms Call. No test clock or refreshed deadline is used.
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let result = mvm_vmm::host::hvf_control_transport::write_frame_with_limit(
+                    &mut stream,
+                    &SignerHelperResponse::Ok {
+                        request_id: request.request_id().into(),
+                        chain_head: format!("head-{index}"),
+                        entry_hash: format!("entry-{index}"),
+                        sig_alg: mvm_core::security::SIG_ALG_ED25519,
+                    },
+                    watchdog,
+                    65536,
+                );
+                if let Err(error) = result {
+                    let error = error.downcast::<std::io::Error>().unwrap();
+                    assert!(matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::NotConnected
+                    ));
+                    assert!(finished.load(Ordering::Acquire));
+                    return accepted;
+                }
+            }
+            accepted
+        });
+        let admission = Arc::new(crate::owned_resources::registered::RegistrationAdmission::new());
+        let client = AuditClient::new_owned_signer_helper(
+            path,
+            "vm-owned".into(),
+            std::process::id(),
+            admission.clone(),
+        );
+        let handler = Arc::new(HostAuditV1Handler::new(client));
+        let mut descriptor = HostAuditV1Handler::capability_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id.verb == "emit_batch")
+            .unwrap();
+        descriptor.limits.timeout_ms = 100;
+        let binding = descriptor.binding();
+        let service = binding.capability.service.clone();
+        let audit = TestAudit::default();
+        let mut registry = Registry::new()
+            .with_owned_resource_limits()
+            .unwrap()
+            .with_capability_audit_sink(Arc::new(audit.clone()));
+        registry.register_capability(handler, descriptor).unwrap();
+        registry.admit_capabilities([binding.clone()]).unwrap();
+        let payload = serde_json::json!({"entries":[
+            {"ts":"2026-11-03T00:00:00Z","fields":{"index":0}},
+            {"ts":"2026-11-03T00:00:00Z","fields":{"index":1}},
+            {"ts":"2026-11-03T00:00:00Z","fields":{"index":2}}
+        ]});
+        let invocation = CapabilityInvocation::from_payload(
+            binding,
+            AgentRequestId::parse("original-batch").unwrap(),
+            &payload,
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .max_io_events_per_tick(16)
+            .thread_stack_size(2 * 1024 * 1024)
+            .build()
+            .unwrap();
+        let result = runtime.block_on(registry.dispatch_capability(
+            &ctx(),
+            &service,
+            "emit_batch",
+            &invocation,
+            payload.clone(),
+            &CancellationToken::new(),
+        ));
+        done.store(true, Ordering::Release);
+        let accepted = server.join().unwrap();
+        assert!(
+            result.is_err(),
+            "late batch completed: {result:?}, accepted={accepted}"
+        );
+        assert_eq!(result.unwrap_err().code, ServiceErrorCode::Timeout);
+        assert_eq!(accepted, 2, "no third append after original deadline");
+        assert!(
+            admission.check().is_err(),
+            "uncertain append fences its owner"
+        );
+        let replay = runtime
+            .block_on(registry.dispatch_capability(
+                &ctx(),
+                &service,
+                "emit_batch",
+                &invocation,
+                payload,
+                &CancellationToken::new(),
+            ))
+            .unwrap_err();
+        assert_eq!(replay.code, ServiceErrorCode::CapabilityReplay);
+        let events = audit.0.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, CapabilityAuditEvent::Invoked { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, CapabilityAuditEvent::TimedOut { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CapabilityAuditEvent::Completed { .. }))
+        );
     }
 }

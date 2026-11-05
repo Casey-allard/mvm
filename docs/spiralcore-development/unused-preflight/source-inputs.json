@@ -1,0 +1,194 @@
+{
+  "base": "8b833aee8be5c1be9ce0d1197b6b98d4d03625f6",
+  "assembly_order": [
+    {
+      "name": "source.tar.gz",
+      "sha256": "33e6d9cbcf031b2bf9f75b4595b545e81cbf2328d23431df8751e4d43f98e169"
+    },
+    {
+      "name": "source.tar.gz",
+      "sha256": "ff096065d416a9f1d9ef356047090466280809a2b289476ef2c73cb8aee209d3"
+    },
+    {
+      "name": "source-overlay.tar.gz",
+      "sha256": "016182f9946d5e6b66566faab43d8ea3436f74aa984dffe509d0e7a025e51a52"
+    }
+  ],
+  "final_overlay_files": [
+    {
+      "path": "crates/mvm-client/src/launch/host_lifetime_preflight.rs",
+      "sha256": "3683d4d156e7485aa0572543242826279dc8b1884d96ff30a59dd7743f9ee716",
+      "bytes": 2563
+    },
+    {
+      "path": "crates/mvm-client/src/launch/mod.rs",
+      "sha256": "15cb1cc50f2271e23a4285d45c05e758669269aad550d0b89a670dec8503cd56",
+      "bytes": 74034
+    },
+    {
+      "path": "crates/mvm-client/src/launch/request.rs",
+      "sha256": "27b3afe83fd354c00e8959922b023bea07a0827b5f4bb3bc44a1a7116653522d",
+      "bytes": 40379
+    },
+    {
+      "path": "crates/mvm-client/src/lib.rs",
+      "sha256": "15221e829a17bced3d8825948057f13c163d06bb75c84a1285a96d561804527a",
+      "bytes": 7789
+    },
+    {
+      "path": "crates/mvm-client/tests/unused-preflight-harness/Cargo.toml",
+      "sha256": "1f70f01e1998866fdfc0898897fc13ef2f91cc6b9548a6e782270bc260202a85",
+      "bytes": 835
+    },
+    {
+      "path": "crates/mvm-client/tests/unused_host_lifetime.rs",
+      "sha256": "b5153d2543a4736fc75312b2eafe103b9b556b1d5386e37f61b5a2ed1d7d48e6",
+      "bytes": 7324
+    },
+    {
+      "path": "crates/mvm-core/src/._host_lifetime.rs",
+      "sha256": "57f324d88b5856edb453e4ee358ba3061d8cfc7ad6454a4b38550ed34d097e1e",
+      "bytes": 163
+    },
+    {
+      "path": "crates/mvm-core/src/host_lifetime.rs",
+      "sha256": "4f85f0957a3f7e86008ae41edc9233ac71656c31b59ad6576eb1c0008b35e3a3",
+      "bytes": 20407
+    },
+    {
+      "path": "crates/mvm-core/src/host_lifetime/._endpoint.rs",
+      "sha256": "57f324d88b5856edb453e4ee358ba3061d8cfc7ad6454a4b38550ed34d097e1e",
+      "bytes": 163
+    },
+    {
+      "path": "crates/mvm-core/src/host_lifetime/endpoint.rs",
+      "sha256": "4e6516b898122dcd1dc6d715d52bb578538123814295d5c6d778106f06c096da",
+      "bytes": 6871
+    },
+    {
+      "path": "crates/mvm-core/tests/host_lifetime.rs",
+      "sha256": "78ac66ad1237265bd169555e785d5143267e50d460d23e4f63028d9ff02beaa2",
+      "bytes": 16402
+    },
+    {
+      "path": "crates/mvm-core/tests/unused_preparation.rs",
+      "sha256": "eb95160f0ab5eee9459f72cf43467274d6dc86f0cc6e12109d27a9aaf27e56a0",
+      "bytes": 3316
+    },
+    {
+      "path": "crates/mvm-hostd/Cargo.toml",
+      "sha256": "ad94e0201dd52fa6f153d4617764fa0f4be80400a7bcd03cfed8229042f49468",
+      "bytes": 11084
+    },
+    {
+      "path": "crates/mvm-hostd/src/._installed_endpoint.rs",
+      "sha256": "57f324d88b5856edb453e4ee358ba3061d8cfc7ad6454a4b38550ed34d097e1e",
+      "bytes": 163
+    },
+    {
+      "path": "crates/mvm-hostd/src/._lib.rs",
+      "sha256": "57f324d88b5856edb453e4ee358ba3061d8cfc7ad6454a4b38550ed34d097e1e",
+      "bytes": 163
+    },
+    {
+      "path": "crates/mvm-hostd/src/installed_endpoint.rs",
+      "sha256": "562c9100a99be90016e9f53916edebfefaec58d188abc2d26375c14dd955531b",
+      "bytes": 9510
+    },
+    {
+      "path": "crates/mvm-hostd/src/jailer/landlock.rs",
+      "sha256": "edb7d5a8d7bb0b1c7abeeec94dc2bbda7f6492ad58d6b1300988475cafd484eb",
+      "bytes": 11098
+    },
+    {
+      "path": "crates/mvm-hostd/src/jailer/mod.rs",
+      "sha256": "2b869352b5d07d0b66f2859af4793b6f7752d729d2cb67d9778adfbb22ebea3d",
+      "bytes": 35921
+    },
+    {
+      "path": "crates/mvm-hostd/src/jailer/seccomp.rs",
+      "sha256": "5c8a775b08875f9645aeda072523f3582b2968a4f06e08a82d2c90e327307aac",
+      "bytes": 22712
+    },
+    {
+      "path": "crates/mvm-hostd/src/lib.rs",
+      "sha256": "ffd4f4b032923926ea1c86b778fdbcf5dac9bd17b17e4244fe87a2e4a8387b3d",
+      "bytes": 4158
+    },
+    {
+      "path": "crates/mvm-hostd/src/supervisor/flowmux/spiralcore_payload.rs",
+      "sha256": "90d8e1c0126591f2a61fa35abdebe917d1340d797953d3a503c8404e1b657c49",
+      "bytes": 30164
+    },
+    {
+      "path": "crates/mvm-hostd/src/supervisor/flowmux/spiralcore_payload/installed.rs",
+      "sha256": "592a700b9bd429fbad72d60672418d3d9a3314be6fce14a9f9fb902b52053a0e",
+      "bytes": 10835
+    },
+    {
+      "path": "crates/mvm-hostd/tests/common/installed_resource_fixture.rs",
+      "sha256": "d3ae9225072bb109d5abe771746b3d7295a0deb133f817b49f973510b597d9be",
+      "bytes": 9534
+    },
+    {
+      "path": "crates/mvm-hostd/tests/installed_endpoint_confinement.rs",
+      "sha256": "8e3c5d06a3461511a440290be64811aa5b062d495c7a446472d56009c1f2bcd9",
+      "bytes": 3377
+    },
+    {
+      "path": "crates/mvm-hostd/tests/installed_endpoint_resources.rs",
+      "sha256": "b523529eb7bbd9764f66827ebf4e0013439871ad0cadc62a09348bc6c15e0b41",
+      "bytes": 5704
+    },
+    {
+      "path": "crates/mvm-hostd/tests/installed_factory_api.rs",
+      "sha256": "efd6e6fa229de72106172fd5422afba3324f951797d8caff4ac83205956092ff",
+      "bytes": 384
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/._network_endpoint_spawn.rs",
+      "sha256": "57f324d88b5856edb453e4ee358ba3061d8cfc7ad6454a4b38550ed34d097e1e",
+      "bytes": 163
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/._restore_image.rs",
+      "sha256": "57f324d88b5856edb453e4ee358ba3061d8cfc7ad6454a4b38550ed34d097e1e",
+      "bytes": 163
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/network_endpoint_spawn.rs",
+      "sha256": "dc5c03be50bdc856fe02d6246ad135a05ac7cf6fca8cf7b6ae8b9b2ed354fb33",
+      "bytes": 122855
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/network_endpoint_spawn/._installed.rs",
+      "sha256": "57f324d88b5856edb453e4ee358ba3061d8cfc7ad6454a4b38550ed34d097e1e",
+      "bytes": 163
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/network_endpoint_spawn/._owned.rs",
+      "sha256": "57f324d88b5856edb453e4ee358ba3061d8cfc7ad6454a4b38550ed34d097e1e",
+      "bytes": 163
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/network_endpoint_spawn/installed.rs",
+      "sha256": "86d20652758ad01c7df9fd491ecb77fedbfb76fdd426adfbefb1ab88d8a0d5a3",
+      "bytes": 21563
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/network_endpoint_spawn/installed/tests.rs",
+      "sha256": "60b3e282907474c74f8c3a56ba9f323ecc3dcd2f8be7ec2f747f85a34ba647e6",
+      "bytes": 15426
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/network_endpoint_spawn/owned.rs",
+      "sha256": "620bf7f40394ddceaf0de6db69e48bff58ce403364d46654aa0fbc7e3f926f58",
+      "bytes": 20645
+    },
+    {
+      "path": "crates/mvm-vmm/src/host/restore_image.rs",
+      "sha256": "2b21230723713ac8f59f46899b1ea910c3ed47fdd472bc1f677e7bb42d8b1b95",
+      "bytes": 54007
+    }
+  ]
+}

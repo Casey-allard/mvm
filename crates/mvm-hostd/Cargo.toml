@@ -236,3 +236,8 @@ trusted-apfs = ["mvm-runtime/trusted-apfs"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "installed_endpoint_confinement"
+path = "tests/installed_endpoint_confinement.rs"
+harness = false

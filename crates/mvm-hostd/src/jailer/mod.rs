@@ -369,6 +369,21 @@ pub fn confine_self(spec: &ConfinementSpec) -> Result<(), JailerError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn confine_self_with_owned_files(
+    spec: &ConfinementSpec,
+    state: &std::fs::File,
+    store: Option<&std::fs::File>,
+) -> Result<(), JailerError> {
+    crate::jailer::landlock::apply_with_owned_files(spec, Some(state), store)?;
+    if store.is_some() {
+        crate::jailer::seccomp::apply_with_owned_store(spec)?;
+    } else {
+        crate::jailer::seccomp::apply(spec)?;
+    }
+    Ok(())
+}
+
 /// Where the kernel lists one directory per thread of the calling process.
 #[cfg(any(target_os = "linux", test))]
 const THREAD_LIST_DIR: &str = "/proc/self/task";

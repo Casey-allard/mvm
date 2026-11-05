@@ -1,0 +1,65 @@
+[
+  {
+    "name": "tokio",
+    "id": "registry+https://github.com/rust-lang/crates.io-index#tokio@1.53.3",
+    "version": "1.53.3",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "manifest_path": "/home/callard/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.3/Cargo.toml"
+  },
+  {
+    "name": "mio",
+    "id": "registry+https://github.com/rust-lang/crates.io-index#mio@1.2.1",
+    "version": "1.2.1",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "manifest_path": "/home/callard/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mio-1.2.1/Cargo.toml"
+  },
+  {
+    "name": "mvm-core",
+    "id": "path+file:///var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-core#0.26.0",
+    "version": "0.26.0",
+    "source": null,
+    "manifest_path": "/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-core/Cargo.toml"
+  },
+  {
+    "name": "mvm-contract",
+    "id": "path+file:///var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-contract#0.26.0",
+    "version": "0.26.0",
+    "source": null,
+    "manifest_path": "/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-contract/Cargo.toml"
+  },
+  {
+    "name": "mvm-hostd",
+    "id": "path+file:///var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-hostd#0.26.0",
+    "version": "0.26.0",
+    "source": null,
+    "manifest_path": "/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-hostd/Cargo.toml"
+  },
+  {
+    "name": "mvm-client",
+    "id": "path+file:///var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-client#0.26.0",
+    "version": "0.26.0",
+    "source": null,
+    "manifest_path": "/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-client/Cargo.toml"
+  },
+  {
+    "name": "mvm-vmm",
+    "id": "path+file:///var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-vmm#0.26.0",
+    "version": "0.26.0",
+    "source": null,
+    "manifest_path": "/var/tmp/spiralcore-unused-preflight-20261104/source/crates/mvm-vmm/Cargo.toml"
+  },
+  {
+    "name": "spiralcore-transfer",
+    "id": "path+file:///var/tmp/spiralcore-unused-preflight-20261104/dependency/crates/spiralcore-transfer#0.1.0",
+    "version": "0.1.0",
+    "source": null,
+    "manifest_path": "/var/tmp/spiralcore-unused-preflight-20261104/dependency/crates/spiralcore-transfer/Cargo.toml"
+  },
+  {
+    "name": "spiralcore-mvm-flowmux",
+    "id": "path+file:///var/tmp/spiralcore-unused-preflight-20261104/dependency/crates/spiralcore-mvm-flowmux#0.1.0",
+    "version": "0.1.0",
+    "source": null,
+    "manifest_path": "/var/tmp/spiralcore-unused-preflight-20261104/dependency/crates/spiralcore-mvm-flowmux/Cargo.toml"
+  }
+]

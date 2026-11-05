@@ -1,0 +1,3 @@
+[patch."https://github.com/R4-Laboratories/SpiralCore"]
+spiralcore-transfer = { path = "/var/tmp/spiralcore-unused-preflight-20261104/dependency/crates/spiralcore-transfer" }
+spiralcore-mvm-flowmux = { path = "/var/tmp/spiralcore-unused-preflight-20261104/dependency/crates/spiralcore-mvm-flowmux" }

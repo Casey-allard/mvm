@@ -310,7 +310,7 @@ impl HostAgentDaemon {
             stdout.flush()?;
             Ok((daemon, listener, control, helper, owner))
         })();
-        let outcome = match setup {
+        match setup {
             Ok((mut daemon, listener, mut control, mut helper, owner)) => {
                 let serving = daemon.serve_owned_control(listener, &owner).await;
                 let closed = daemon.close_owned().await;
@@ -331,8 +331,7 @@ impl HostAgentDaemon {
                 stopped?;
                 Err(error)
             }
-        };
-        outcome
+        }
     }
 
     async fn serve_owned_control(
@@ -389,6 +388,7 @@ impl HostAgentDaemon {
     }
 
     pub(crate) fn with_owned_lifecycle(mut self, signer: u32) -> Result<Self> {
+        mvm_core::naming::validate_vm_name(&self.tenant_id)?;
         ensure!(
             (1..=JOURNAL_CAP).contains(&self.max_frame_bytes),
             "owned broker frame limit"
@@ -509,6 +509,66 @@ async fn stop_signer(signer: &mut tokio::process::Child) -> Result<()> {
 #[cfg(test)]
 mod bounded_closing_tests {
     use super::*;
+
+    fn private_directory() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    fn daemon(directory: &Path, tenant: &str) -> Result<HostAgentDaemon> {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        HostAgentDaemon::new(tenant, key, 65536)
+            .with_registration_journal(directory.join("registrations.json"))
+            .with_owned_lifecycle(1)
+    }
+
+    #[test]
+    fn owned_child_refuses_unbounded_tenant_before_service_clones() {
+        let directory = private_directory();
+        assert!(daemon(directory.path(), &"t".repeat(64)).is_err());
+        assert!(!directory.path().join("registrations.json").exists());
+        assert!(daemon(directory.path(), &"t".repeat(63)).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_registration_refuses_repeated_service_expansion_before_binding() {
+        let directory = private_directory();
+        let mut daemon = daemon(directory.path(), "local").unwrap();
+        let mut registration =
+            super::super::tests::register(directory.path(), "vm-1", "local", None);
+        let socket = PathBuf::from(&registration.broker_listen_socket);
+        registration.services_bindings =
+            vec![mvm_core::protocol::broker::ServiceId::parse("host.audit.v1").unwrap(); 3];
+        assert!(daemon.register(&registration).is_err());
+        assert!(!socket.exists(), "shape refusal precedes listener effects");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_registration_refuses_large_capability_key_before_binding() {
+        use mvm_contract::protocol::agent_capability::{CapabilityBinding, CapabilityId};
+        let directory = private_directory();
+        let mut daemon = daemon(directory.path(), "local").unwrap();
+        let mut registration =
+            super::super::tests::register(directory.path(), "vm-1", "local", None);
+        let socket = PathBuf::from(&registration.broker_listen_socket);
+        registration.capability_bindings = vec![CapabilityBinding {
+            capability: CapabilityId::new(
+                mvm_core::protocol::broker::ServiceId::parse(format!(
+                    "host.{}.v1",
+                    "a".repeat(100)
+                ))
+                .unwrap(),
+                "v".repeat(40),
+            )
+            .unwrap(),
+            descriptor_digest: [1; 32],
+        }];
+        assert!(daemon.register(&registration).is_err());
+        assert!(!socket.exists(), "shape refusal precedes listener effects");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_deregister_failures_do_not_accumulate_closing_names() {
         let directory = tempfile::Builder::new()

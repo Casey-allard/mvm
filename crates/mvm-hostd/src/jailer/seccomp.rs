@@ -339,6 +339,14 @@ fn syscall_name_to_nr(name: &str) -> Option<libc::c_long> {
 /// First installs the refusal reporter, so a call the filter refuses is named
 /// on stderr before the process dies of it rather than silently.
 pub fn apply(spec: &ConfinementSpec) -> Result<(), JailerError> {
+    apply_inner(spec, false)
+}
+
+pub(crate) fn apply_with_owned_store(spec: &ConfinementSpec) -> Result<(), JailerError> {
+    apply_inner(spec, true)
+}
+
+fn apply_inner(spec: &ConfinementSpec, owned_store: bool) -> Result<(), JailerError> {
     crate::jailer::refusal_report::install(process_label())?;
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for name in &spec.allowed_syscalls {
@@ -348,6 +356,15 @@ pub fn apply(spec: &ConfinementSpec) -> Result<(), JailerError> {
             ))
         })?;
         rules.insert(nr, vec![]);
+    }
+    if owned_store {
+        // Current-owner verification reads the effective UID after confinement.
+        rules.insert(libc::SYS_geteuid, vec![]);
+        // Store retirement removes only directories within its Landlock grant.
+        #[cfg(target_arch = "x86_64")]
+        rules.insert(libc::SYS_rmdir, vec![]);
+        #[cfg(target_arch = "aarch64")]
+        rules.insert(libc::SYS_unlinkat, vec![]);
     }
     // SeccompAction::Trap (vs Errno(EACCES)) is intentional: the
     // bridge sidecar is expected to be killed by SIGSYS on a forbidden

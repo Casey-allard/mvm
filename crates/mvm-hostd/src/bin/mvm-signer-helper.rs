@@ -61,6 +61,9 @@ fn main() -> Result<()> {
     };
     let cfg: SignerHelperConfig =
         parse_config(&raw).context("mvm-signer-helper config parse failed")?;
+    if owned {
+        mvm_core::naming::validate_vm_name(&cfg.tenant_id)?;
+    }
     info!(
         tenant_id = %cfg.tenant_id,
         uds_path = %cfg.uds_path.display(),

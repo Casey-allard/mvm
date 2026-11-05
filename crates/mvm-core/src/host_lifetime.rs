@@ -12,6 +12,7 @@ use rustix::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    any::Any,
     fmt,
     fs::File,
     io::Read,
@@ -140,6 +141,15 @@ impl PreparedHostLifetimeLease {
 
     /// Read only the retained directory, with bounded no-follow state and marker checks.
     pub fn verify_current(&self) -> Result<()> {
+        self.with_verification_state(|_| Ok(()))
+    }
+
+    /// Borrow the readonly state file only after the same original-state checks.
+    /// No holder or directory descriptor is supplied to the callback.
+    pub fn with_verification_state<T>(
+        &self,
+        operation: impl FnOnce(&File) -> Result<T>,
+    ) -> Result<T> {
         let directory = self.directory.metadata()?;
         let holder = self.holder.metadata()?;
         ensure!(
@@ -184,7 +194,7 @@ impl PreparedHostLifetimeLease {
                 && <[u8; 32]>::from(Sha256::digest(&bytes[..limit])) == self.expected.state_sha256,
             "host lifetime original state differs"
         );
-        Ok(())
+        operation(&file)
     }
 
     /// Duplicate the SAME open descriptions for an explicit native handoff.
@@ -237,10 +247,22 @@ pub trait CoreCurrentParentPermit: Send + Sync {
 pub struct PreparedHostLifetime {
     lease: PreparedHostLifetimeLease,
     binding: HostLaunchBinding,
-    parent_owner: Box<dyn Send + Sync>,
+    parent_owner: Box<dyn Any + Send + Sync>,
 }
 
 impl PreparedHostLifetime {
+    pub fn binding(&self) -> &HostLaunchBinding {
+        &self.binding
+    }
+
+    /// Cleanup identity only: equal metadata or a different erasure is not the
+    /// same original Arc. This exports neither ownership nor launch permission.
+    pub fn retains_parent_owner<T: Send + Sync + 'static>(&self, original: &Arc<T>) -> bool {
+        self.parent_owner
+            .downcast_ref::<Arc<T>>()
+            .is_some_and(|held| Arc::ptr_eq(held, original))
+    }
+
     /// Retain a real parent owner; the erased value alone proves no accounting.
     pub fn bind(
         inputs: HostLifetimeInputs,
@@ -288,7 +310,7 @@ struct AdmissionBinding {
 pub struct HostLifetimeAnchor {
     lease: PreparedHostLifetimeLease,
     binding: HostLaunchBinding,
-    _parent_owner: Box<dyn Send + Sync>,
+    _parent_owner: Box<dyn Any + Send + Sync>,
     admitted: Mutex<Option<AdmissionBinding>>,
     current_parent: Mutex<Option<Arc<dyn CoreCurrentParentPermit>>>,
     native_claimed: AtomicBool,
@@ -461,6 +483,14 @@ impl HostLifetimeAnchor {
             nonce: plan.nonce.clone(),
             body_sha256: Sha256::digest(serde_jcs::to_vec(&plan)?).into(),
         })
+    }
+
+    /// Compare the original erased owner before a current-parent permit exists.
+    /// This exports no owner, descriptor, reservation or admission authority.
+    pub fn retains_parent_owner<T: Send + Sync + 'static>(&self, original: &Arc<T>) -> bool {
+        self._parent_owner
+            .downcast_ref::<Arc<T>>()
+            .is_some_and(|held| Arc::ptr_eq(held, original))
     }
 
     /// Compare the installed original parent object without exporting it.
