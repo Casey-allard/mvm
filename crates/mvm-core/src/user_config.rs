@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+mod owned;
+pub use owned::{load_strict_bounded, owned_config_workspace_requirement};
+
 /// Guest RAM, in MiB, idle standbys may hold in total when the operator has
 /// not set `standby_memory_mib`: four standbys at the default 512 MiB sizing.
 pub const DEFAULT_STANDBY_MEMORY_MIB: u64 = 2048;

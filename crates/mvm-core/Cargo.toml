@@ -254,6 +254,11 @@ name = "manifest_fixtures"
 path = "tests/manifest_fixtures.rs"
 required-features = ["host-state"]
 
+[[test]]
+name = "owned_user_config"
+path = "tests/owned_user_config.rs"
+required-features = ["host-state"]
+
 [dev-dependencies]
 # Test-only: the mandatory-deny range test parses CIDRs to cross-check the
 # generated iptables script. No production path in this crate uses it.

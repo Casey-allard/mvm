@@ -1041,7 +1041,7 @@ impl<'a> Default for SubstitutionSpawnParamsBuilder<'a> {
 }
 
 mod proxy;
-pub use proxy::EgressProxySpawnConfig;
+pub use proxy::{EgressProxySpawnConfig, InstalledEndpointSettings};
 
 /// The endpoint config a spawn with (or without) a FlowMux identity emits.
 ///

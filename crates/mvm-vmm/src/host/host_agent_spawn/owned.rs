@@ -21,6 +21,14 @@ use zeroize::Zeroizing;
 pub trait HostAgentParentPermit: Send + Sync {
     fn check_current(&self, tenant: &str) -> Result<()>;
     fn check_registration(&self, params: &HostAgentServicesParams<'_>) -> Result<()>;
+    /// Borrow the captured settings under this original permit's lifetime.
+    /// An installed consumer cannot keep the snapshot after its owner.
+    fn installed_endpoint_settings(
+        &self,
+        _params: &HostAgentServicesParams<'_>,
+    ) -> Result<&crate::host::network_endpoint_spawn::InstalledEndpointSettings> {
+        anyhow::bail!("original installed endpoint settings unavailable")
+    }
 }
 pub struct OwnedHostAgentInputs {
     pub tenant: String,
