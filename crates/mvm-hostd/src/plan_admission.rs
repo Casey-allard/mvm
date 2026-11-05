@@ -5195,6 +5195,8 @@ mod tests {
         };
         let mut input = input_with_pin("mapped-local-admission", &pin);
         input.backend_name = "mock";
+        let rootfs_sha = mvm_core::plan::bundle::sha256_hex(b"rootfs-bytes");
+        input.image_sha256 = &rootfs_sha;
         input.network_mode = NetworkMode::HostVsockProxy;
         let grants = mvm_contract::grants::Grants {
             egress: Some(mvm_contract::grants::EgressGrant {
@@ -5229,9 +5231,9 @@ mod tests {
         let wrong = mapping([2; 32]);
         let correct = mapping([1; 32]);
         let posture = RunPosture::on_backend(Variant::Dev, backend.kind());
-        let admit = |mapping| {
+        let admit = |plan: &ExecutionPlan, mapping| {
             admit_plan_for_run(
-                &plan,
+                plan,
                 &SystemClock,
                 &ledger,
                 Some(dir.path()),
@@ -5241,10 +5243,20 @@ mod tests {
             )
         };
         assert!(
-            admit(&wrong).is_err(),
+            admit(&plan, &wrong).is_err(),
             "wrong SPKI must be rejected before nonce spend"
         );
-        let admitted = admit(&correct).unwrap();
+        let mut mismatched_image = plan.clone();
+        mismatched_image.image.sha256 = mvm_core::plan::bundle::sha256_hex(b"other signed image");
+        mismatched_image.plan_id = mvm_core::plan::compute_plan_id(&mismatched_image);
+        let error = admit(&mismatched_image, &correct)
+            .err()
+            .expect("installed mapping accepted a different signed rootfs from its bundle");
+        assert!(
+            format!("{error:#}")
+                .contains("installed payload mapping image differs from the signed bundle")
+        );
+        let admitted = admit(&plan, &correct).unwrap();
         assert!(
             admitted
                 .check_launch_network_policy(&selected, true)
@@ -5257,7 +5269,7 @@ mod tests {
         );
         assert_eq!(admitted.plan().nonce, plan.nonce);
         assert!(
-            admit(&correct).is_err(),
+            admit(&plan, &correct).is_err(),
             "accepted original nonce cannot be reused"
         );
         let error = start_admitted(StartAdmittedParams {
