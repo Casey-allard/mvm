@@ -431,13 +431,14 @@ fn admit_signed_and_boot_local(
     ctx: LocalRunContext<'_>,
     #[cfg(unix)] owner: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
 ) -> Result<StartedMachine> {
-    use crate::plan_admission::{RunPosture, StartAdmittedParams, start_admitted};
+    use crate::plan_admission::{
+        BundleAdmissionContext, BundleImageAdmissionContext, RunPosture, StartAdmittedParams,
+        start_admitted, verify_external_plan,
+    };
+    use mvm_core::plan::bundle::{FsBundleResolver, FsTrustStore};
 
-    let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind());
-    let admitted = crate::plan_admission::admit_signed_plan_for_run(
-        signed, ctx.clock, ctx.ledger, None, posture,
-    )?;
-    let plan = admitted.plan();
+    let verified = verify_external_plan(signed)?;
+    let plan = verified.plan();
     if let Some(pin) = &req.registry_pack_image {
         anyhow::ensure!(
             plan.asset_identities.iter().any(|asset| {
@@ -489,11 +490,40 @@ fn admit_signed_and_boot_local(
     if let Some(owner) = owner {
         owner.bind_to_config(&mut config)?;
     }
-    attach_guest_runtime(&mut config, &req.backend_name)?;
+    attach_guest_runtime(&mut config, backend.name())?;
+
+    let bundle_inputs = plan
+        .bundle
+        .as_ref()
+        .map(|_| {
+            Ok::<_, anyhow::Error>((
+                FsBundleResolver::default_path()?,
+                FsTrustStore::default_path()?,
+                mvm_core::image_set::BackendImageSupport::for_backend(backend.kind()),
+                mvm_build::stage0_kernel::current_image_set_protocol_support(),
+            ))
+        })
+        .transpose()?;
+    let bundle = bundle_inputs
+        .as_ref()
+        .map(
+            |(resolver, trust, support, protocols)| BundleAdmissionContext {
+                resolver,
+                trust,
+                image: support.as_ref().map(|backend| BundleImageAdmissionContext {
+                    arch: mvm_core::arch::GuestArch::host(),
+                    backend,
+                    host_protocols: protocols,
+                }),
+            },
+        );
+    let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind())
+        .with_raw_local_runtime(&config);
+    let admitted = verified.admit(ctx.clock, ctx.ledger, bundle.as_ref(), posture)?;
 
     crate::audit::durability::record_admission(
         ctx.emitter,
-        plan,
+        admitted.plan(),
         admitted.signer_id(),
         crate::audit::durability::AuditDurability::BestEffort,
     )?;

@@ -523,6 +523,19 @@ pub fn admit_signed_plan_for_run(
     bundle_ctx: Option<&BundleAdmissionContext<'_>>,
     posture: RunPosture,
 ) -> Result<AdmittedPlan> {
+    verify_external_plan(signed)?.admit(clock, ledger, bundle_ctx, posture)
+}
+
+/// A fleet plan authenticated against the host's configured signer set.
+/// Local launch can project the actual config from this body before admission.
+pub(crate) struct VerifiedExternalPlan<'a> {
+    plan: ExecutionPlan,
+    signed: &'a SignedExecutionPlan,
+}
+
+pub(crate) fn verify_external_plan(
+    signed: &SignedExecutionPlan,
+) -> Result<VerifiedExternalPlan<'_>> {
     let trusted = host_trusted_plan_signers()?;
     if trusted.is_empty() {
         anyhow::bail!(
@@ -534,31 +547,53 @@ pub fn admit_signed_plan_for_run(
         trusted.iter().map(|(id, key)| (id.as_str(), key)).collect();
     let verified =
         verify_plan(signed, &trusted_refs).context("verifying externally-signed plan")?;
-    let signer_id = signed.0.signer_id.clone();
-
-    posture.verify_runtime()?;
-    let assurance_runtime = posture.assurance_runtime(&verified)?;
-    validate_extension_bindings(&verified)?;
-    // No extension verification context on this path: a plan that binds
-    // optional extensions is refused rather than admitted unchecked.
-    let extensions = verify_extension_packs(&verified, None)?;
-    verify_registry_pack_assets(&verified)?;
-    admit_grants(&verified, &host_grant_ceiling(), posture)?;
-    admit_within_host_budget(&verified)?;
-
-    finish_admission(VerifiedAdmission {
-        verified,
-        // The caller lends the envelope; the admitted plan owns a copy so
-        // downstream consumers can re-verify without trusting this process.
-        signed: signed.clone(),
-        signer_id,
-        extensions,
-        assurance_runtime,
-        posture,
-        clock,
-        ledger,
-        bundle_ctx,
+    Ok(VerifiedExternalPlan {
+        plan: verified,
+        signed,
     })
+}
+
+impl VerifiedExternalPlan<'_> {
+    pub(crate) fn plan(&self) -> &ExecutionPlan {
+        &self.plan
+    }
+
+    pub(crate) fn admit(
+        self,
+        clock: &dyn Clock,
+        ledger: &InMemoryNonceLedger,
+        bundle_ctx: Option<&BundleAdmissionContext<'_>>,
+        posture: RunPosture<'_>,
+    ) -> Result<AdmittedPlan> {
+        let Self {
+            plan: verified,
+            signed,
+        } = self;
+        let signer_id = signed.0.signer_id.clone();
+        posture.verify_runtime()?;
+        let assurance_runtime = posture.assurance_runtime(&verified)?;
+        validate_extension_bindings(&verified)?;
+        // No extension verification context on this path: a plan that binds
+        // optional extensions is refused rather than admitted unchecked.
+        let extensions = verify_extension_packs(&verified, None)?;
+        verify_registry_pack_assets(&verified)?;
+        admit_grants(&verified, &host_grant_ceiling(), posture)?;
+        admit_within_host_budget(&verified)?;
+
+        finish_admission(VerifiedAdmission {
+            verified,
+            // The caller lends the envelope; the admitted plan owns a copy so
+            // downstream consumers can re-verify without trusting this process.
+            signed: signed.clone(),
+            signer_id,
+            extensions,
+            assurance_runtime,
+            posture,
+            clock,
+            ledger,
+            bundle_ctx,
+        })
+    }
 }
 
 /// Everything the shared post-verification tail of admission needs.
@@ -583,6 +618,74 @@ struct VerifiedAdmission<'a> {
     clock: &'a dyn Clock,
     ledger: &'a InMemoryNonceLedger,
     bundle_ctx: Option<&'a BundleAdmissionContext<'a>>,
+}
+
+fn verify_raw_local_bundle(
+    plan: &ExecutionPlan,
+    bundle: &mvm_core::plan::bundle::VerifiedBundle,
+    config: &VmStartConfig,
+    backend: BackendKind,
+) -> Result<()> {
+    use mvm_core::plan::bundle::{ArtifactRole, BundleArtifact};
+
+    anyhow::ensure!(
+        backend == BackendKind::Mock,
+        "native bundle launch requires verified boot artifact custody"
+    );
+    anyhow::ensure!(
+        bundle.boot_assets.is_none() && bundle.embedded_image_sets.is_empty(),
+        "raw local launch requires bundle runtime preparation for signed boot assets"
+    );
+    let verify = |artifact: &BundleArtifact, path: &str, role: &str| -> Result<()> {
+        let path = std::path::Path::new(path);
+        let meta =
+            std::fs::symlink_metadata(path).with_context(|| format!("reading local {role}"))?;
+        anyhow::ensure!(
+            meta.is_file()
+                && meta.len() == artifact.size_bytes
+                && mvm_core::crypto::image_verify::sha256_file(path)? == artifact.sha256,
+            "local {role} differs from the signed bundle"
+        );
+        Ok(())
+    };
+    let manifest = &bundle.manifest;
+    let rootfs = manifest
+        .find_by_role(&ArtifactRole::Rootfs)
+        .context("bundle rootfs missing")?;
+    anyhow::ensure!(
+        plan.image.sha256 == rootfs.sha256,
+        "local rootfs differs from the signed bundle"
+    );
+    verify(rootfs, &config.rootfs_path, "rootfs")?;
+
+    if let Some(path) = config.kernel_path.as_deref() {
+        let kernel = manifest
+            .find_by_role(&ArtifactRole::Kernel)
+            .context("bundle kernel missing")?;
+        verify(kernel, path, "kernel")?;
+    }
+
+    if let Some(verity) = &manifest.verity {
+        let sidecar = manifest
+            .find_by_name(&verity.sidecar_artifact)
+            .context("bundle verity sidecar missing")?;
+        anyhow::ensure!(
+            sidecar.role == ArtifactRole::VerityHashSidecar
+                && config.roothash.as_deref() == Some(verity.roothash.as_str()),
+            "local verity root differs from the signed bundle"
+        );
+        let path = config
+            .verity_path
+            .as_deref()
+            .context("signed bundle verity sidecar not selected")?;
+        verify(sidecar, path, "verity sidecar")?;
+    } else {
+        anyhow::ensure!(
+            config.roothash.is_none() && config.verity_path.is_none(),
+            "local verity selection is absent from the signed bundle"
+        );
+    }
+    Ok(())
 }
 
 /// The checks every admitted plan passes after its signature has verified,
@@ -663,6 +766,16 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
             verify_plan_bundle(pin, ctx.resolver, ctx.trust)
         }
         .with_context(|| format!("bundle re-verify for pin {}", pin.bundle_sha256))?;
+        if posture.raw_local_runtime {
+            verify_raw_local_bundle(
+                &verified,
+                &verified_bundle,
+                posture
+                    .runtime_config
+                    .context("raw local bundle requires the selected launch config")?,
+                backend.context("raw local bundle requires the selected backend")?,
+            )?;
+        }
         bundle_environment::verify_environment(&verified, &verified_bundle.manifest, posture)?;
         if !verified_bundle.embedded_image_sets.is_empty() {
             let image = ctx.image.ok_or_else(|| {
@@ -947,6 +1060,7 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
+    raw_local_runtime: bool,
     installed_payload_mapping: Option<&'a CooperatingPayloadPolicy>,
 }
 
@@ -959,6 +1073,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
+            raw_local_runtime: false,
             installed_payload_mapping: None,
         }
     }
@@ -976,6 +1091,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
+            raw_local_runtime: false,
             installed_payload_mapping: None,
         }
     }
@@ -984,6 +1100,13 @@ impl<'a> RunPosture<'a> {
     #[must_use]
     pub fn with_runtime(mut self, runtime_config: Option<&'a VmStartConfig>) -> Self {
         self.runtime_config = runtime_config;
+        self
+    }
+
+    /// The raw local runner selects the actual boot files instead of resolving a bundle.
+    pub(crate) fn with_raw_local_runtime(mut self, config: &'a VmStartConfig) -> Self {
+        self.runtime_config = Some(config);
+        self.raw_local_runtime = true;
         self
     }
 
@@ -4816,6 +4939,125 @@ mod tests {
             !format!("{retry:#}").contains("replay protection"),
             "{retry:#}"
         );
+    }
+
+    #[test]
+    fn signed_local_launch_reverifies_bundle_from_host_store() {
+        use mvm_core::plan::bundle::{FsBundleResolver, FsTrustStore};
+        use mvm_core::user_config::{MvmConfig, TrustedPlanSigner};
+
+        let (_env, home) = host_with_ceiling(Default::default());
+        let fleet = ed25519_dalek::SigningKey::from_bytes(&[54; 32]);
+        mvm_core::user_config::save(
+            &MvmConfig {
+                trusted_plan_signers: vec![TrustedPlanSigner {
+                    signer_id: "local-bundled-fleet".into(),
+                    ed25519_pubkey_hex: hex::encode(fleet.verifying_key().as_bytes()),
+                }],
+                ..MvmConfig::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let rootfs = home.path().join("rootfs.ext4");
+        let rootfs_bytes = b"signed local bundle rootfs";
+        std::fs::write(&rootfs, rootfs_bytes).unwrap();
+        let rootfs_sha = mvm_core::crypto::image_verify::sha256_file(&rootfs).unwrap();
+        let publisher = ed25519_dalek::SigningKey::from_bytes(&[55; 32]);
+        let (archive, pin) = make_test_bundle(&publisher, b"kernel", rootfs_bytes);
+        let bundles = FsBundleResolver::default_path().unwrap();
+        std::fs::create_dir_all(bundles.root()).unwrap();
+        std::fs::write(
+            bundles.root().join(format!("{}.mvmpkg", pin.bundle_sha256)),
+            archive,
+        )
+        .unwrap();
+        let trust = FsTrustStore::default_path().unwrap();
+        std::fs::create_dir_all(trust.root()).unwrap();
+        let publisher_pin = trust.root().join(format!("{}.pub", pin.key_id.0));
+        let mut input = input_with_pin("local-bundled-vm", &pin);
+        input.backend_name = "mock";
+        input.image_sha256 = &rootfs_sha;
+        let plan = synthesize_plan(&input).unwrap();
+        let signed = sign_plan(&plan, &fleet, "local-bundled-fleet");
+
+        let backend = mvm_runtime::AnyBackend::from_hypervisor("mock");
+        let ledger = InMemoryNonceLedger::new();
+        let mut req = crate::run::LocalRunRequest {
+            name: "local-bundled-vm".into(),
+            rootfs_path: rootfs,
+            kernel_path: None,
+            verity_path: None,
+            roothash: None,
+            cpus: input.cpus,
+            mem_mib: input.mem_mib.try_into().unwrap(),
+            backend_name: "mock".into(),
+            volumes: Vec::new(),
+            destroy_on_exit: true,
+            grants: None,
+            secrets: Vec::new(),
+            secret_release: SecretReleasePolicy::None,
+            signed_plan: Some(signed),
+            registry_pack_image: None,
+        };
+        let boot = |req: &crate::run::LocalRunRequest| {
+            crate::run::admit_and_boot_local(
+                &backend,
+                req,
+                crate::run::LocalRunContext {
+                    clock: &SystemClock,
+                    ledger: &ledger,
+                    host_signer_keys_dir: None,
+                    emitter: None,
+                    assurance: None,
+                },
+            )
+        };
+        let untrusted = boot(&req).expect_err("an unenrolled publisher must be refused");
+        assert!(format!("{untrusted:#}").contains("trust store has no entry"));
+        assert!(backend.list().unwrap().is_empty());
+        std::fs::write(&publisher_pin, publisher.verifying_key().as_bytes()).unwrap();
+        let different_rootfs = home.path().join("different.ext4");
+        std::fs::write(
+            &different_rootfs,
+            b"fleet-signed but outside the publisher bundle",
+        )
+        .unwrap();
+        let mut different_plan = plan.clone();
+        different_plan.image.sha256 =
+            mvm_core::crypto::image_verify::sha256_file(&different_rootfs).unwrap();
+        let original_rootfs = std::mem::replace(&mut req.rootfs_path, different_rootfs);
+        let original_signed =
+            req.signed_plan
+                .replace(sign_plan(&different_plan, &fleet, "local-bundled-fleet"));
+        let mismatch = boot(&req)
+            .err()
+            .expect("separately signed rootfs reached dispatch outside the publisher bundle");
+        assert!(format!("{mismatch:#}").contains("local rootfs differs from the signed bundle"));
+        assert!(backend.list().unwrap().is_empty());
+
+        req.rootfs_path = original_rootfs;
+        req.signed_plan = original_signed;
+        let kernel = home.path().join("vmlinux");
+        std::fs::write(&kernel, b"bad kernel").unwrap();
+        req.kernel_path = Some(kernel.clone());
+        let mismatch = boot(&req).expect_err("caller kernel must match the publisher bundle");
+        assert!(format!("{mismatch:#}").contains("local kernel differs from the signed bundle"));
+        assert!(backend.list().unwrap().is_empty());
+
+        std::fs::write(&kernel, b"kernel").unwrap();
+        req.verity_path = Some(kernel);
+        req.roothash = Some("a".repeat(64));
+        let mismatch = boot(&req).expect_err("caller must not add unbound verity inputs");
+        assert!(format!("{mismatch:#}").contains("local verity selection is absent"));
+        assert!(backend.list().unwrap().is_empty());
+
+        req.verity_path = None;
+        req.roothash = None;
+        let started = boot(&req).expect("enrolled bundle publisher and original nonce admit");
+        assert_eq!(started.admitted.plan().nonce, plan.nonce);
+        assert_eq!(started.vm_id.0, "local-bundled-vm");
     }
 
     #[test]
