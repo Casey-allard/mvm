@@ -73,7 +73,7 @@ use mvm_contract::provenance::{
 };
 use mvm_core::pack_cache::{PackVerifyCtx, resolve_pack_digest};
 use mvm_core::packs::{PackKind, Sha256Hex};
-use mvm_core::plan::bundle::{BundleResolver, TrustStore};
+use mvm_core::plan::bundle::{ArtifactRole, BundleResolver, PlanArtifact, TrustStore};
 use mvm_core::plan::{
     AssetIdentity, AssetKind, ExecutionPlan, NetworkMode, PlanId, PlanValidityError,
     SignedExecutionPlan, Variant, check_embedded_image_set_for_backend, check_window, sign_plan,
@@ -688,6 +688,21 @@ fn verify_raw_local_bundle(
     Ok(())
 }
 
+fn require_installed_mapped_runtime(config: &VmStartConfig, pin: &PlanArtifact) -> Result<()> {
+    anyhow::ensure!(
+        config
+            .legacy_portable_runtime
+            .as_ref()
+            .is_some_and(|proof| &proof.pin == pin)
+            || config
+                .canonical_kernel
+                .as_ref()
+                .is_some_and(|owner| owner.pin() == pin),
+        "installed payload mapping requires the runtime from its signed bundle"
+    );
+    Ok(())
+}
+
 /// The checks every admitted plan passes after its signature has verified,
 /// shared by the host-signed and externally-signed paths: content-address,
 /// ingress shape, validity window, replay protection, bundle re-verify.
@@ -775,6 +790,24 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
                     .context("raw local bundle requires the selected launch config")?,
                 backend.context("raw local bundle requires the selected backend")?,
             )?;
+        }
+        if posture.installed_payload_mapping.is_some() {
+            let rootfs = verified_bundle
+                .manifest
+                .find_by_role(&ArtifactRole::Rootfs)
+                .context("installed payload mapping requires a signed bundle rootfs")?;
+            anyhow::ensure!(
+                verified.image.sha256 == rootfs.sha256,
+                "installed payload mapping image differs from the signed bundle"
+            );
+            if let Some(config) = posture.runtime_config {
+                require_installed_mapped_runtime(config, pin)?;
+            } else {
+                anyhow::ensure!(
+                    backend == Some(BackendKind::Mock),
+                    "installed payload mapping requires the selected bundle runtime"
+                );
+            }
         }
         bundle_environment::verify_environment(&verified, &verified_bundle.manifest, posture)?;
         if !verified_bundle.embedded_image_sets.is_empty() {
@@ -2370,6 +2403,15 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
         admitted
             .check_launch_network_policy(&params.config.network_policy, installed)
             .map_err(|error| ("launch-network-policy", error))?;
+        if admitted.installed_payload_mapping.is_some() {
+            admitted
+                .plan()
+                .bundle
+                .as_ref()
+                .context("installed payload mapping requires its signed bundle")
+                .and_then(|pin| require_installed_mapped_runtime(&params.config, pin))
+                .map_err(|error| ("guest-runtime", error))?;
+        }
         crate::owner_access::require_selected(admitted.plan())
             .map_err(|error| ("owner-access", error))?;
         if let Some(registry) = crate::owner_access::installed() {
@@ -5195,6 +5237,8 @@ mod tests {
         };
         let mut input = input_with_pin("mapped-local-admission", &pin);
         input.backend_name = "mock";
+        let rootfs_sha = mvm_core::plan::bundle::sha256_hex(b"rootfs-bytes");
+        input.image_sha256 = &rootfs_sha;
         input.network_mode = NetworkMode::HostVsockProxy;
         let grants = mvm_contract::grants::Grants {
             egress: Some(mvm_contract::grants::EgressGrant {
@@ -5229,9 +5273,9 @@ mod tests {
         let wrong = mapping([2; 32]);
         let correct = mapping([1; 32]);
         let posture = RunPosture::on_backend(Variant::Dev, backend.kind());
-        let admit = |mapping| {
+        let admit = |plan: &ExecutionPlan, mapping| {
             admit_plan_for_run(
-                &plan,
+                plan,
                 &SystemClock,
                 &ledger,
                 Some(dir.path()),
@@ -5241,10 +5285,20 @@ mod tests {
             )
         };
         assert!(
-            admit(&wrong).is_err(),
+            admit(&plan, &wrong).is_err(),
             "wrong SPKI must be rejected before nonce spend"
         );
-        let admitted = admit(&correct).unwrap();
+        let mut mismatched_image = plan.clone();
+        mismatched_image.image.sha256 = mvm_core::plan::bundle::sha256_hex(b"other signed image");
+        mismatched_image.plan_id = mvm_core::plan::compute_plan_id(&mismatched_image);
+        let error = admit(&mismatched_image, &correct)
+            .err()
+            .expect("installed mapping accepted a different signed rootfs from its bundle");
+        assert!(
+            format!("{error:#}")
+                .contains("installed payload mapping image differs from the signed bundle")
+        );
+        let admitted = admit(&plan, &correct).unwrap();
         assert!(
             admitted
                 .check_launch_network_policy(&selected, true)
@@ -5257,7 +5311,7 @@ mod tests {
         );
         assert_eq!(admitted.plan().nonce, plan.nonce);
         assert!(
-            admit(&correct).is_err(),
+            admit(&plan, &correct).is_err(),
             "accepted original nonce cannot be reused"
         );
         let error = start_admitted(StartAdmittedParams {
