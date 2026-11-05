@@ -157,6 +157,7 @@ pub struct AdmittedPlan {
     assurance_runtime: Option<AssuranceRuntimeBinding>,
     canonical_kernel: Option<std::sync::Arc<canonical_kernel::AdmittedKernel>>,
     backend: Option<BackendKind>,
+    dispatched: bool,
 }
 
 /// Re-verified host artifact behind one extension binding in the signed plan.
@@ -195,6 +196,24 @@ impl AdmittedPlan {
         &self.signed
     }
 
+    /// Check the original admission against the backend and current host time.
+    pub fn check_unlaunched_for_backend(&self, backend: BackendKind) -> Result<()> {
+        self.check_not_dispatched()?;
+        anyhow::ensure!(
+            self.backend.is_none_or(|expected| expected == backend),
+            "admitted backend differs from dispatch backend"
+        );
+        check_window(&self.plan, SystemClock.now()).context("admitted launch validity window")
+    }
+
+    fn check_not_dispatched(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.dispatched,
+            "original admitted plan was already dispatched"
+        );
+        Ok(())
+    }
+
     /// Exact re-verified extension artifacts available to this launch.
     #[must_use]
     pub fn extensions(&self) -> &[AdmittedExtension] {
@@ -224,6 +243,7 @@ impl AdmittedPlan {
             assurance_runtime: None,
             canonical_kernel: None,
             backend: None,
+            dispatched: false,
         }
     }
 
@@ -613,6 +633,7 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         assurance_runtime,
         canonical_kernel,
         backend,
+        dispatched: false,
     })
 }
 
@@ -2089,16 +2110,30 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
         crate::host_lifetime_parent::require_installed()?;
     }
     let backend = params.backend;
-    let admitted = params.admitted;
-    crate::owner_access::require_selected(admitted.plan())?;
-    if let Some(registry) = crate::owner_access::installed() {
-        registry.preflight(&admitted, &params.config)?;
-    }
+    let mut admitted = params.admitted;
+    admitted.check_not_dispatched()?;
 
     // A refusal in any post-admission gate must still terminate the chain:
     // `plan.admitted` already fired, so a gate refusal emits `plan.failed`
     // carrying the refusing stage rather than leaving a dangling admission.
     let gated = (|| {
+        admitted
+            .check_unlaunched_for_backend(backend.kind())
+            .map_err(|error| ("launch-admission", error))?;
+        #[cfg(unix)]
+        if params.config.host_lifetime.is_some() && admitted.backend != Some(backend.kind()) {
+            return Err((
+                "launch-admission",
+                anyhow::anyhow!("installed launch requires a concrete admitted backend"),
+            ));
+        }
+        crate::owner_access::require_selected(admitted.plan())
+            .map_err(|error| ("owner-access", error))?;
+        if let Some(registry) = crate::owner_access::installed() {
+            registry
+                .preflight(&admitted, &params.config)
+                .map_err(|error| ("owner-access", error))?;
+        }
         if params.assurance.is_some() || admitted.assurance_runtime.is_some() {
             admitted
                 .verify_assurance_launch(&params.config)
@@ -2132,17 +2167,21 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
     let backend_name = backend.name().to_string();
     let vm_name = config.name.clone();
     #[cfg(unix)]
-    crate::host_lifetime_parent::bind_current(&admitted,&config,backend.kind())?;
+    crate::host_lifetime_parent::bind_current(&admitted, &config, backend.kind())?;
     registry_pack::verify_runtime_at_dispatch(
         _built_runtime.as_ref(),
         &config,
         &admitted,
         params.emitter,
     )?;
-    match backend
-        .start(&config)
-        .context("backend start after signed-plan admission")
-    {
+    match admitted
+        .check_unlaunched_for_backend(backend.kind())
+        .and_then(|()| {
+            admitted.dispatched = true;
+            backend
+                .start(&config)
+                .context("backend start after signed-plan admission")
+        }) {
         Ok(vm_id) => {
             // A VM whose grants could not be applied is running without the
             // bounds it was admitted under; the helper stops it rather than
@@ -5524,6 +5563,113 @@ mod tests {
             backend.status(&started.vm_id).unwrap(),
             mvm_core::vm_backend::VmStatus::Running
         ));
+    }
+
+    #[test]
+    fn signed_admission_cannot_dispatch_a_second_backend() {
+        let (_env, _home) = host_with_ceiling(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let first = mvm_runtime::AnyBackend::from_hypervisor("mock");
+        let second = mvm_runtime::AnyBackend::from_hypervisor("mock");
+        let config = VmStartConfig {
+            name: "single-use-admission".into(),
+            rootfs_path: "/store/rootfs.ext4".into(),
+            ..Default::default()
+        };
+        let admitted = admit_for_run(
+            &fixture_input(&config.name),
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(dir.path()),
+            None,
+            RunPosture::on_backend(Variant::Dev, first.kind()),
+        )
+        .unwrap();
+        let started = start_admitted(StartAdmittedParams {
+            backend: &first,
+            admitted,
+            config: config.clone(),
+            policy_bundle: None,
+            emitter: None,
+            assurance: None,
+        })
+        .expect("original admission must start the first backend");
+
+        // A different instance of the same backend avoids a duplicate name
+        // rejection masking a second dispatch with the original signed token.
+        let result = start_admitted(StartAdmittedParams {
+            backend: &second,
+            admitted: started.admitted,
+            config,
+            policy_bundle: None,
+            emitter: None,
+            assurance: None,
+        });
+        let error = result.expect_err("original admitted plan must refuse second dispatch");
+        assert!(
+            error.to_string().contains("already dispatched"),
+            "{error:#}"
+        );
+        assert!(!matches!(
+            second.status(&started.vm_id),
+            Ok(mvm_core::vm_backend::VmStatus::Running)
+        ));
+    }
+
+    #[test]
+    fn signed_admission_refuses_expired_or_different_backend_before_dispatch() {
+        let (_env, _home) = host_with_ceiling(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let backend = mvm_runtime::AnyBackend::from_hypervisor("mock");
+        let expired_clock = FixedClock(SystemClock.now() - chrono::Duration::hours(1));
+        for (clock, selected, reason) in [
+            (
+                &expired_clock as &dyn Clock,
+                backend.kind(),
+                "validity window",
+            ),
+            (
+                &SystemClock as &dyn Clock,
+                BackendKind::Firecracker,
+                "differs from dispatch",
+            ),
+        ] {
+            let config = VmStartConfig {
+                name: "dispatch-recheck".into(),
+                rootfs_path: "/store/rootfs.ext4".into(),
+                ..Default::default()
+            };
+            let mut plan = synthesize_plan(&fixture_input(&config.name)).unwrap();
+            let now = clock.now();
+            plan.valid_from = now - chrono::Duration::seconds(1);
+            plan.valid_until = now + chrono::Duration::minutes(5);
+            plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+            let admitted = admit_plan_for_run(
+                &plan,
+                clock,
+                &InMemoryNonceLedger::new(),
+                Some(dir.path()),
+                None,
+                None,
+                RunPosture::on_backend(Variant::Dev, selected),
+            )
+            .unwrap();
+            let vm_id = VmId(config.name.clone());
+            let error = start_admitted(StartAdmittedParams {
+                backend: &backend,
+                admitted,
+                config,
+                policy_bundle: None,
+                emitter: None,
+                assurance: None,
+            })
+            .expect_err("stale or substituted admission must refuse dispatch");
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+            assert!(!matches!(
+                backend.status(&vm_id),
+                Ok(mvm_core::vm_backend::VmStatus::Running)
+            ));
+        }
     }
 
     #[test]
