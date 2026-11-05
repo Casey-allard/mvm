@@ -64,6 +64,7 @@ use ed25519_dalek::VerifyingKey;
 use mvm_build::guest_libc::GuestLibc;
 use mvm_contract::grants::ceiling::GrantCeiling;
 use mvm_contract::grants::{CpuGrant, Grants};
+use mvm_contract::policy::network_policy::{CooperatingPayloadPolicy, NetworkPolicy};
 use mvm_contract::protocol::capability_negotiation::negotiate_grants;
 use mvm_contract::protocol::resource_controls::{EnforcedGrants, ResourceControls};
 use mvm_contract::provenance::{
@@ -74,9 +75,9 @@ use mvm_core::pack_cache::{PackVerifyCtx, resolve_pack_digest};
 use mvm_core::packs::{PackKind, Sha256Hex};
 use mvm_core::plan::bundle::{BundleResolver, TrustStore};
 use mvm_core::plan::{
-    ExecutionPlan, PlanId, PlanValidityError, SignedExecutionPlan, Variant,
-    check_embedded_image_set_for_backend, check_window, sign_plan, verify_plan, verify_plan_bundle,
-    verify_plan_id,
+    AssetIdentity, AssetKind, ExecutionPlan, NetworkMode, PlanId, PlanValidityError,
+    SignedExecutionPlan, Variant, check_embedded_image_set_for_backend, check_window, sign_plan,
+    verify_plan, verify_plan_bundle, verify_plan_id,
 };
 use mvm_core::policy::PolicyBundle;
 use mvm_core::spawn_scope;
@@ -158,6 +159,7 @@ pub struct AdmittedPlan {
     canonical_kernel: Option<std::sync::Arc<canonical_kernel::AdmittedKernel>>,
     backend: Option<BackendKind>,
     dispatched: bool,
+    installed_payload_mapping: Option<CooperatingPayloadPolicy>,
 }
 
 /// Re-verified host artifact behind one extension binding in the signed plan.
@@ -167,7 +169,82 @@ pub struct AdmittedExtension {
     pub root: std::path::PathBuf,
 }
 
+fn local_network_policy(plan: &ExecutionPlan) -> NetworkPolicy {
+    plan.grants.as_ref().map_or_else(
+        NetworkPolicy::deny_all,
+        mvm_contract::grants::projection::network_policy_from_grants,
+    )
+}
+
+fn signed_network_policy_asset(plan: &ExecutionPlan) -> Result<Option<&AssetIdentity>> {
+    let mut assets = plan
+        .asset_identities
+        .iter()
+        .filter(|asset| asset.kind == AssetKind::Policy && asset.name == "network_policy");
+    let selected = assets.next();
+    anyhow::ensure!(assets.next().is_none(), "ambiguous signed network policy");
+    Ok(selected)
+}
+
 impl AdmittedPlan {
+    fn local_launch_network_policy(&self) -> NetworkPolicy {
+        local_network_policy(&self.plan)
+            .with_payload_mapping(self.installed_payload_mapping.clone())
+    }
+
+    fn check_launch_network_policy(&self, policy: &NetworkPolicy, installed: bool) -> Result<()> {
+        if self.installed_payload_mapping.is_some() {
+            anyhow::ensure!(
+                installed,
+                "installed payload mapping requires its original host lifetime"
+            );
+            anyhow::ensure!(
+                *policy == self.local_launch_network_policy(),
+                "installed launch network policy differs from its original admission"
+            );
+            return Ok(());
+        }
+
+        let mapped = policy.payload_mapping().is_some();
+        let bundled_vsock =
+            self.plan.network_mode == NetworkMode::HostVsockProxy && self.plan.bundle.is_some();
+        if mapped {
+            anyhow::ensure!(
+                !installed,
+                "installed launch has no original mapped policy admission"
+            );
+            anyhow::ensure!(
+                bundled_vsock,
+                "mapped launch requires a bundled vsock admission"
+            );
+        }
+        if !bundled_vsock {
+            return Ok(());
+        }
+
+        let signed_asset = signed_network_policy_asset(&self.plan)?;
+        if !mapped && signed_asset.is_none() {
+            return Ok(());
+        }
+        // Check the canonical commitment even if the caller removed the mapping.
+        // Historical mapped callers can also bind a differently named policy asset.
+        let digest = mvm_core::policy::network_policy::content_sha256(policy);
+        let matches = signed_asset.map_or_else(
+            || {
+                self.plan
+                    .asset_identities
+                    .iter()
+                    .any(|asset| asset.kind == AssetKind::Policy && asset.digest == digest)
+            },
+            |asset| asset.digest == digest,
+        );
+        anyhow::ensure!(
+            matches,
+            "launch network policy differs from its signed policy asset"
+        );
+        Ok(())
+    }
+
     /// The verified plan body — what every downstream authorization decision
     /// reads.
     #[must_use]
@@ -244,6 +321,7 @@ impl AdmittedPlan {
             canonical_kernel: None,
             backend: None,
             dispatched: false,
+            installed_payload_mapping: None,
         }
     }
 
@@ -620,6 +698,30 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         })?;
     }
 
+    let installed_payload_mapping = posture
+        .installed_payload_mapping
+        .map(|mapping| -> Result<_> {
+            anyhow::ensure!(
+                backend.is_some()
+                    && verified.network_mode == NetworkMode::HostVsockProxy
+                    && verified.bundle.is_some(),
+                "installed payload mapping requires a bundled vsock admission"
+            );
+            let policy =
+                local_network_policy(&verified).with_payload_mapping(Some(mapping.clone()));
+            anyhow::ensure!(
+                policy.allows_egress(),
+                "installed payload mapping requires a signed egress allow-list"
+            );
+            let digest = mvm_core::policy::network_policy::content_sha256(&policy);
+            anyhow::ensure!(
+                signed_network_policy_asset(&verified)?.is_some_and(|asset| asset.digest == digest),
+                "installed payload mapping differs from the signed network policy"
+            );
+            Ok(mapping.clone())
+        })
+        .transpose()?;
+
     // Spend the nonce only after every fallible descriptor and bundle check.
     // Refusal must not consume an externally signed plan's replay allowance.
     ledger.spend(&signer_id, &verified, now)?;
@@ -634,6 +736,7 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         canonical_kernel,
         backend,
         dispatched: false,
+        installed_payload_mapping,
     })
 }
 
@@ -844,6 +947,7 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
+    installed_payload_mapping: Option<&'a CooperatingPayloadPolicy>,
 }
 
 impl<'a> RunPosture<'a> {
@@ -855,6 +959,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
+            installed_payload_mapping: None,
         }
     }
 
@@ -871,6 +976,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
+            installed_payload_mapping: None,
         }
     }
 
@@ -878,6 +984,14 @@ impl<'a> RunPosture<'a> {
     #[must_use]
     pub fn with_runtime(mut self, runtime_config: Option<&'a VmStartConfig>) -> Self {
         self.runtime_config = runtime_config;
+        self
+    }
+
+    /// Select the operator mapping committed by a bundled installed plan.
+    /// Admission verifies the full policy before spending the nonce.
+    #[must_use]
+    pub fn with_installed_payload_mapping(mut self, mapping: &'a CooperatingPayloadPolicy) -> Self {
+        self.installed_payload_mapping = Some(mapping);
         self
     }
 
@@ -2106,7 +2220,11 @@ pub struct StartAdmittedParams<'a> {
 #[tracing::instrument(skip_all)]
 pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine> {
     #[cfg(unix)]
-    if params.config.host_lifetime.is_some() {
+    let installed = params.config.host_lifetime.is_some();
+    #[cfg(not(unix))]
+    let installed = false;
+    #[cfg(unix)]
+    if installed {
         crate::host_lifetime_parent::require_installed()?;
     }
     let backend = params.backend;
@@ -2120,13 +2238,15 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
         admitted
             .check_unlaunched_for_backend(backend.kind())
             .map_err(|error| ("launch-admission", error))?;
-        #[cfg(unix)]
-        if params.config.host_lifetime.is_some() && admitted.backend != Some(backend.kind()) {
+        if installed && admitted.backend != Some(backend.kind()) {
             return Err((
                 "launch-admission",
                 anyhow::anyhow!("installed launch requires a concrete admitted backend"),
             ));
         }
+        admitted
+            .check_launch_network_policy(&params.config.network_policy, installed)
+            .map_err(|error| ("launch-network-policy", error))?;
         crate::owner_access::require_selected(admitted.plan())
             .map_err(|error| ("owner-access", error))?;
         if let Some(registry) = crate::owner_access::installed() {
@@ -4696,6 +4816,225 @@ mod tests {
             !format!("{retry:#}").contains("replay protection"),
             "{retry:#}"
         );
+    }
+
+    #[test]
+    fn canonical_dispatch_refuses_substituted_bundled_mapping() {
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, HostPort, PayloadMappingProfile,
+        };
+        use mvm_core::plan::{AssetIdentity, AssetKind, NetworkMode};
+
+        let (_env, _home) = host_with_ceiling(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let publisher = ed25519_dalek::SigningKey::from_bytes(&[36; 32]);
+        let (archive, pin) = make_test_bundle(&publisher, b"kernel-bytes", b"rootfs-bytes");
+        let key_id = key_id_from_pubkey(&publisher.verifying_key());
+        let trust = MapTrust(HashMap::from([(key_id, publisher.verifying_key())]));
+        let resolver = FixedResolver(archive);
+        let ctx = BundleAdmissionContext {
+            resolver: &resolver,
+            trust: &trust,
+            image: None,
+        };
+        let mut input = input_with_pin("mapped-local-admission", &pin);
+        input.backend_name = "mock";
+        input.network_mode = NetworkMode::HostVsockProxy;
+        let grants = mvm_contract::grants::Grants {
+            egress: Some(mvm_contract::grants::EgressGrant {
+                allow: vec![HostPort::new("peer.example", 443)],
+            }),
+            ..Default::default()
+        };
+        let mapping = |spki| {
+            CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                host: "peer.example".into(),
+                port: 443,
+                server_name: "peer.example".into(),
+                spki_sha256: spki,
+                profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
+            }])
+            .unwrap()
+        };
+        let selected = mvm_contract::grants::projection::network_policy_from_grants(&grants)
+            .with_payload_mapping(Some(mapping([1; 32])));
+        input.grants = Some(grants);
+        input.assets.push(
+            AssetIdentity::new(
+                AssetKind::Policy,
+                "network_policy",
+                mvm_core::policy::network_policy::content_sha256(&selected),
+            )
+            .unwrap(),
+        );
+        let backend = mvm_runtime::AnyBackend::from_hypervisor("mock");
+        let admitted = admit_for_run(
+            &input,
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(dir.path()),
+            Some(&ctx),
+            RunPosture::on_backend(Variant::Dev, backend.kind()),
+        )
+        .expect("real signed admission verifies original publisher bundle");
+        assert!(
+            admitted
+                .check_launch_network_policy(&selected, false)
+                .is_ok()
+        );
+        assert!(
+            admitted
+                .check_launch_network_policy(&selected, true)
+                .is_err()
+        );
+        assert!(
+            admitted
+                .check_launch_network_policy(&local_network_policy(admitted.plan()), true)
+                .is_err()
+        );
+        let substituted = selected.with_payload_mapping(Some(mapping([2; 32])));
+        let error = start_admitted(StartAdmittedParams {
+            backend: &backend,
+            admitted,
+            config: mvm_core::vm_backend::VmStartConfig {
+                name: "mapped-local-admission".into(),
+                rootfs_path: "/store/rootfs.ext4".into(),
+                network_policy: substituted,
+                ..Default::default()
+            },
+            policy_bundle: None,
+            emitter: None,
+            assurance: None,
+        })
+        .err()
+        .expect("substituted peer SPKI reached canonical backend start");
+        assert!(format!("{error:#}").contains("launch network policy differs"));
+        assert!(backend.list().unwrap().is_empty());
+
+        // An independent, signed unmapped egress policy is still accepted.
+        let plain = mvm_contract::grants::projection::network_policy_from_grants(
+            input.grants.as_ref().unwrap(),
+        );
+        input.assets[0].digest = mvm_core::policy::network_policy::content_sha256(&plain);
+        let plain_admission = admit_for_run(
+            &input,
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(dir.path()),
+            Some(&ctx),
+            RunPosture::on_backend(Variant::Dev, backend.kind()),
+        )
+        .unwrap();
+        assert!(
+            plain_admission
+                .check_launch_network_policy(&plain, true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn original_bundled_admission_binds_only_its_signed_mapped_policy() {
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, HostPort, PayloadMappingProfile,
+        };
+        use mvm_core::plan::{AssetIdentity, AssetKind, NetworkMode};
+
+        let (_env, _home) = host_with_ceiling(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let publisher = ed25519_dalek::SigningKey::from_bytes(&[36; 32]);
+        let (archive, pin) = make_test_bundle(&publisher, b"kernel-bytes", b"rootfs-bytes");
+        let key_id = key_id_from_pubkey(&publisher.verifying_key());
+        let trust = MapTrust(HashMap::from([(key_id, publisher.verifying_key())]));
+        let resolver = FixedResolver(archive);
+        let ctx = BundleAdmissionContext {
+            resolver: &resolver,
+            trust: &trust,
+            image: None,
+        };
+        let mut input = input_with_pin("mapped-local-admission", &pin);
+        input.backend_name = "mock";
+        input.network_mode = NetworkMode::HostVsockProxy;
+        let grants = mvm_contract::grants::Grants {
+            egress: Some(mvm_contract::grants::EgressGrant {
+                allow: vec![HostPort::new("peer.example", 443)],
+            }),
+            ..Default::default()
+        };
+        let mapping = |spki| {
+            CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                host: "peer.example".into(),
+                port: 443,
+                server_name: "peer.example".into(),
+                spki_sha256: spki,
+                profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
+            }])
+            .unwrap()
+        };
+        let selected = mvm_contract::grants::projection::network_policy_from_grants(&grants)
+            .with_payload_mapping(Some(mapping([1; 32])));
+        input.grants = Some(grants);
+        input.assets.push(
+            AssetIdentity::new(
+                AssetKind::Policy,
+                "network_policy",
+                mvm_core::policy::network_policy::content_sha256(&selected),
+            )
+            .unwrap(),
+        );
+        let backend = mvm_runtime::AnyBackend::from_hypervisor("mock");
+        let plan = synthesize_plan(&input).unwrap();
+        let ledger = InMemoryNonceLedger::new();
+        let wrong = mapping([2; 32]);
+        let correct = mapping([1; 32]);
+        let posture = RunPosture::on_backend(Variant::Dev, backend.kind());
+        let admit = |mapping| {
+            admit_plan_for_run(
+                &plan,
+                &SystemClock,
+                &ledger,
+                Some(dir.path()),
+                Some(&ctx),
+                None,
+                posture.with_installed_payload_mapping(mapping),
+            )
+        };
+        assert!(
+            admit(&wrong).is_err(),
+            "wrong SPKI must be rejected before nonce spend"
+        );
+        let admitted = admit(&correct).unwrap();
+        assert!(
+            admitted
+                .check_launch_network_policy(&selected, true)
+                .is_ok()
+        );
+        assert!(
+            admitted
+                .check_launch_network_policy(&local_network_policy(admitted.plan()), true)
+                .is_err()
+        );
+        assert_eq!(admitted.plan().nonce, plan.nonce);
+        assert!(
+            admit(&correct).is_err(),
+            "accepted original nonce cannot be reused"
+        );
+        let error = start_admitted(StartAdmittedParams {
+            backend: &backend,
+            admitted,
+            config: VmStartConfig {
+                name: "mapped-local-admission".into(),
+                rootfs_path: "/store/rootfs.ext4".into(),
+                network_policy: selected,
+                ..Default::default()
+            },
+            policy_bundle: None,
+            emitter: None,
+            assurance: None,
+        })
+        .err()
+        .expect("installed mapping reached a backend without its original host lifetime");
+        assert!(format!("{error:#}").contains("requires its original host lifetime"));
+        assert!(backend.list().unwrap().is_empty());
     }
 
     #[test]
