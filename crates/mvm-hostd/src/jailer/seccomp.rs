@@ -10,6 +10,8 @@
 
 use crate::jailer::{ConfinementSpec, JailerError};
 use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+#[cfg(target_arch = "x86_64")]
+use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition};
 use std::collections::BTreeMap;
 
 #[cfg(target_arch = "x86_64")]
@@ -362,7 +364,22 @@ fn apply_inner(spec: &ConfinementSpec, owned_store: bool) -> Result<(), JailerEr
         rules.insert(libc::SYS_geteuid, vec![]);
         // Store retirement removes only directories within its Landlock grant.
         #[cfg(target_arch = "x86_64")]
-        rules.insert(libc::SYS_rmdir, vec![]);
+        {
+            rules.insert(libc::SYS_rmdir, vec![]);
+            // Descriptor-relative store cleanup unlinks files and directories.
+            // Compare all native flag bits, including the upper argument bits.
+            let removals = [0, libc::AT_REMOVEDIR as u64]
+                .into_iter()
+                .map(|flags| {
+                    let condition =
+                        SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, flags)
+                            .map_err(|error| JailerError::SeccompInstall(error.to_string()))?;
+                    SeccompRule::new(vec![condition])
+                        .map_err(|error| JailerError::SeccompInstall(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            rules.insert(libc::SYS_unlinkat, removals);
+        }
         #[cfg(target_arch = "aarch64")]
         rules.insert(libc::SYS_unlinkat, vec![]);
     }
@@ -457,3 +474,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "seccomp_owned_store_tests.rs"]
+mod owned_store_tests;
