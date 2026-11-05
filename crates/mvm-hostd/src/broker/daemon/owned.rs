@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::ensure;
+use mvm_core::protocol::broker_control::DeregisterVm;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -457,10 +458,8 @@ impl HostAgentDaemon {
         }
         let names: Vec<_> = self.owned_paths.keys().cloned().collect();
         for vm_id in names {
-            self.apply_owned(&ControlRequest::Deregister(
-                super::super::control::DeregisterVm { vm_id },
-            ))
-            .await?;
+            self.apply_owned(&ControlRequest::Deregister(DeregisterVm { vm_id }))
+                .await?;
         }
         ensure!(
             self.vms.is_empty() && self.owned_paths.is_empty() && self.registrations.is_empty(),
@@ -529,11 +528,9 @@ mod bounded_closing_tests {
         for index in 0..16 {
             assert!(
                 daemon
-                    .apply_owned(&ControlRequest::Deregister(
-                        super::super::super::control::DeregisterVm {
-                            vm_id: format!("vm-fault-{index}")
-                        }
-                    ))
+                    .apply_owned(&ControlRequest::Deregister(DeregisterVm {
+                        vm_id: format!("vm-fault-{index}")
+                    }))
                     .await
                     .is_err()
             );
