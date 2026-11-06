@@ -74,11 +74,15 @@ pub trait NetworkEndpointSpawner: Send + Sync {
     /// Provision authentication without starting an endpoint or granting egress.
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>>;
     #[cfg(unix)]
+    fn supports_registered_installed_endpoint(&self) -> bool {
+        false
+    }
+    #[cfg(unix)]
     fn spawn_installed(
         &self,
         _req: &NetworkEndpointSpawnRequest<'_>,
         _config: &VmStartConfig,
-        _agent: Option<&mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar>,
+        _original: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
     ) -> Result<InstalledSpawnedEndpoint> {
         anyhow::bail!("installed endpoint requires an original owned helper implementation")
     }

@@ -113,7 +113,7 @@ impl NetworkEndpointSpawner for NoEndpoint {
         &self,
         _: &NetworkEndpointSpawnRequest<'_>,
         _: &VmStartConfig,
-        _: Option<&mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar>,
+        _: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
     ) -> Result<InstalledSpawnedEndpoint> {
         // This sentinel driver fixture deliberately has no helper effects;
         // it does not establish production endpoint or telemetry support.
@@ -301,6 +301,22 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
         refused
             .to_string()
             .contains("installed endpoint policy differs"),
+        "{refused:#}"
+    );
+    let unsupported = WorkloadLaunchInputs {
+        config: &injected_config,
+        network_policy: &injected_config.network_policy,
+        cmdline: "console=ttyS0".into(),
+        ..mismatched
+    };
+    let refused = runner
+        .start_workload(&unsupported)
+        .err()
+        .expect("unsupported spawner");
+    assert!(
+        refused
+            .to_string()
+            .contains("registered installed endpoint startup unavailable"),
         "{refused:#}"
     );
     let id = VmId(config.name.clone());

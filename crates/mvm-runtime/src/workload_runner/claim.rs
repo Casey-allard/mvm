@@ -402,7 +402,7 @@ impl<'a> ClaimGuards<'a> {
         vm: &VmId,
         inputs: &EndpointSpawnInputs<'_>,
         config: &mvm_core::vm_backend::VmStartConfig,
-        agent: Option<&mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar>,
+        original: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
     ) -> Result<EndpointHandle> {
         let anchor = config
             .host_lifetime
@@ -423,7 +423,7 @@ impl<'a> ClaimGuards<'a> {
             ingress: inputs.ingress,
             identity: inputs.identity,
         };
-        let spawned = self.spawner.spawn_installed(&request, config, agent)?;
+        let spawned = self.spawner.spawn_installed(&request, config, original)?;
         anyhow::ensure!(
             spawned.owner.is_some() || (spawned.egress_uds.is_none() && !spawned.telemetry),
             "installed helper effects have no original child"

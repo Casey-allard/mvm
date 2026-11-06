@@ -56,6 +56,7 @@ struct Custody {
     endpoint: Option<crate::workload_runner::claim::EndpointHandle>,
     endpoint_retirement: Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement>,
     broker: Option<BrokerGuard>,
+    broker_cleanup_active: bool,
     launch: Option<(
         crate::runtime_evidence::RuntimeLifecycleLease,
         crate::kernel_custody::KernelBoundLaunch,
@@ -93,6 +94,7 @@ impl InstalledSlots {
                 endpoint: None,
                 endpoint_retirement: None,
                 broker: None,
+                broker_cleanup_active: false,
                 launch: None,
                 retired: false,
                 exit: None,
@@ -152,10 +154,15 @@ impl InstalledSlot {
         }
     }
     fn access(&self) -> Result<MutexGuard<'_, Option<Custody>>> {
-        self.state.try_lock().map_err(|error| match error {
+        let guard = self.state.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => anyhow::anyhow!("installed VM operation in progress"),
             TryLockError::Poisoned(_) => anyhow::anyhow!("installed VM custody poisoned"),
-        })
+        })?;
+        anyhow::ensure!(
+            !guard.as_ref().is_some_and(|state| state.broker_cleanup_active),
+            "original broker cleanup in progress"
+        );
+        Ok(guard)
     }
 
     pub(super) fn matches(&self, owner: &Arc<HostLifetimeAnchor>) -> bool {
@@ -170,25 +177,28 @@ impl InstalledSlot {
         Box::new(InstalledVmView(Arc::clone(self)))
     }
 
-    pub(super) fn retain_launch(
+    pub(super) fn retain_start(
         &self,
         lifecycle: crate::runtime_evidence::RuntimeLifecycleLease,
         kernel: crate::kernel_custody::KernelBoundLaunch,
-    ) -> Result<()> {
-        let (mut guard, (lifecycle, kernel)) = self.retain_guard((lifecycle, kernel))?;
-        let state = guard.as_mut().context("installed custody unavailable")?;
-        anyhow::ensure!(state.launch.is_none(), "installed launch already retained");
+        outcome: Result<Box<dyn RunningVm>>,
+    ) -> Result<Box<dyn RunningVm>> {
+        let (mut guard, (lifecycle, kernel, outcome)) =
+            self.retain_guard((lifecycle, kernel, outcome))?;
+        let state = guard.as_mut().expect("checked original custody");
+        if state.launch.is_some() || state.failure.is_some() {
+            drop(guard);
+            std::mem::forget((Arc::clone(&self.owner), lifecycle, kernel, outcome));
+            anyhow::bail!("original installed launch already retained; custody quarantined");
+        }
         state.launch = Some((lifecycle, kernel));
-        Ok(())
-    }
-
-    pub(super) fn retain_failure(&self, error: anyhow::Error) -> Result<()> {
-        let (mut guard, error) = self.retain_guard(error)?;
-        guard
-            .as_mut()
-            .context("installed custody unavailable")?
-            .failure = Some(error);
-        Ok(())
+        match outcome {
+            Ok(vm) => Ok(vm),
+            Err(error) => {
+                state.failure = Some(error);
+                anyhow::bail!("installed native startup failed; original error retained")
+            }
+        }
     }
 
     pub(super) fn retain_endpoint(
@@ -207,11 +217,28 @@ impl InstalledSlot {
 
     pub(super) fn retain_broker(&self, broker: BrokerGuard) -> Result<()> {
         let (mut guard, broker) = self.retain_guard(broker)?;
-        guard
-            .as_mut()
-            .context("installed custody unavailable")?
-            .broker = Some(broker);
+        let state = guard.as_mut().expect("checked original custody");
+        if state.broker.is_some() {
+            drop(guard);
+            std::mem::forget((Arc::clone(&self.owner), broker));
+            anyhow::bail!("original installed broker already retained; custody quarantined");
+        }
+        state.broker = Some(broker);
         Ok(())
+    }
+
+    pub(super) fn broker_registration(
+        &self,
+    ) -> Result<Arc<mvm_vmm::host::host_agent_spawn::OwnedVmRegistration>> {
+        let guard = self.access()?;
+        let broker = guard
+            .as_ref()
+            .and_then(|state| state.broker.as_ref())
+            .context("original installed broker registration missing")?;
+        match &broker.0 {
+            super::BrokerCustody::Installed(registration) => Ok(Arc::clone(registration)),
+            _ => anyhow::bail!("legacy broker is not an installed registration"),
+        }
     }
 
     pub(super) fn retain_vm(
@@ -299,9 +326,36 @@ impl InstalledSlot {
             endpoint.shutdown_owned()?;
             state.endpoint_retirement = endpoint.take_owned_retirement()?;
         }
-        if let Some(broker) = state.broker.as_mut() {
+        if state.broker.as_ref().is_some_and(|broker| {
+            matches!(&broker.0, super::BrokerCustody::Installed(_))
+        }) {
+            let mut broker = state.broker.take().expect("checked original broker custody");
+            state.broker_cleanup_active = true;
+            drop(guard);
+            // Signed deregistration performs bounded I/O. Keep exclusive custody,
+            // but release the Runtime mutex while the original agent handles it.
+            let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                broker.shutdown_owned()
+            }));
+            guard = match self.state.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    std::mem::forget((Arc::clone(&self.owner), broker));
+                    anyhow::bail!("installed broker cleanup custody poisoned; broker quarantined");
+                }
+            };
+            let Some(state) = guard.as_mut().filter(|state| state.broker_cleanup_active && state.broker.is_none()) else {
+                drop(guard);
+                std::mem::forget((Arc::clone(&self.owner), broker));
+                anyhow::bail!("installed broker cleanup custody changed; broker quarantined");
+            };
+            state.broker = Some(broker);
+            state.broker_cleanup_active = false;
+            stopped.map_err(|_| anyhow::anyhow!("original broker cleanup panicked; custody retained"))??;
+        } else if let Some(broker) = state.broker.as_mut() {
             broker.shutdown_owned()?;
         }
+        let state = guard.as_mut().context("installed custody unavailable")?;
         streamer.stop(&self.id.0);
         let (lifecycle, _) = state
             .launch
