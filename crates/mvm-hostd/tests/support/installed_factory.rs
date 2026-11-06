@@ -614,179 +614,203 @@ fn child_mode(
             .unwrap()
             .with_factory(Arc::new(factory)),
     );
-    let gate = mvm_hostd::supervisor::network_endpoint::build_egress_gate(&policy);
-    let host_key = SigningKey::from_bytes(&HOST_SEED);
-    let host_anchor = host_key.verifying_key();
-    let guest_key = SigningKey::from_bytes(&GUEST_SEED);
-    let guest_anchor = guest_key.verifying_key();
-    let (host_stream, mut guest_stream) = UnixStream::pair().unwrap();
-    let send_buffer = if case == Case::BlockedWrite {
-        Some(small_send_buffer(&host_stream))
+    if matches!(case, Case::AttachClose | Case::AttachPoison) {
+        // Drive the original installed mapping directly. These two cases
+        // qualify reader custody at the attach hook, independently of the
+        // signed controller integration exercised in owned_host_agent.
+        use mvm_hostd::supervisor::flowmux::payload_mapping::AdmittedTcpFacts;
+
+        let peer = &policy.peers()[0];
+        let address = SocketAddr::new(peer.host_addr.parse().unwrap(), peer.host_port);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let upstream =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        let relays = relays.as_ref().unwrap();
+        let reservation = relays.reserve_until(deadline).unwrap();
+        let (guest, _guest_peer) = UnixStream::pair().unwrap();
+        reservation.bind_setup(&upstream, Arc::new(guest)).unwrap();
+        let result = mapping.map(
+            upstream,
+            AdmittedTcpFacts {
+                session_id,
+                guest_key: SigningKey::from_bytes(&GUEST_SEED)
+                    .verifying_key()
+                    .to_bytes(),
+                stream_id: 1,
+                requested_host: TARGET.into(),
+                requested_port: 443,
+                route: "peer",
+                deadline,
+                owned_relay: Some(reservation.witness().unwrap()),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "custody injection unexpectedly published a stream"
+        );
+        drop(reservation);
     } else {
-        None
-    };
-    let setup_observer = if matches!(case, Case::StalledTls | Case::StalledArtifact) {
-        Some(UnixListener::bind(store.parent().unwrap().join("setup-seen.sock")).unwrap())
-    } else {
-        None
-    };
-    guest_stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    guest_stream
-        .set_write_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    std::thread::scope(|scope| {
-        let session_relays = relays.clone();
-        let host = scope.spawn(move || {
-            let mut host = FlowMuxSession::accept_with(
-                host_stream,
-                FlowMuxAccept::new(
-                    &session_id,
-                    host_key,
-                    guest_anchor,
-                    RegistryLimits::default(),
-                    gate,
-                )
-                .with_payload_mapping(Some(mapping))
-                .with_owned_tcp_relays(session_relays),
-            )
+        let gate = mvm_hostd::supervisor::network_endpoint::build_egress_gate(&policy);
+        let host_key = SigningKey::from_bytes(&HOST_SEED);
+        let host_anchor = host_key.verifying_key();
+        let guest_key = SigningKey::from_bytes(&GUEST_SEED);
+        let guest_anchor = guest_key.verifying_key();
+        let (host_stream, mut guest_stream) = UnixStream::pair().unwrap();
+        let send_buffer = if case == Case::BlockedWrite {
+            Some(small_send_buffer(&host_stream))
+        } else {
+            None
+        };
+        let setup_observer = if matches!(case, Case::StalledTls | Case::StalledArtifact) {
+            Some(UnixListener::bind(store.parent().unwrap().join("setup-seen.sock")).unwrap())
+        } else {
+            None
+        };
+        guest_stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-            host.serve()
-        });
-        let (mut session, _) = Session::guest(&mut guest_stream, guest_key, &host_anchor).unwrap();
-        send(
-            &mut guest_stream,
-            &mut session,
-            Opcode::Hello,
-            0,
-            &Handshake::local("installed-fixture").encode(),
-        );
-        assert_eq!(receive(&mut guest_stream, &mut session).0, Opcode::HelloAck);
-        send(
-            &mut guest_stream,
-            &mut session,
-            Opcode::OpenTcp,
-            1,
-            format!("{TARGET}:443").as_bytes(),
-        );
-        if let Some(observer) = &setup_observer {
-            let mut ready = libc::pollfd {
-                fd: observer.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: arm the original fixture event before accepting its
-            // bounded notification; no sleep-based readiness guess is used.
-            assert!(unsafe { libc::poll(&mut ready, 1, 3000) } > 0);
-            let (mut event, _) = observer.accept().unwrap();
-            event
-                .set_read_timeout(Some(Duration::from_secs(1)))
+        guest_stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        std::thread::scope(|scope| {
+            let session_relays = relays.clone();
+            let host = scope.spawn(move || {
+                let mut host = FlowMuxSession::accept_with(
+                    host_stream,
+                    FlowMuxAccept::new(
+                        &session_id,
+                        host_key,
+                        guest_anchor,
+                        RegistryLimits::default(),
+                        gate,
+                    )
+                    .with_payload_mapping(Some(mapping))
+                    .with_owned_tcp_relays(session_relays),
+                )
                 .unwrap();
-            let mut byte = [0u8; 1];
-            event.read_exact(&mut byte).unwrap();
-            assert_eq!(byte, [1]);
-            assert_eq!(
-                pool.snapshot().unwrap().active,
-                u16::from(case == Case::StalledArtifact),
-                "codec exists only after authenticated setup"
+                host.serve()
+            });
+            let (mut session, _) =
+                Session::guest(&mut guest_stream, guest_key, &host_anchor).unwrap();
+            send(
+                &mut guest_stream,
+                &mut session,
+                Opcode::Hello,
+                0,
+                &Handshake::local("installed-fixture").encode(),
             );
-            let joined = relays
-                .as_ref()
-                .unwrap()
-                .close_and_join(Instant::now() + Duration::from_secs(2));
-            eprintln!("stalled original setup cleanup: {joined:?}");
-            let _ = guest_stream.shutdown(Shutdown::Both);
-            drop(guest_stream);
-            assert_cancelled_session(host.join().unwrap());
-            joined.unwrap();
-            return;
-        }
-        if case == Case::AttachClose {
-            let mut byte = [0u8; 1];
-            assert_cancelled_read(guest_stream.read(&mut byte));
-            drop(guest_stream);
-            assert_cancelled_session(host.join().unwrap());
-            return;
-        }
-        if case == Case::AttachPoison {
-            let refused = receive(&mut guest_stream, &mut session);
-            assert_eq!((refused.0, refused.1), (Opcode::Refused, 1));
-            drop(guest_stream);
-            host.join().unwrap().unwrap();
-            return;
-        }
-        let opened = receive(&mut guest_stream, &mut session);
-        assert_eq!(
-            opened.0,
-            Opcode::Opened,
-            "{}",
-            String::from_utf8_lossy(&opened.2)
-        );
-        assert_eq!(pool.snapshot().unwrap().active, 1);
-        if matches!(case, Case::BlockedRead | Case::ExpiredJoin) {
-            if case == Case::ExpiredJoin {
-                let error = relays
-                    .as_ref()
-                    .unwrap()
-                    .close_and_join(Instant::now())
-                    .unwrap_err();
-                assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-                // The original group still owns its relay/wake and mapped
-                // codec charge. Expiry is not a successful cleanup receipt.
-                assert_eq!(pool.snapshot().unwrap().active, 1);
-            }
-            relays
-                .as_ref()
-                .unwrap()
-                .close_and_join(Instant::now() + Duration::from_secs(2))
-                .unwrap();
-            drop(guest_stream);
-            assert_cancelled_session(host.join().unwrap());
-            return;
-        }
-        if case == Case::Capacity {
+            assert_eq!(receive(&mut guest_stream, &mut session).0, Opcode::HelloAck);
             send(
                 &mut guest_stream,
                 &mut session,
                 Opcode::OpenTcp,
-                3,
+                1,
                 format!("{TARGET}:443").as_bytes(),
             );
-            let overflow = receive(&mut guest_stream, &mut session);
-            assert_eq!((overflow.0, overflow.1), (Opcode::Refused, 3));
-        }
-        send(&mut guest_stream, &mut session, Opcode::Data, 1, &payload());
-        send(&mut guest_stream, &mut session, Opcode::HalfClose, 1, &[]);
-        if case == Case::BlockedWrite {
-            observe_partial_large_frame(&mut guest_stream, &mut session, send_buffer.unwrap());
-            relays
-                .as_ref()
-                .unwrap()
-                .close_and_join(Instant::now() + Duration::from_secs(2))
-                .unwrap();
-            drop(guest_stream);
-            assert_cancelled_session(host.join().unwrap());
-            return;
-        }
-        let mut returned = Vec::new();
-        loop {
-            let (opcode, stream, bytes) = receive(&mut guest_stream, &mut session);
-            assert_eq!(stream, 1);
-            match opcode {
-                Opcode::WindowUpdate => {}
-                Opcode::Data => {
-                    assert!(returned.len() + bytes.len() <= payload().len());
-                    returned.extend_from_slice(&bytes);
-                }
-                Opcode::HalfClose => break,
-                other => panic!("unexpected {other:?}: {}", String::from_utf8_lossy(&bytes)),
+            if let Some(observer) = &setup_observer {
+                let mut ready = libc::pollfd {
+                    fd: observer.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: arm the original fixture event before accepting its
+                // bounded notification; no sleep-based readiness guess is used.
+                assert!(unsafe { libc::poll(&mut ready, 1, 3000) } > 0);
+                let (mut event, _) = observer.accept().unwrap();
+                event
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut byte = [0u8; 1];
+                event.read_exact(&mut byte).unwrap();
+                assert_eq!(byte, [1]);
+                assert_eq!(
+                    pool.snapshot().unwrap().active,
+                    u16::from(case == Case::StalledArtifact),
+                    "codec exists only after authenticated setup"
+                );
+                let joined = relays
+                    .as_ref()
+                    .unwrap()
+                    .close_and_join(Instant::now() + Duration::from_secs(2));
+                eprintln!("stalled original setup cleanup: {joined:?}");
+                let _ = guest_stream.shutdown(Shutdown::Both);
+                drop(guest_stream);
+                assert_cancelled_session(host.join().unwrap());
+                joined.unwrap();
+                return;
             }
-        }
-        assert_eq!(returned, payload(), "exact reverse application bytes");
-        drop(guest_stream);
-        host.join().unwrap().unwrap();
-    });
+            let opened = receive(&mut guest_stream, &mut session);
+            assert_eq!(
+                opened.0,
+                Opcode::Opened,
+                "{}",
+                String::from_utf8_lossy(&opened.2)
+            );
+            assert_eq!(pool.snapshot().unwrap().active, 1);
+            if matches!(case, Case::BlockedRead | Case::ExpiredJoin) {
+                if case == Case::ExpiredJoin {
+                    let error = relays
+                        .as_ref()
+                        .unwrap()
+                        .close_and_join(Instant::now())
+                        .unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                    // The original group still owns its relay/wake and mapped
+                    // codec charge. Expiry is not a successful cleanup receipt.
+                    assert_eq!(pool.snapshot().unwrap().active, 1);
+                }
+                relays
+                    .as_ref()
+                    .unwrap()
+                    .close_and_join(Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+                drop(guest_stream);
+                assert_cancelled_session(host.join().unwrap());
+                return;
+            }
+            if case == Case::Capacity {
+                send(
+                    &mut guest_stream,
+                    &mut session,
+                    Opcode::OpenTcp,
+                    3,
+                    format!("{TARGET}:443").as_bytes(),
+                );
+                let overflow = receive(&mut guest_stream, &mut session);
+                assert_eq!((overflow.0, overflow.1), (Opcode::Refused, 3));
+            }
+            send(&mut guest_stream, &mut session, Opcode::Data, 1, &payload());
+            send(&mut guest_stream, &mut session, Opcode::HalfClose, 1, &[]);
+            if case == Case::BlockedWrite {
+                observe_partial_large_frame(&mut guest_stream, &mut session, send_buffer.unwrap());
+                relays
+                    .as_ref()
+                    .unwrap()
+                    .close_and_join(Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+                drop(guest_stream);
+                assert_cancelled_session(host.join().unwrap());
+                return;
+            }
+            let mut returned = Vec::new();
+            loop {
+                let (opcode, stream, bytes) = receive(&mut guest_stream, &mut session);
+                assert_eq!(stream, 1);
+                match opcode {
+                    Opcode::WindowUpdate => {}
+                    Opcode::Data => {
+                        assert!(returned.len() + bytes.len() <= payload().len());
+                        returned.extend_from_slice(&bytes);
+                    }
+                    Opcode::HalfClose => break,
+                    other => panic!("unexpected {other:?}: {}", String::from_utf8_lossy(&bytes)),
+                }
+            }
+            assert_eq!(returned, payload(), "exact reverse application bytes");
+            drop(guest_stream);
+            host.join().unwrap().unwrap();
+        });
+    }
     observe(relays.as_ref().unwrap(), &pool);
     if case == Case::AttachPoison {
         assert_eq!(

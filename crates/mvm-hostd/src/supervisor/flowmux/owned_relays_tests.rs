@@ -2,10 +2,18 @@ use super::*;
 use crate::supervisor::flowmux::PayloadResourcePool;
 use std::sync::Weak;
 
-#[path = "../../../tests/support/installed_factory.rs"]
-pub mod installed_factory;
-#[path = "../../../tests/common/installed_resource_fixture.rs"]
-pub mod installed_resource_fixture;
+// The installed factory fixture also supports standalone integration targets.
+#[allow(dead_code, unreachable_pub)]
+mod installed_factory {
+    use crate as mvm_hostd;
+    include!("../../../tests/support/installed_factory.rs");
+}
+
+#[allow(dead_code, unreachable_pub)]
+mod installed_resource_fixture {
+    use crate as mvm_hostd;
+    include!("../../../tests/support/installed_factory_fixture.rs");
+}
 
 struct Hook {
     group: Weak<OwnedTcpRelays>,
