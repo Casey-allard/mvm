@@ -26,8 +26,25 @@ use std::{
 pub fn run_installed_endpoint() -> Result<()> {
     let mut child = InstalledEndpointChild::from_stdio()
         .map_err(|_| anyhow::anyhow!("installed endpoint handshake failed"))?;
-    let _resources = InstalledEndpointResources::from_child(&mut child)
+    let resources = InstalledEndpointResources::from_child(&mut child)
         .map_err(|_| anyhow::anyhow!("installed endpoint resource adoption failed"))?;
+    if let InstalledEndpointProgram::Network(config) = &resources.program
+        && let Some(telemetry) = &config.telemetry
+    {
+        let check = (|| -> Result<()> {
+            let audit = resources.lease.audit()?;
+            ensure!(
+                audit.tenant() == config.tenant_id && audit.socket() == telemetry.signer_sock,
+                "installed signer differs"
+            );
+            let records = child
+                .take_telemetry_records()?
+                .context("installed records missing")?;
+            records.check_for(&resources.lease, &telemetry.state_dir)?;
+            Ok(())
+        })();
+        check.map_err(|_| anyhow::anyhow!("installed retained telemetry adoption failed"))?;
+    }
     anyhow::bail!("installed endpoint controller unavailable")
 }
 

@@ -122,6 +122,11 @@ impl OwnedEndpoint {
             Ok(status) => {
                 self.status = status;
                 self.exit_observed |= status.is_some();
+                if status.is_some()
+                    && let Some(installed) = &mut self.installed
+                {
+                    installed.audit.take();
+                }
                 Ok(status)
             }
             Err(error) => {

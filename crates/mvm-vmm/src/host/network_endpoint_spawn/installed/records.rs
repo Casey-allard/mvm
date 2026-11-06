@@ -71,7 +71,6 @@ fn object(metadata: &rustix::fs::Stat) -> (u64, u64) {
 }
 
 impl RecordsProjection {
-    #[cfg(test)]
     pub(super) fn from_original(state_path: &Path, state: &File, records: &File) -> Result<Self> {
         let directory = state.metadata().map_err(|_| refused())?;
         let file = check_file(records.as_fd())?;

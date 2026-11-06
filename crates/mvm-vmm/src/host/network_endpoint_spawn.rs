@@ -214,17 +214,18 @@ pub use egress_tls::{
     EGRESS_CA_STATE_FILE, EgressTlsDelivery, build_egress_tls_delivery, forget_egress_tls_delivery,
     load_egress_tls_delivery, persist_egress_tls_delivery,
 };
-mod owned;
 mod installed;
+mod owned;
 pub use installed::{
-    INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointAudit, InstalledEndpointChild, InstalledEndpointLease,
-    InstalledHostServices, InstalledTelemetryRecords, spawn_network_endpoint_installed,
+    INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointAudit, InstalledEndpointChild,
+    InstalledEndpointLease, InstalledHostServices, InstalledTelemetryRecords,
+    spawn_network_endpoint_installed, spawn_network_endpoint_installed_registered,
 };
-pub(crate) use owned::{nonblocking as owned_pipe_nonblocking, ready as owned_pipe_ready};
 use owned::endpoint_command;
 pub use owned::{
     EndpointRetirement, OwnedEndpoint, OwnedEndpointSpawnError, spawn_network_endpoint_owned,
 };
+pub(crate) use owned::{nonblocking as owned_pipe_nonblocking, ready as owned_pipe_ready};
 mod endpoint_identity;
 mod stderr_log;
 pub use endpoint_identity::EndpointPid;
@@ -1080,120 +1081,136 @@ pub fn endpoint_config_for_identity(
 
 /// Build the EndpointConfig JSON the endpoint reads on stdin. Pure (no spawn)
 /// so the wire form — including the claim-10 policy + egress mode — is unit-testable.
+/// One canonical field projection for both compatibility JSON trees and the
+/// installed bounded writer. The view borrows existing admitted inputs.
+struct EndpointConfigProjection<'a, 'p>(
+    &'a SubstitutionSpawnParams<'p>,
+    Option<&'a collector::TelemetrySection<'a>>,
+);
+impl Serialize for EndpointConfigProjection<'_, '_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let params = self.0;
+        let mut cfg = serializer.serialize_map(None)?;
+        cfg.serialize_entry("tenant_id", params.tenant)?;
+        cfg.serialize_entry("instance_id", params.vm_name)?;
+        cfg.serialize_entry("secrets", params.secrets)?;
+        cfg.serialize_entry("redaction", params.redaction)?;
+        cfg.serialize_entry("transport", &params.transport)?;
+        cfg.serialize_entry(
+            "egress_mode",
+            if params.flowmux_identity.is_some() {
+                "flow_mux"
+            } else {
+                "wire"
+            },
+        )?;
+        cfg.serialize_entry("network_limits", &params.network_limits)?;
+        cfg.serialize_entry("ingress", params.ingress)?;
+        if let Some(tools) = params.tools.filter(|rules| !rules.is_empty()) {
+            cfg.serialize_entry("tools", tools)?;
+        }
+        if params.telemetry {
+            if let Some(section) = self.1 {
+                cfg.serialize_entry("telemetry", section)?;
+            } else {
+                cfg.serialize_entry(
+                    "telemetry",
+                    &telemetry_section(params.tenant, params.state_dir),
+                )?;
+            }
+        }
+        if let Some(marker) = &params.session_marker {
+            cfg.serialize_entry("session_marker", marker)?;
+        }
+        if params.flowmux_identity.is_some() {
+            cfg.serialize_entry(
+                "session_ready_socket",
+                &session_ready_socket_path(params.state_dir),
+            )?;
+            cfg.serialize_entry(
+                "connector_uds_path",
+                &connector_socket_path(params.state_dir),
+            )?;
+            cfg.serialize_entry(
+                "approval_socket",
+                &mvm_core::config::vm_approval_socket_at(params.state_dir),
+            )?;
+        }
+        if let Some(proxy) = &params.egress_proxy {
+            if let Some(value) = &proxy.https {
+                cfg.serialize_entry("proxy_https", value)?;
+            }
+            if let Some(value) = &proxy.http {
+                cfg.serialize_entry("proxy_http", value)?;
+            }
+            if let Some(value) = &proxy.no_proxy {
+                cfg.serialize_entry("no_proxy", value)?;
+            }
+        }
+        if let Some((cert_pem, key_pem)) = &params.tls_intermediate {
+            #[derive(Serialize)]
+            struct Intermediate<'a> {
+                cert_pem: &'a str,
+                key_pem: &'a str,
+            }
+            cfg.serialize_entry("tls_intermediate", &Intermediate { cert_pem, key_pem })?;
+        }
+        if let Some(policy) = params.network_policy {
+            cfg.serialize_entry("network_policy", policy)?;
+        }
+        if let Some(binding) = &params.admitted_network_plan {
+            cfg.serialize_entry("admitted_network_plan", binding)?;
+        }
+        if let Some(RemoteResolverSpawnConfig {
+            uds_path,
+            timeout_secs,
+        }) = params.resolver_remote
+        {
+            #[derive(Serialize)]
+            struct Resolver<'a> {
+                backend: &'static str,
+                uds_path: &'a Path,
+                timeout_secs: u64,
+            }
+            cfg.serialize_entry(
+                "resolver",
+                &Resolver {
+                    backend: "remote",
+                    uds_path,
+                    timeout_secs,
+                },
+            )?;
+        }
+        if let Some(dir) = params.binding_store_dir {
+            cfg.serialize_entry("binding_store_dir", dir)?;
+        }
+        if let Some(id) = &params.flowmux_identity {
+            #[derive(Serialize)]
+            struct Identity<'a> {
+                session_id: &'a str,
+                host_signing_key_base64: &'a str,
+                guest_verifying_key_base64: &'a str,
+            }
+            cfg.serialize_entry(
+                "flowmux_identity",
+                &Identity {
+                    session_id: &id.session_id,
+                    host_signing_key_base64: &id.host_signing_key_base64,
+                    guest_verifying_key_base64: &id.guest_verifying_key_base64,
+                },
+            )?;
+        }
+        cfg.end()
+    }
+}
+
 fn build_endpoint_config_json(params: &SubstitutionSpawnParams<'_>) -> serde_json::Value {
-    let mut cfg = serde_json::json!({
-        "tenant_id": params.tenant,
-        // The machine this endpoint serves. It stamps every audit entry it
-        // records with it, so a reader of the shared tenant chain can tell
-        // whose egress decision each one was.
-        "instance_id": params.vm_name,
-        "secrets": params.secrets,
-        // Per-destination redaction policy from the signed plan; the endpoint
-        // applies it to the cleartext it forwards. Default (all-off) is harmless.
-        "redaction": serde_json::to_value(params.redaction)
-            .expect("RedactionPolicy serializes to JSON"),
-        // Backend-shaped guest→host channel: FC/QEMU dial the per-port vsock
-        // (Vsock); libkrun/HVF route through the per-VM UDS the VMM proxies (Uds).
-        "transport": serde_json::to_value(&params.transport)
-            .expect("EndpointTransport serializes to JSON"),
-        // Which egress protocol the relayed stream carries. One authenticated
-        // FlowMux session whenever this boot has an identity; "wire" only for
-        // the tiers that still speak the substitution protocol directly.
-        // "raw" is gone: nothing selects it, and the guest cannot speak it.
-        "egress_mode": if params.flowmux_identity.is_some() {
-            "flow_mux"
-        } else {
-            "wire"
-        },
-        "network_limits": params.network_limits,
-        "ingress": params.ingress,
-    });
-    if let Some(tools) = params.tools.filter(|rules| !rules.is_empty()) {
-        cfg["tools"] = serde_json::to_value(tools).expect("ToolRules serializes to JSON");
-    }
-    if params.telemetry {
-        // The embedded collector's inputs, derived here so the spawner's one
-        // provisioning decision fans out to every path the endpoint needs.
-        cfg["telemetry"] = telemetry_section(params.tenant, params.state_dir);
-    }
-    if let Some(marker) = params.session_marker.as_ref() {
-        cfg["session_marker"] = serde_json::json!(marker);
-    }
-    if params.flowmux_identity.is_some() {
-        cfg["session_ready_socket"] =
-            serde_json::json!(session_ready_socket_path(params.state_dir));
-        cfg["connector_uds_path"] = serde_json::json!(connector_socket_path(params.state_dir));
-        // Where an `ask` is put to the operator. The foreground `mvmctl`
-        // binds it for the life of the run; nothing there is a denial.
-        cfg["approval_socket"] =
-            serde_json::json!(mvm_core::config::vm_approval_socket_at(params.state_dir));
-    }
-    if let Some(proxy) = params.egress_proxy.as_ref() {
-        // `EndpointConfig.proxy_*`: the operator's upstream proxy for the
-        // forward leg. Resolved on the host, where configuration lives, rather
-        // than in the endpoint, which self-confines before it serves. Keys are
-        // emitted only when set so the endpoint's `#[serde(default)]` fields
-        // keep meaning "dial direct".
-        if let Some(v) = proxy.https.as_deref() {
-            cfg["proxy_https"] = serde_json::Value::String(v.to_string());
-        }
-        if let Some(v) = proxy.http.as_deref() {
-            cfg["proxy_http"] = serde_json::Value::String(v.to_string());
-        }
-        if let Some(v) = proxy.no_proxy.as_deref() {
-            cfg["no_proxy"] = serde_json::Value::String(v.to_string());
-        }
-    }
-    if let Some((cert_pem, key_pem)) = &params.tls_intermediate {
-        // `EndpointConfig.tls_intermediate`: the per-VM name-constrained
-        // intermediate the `https` terminator mints per-SNI leaves under. The
-        // KEY only ever reaches this host endpoint — never the guest.
-        cfg["tls_intermediate"] = serde_json::json!({
-            "cert_pem": cert_pem,
-            "key_pem": key_pem,
-        });
-    }
-    if let Some(policy) = params.network_policy {
-        // `EndpointConfig.network_policy`: the policy the endpoint gates every
-        // destination against. Omitted when `None`, and an endpoint whose
-        // config carries no policy denies every destination.
-        cfg["network_policy"] =
-            serde_json::to_value(policy).expect("NetworkPolicy serializes to JSON");
-    }
-    if let Some(binding) = &params.admitted_network_plan {
-        cfg["admitted_network_plan"] =
-            serde_json::to_value(binding).expect("admitted network facts serialize");
-    }
-    if let Some(RemoteResolverSpawnConfig {
-        uds_path,
-        timeout_secs,
-    }) = params.resolver_remote
-    {
-        // `EndpointConfig.resolver`: internally tagged on `backend` (see
-        // `ResolverBackend`'s `#[serde(tag = "backend", rename_all =
-        // "snake_case")]`) — `Remote { uds_path, timeout_secs }` becomes
-        // `{"backend":"remote","uds_path":...,"timeout_secs":...}`. Built by
-        // hand (not by depending on `mvm_hostd::ResolverBackend`) for the same
-        // reason `RemoteResolverSpawnConfig` isn't that type: the dependency
-        // only runs `mvm-hostd -> mvm-vmm`, never back. Omitted when `None` so
-        // legacy configs land on `EndpointConfig`'s `#[serde(default)]` Local.
-        cfg["resolver"] = serde_json::json!({
-            "backend": "remote",
-            "uds_path": uds_path,
-            "timeout_secs": timeout_secs,
-        });
-    }
-    if let Some(dir) = params.binding_store_dir {
-        cfg["binding_store_dir"] = serde_json::json!(dir);
-    }
-    if let Some(id) = &params.flowmux_identity {
-        cfg["flowmux_identity"] = serde_json::json!({
-            "session_id": id.session_id,
-            "host_signing_key_base64": id.host_signing_key_base64,
-            "guest_verifying_key_base64": id.guest_verifying_key_base64,
-        });
-    }
-    cfg
+    serde_json::to_value(EndpointConfigProjection(params, None))
+        .expect("canonical endpoint configuration serializes to JSON")
 }
 
 /// Spawn the per-VM `mvm-network-endpoint` moat. Hands it the

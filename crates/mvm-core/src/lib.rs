@@ -10,6 +10,7 @@ pub mod action;
 pub mod admission_durability;
 pub mod arch;
 pub mod audit_verify;
+pub mod bounded_owned_json;
 pub mod build_env;
 pub mod canonical_linux;
 pub mod catalog;

@@ -26,8 +26,11 @@ use std::{
 use zeroize::Zeroizing;
 
 mod audit;
+mod bootstrap;
+mod producer;
 mod records;
 pub use audit::InstalledEndpointAudit;
+use bootstrap::{INSTALLED_BOOTSTRAP_MIN_BYTES, installed_endpoint_bootstrap_requirement};
 pub use records::InstalledTelemetryRecords;
 
 const CONFIG_LIMIT: usize = 65_536;
@@ -71,6 +74,10 @@ impl<'a> InstalledHostServices<'a> {
             .check_current_for(self.registrar, &self.params)
     }
 
+    fn check_endpoint(&self, params: &SubstitutionSpawnParams<'_>) -> Result<()> {
+        self.check_endpoint_binding(params.vm_name, params.tenant, params.state_dir)
+    }
+
     pub fn check_flowmux_host_anchor(&self, candidate: &[u8; 32]) -> Result<()> {
         self.registration
             .check_flowmux_host_anchor(self.registrar, &self.params, candidate)
@@ -89,14 +96,14 @@ struct Challenge {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Prepare {
+struct Prepare<C = serde_json::Value> {
     version: u8,
     nonce: [u8; 32],
     projection: EndpointPartitionProjection,
     directory: i32,
     holder: i32,
     expected: HostLeaseExpectation,
-    config: serde_json::Value,
+    config: C,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     telemetry_records: Option<records::RecordsProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,91 +208,303 @@ pub fn spawn_network_endpoint_installed(
     // Install supporting custody BEFORE any fallible post-spawn operation.
     endpoint.installed = Some(InstalledCustody {
         handoff,
+        audit: None,
+        telemetry: None,
         input: None,
         output: None,
         nonce: [0; 32],
         drained: false,
     });
-    let result: Result<()> = (|| {
-        endpoint.arm()?;
-        let child = endpoint
-            .child
-            .as_mut()
-            .context("original endpoint child missing")?;
-        let input = child.stdin.take();
-        let output = child.stdout.take();
-        let installed = endpoint
-            .installed
-            .as_mut()
-            .context("installed endpoint custody missing")?;
-        installed.input = input;
-        installed.output = output;
-        let challenge: Challenge = read_frame(
-            installed
-                .output
-                .as_mut()
-                .context("installed output missing")?,
-            CONTROL_LIMIT,
-            deadline,
-        )?;
-        if challenge.version != 1 || challenge.nonce == [0; 32] {
-            bail!("invalid installed endpoint challenge")
-        }
-        installed.nonce = challenge.nonce;
-        installed.handoff.check_current()?;
-        write_frame(
-            installed
-                .input
-                .as_mut()
-                .context("installed input missing")?,
-            &Prepare {
-                version: 1,
-                nonce: challenge.nonce,
-                projection: installed.handoff.partition().projection().clone(),
-                directory: installed.handoff.holder().directory().as_raw_fd(),
-                holder: installed.handoff.holder().holder().as_raw_fd(),
-                expected: installed.handoff.holder().expectation().clone(),
-                config,
-                telemetry_records: None,
-                audit: None,
-            },
-            CONFIG_LIMIT,
-            deadline,
-        )?;
-        let ready: Ready = read_frame(
-            installed
-                .output
-                .as_mut()
-                .context("installed output missing")?,
-            CONFIG_LIMIT,
-            deadline,
-        )?;
-        let expected = installed.handoff.partition().projection();
-        if ready.version != 1
-            || ready.nonce != challenge.nonce
-            || ready.session != expected.session
-            || ready.serial != expected.partition_serial
-        {
-            bail!("installed endpoint readiness lineage differs")
-        }
-        installed.handoff.check_current()?;
-        endpoint.ensure_running()?;
-        owned::create_evidence(&params.state_dir.join(SUBST_PID_FILE))?
-            .write_all(EndpointPid::of_child(endpoint.id()).render().as_bytes())?;
-        let env = Zeroizing::new(serde_json::to_vec(&ready.handshake.env)?);
-        owned::create_evidence(&env_path)?.write_all(&env)?;
-        record_secret_fingerprints(params.vm_name, ready.handshake.input_fingerprints);
-        Ok(())
-    })();
+    let result = complete_start(&mut endpoint, config, None, None, &params, None, deadline);
     match result {
         Ok(()) => Ok(endpoint),
         Err(reason) => Err(owned::OwnedEndpointSpawnError { reason, endpoint }.into()),
     }
 }
 
+fn validate_installed_proxy(proxy: Option<&EgressProxySpawnConfig>) -> Result<()> {
+    let proxy =
+        proxy.context("installed endpoint requires canonical pre-resolved proxy settings")?;
+    let bytes = [&proxy.https, &proxy.http, &proxy.no_proxy]
+        .into_iter()
+        .flatten()
+        .try_fold(0usize, |bytes, value| bytes.checked_add(value.len()))
+        .context("installed endpoint proxy length overflow")?;
+    if bytes > CONFIG_LIMIT {
+        bail!("installed endpoint proxy settings exceed input bound")
+    }
+    Ok(())
+}
+
+/// Spawn only through the existing canonical endpoint binary/config path while
+/// retaining the original typed partition and holder through terminal cleanup.
+pub fn spawn_network_endpoint_installed_registered(
+    mut params: SubstitutionSpawnParams<'_>,
+    handoff: PreparedEndpointHandoff,
+    original: &InstalledHostServices<'_>,
+) -> Result<OwnedEndpoint> {
+    let deadline = Instant::now() + STARTUP_LIMIT;
+    if !params.telemetry {
+        bail!("registered installed endpoint requires retained telemetry");
+    }
+    owned::require_child_custody()?;
+    handoff.check_current()?;
+    original.check_endpoint(&params)?;
+    let projection = handoff.partition().projection();
+    if params.lifetime != EndpointLifetime::Launcher
+        || params.vm_name != projection.binding.vm_name
+        || projection.profile != 2
+        || projection.limits.host_metadata_bytes < INSTALLED_BOOTSTRAP_MIN_BYTES
+        || params.state_dir.as_os_str().len() > 4096
+        || params.tools.is_some_and(|rules| !rules.is_empty())
+        || !params.ingress.is_empty()
+        || !params.secrets.is_empty()
+    {
+        bail!("installed endpoint shape or declared resource floor unsupported")
+    }
+    let identity = params
+        .flowmux_identity
+        .as_ref()
+        .context("installed endpoint identity missing")?;
+    if identity.session_id != hex::encode(projection.session) {
+        bail!("installed endpoint canonical session differs")
+    }
+    let policy = params
+        .network_policy
+        .context("installed endpoint policy missing")?;
+    let plan = params
+        .admitted_network_plan
+        .as_ref()
+        .context("installed endpoint original admitted facts missing")?;
+    if plan.plan_id.0 != projection.admitted_plan_id || policy.payload_mapping().is_none() {
+        bail!("installed endpoint differs from original admitted mapping")
+    }
+    let env_path = mvm_core::config::vm_substitution_env_path(params.vm_name);
+    owned::refuse_existing_evidence(&params, &env_path)?;
+    // Installed embeddings resolve the canonical operator table/environment
+    // under their original retained credit. Never allocate an unbounded
+    // ambient variable or operator TOML here, and never invent direct egress.
+    let settings = original
+        .registration
+        .installed_endpoint_settings(original.registrar, &original.params)?;
+    let direct = EgressProxySpawnConfig::default();
+    let proxy = match settings {
+        InstalledEndpointSettings::ResolvedDirect => &direct,
+        InstalledEndpointSettings::ResolvedConfigured(proxy) => proxy,
+    };
+    validate_installed_proxy(Some(proxy))?;
+    if params
+        .egress_proxy
+        .as_ref()
+        .is_some_and(|supplied| supplied != proxy)
+    {
+        bail!("installed endpoint proxy differs from original settings");
+    }
+    params.egress_proxy = Some(proxy.clone());
+    params.session_marker = Some(params.state_dir.join(SUBST_SESSION_FILE));
+    let metadata = projection.limits.host_metadata_bytes;
+    let telemetry_template = super::collector::TelemetrySection::owned(
+        params.tenant,
+        params.state_dir,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    )?;
+    let config = encode_config_with_telemetry_credit(&params, &telemetry_template, metadata)?;
+    original.check_endpoint(&params)?;
+    // The canonical digest and proxy parser run only after the original
+    // partition has passed the bounded config's full instance requirement.
+    plan.validate_for(policy, params.tenant, params.vm_name)?;
+    if let Some(proxy) = &params.egress_proxy {
+        proxy.resolve()?;
+    }
+    let audit = original
+        .registration
+        .prepare_endpoint_audit(original.registrar, &original.params)?;
+    let mut preparation = producer::Preparation::new(handoff, audit);
+    let startup: Result<OwnedEndpoint> = (|| {
+        let audit_projection = audit::AuditProjection::from_original(
+            preparation
+                .custody()
+                .audit
+                .as_ref()
+                .context("original audit custody missing")?,
+        )?;
+        // The actual key has the same width as the verified placeholder.
+        drop(config);
+        let keys_dir = telemetry_template.keys_directory()?.to_path_buf();
+        let (key, records_projection) =
+            preparation.prepare_retained(&params, original, &keys_dir, deadline)?;
+        use base64::Engine as _;
+        let key =
+            Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(key.expose_bytes()));
+        let telemetry = telemetry_template.with_key(&key)?;
+        let config = encode_config_with_telemetry_credit(&params, &telemetry, metadata)?;
+        preparation.check_current(original, &params, deadline)?;
+        let bin = resolve_network_endpoint_path()?;
+        preparation.check_current(original, &params, deadline)?;
+        let log = owned::create_evidence(&endpoint_stderr_log_path(params.state_dir))?;
+        let mut command = owned::endpoint_command(
+            mvm_core::env_hygiene::helper_command(&bin),
+            EndpointLifetime::Launcher,
+            params.state_dir,
+            log,
+        );
+        command.arg("--installed-partition");
+        let mut fds = vec![
+            preparation
+                .custody()
+                .handoff
+                .holder()
+                .directory()
+                .as_raw_fd(),
+            preparation.custody().handoff.holder().holder().as_raw_fd(),
+        ];
+        fds.extend(
+            preparation
+                .custody()
+                .audit
+                .as_ref()
+                .expect("original audit custody")
+                .event_descriptors()
+                .map(|fd| fd.as_raw_fd()),
+        );
+        fds.push(records_projection.descriptor());
+        if fds.iter().any(|fd| *fd <= 2)
+            || fds
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != fds.len()
+        {
+            bail!("installed endpoint descriptors differ")
+        }
+        crate::host::restore_image::inherit_descriptors(&mut command, fds);
+        preparation.check_current(original, &params, deadline)?;
+        let child = command
+            .spawn()
+            .context("spawn original installed endpoint")?;
+        let mut endpoint = OwnedEndpoint::new(child);
+        // Install supporting custody BEFORE any fallible post-spawn operation.
+        endpoint.installed = Some(preparation.take());
+        let result = complete_start(
+            &mut endpoint,
+            config,
+            Some(audit_projection),
+            Some(records_projection),
+            &params,
+            Some(original),
+            deadline,
+        );
+        match result {
+            Ok(()) => Ok(endpoint),
+            Err(reason) => Err(owned::OwnedEndpointSpawnError { reason, endpoint }.into()),
+        }
+    })();
+    startup.map_err(|reason| preparation.error(reason))
+}
+
+fn complete_start<C: Serialize>(
+    endpoint: &mut OwnedEndpoint,
+    config: C,
+    audit: Option<audit::AuditProjection>,
+    telemetry_records: Option<records::RecordsProjection>,
+    params: &SubstitutionSpawnParams<'_>,
+    original: Option<&InstalledHostServices<'_>>,
+    deadline: Instant,
+) -> Result<()> {
+    endpoint.arm()?;
+    let child = endpoint
+        .child
+        .as_mut()
+        .context("original endpoint child missing")?;
+    let input = child.stdin.take();
+    let output = child.stdout.take();
+    let installed = endpoint
+        .installed
+        .as_mut()
+        .context("installed endpoint custody missing")?;
+    installed.input = input;
+    installed.output = output;
+    let challenge: Challenge = read_frame(
+        installed
+            .output
+            .as_mut()
+            .context("installed output missing")?,
+        CONTROL_LIMIT,
+        deadline,
+    )?;
+    if challenge.version != 1 || challenge.nonce == [0; 32] {
+        bail!("invalid installed endpoint challenge")
+    }
+    installed.nonce = challenge.nonce;
+    installed.handoff.check_current()?;
+    if let Some(original) = original {
+        installed
+            .audit
+            .as_ref()
+            .context("original audit custody missing")?
+            .check_current()?;
+        original.check_endpoint(params)?;
+    }
+    write_frame(
+        installed
+            .input
+            .as_mut()
+            .context("installed input missing")?,
+        &Prepare {
+            version: 1,
+            nonce: challenge.nonce,
+            projection: installed.handoff.partition().projection().clone(),
+            directory: installed.handoff.holder().directory().as_raw_fd(),
+            holder: installed.handoff.holder().holder().as_raw_fd(),
+            expected: installed.handoff.holder().expectation().clone(),
+            config,
+            telemetry_records,
+            audit,
+        },
+        CONFIG_LIMIT,
+        deadline,
+    )?;
+    let ready: Ready = read_frame(
+        installed
+            .output
+            .as_mut()
+            .context("installed output missing")?,
+        CONFIG_LIMIT,
+        deadline,
+    )?;
+    let expected = installed.handoff.partition().projection();
+    if ready.version != 1
+        || ready.nonce != challenge.nonce
+        || ready.session != expected.session
+        || ready.serial != expected.partition_serial
+    {
+        bail!("installed endpoint readiness lineage differs")
+    }
+    installed.handoff.check_current()?;
+    if let Some(original) = original {
+        installed
+            .audit
+            .as_ref()
+            .context("original audit custody missing")?
+            .check_current()?;
+        original.check_endpoint(params)?;
+    }
+    endpoint.ensure_running()?;
+    owned::create_evidence(&params.state_dir.join(SUBST_PID_FILE))?
+        .write_all(EndpointPid::of_child(endpoint.id()).render().as_bytes())?;
+    let env = Zeroizing::new(serde_json::to_vec(&ready.handshake.env)?);
+    owned::create_evidence(&mvm_core::config::vm_substitution_env_path(params.vm_name))?
+        .write_all(&env)?;
+    record_secret_fingerprints(params.vm_name, ready.handshake.input_fingerprints);
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) struct InstalledCustody {
     pub(super) handoff: PreparedEndpointHandoff,
+    pub(super) audit: Option<crate::host::host_agent_spawn::PreparedEndpointAudit>,
+    telemetry: Option<producer::RetainedFiles>,
     pub(super) input: Option<ChildStdin>,
     pub(super) output: Option<ChildStdout>,
     nonce: [u8; 32],
@@ -665,6 +884,40 @@ struct BoundedBytes {
     bytes: Zeroizing<Vec<u8>>,
     limit: usize,
 }
+fn encode_config_projection(
+    params: &SubstitutionSpawnParams<'_>,
+    telemetry: Option<&super::collector::TelemetrySection<'_>>,
+) -> Result<Box<serde_json::value::RawValue>> {
+    if params.telemetry != telemetry.is_some() || params.state_dir.as_os_str().len() > 4096 {
+        bail!("installed endpoint configuration shape unsupported")
+    }
+    let mut bounded = BoundedBytes {
+        bytes: Zeroizing::new(Vec::with_capacity(CONFIG_LIMIT)),
+        limit: CONFIG_LIMIT,
+    };
+    serde_json::to_writer(&mut bounded, &EndpointConfigProjection(params, telemetry))
+        .map_err(|_| anyhow!("installed endpoint configuration exceeds bound"))?;
+    let text = String::from_utf8(std::mem::take(&mut bounded.bytes))
+        .map_err(|_| anyhow!("invalid installed endpoint configuration"))?;
+    serde_json::value::RawValue::from_string(text)
+        .map_err(|_| anyhow!("invalid installed endpoint configuration"))
+}
+
+pub(super) fn encode_config_with_telemetry_credit(
+    params: &SubstitutionSpawnParams<'_>,
+    telemetry: &super::collector::TelemetrySection<'_>,
+    metadata: u64,
+) -> Result<Box<serde_json::value::RawValue>> {
+    if metadata < INSTALLED_BOOTSTRAP_MIN_BYTES {
+        bail!("installed endpoint bootstrap credit missing")
+    }
+    let config = encode_config_projection(params, Some(telemetry))?;
+    if installed_endpoint_bootstrap_requirement(config.get())? > metadata {
+        bail!("installed endpoint typed configuration credit missing")
+    }
+    Ok(config)
+}
+
 impl Write for BoundedBytes {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {

@@ -356,6 +356,8 @@ fn pipe_exchange(mode: &str) {
             let mut endpoint = OwnedEndpoint::new(child.0.take().unwrap());
             endpoint.installed = Some(InstalledCustody {
                 handoff,
+                audit: None,
+                telemetry: None,
                 input: Some(input),
                 output: Some(output),
                 nonce: challenge.nonce,

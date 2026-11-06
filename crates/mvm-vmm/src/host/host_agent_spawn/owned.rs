@@ -264,6 +264,10 @@ impl PreparedEndpointAudit {
         result
     }
 
+    pub(crate) fn event_descriptors(&self) -> [std::os::fd::BorrowedFd<'_>; 2] {
+        use std::os::fd::AsFd;
+        [self.signer.as_fd(), self.daemon.as_fd()]
+    }
     pub fn signer_pid(&self) -> u32 {
         self.signer_pid
     }
@@ -1107,6 +1111,17 @@ impl OwnedVmRegistration {
         self.shared.holder.verify_current()?;
         self.shared.running()?;
         active()
+    }
+
+    pub(crate) fn installed_endpoint_settings(
+        &self,
+        original: &OwnedHostAgentRegistrar,
+        params: &HostAgentServicesParams<'_>,
+    ) -> Result<&crate::host::network_endpoint_spawn::InstalledEndpointSettings> {
+        self.check_current_for(original, params)?;
+        let settings = self.shared.parent.installed_endpoint_settings(params)?;
+        self.check_current_for(original, params)?;
+        Ok(settings)
     }
 
     pub(crate) fn check_flowmux_host_anchor(

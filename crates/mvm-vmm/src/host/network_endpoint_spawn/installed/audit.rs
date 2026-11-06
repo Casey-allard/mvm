@@ -1,7 +1,7 @@
 //! The private Prepare record binds inherited original-process observations.
 //! Public metadata never constructs this capability.
 use super::*;
-use crate::host::host_agent_spawn::require_live_event;
+use crate::host::host_agent_spawn::{PreparedEndpointAudit, require_live_event};
 use std::os::fd::AsFd;
 
 #[derive(Serialize, Deserialize)]
@@ -56,6 +56,24 @@ impl AuditProjection {
         Ok(())
     }
 
+    pub(super) fn from_original(original: &PreparedEndpointAudit) -> Result<Self> {
+        original.check_current()?;
+        let [signer, daemon] = original.event_descriptors();
+        let projection = Self {
+            #[cfg(target_os = "macos")]
+            version: 2,
+            #[cfg(not(target_os = "macos"))]
+            version: 1,
+            socket: original.socket().to_owned(),
+            signer_pid: original.signer_pid(),
+            tenant: original.tenant().to_owned(),
+            vm: original.vm().to_owned(),
+            signer_event: signer.as_raw_fd(),
+            daemon_event: daemon.as_raw_fd(),
+        };
+        projection.check_shape()?;
+        Ok(projection)
+    }
     fn check_shape(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         let expected_version = 1;
