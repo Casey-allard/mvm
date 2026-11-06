@@ -158,7 +158,11 @@ fn workload_cmdline_for_hostname(
     let grants: Vec<String> = [
         verb_grant_cmdline_token(&config.name),
         require_grant_cmdline_token(&config.name),
-        host_signer_pub_cmdline_token(&config.name),
+        if uses_installed_payload_anchor(config) {
+            None
+        } else {
+            host_signer_pub_cmdline_token(&config.name)
+        },
         telemetry_cmdline_token(&config.name),
         seccomp_cmdline_token(config),
         profile_cmdline_token(config),
@@ -225,6 +229,20 @@ pub fn runner_cmdline(
     base_bootargs: impl Fn(bool) -> String,
 ) -> String {
     runner_cmdline_for_hostname(config, state_dir, base_bootargs, Some(&config.name))
+}
+
+/// The installed mapped payload path supplies its checked public anchor at the
+/// original endpoint ownership boundary, after the initial cmdline assembly.
+pub fn uses_installed_payload_anchor(config: &VmStartConfig) -> bool {
+    #[cfg(unix)]
+    {
+        config.host_lifetime.is_some() && config.network_policy.payload_mapping().is_some()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        false
+    }
 }
 
 /// Assemble a factory parent's cmdline without binding it to the parent's

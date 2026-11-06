@@ -394,6 +394,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         writable_images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
     ) -> Result<Box<dyn RunningVm>> {
         self.require_caller_registration_shape(inputs.config)?;
+        Self::check_installed_endpoint_inputs(inputs)?;
         #[cfg(unix)]
         let installed = match &inputs.config.host_lifetime {
             Some(owner) => Some(self.installed.reserve(owner)?),
@@ -481,12 +482,29 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         Ok(())
     }
 
+    fn check_installed_endpoint_inputs(inputs: &WorkloadLaunchInputs<'_>) -> Result<()> {
+        #[cfg(unix)]
+        if inputs.config.host_lifetime.is_some() {
+            anyhow::ensure!(
+                inputs.network_policy == &inputs.config.network_policy,
+                "installed endpoint policy differs from launch configuration"
+            );
+        }
+        anyhow::ensure!(
+            !cmdline::uses_installed_payload_anchor(inputs.config)
+                || mvm_agentd::vsock::host_signer_pub_token(&inputs.cmdline).is_none(),
+            "installed workload cmdline contains an unbound host signer anchor"
+        );
+        Ok(())
+    }
+
     /// Prepare the same policy, endpoint and device mapping for both ordinary
     /// boots and the concrete owned cold channel.
     fn prepare_workload_boot(
         &self,
         inputs: &WorkloadLaunchInputs<'_>,
     ) -> Result<PreparedWorkloadBoot> {
+        Self::check_installed_endpoint_inputs(inputs)?;
         // A caller times this call from outside and cannot see past it, yet the
         // VMM boot and every post-boot registration happen in here. Off unless
         // a measurement asked for it.

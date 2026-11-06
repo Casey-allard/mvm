@@ -227,6 +227,85 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
         )
         .unwrap();
     let runner = WorkloadRunner::new(driver, NoEndpoint, NoBroker);
+    // An installed mapped workload must not accept an anchor preinserted by
+    // a caller. The genuine signer is selected at original endpoint startup.
+    use mvm_contract::policy::network_policy::{
+        CooperatingPayloadPolicy, CooperatingTcpPeer, PayloadMappingProfile,
+    };
+    let mut injected_config = config.clone();
+    injected_config.network_policy =
+        NetworkPolicy::allow_list(vec![mvm_core::policy::network_policy::HostPort::new(
+            "peer.example",
+            443,
+        )])
+        .with_payload_mapping(Some(
+            CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                host: "peer.example".into(),
+                port: 443,
+                server_name: "peer.example".into(),
+                spki_sha256: [5; 32],
+                profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
+            }])
+            .unwrap(),
+        ));
+    let state_dir = vm_state_dir(&config.name);
+    mvm_core::config::create_private_dir(&state_dir).unwrap();
+    let keys = mvm_core::config::mvm_keys_dir();
+    mvm_core::config::create_private_dir(&keys).unwrap();
+    let signer = keys.join(mvm_vmm::host::broker_services_spawn::HOST_SIGNER_PUB);
+    std::fs::write(
+        &signer,
+        ed25519_dalek::SigningKey::from_bytes(&[19; 32])
+            .verifying_key()
+            .to_bytes(),
+    )
+    .unwrap();
+    let render = |config| cmdline::runner_cmdline(config, &state_dir, |_| "console=ttyS0".into());
+    assert!(mvm_agentd::vsock::host_signer_pub_token(&render(&config)).is_some());
+    assert!(mvm_agentd::vsock::host_signer_pub_token(&render(&injected_config)).is_none());
+    std::fs::remove_file(signer).unwrap();
+    let redaction = RedactionPolicy::default();
+    let injected = WorkloadLaunchInputs {
+        config: &injected_config,
+        tenant: "local",
+        secrets: &[],
+        redaction: &redaction,
+        network_policy: &injected_config.network_policy,
+        cmdline: format!(
+            "console=ttyS0 mvm.host_signer_pub={}",
+            hex::encode(
+                ed25519_dalek::SigningKey::from_bytes(&[19; 32])
+                    .verifying_key()
+                    .to_bytes()
+            )
+        ),
+    };
+    let refused = runner
+        .start_workload(&injected)
+        .err()
+        .expect("injected signer");
+    assert!(
+        refused.to_string().contains("unbound host signer anchor"),
+        "{refused:#}"
+    );
+    let mismatched = WorkloadLaunchInputs {
+        config: &config,
+        cmdline: injected.cmdline.clone(),
+        ..injected
+    };
+    let refused = runner
+        .start_workload(&mismatched)
+        .err()
+        .expect("policy mismatch");
+    assert!(
+        refused
+            .to_string()
+            .contains("installed endpoint policy differs"),
+        "{refused:#}"
+    );
+    let id = VmId(config.name.clone());
+    assert!(!installed::marker(&id).exists());
+    assert!(runner.installed.find(&id).unwrap().is_none());
     runner.start(&config).unwrap();
     assert_eq!(
         dropped.load(Ordering::SeqCst),
@@ -234,7 +313,6 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
         "start discarded the actual original native handle"
     );
     assert_eq!(attached.load(Ordering::SeqCst), 0);
-    let id = VmId(config.name.clone());
     assert!(
         runner.status(&id).is_ok(),
         "owned status uses the original handle"
