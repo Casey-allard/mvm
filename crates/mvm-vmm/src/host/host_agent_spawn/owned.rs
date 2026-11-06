@@ -5,6 +5,7 @@ use crate::host::process_exit::{
 };
 use anyhow::ensure;
 use mvm_core::host_lifetime::PreparedHostLifetimeLease;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -154,6 +155,7 @@ pub struct OwnedVmRegistration {
     shared: Arc<Shared>,
     vm: String,
     serial: u64,
+    commitment: [u8; 32],
     retired: bool,
 }
 impl fmt::Debug for OwnedHostAgent {
@@ -596,6 +598,37 @@ fn registration_bounds(params: &HostAgentServicesParams<'_>) -> Result<()> {
     Ok(())
 }
 
+struct RegistrationCommitment {
+    bytes: usize,
+    hash: Sha256,
+}
+impl Write for RegistrationCommitment {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > CONTROL_MAX_FRAME_BYTES.saturating_sub(self.bytes) {
+            return Err(std::io::Error::other("owned canonical registration limit"));
+        }
+        self.bytes += bytes.len();
+        self.hash.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn registration_commitment(request: &RegisterVm) -> Result<[u8; 32]> {
+    let mut output = RegistrationCommitment {
+        bytes: 0,
+        hash: Sha256::new(),
+    };
+    // Local retained-facts identity only: this digest grants no authority and
+    // changes neither the canonical Register value nor its signed wire bytes.
+    output
+        .hash
+        .update(b"mvm.installed-host-agent.registration.v1\0");
+    serde_json::to_writer(&mut output, request)?;
+    Ok(output.hash.finalize().into())
+}
+
 fn owned_control(
     shared: &Shared,
     request: ControlRequest,
@@ -666,6 +699,8 @@ impl OwnedHostAgentRegistrar {
         self.shared.parent.check_registration(&params)?;
         validate_owned_host_agent_services(&params)?;
         registration_bounds(&params)?;
+        let request = registration(&params, &self.shared.tenant);
+        let commitment = registration_commitment(&request)?;
         self.shared.holder.verify_current()?;
         self.shared.running()?;
         for file in [
@@ -708,11 +743,12 @@ impl OwnedHostAgentRegistrar {
             shared: self.shared.clone(),
             vm: params.vm_name.into(),
             serial,
+            commitment,
             retired: false,
         };
         let result = owned_control(
             &self.shared,
-            ControlRequest::Register(Box::new(registration(&params, &self.shared.tenant))),
+            ControlRequest::Register(Box::new(request)),
             Some(&params),
         )
         .and_then(|()| self.shared.running())
@@ -755,6 +791,68 @@ impl OwnedHostAgentRegistrar {
     }
 }
 impl OwnedVmRegistration {
+    /// Observe the same original active registration before installed work.
+    /// This sends no request and reserves no future admission.
+    pub(crate) fn check_current_for(
+        &self,
+        original: &OwnedHostAgentRegistrar,
+        params: &HostAgentServicesParams<'_>,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.shared, &original.shared)
+                && !self.retired
+                && params.tenant_id == Some(self.shared.tenant.as_str())
+                && params.vm_name == self.vm,
+            "owned registration original identity differs"
+        );
+        let active = || -> Result<()> {
+            let ledger = self
+                .shared
+                .ledger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("owned registration ledger poisoned"))?;
+            ensure!(
+                !ledger.closed
+                    && !ledger.fenced
+                    && ledger.slots.get(&self.vm).is_some_and(|slot| {
+                        slot.serial == self.serial && slot.phase == Phase::Active
+                    }),
+                "owned registration is not current and active"
+            );
+            Ok(())
+        };
+        active()?;
+        validate_owned_host_agent_services(params)?;
+        registration_bounds(params)?;
+        ensure!(
+            registration_commitment(&registration(params, &self.shared.tenant))? == self.commitment,
+            "owned registration original facts differ"
+        );
+        // No parent/filesystem/process observation runs under the ledger.
+        self.shared.parent.check_current(&self.shared.tenant)?;
+        self.shared.parent.check_registration(params)?;
+        self.shared.holder.verify_current()?;
+        self.shared.running()?;
+        active()
+    }
+
+    pub(crate) fn check_flowmux_host_anchor(
+        &self,
+        original: &OwnedHostAgentRegistrar,
+        params: &HostAgentServicesParams<'_>,
+        candidate: &[u8; 32],
+    ) -> Result<()> {
+        self.check_current_for(original, params)?;
+        let original_anchor = ed25519_dalek::SigningKey::from_bytes(&self.shared.key)
+            .verifying_key()
+            .to_bytes();
+        ensure!(
+            candidate == &original_anchor,
+            "installed FlowMux host anchor differs from original registered signer"
+        );
+        self.check_current_for(original, params)
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         if self.retired {
             return Ok(());

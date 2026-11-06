@@ -3,7 +3,10 @@
 //! typed handoff and the child adopts its original inherited holder.
 
 use super::*;
-use crate::host::process_exit::{ProcessExitObserver, ProcessExitWait};
+use crate::host::{
+    host_agent_spawn::{HostAgentServicesParams, OwnedHostAgentRegistrar, OwnedVmRegistration},
+    process_exit::{ProcessExitObserver, ProcessExitWait},
+};
 use mvm_core::host_lifetime::{
     EndpointPartitionProjection, HostLeaseExpectation, PreparedEndpointHandoff,
     PreparedHostLifetimeLease,
@@ -25,6 +28,49 @@ use zeroize::Zeroizing;
 const CONFIG_LIMIT: usize = 65_536;
 const CONTROL_LIMIT: usize = 1024;
 const STARTUP_LIMIT: Duration = Duration::from_secs(10);
+
+/// Borrow the exact original host-agent registration through endpoint startup.
+pub struct InstalledHostServices<'a> {
+    registrar: &'a OwnedHostAgentRegistrar,
+    registration: &'a OwnedVmRegistration,
+    params: HostAgentServicesParams<'a>,
+}
+
+impl<'a> InstalledHostServices<'a> {
+    pub fn new(
+        registrar: &'a OwnedHostAgentRegistrar,
+        registration: &'a OwnedVmRegistration,
+        params: HostAgentServicesParams<'a>,
+    ) -> Result<Self> {
+        registration.check_current_for(registrar, &params)?;
+        Ok(Self {
+            registrar,
+            registration,
+            params,
+        })
+    }
+
+    pub fn check_endpoint_binding(
+        &self,
+        vm_name: &str,
+        tenant: &str,
+        state_dir: &Path,
+    ) -> Result<()> {
+        if vm_name != self.params.vm_name
+            || Some(tenant) != self.params.tenant_id
+            || state_dir != self.params.state_dir
+        {
+            bail!("installed endpoint differs from original host-service registration");
+        }
+        self.registration
+            .check_current_for(self.registrar, &self.params)
+    }
+
+    pub fn check_flowmux_host_anchor(&self, candidate: &[u8; 32]) -> Result<()> {
+        self.registration
+            .check_flowmux_host_anchor(self.registrar, &self.params, candidate)
+    }
+}
 
 #[cfg(test)]
 #[path = "installed/tests.rs"]
