@@ -621,7 +621,7 @@ pub fn install_image_set_initramfs_archive(
 
 // The runtime image is about 1.26 MiB today. Allow substantial growth, but
 // never expand a signed outer archive into unbounded temporary storage.
-const INITRAMFS_ARCHIVE_LIMITS: InitramfsArchiveLimits = InitramfsArchiveLimits {
+pub(crate) const INITRAMFS_ARCHIVE_LIMITS: InitramfsArchiveLimits = InitramfsArchiveLimits {
     file_bytes: 64 * 1024 * 1024,
     total_bytes: 128 * 1024 * 1024,
 };

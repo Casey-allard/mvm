@@ -388,9 +388,7 @@ fn verify_archive(
     );
     let [overlay_member, initramfs_member] =
         select_boot_asset_members(&boot.image_set.manifest, proof.arch)?;
-    let scratch = tempfile::tempdir()?;
-    let mut archives = Vec::new();
-    for (index, member) in [overlay_member, initramfs_member].into_iter().enumerate() {
+    let signed_member = |member: &mvm_core::image_set::ImageSetMember| -> Result<&[u8]> {
         ensure!(
             member.artifacts.len() == 1,
             "portable role requires exactly one archive"
@@ -410,33 +408,27 @@ fn verify_archive(
                 && mvm_core::plan::bundle::sha256_hex(bytes) == artifact.sha256.as_str(),
             "portable member differs from original image set"
         );
-        let archive = scratch.path().join(format!("archive-{index}"));
-        std::fs::write(&archive, bytes)?;
-        archives.push(archive);
-    }
-    let overlay_stage = tempfile::tempdir_in(scratch.path())?;
-    let initrd_stage = tempfile::tempdir_in(scratch.path())?;
-    let overlay = mvm_build::runtime_overlay::parse_authenticated_legacy_overlay(
-        &archives[0],
-        overlay_stage.path(),
-        proof.arch,
-    )?;
-    let initrd = mvm_build::initramfs::parse_authenticated_legacy_initramfs(
-        &archives[1],
-        initrd_stage.path(),
-    )?;
-    let overlay_bytes = std::fs::read(&overlay.overlay_ext4)?;
-    let verity_bytes = std::fs::read(&overlay.sidecar)?;
-    let initrd_bytes = std::fs::read(&initrd.image_path)?;
+        Ok(bytes)
+    };
+    let overlay_bytes = signed_member(overlay_member)?;
+    let initrd_bytes = signed_member(initramfs_member)?;
+    let (overlay, initrd) = if exact_bytes.is_some() {
+        (
+            mvm_build::legacy_boot_payload::overlay(overlay_bytes)?,
+            mvm_build::legacy_boot_payload::initramfs(initrd_bytes)?,
+        )
+    } else {
+        decode_ordinary_boot_assets(overlay_bytes, initrd_bytes, proof.arch)?
+    };
     ensure!(
-        role_bytes(&bundle, ArtifactRole::Initrd)? == initrd_bytes,
+        role_bytes(&bundle, ArtifactRole::Initrd)? == initrd.image,
         "portable initrd differs from signed Initrd role"
     );
     if let Some(pin) = &config.bundle_boot_assets {
         ensure!(
             pin.arch == proof.arch
                 && pin.manifest_sha256.as_str() == proof.manifest_sha256
-                && pin.initrd_sha256.as_str() == mvm_core::plan::bundle::sha256_hex(&initrd_bytes),
+                && pin.initrd_sha256.as_str() == mvm_core::plan::bundle::sha256_hex(&initrd.image),
             "portable boot pin differs from original bundle"
         );
     }
@@ -445,13 +437,52 @@ fn verify_archive(
         workload_verity: WorkloadVerity::from_bundle(&bundle)?,
         kernel: role_bytes(&bundle, ArtifactRole::Kernel)?.to_vec(),
         archive: original,
-        overlay: overlay_bytes,
+        overlay: overlay.image,
         overlay_version: overlay.version,
         overlay_roothash: overlay.roothash,
-        verity: verity_bytes,
-        initrd: initrd_bytes,
+        verity: overlay.verity,
+        initrd: initrd.image,
         initrd_version: initrd.version,
     })
+}
+
+fn decode_ordinary_boot_assets(
+    overlay_bytes: &[u8],
+    initrd_bytes: &[u8],
+    arch: mvm_core::arch::GuestArch,
+) -> Result<(
+    mvm_build::legacy_boot_payload::OverlayPayload,
+    mvm_build::legacy_boot_payload::InitramfsPayload,
+)> {
+    use mvm_build::legacy_boot_payload::{InitramfsPayload, OverlayPayload};
+    let scratch = tempfile::tempdir()?;
+    let overlay_archive = scratch.path().join("archive-0");
+    let initrd_archive = scratch.path().join("archive-1");
+    std::fs::write(&overlay_archive, overlay_bytes)?;
+    std::fs::write(&initrd_archive, initrd_bytes)?;
+    let overlay_stage = tempfile::tempdir_in(scratch.path())?;
+    let initrd_stage = tempfile::tempdir_in(scratch.path())?;
+    let overlay = mvm_build::runtime_overlay::parse_authenticated_legacy_overlay(
+        &overlay_archive,
+        overlay_stage.path(),
+        arch,
+    )?;
+    let initrd = mvm_build::initramfs::parse_authenticated_legacy_initramfs(
+        &initrd_archive,
+        initrd_stage.path(),
+    )?;
+    Ok((
+        OverlayPayload {
+            image: std::fs::read(&overlay.overlay_ext4)?,
+            verity: std::fs::read(&overlay.sidecar)?,
+            roothash: overlay.roothash,
+            version: overlay.version,
+        },
+        InitramfsPayload {
+            image: std::fs::read(&initrd.image_path)?,
+            version: initrd.version,
+        },
+    ))
 }
 
 fn selected_file_matches(path: &Path, expected: &[u8], installed: bool) -> Result<bool> {
@@ -721,6 +752,97 @@ mod tests {
             overlay_roothash: config.runtime_overlay_roothash.clone().unwrap(),
             version: config.runtime_overlay_version.clone().unwrap(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quoted_portable_verification_needs_no_filesystem_scratch() {
+        use mvm_core::host_lifetime::{
+            HostLaunchBinding, HostLeaseExpectation, HostLifetimeInputs, PreparedHostLifetime,
+        };
+        use std::{
+            fs::{File, OpenOptions},
+            num::NonZeroU64,
+            os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        let mut config = fixture(home.path(), Some(2), false, 4).unwrap();
+        let expected = verify_archive(&config, 2).unwrap();
+        let proof = config.legacy_portable_runtime.as_ref().unwrap();
+        let length = NonZeroU64::new(std::fs::metadata(&proof.archive).unwrap().len()).unwrap();
+        let private = home.path().join("owner");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = private.join("state");
+        std::fs::write(&state, b"a").unwrap();
+        std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(private.join("holder"))
+            .unwrap();
+        let prepared = PreparedHostLifetime::bind(
+            HostLifetimeInputs {
+                directory: File::open(&private).unwrap(),
+                holder,
+                expected: HostLeaseExpectation {
+                    state_name: "state".into(),
+                    state_bytes: 1,
+                    state_sha256: hex::decode(sha256_hex(b"a")).unwrap().try_into().unwrap(),
+                    absent_names: ["next".into(), "intent".into()],
+                },
+                binding: HostLaunchBinding {
+                    installation: [1; 32],
+                    profile: [2; 32],
+                    generation: 1,
+                    grant_serial: 1,
+                    vm_name: config.name.clone(),
+                    backend: mvm_core::vm_backend::BackendKind::Hvf,
+                    cpus: 1,
+                    memory_mib: 128,
+                },
+            },
+            (),
+        )
+        .unwrap()
+        .with_portable_archive(proof.pin.clone(), length)
+        .unwrap();
+        config.host_lifetime = Some(prepared.into_anchor());
+
+        let unavailable = home.path().join("no-scratch");
+        std::fs::write(&unavailable, b"regular file, not a scratch directory").unwrap();
+        env.set("TMPDIR", &unavailable);
+        let actual = verify_archive(&config, 2).expect("quoted verification must not use TMPDIR");
+        assert_eq!(actual.archive, expected.archive);
+        assert_eq!(actual.rootfs, expected.rootfs);
+        assert_eq!(actual.kernel, expected.kernel);
+        assert_eq!(actual.overlay, expected.overlay);
+        assert_eq!(actual.verity, expected.verity);
+        assert_eq!(actual.initrd, expected.initrd);
+        assert_eq!(actual.overlay_roothash, expected.overlay_roothash);
+        assert_eq!(actual.overlay_version, expected.overlay_version);
+        assert_eq!(actual.initrd_version, expected.initrd_version);
+
+        let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
+        let bound = lease
+            .bind(&config)
+            .expect("quoted runtime must bind without scratch");
+        let bound_archive = &bound.legacy_portable_runtime.as_ref().unwrap().archive;
+        let generation = bound_archive.parent().unwrap();
+        assert_eq!(std::fs::read(bound_archive).unwrap(), expected.archive);
+        assert_eq!(std::fs::read(&bound.rootfs_path).unwrap(), expected.rootfs);
+        assert_eq!(
+            std::fs::read(bound.initrd_path.as_ref().unwrap()).unwrap(),
+            expected.initrd
+        );
+        assert!(lease.retire_portable_generation().unwrap());
+        assert!(!generation.exists());
+        assert!(lease.retire_portable_generation().unwrap());
     }
 
     #[test]

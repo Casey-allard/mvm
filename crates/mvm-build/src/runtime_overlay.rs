@@ -1030,7 +1030,7 @@ pub fn parse_authenticated_legacy_overlay(
 const RELEASE_GUEST_RUNTIME_FILES: [&str; 4] =
     crate::guest_agent_build::OCI_GUEST_RUNTIME_BINARY_NAMES;
 
-const OVERLAY_ARCHIVE_MEMBERS: [&str; 9] = [
+pub(crate) const OVERLAY_ARCHIVE_MEMBERS: [&str; 9] = [
     "overlay.ext4",
     "overlay.verity",
     "overlay.roothash",
@@ -1075,16 +1075,13 @@ pub(crate) fn extract_release_archive(
 ) -> Result<(), RuntimeOverlayError> {
     // Release bundles contain several executables, unlike the single initramfs
     // image. Bound expansion while leaving room for larger runtime binaries.
-    extract_release_archive_with_limits(
-        archive_path,
-        stage,
-        expected,
-        ExpandedArchiveLimits {
-            file_bytes: 128 * 1024 * 1024,
-            total_bytes: 512 * 1024 * 1024,
-        },
-    )
+    extract_release_archive_with_limits(archive_path, stage, expected, OVERLAY_ARCHIVE_LIMITS)
 }
+
+pub(crate) const OVERLAY_ARCHIVE_LIMITS: ExpandedArchiveLimits = ExpandedArchiveLimits {
+    file_bytes: 128 * 1024 * 1024,
+    total_bytes: 512 * 1024 * 1024,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExpandedArchiveLimits {
@@ -1121,7 +1118,7 @@ impl ExpandedArchiveLimits {
     /// reads one extra byte but never writes it, including at an exact fit.
     pub(crate) fn copy_entry(
         &self,
-        entry: &mut impl std::io::Read,
+        entry: &mut (impl std::io::Read + ?Sized),
         out: &mut impl std::io::Write,
         remaining: &mut u64,
     ) -> std::io::Result<()> {
@@ -1146,8 +1143,36 @@ fn extract_release_archive_with_limits(
     expected: &[&'static str],
     limits: ExpandedArchiveLimits,
 ) -> Result<(), RuntimeOverlayError> {
-    let file = std::fs::File::open(archive_path)?;
-    let decoder = flate2::read::GzDecoder::new(file);
+    scan_release_archive(
+        std::fs::File::open(archive_path)?,
+        archive_path,
+        expected,
+        limits,
+        |name, entry, remaining| {
+            let dest = stage.join(name);
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)?;
+            limits.copy_entry(entry, &mut out, remaining).map_err(|e| {
+                RuntimeOverlayError::InvalidArchive {
+                    archive_path: archive_path.to_path_buf(),
+                    reason: format!("extract {name}: {e}"),
+                }
+            })?;
+            set_cache_perms(&dest)
+        },
+    )
+}
+
+pub(crate) fn scan_release_archive<E: From<RuntimeOverlayError>>(
+    reader: impl std::io::Read,
+    archive_path: &Path,
+    expected: &[&'static str],
+    limits: ExpandedArchiveLimits,
+    mut consume: impl FnMut(&'static str, &mut dyn std::io::Read, &mut u64) -> Result<(), E>,
+) -> Result<(), E> {
+    let decoder = flate2::read::GzDecoder::new(reader);
     let mut archive = tar::Archive::new(limits.archive_reader(decoder));
     let mut seen = std::collections::BTreeSet::new();
     let mut remaining = limits.total_bytes;
@@ -1174,7 +1199,8 @@ fn extract_release_archive_with_limits(
             return Err(RuntimeOverlayError::InvalidArchive {
                 archive_path: archive_path.to_path_buf(),
                 reason: format!("unsafe or unexpected path {:?}", path.display()),
-            });
+            }
+            .into());
         };
         match entry.header().entry_type() {
             tar::EntryType::Regular => {
@@ -1182,20 +1208,10 @@ fn extract_release_archive_with_limits(
                     return Err(RuntimeOverlayError::InvalidArchive {
                         archive_path: archive_path.to_path_buf(),
                         reason: format!("duplicate archive member {name}"),
-                    });
+                    }
+                    .into());
                 }
-                let dest = stage.join(name);
-                let mut out = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&dest)?;
-                limits
-                    .copy_entry(&mut entry, &mut out, &mut remaining)
-                    .map_err(|e| RuntimeOverlayError::InvalidArchive {
-                        archive_path: archive_path.to_path_buf(),
-                        reason: format!("extract {name}: {e}"),
-                    })?;
-                set_cache_perms(&dest)?;
+                consume(name, &mut entry, &mut remaining)?;
             }
             other => {
                 return Err(RuntimeOverlayError::InvalidArchive {
@@ -1204,7 +1220,8 @@ fn extract_release_archive_with_limits(
                         "unsupported tar entry type {other:?} for {:?}",
                         path.display()
                     ),
-                });
+                }
+                .into());
             }
         }
     }
@@ -1220,7 +1237,8 @@ fn extract_release_archive_with_limits(
             return Err(RuntimeOverlayError::InvalidArchive {
                 archive_path: archive_path.to_path_buf(),
                 reason: format!("missing required archive member {required}"),
-            });
+            }
+            .into());
         }
     }
     Ok(())

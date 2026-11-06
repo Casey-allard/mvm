@@ -59,8 +59,10 @@ budget the additional decoded artifacts and workspace separately.
 Provision the signed image-set cache before attaching the installed mapping.
 The quoted attachment resolves those existing inputs without installing or
 replacing cache members. Runtime compares the selected files against the
-authenticated bytes with bounded read buffers. The archive length and this
-comparison do not set a peak bound for decoding or snapshot storage.
+authenticated bytes with bounded read buffers. Quoted portable verification
+decodes its boot members without writing temporary archives or extracted
+files. The installer still budgets archive buffers, decoded members and
+private snapshot storage.
 
 Runtime holds the original lifecycle directory and lock through shutdown.
 After it verifies native exit or a pre-dispatch refusal and retires the

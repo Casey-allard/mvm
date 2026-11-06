@@ -141,6 +141,8 @@ pub mod guest_libc;
 #[cfg(unix)]
 pub mod initramfs;
 #[cfg(unix)]
+pub mod legacy_boot_payload;
+#[cfg(unix)]
 pub mod intoto;
 /// Content identity for fetched kernel artifacts.
 #[cfg(unix)]
