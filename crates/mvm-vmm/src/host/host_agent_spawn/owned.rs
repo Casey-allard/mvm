@@ -104,10 +104,33 @@ struct Process {
     #[cfg(target_os = "macos")]
     liveness: Option<std::os::fd::OwnedFd>,
 }
+/// Transferable process observation offered by the private owned-helper wire.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnedAuditSideband {
+    Unavailable,
+    PidfdV1,
+    DarwinPipeV1,
+}
+impl OwnedAuditSideband {
+    pub fn supported() -> std::io::Result<Self> {
+        match audit_capability::require_supported_platform() {
+            Ok(()) => Ok(if cfg!(target_os = "macos") {
+                Self::DarwinPipeV1
+            } else {
+                Self::PidfdV1
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(Self::Unavailable),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 struct Shared {
     tenant: String,
     control_socket: PathBuf,
     signer_socket: PathBuf,
+    audit_sideband: OwnedAuditSideband,
     key: Zeroizing<[u8; 32]>,
     parent: Arc<dyn HostAgentParentPermit>,
     holder: PreparedHostLifetimeLease,
@@ -260,11 +283,17 @@ struct OwnedReady {
     nonce: [u8; 16],
     pid: u32,
     signer_pid: u32,
+    audit_sideband: OwnedAuditSideband,
     #[cfg(target_os = "macos")]
     liveness: String,
 }
 impl OwnedReady {
-    fn validate(&self, nonce: [u8; 16], daemon_pid: u32) -> Result<()> {
+    fn validate(
+        &self,
+        nonce: [u8; 16],
+        daemon_pid: u32,
+        audit_sideband: OwnedAuditSideband,
+    ) -> Result<()> {
         #[cfg(target_os = "macos")]
         ensure!(
             self.liveness == "pipe_v1",
@@ -276,6 +305,10 @@ impl OwnedReady {
                 && self.signer_pid > 1
                 && self.signer_pid != daemon_pid,
             "owned readiness identity mismatch"
+        );
+        ensure!(
+            self.audit_sideband == audit_sideband,
+            "owned readiness audit sideband differs"
         );
         Ok(())
     }
@@ -393,7 +426,7 @@ fn signing_key() -> Result<Zeroizing<[u8; 32]>> {
 
 impl OwnedHostAgent {
     pub fn spawn(inputs: OwnedHostAgentInputs) -> Result<Self> {
-        audit_capability::require_supported_platform()?;
+        let audit_sideband = OwnedAuditSideband::supported()?;
         mvm_core::naming::validate_vm_name(&inputs.tenant)?;
         ensure!(
             mvm_core::config::mvm_home_strict()?.as_os_str().len() <= 4096,
@@ -476,6 +509,7 @@ impl OwnedHostAgent {
                 tenant: inputs.tenant,
                 control_socket: socket,
                 signer_socket,
+                audit_sideband,
                 key,
                 parent: inputs.parent,
                 holder: inputs.holder,
@@ -545,7 +579,7 @@ impl OwnedHostAgent {
             let bytes = crate::host::owned_liveness::read_ready_frame(&mut stdout, deadline)?;
             let ready: OwnedReady = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("invalid owned readiness"))?;
-            ready.validate(nonce, process.child.id())?;
+            ready.validate(nonce, process.child.id(), self.shared.audit_sideband)?;
             ensure!(
                 process.child.try_wait()?.is_none(),
                 "owned readiness identity mismatch"
@@ -804,7 +838,7 @@ fn owned_control(
         CONTROL_MAX_FRAME_BYTES,
     )? {
         ControlResponse::Ok => {
-            if registration.is_some() {
+            if registration.is_some() && shared.audit_sideband != OwnedAuditSideband::Unavailable {
                 // Register may already have durable effects. Missing or invalid
                 // sideband is uncertainty, never a no-effects/refund disposition.
                 Ok(Some(receive_signer_event(&stream, deadline)?))
@@ -839,7 +873,6 @@ impl OwnedHostAgentRegistrar {
     }
 
     pub fn register(&self, params: HostAgentServicesParams<'_>) -> Result<OwnedVmRegistration> {
-        audit_capability::require_supported_platform()?;
         ensure!(
             params.tenant_id == Some(self.shared.tenant.as_str()),
             "owned registration tenant mismatch"
@@ -902,13 +935,14 @@ impl OwnedHostAgentRegistrar {
             Some(&params),
         )
         .and_then(|event| {
-            let event = event.context("original signer event missing")?;
-            require_live_event(&event)?;
-            guard
-                .audit
-                .lock()
-                .map_err(|_| anyhow::anyhow!("audit preparation poisoned"))?
-                .signer = Some(event);
+            if let Some(event) = event {
+                require_live_event(&event)?;
+                guard
+                    .audit
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("audit preparation poisoned"))?
+                    .signer = Some(event);
+            }
             self.shared.running()
         })
         .and_then(|()| self.shared.parent.check_registration(&params))
@@ -958,6 +992,13 @@ impl OwnedVmRegistration {
         params: &HostAgentServicesParams<'_>,
     ) -> Result<PreparedEndpointAudit> {
         self.check_current_for(original, params)?;
+        if self.shared.audit_sideband == OwnedAuditSideband::Unavailable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "original audit sideband is unsupported on this host",
+            )
+            .into());
+        }
         let (signer, registration_pin) = {
             let mut audit = self
                 .audit
@@ -1173,7 +1214,24 @@ impl Drop for OwnedVmRegistration {
 
 #[cfg(test)]
 mod ready_tests {
-    use super::OwnedReady;
+    use super::{OwnedAuditSideband, OwnedReady};
+
+    #[test]
+    fn readiness_requires_an_explicit_audit_sideband_mode() {
+        let mut wire = serde_json::json!({
+            "nonce": ([7_u8; 16]),
+            "pid": 41,
+            "signer_pid": 42,
+            "audit_sideband": OwnedAuditSideband::Unavailable,
+        });
+        #[cfg(target_os = "macos")]
+        {
+            wire["liveness"] = serde_json::json!("pipe_v1");
+        }
+        assert!(serde_json::from_value::<OwnedReady>(wire.clone()).is_ok());
+        wire.as_object_mut().unwrap().remove("audit_sideband");
+        assert!(serde_json::from_value::<OwnedReady>(wire).is_err());
+    }
 
     #[test]
     fn owned_ready_rejects_foreign_nonce_daemon_and_invalid_signer_metadata() {
@@ -1181,15 +1239,22 @@ mod ready_tests {
             nonce: [7; 16],
             pid: 41,
             signer_pid: 42,
+            audit_sideband: OwnedAuditSideband::PidfdV1,
             #[cfg(target_os = "macos")]
             liveness: "pipe_v1".into(),
         };
-        ready.validate([7; 16], 41).unwrap();
-        assert!(ready.validate([8; 16], 41).is_err());
-        assert!(ready.validate([7; 16], 43).is_err());
+        let sideband = ready.audit_sideband;
+        ready.validate([7; 16], 41, sideband).unwrap();
+        assert!(
+            ready
+                .validate([7; 16], 41, OwnedAuditSideband::Unavailable)
+                .is_err()
+        );
+        assert!(ready.validate([8; 16], 41, sideband).is_err());
+        assert!(ready.validate([7; 16], 43, sideband).is_err());
         for signer in [0, 1, 41] {
             ready.signer_pid = signer;
-            assert!(ready.validate([7; 16], 41).is_err());
+            assert!(ready.validate([7; 16], 41, sideband).is_err());
         }
         assert!(
             serde_json::from_str::<OwnedReady>(

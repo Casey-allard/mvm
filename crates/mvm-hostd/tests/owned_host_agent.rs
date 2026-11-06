@@ -456,6 +456,18 @@ fn installed_signer_requires_the_original_current_registration() {
         capability_bindings: &[],
         service_proxies: &[],
     };
+    #[cfg(target_os = "macos")]
+    if mvm_vmm::host::host_agent_spawn::OwnedAuditSideband::supported().unwrap()
+        == mvm_vmm::host::host_agent_spawn::OwnedAuditSideband::Unavailable
+    {
+        let error = registration
+            .prepare_endpoint_audit(&registrar, &params())
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
     let original_anchor = fixture.verifying.to_bytes();
     let foreign_anchor = ed25519_dalek::SigningKey::from_bytes(&[17; 32])
         .verifying_key()
@@ -537,6 +549,7 @@ fn installed_runtime_broker_uses_the_original_registrar_even_without_services() 
     agent.shutdown().unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn original_registered_audit_event_is_claimed_once_and_pins_cleanup() {
     let fixture = Fixture::new();

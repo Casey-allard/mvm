@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::ensure;
 use mvm_core::protocol::broker_control::DeregisterVm;
+use mvm_vmm::host::host_agent_spawn::OwnedAuditSideband;
 use mvm_vmm::host::process_exit::{ProcessExitObserver, ProcessExitWait};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use std::fs::File;
@@ -392,6 +393,7 @@ impl HostAgentDaemon {
         nonce: [u8; 16],
         mut signer: tokio::process::Child,
     ) -> Result<()> {
+        let audit_sideband = OwnedAuditSideband::supported()?;
         let setup = (|| -> Result<_> {
             let signer_pid = signer.id().context("original signer child ID missing")?;
             ensure!(
@@ -444,7 +446,8 @@ impl HostAgentDaemon {
                 mvm_vmm::host::owned_liveness::require_live_read_pipe(reader)?;
             }
             let ready = serde_json::json!({
-                "nonce":nonce,"pid":std::process::id(),"signer_pid":signer_pid
+                "nonce":nonce,"pid":std::process::id(),"signer_pid":signer_pid,
+                "audit_sideband":audit_sideband
             });
             #[cfg(target_os = "macos")]
             let ready = {
@@ -479,7 +482,14 @@ impl HostAgentDaemon {
                 signer_event,
             )) => {
                 let serving = daemon
-                    .serve_owned_control(listener, &owner, &signer, &original_exit, &signer_event)
+                    .serve_owned_control(
+                        listener,
+                        &owner,
+                        &signer,
+                        &original_exit,
+                        &signer_event,
+                        audit_sideband,
+                    )
                     .await;
                 let closed = daemon.close_owned().await;
                 daemon
@@ -522,6 +532,7 @@ impl HostAgentDaemon {
         signer: &tokio::process::Child,
         original_exit: &ProcessExitObserver,
         signer_event: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+        audit_sideband: OwnedAuditSideband,
     ) -> Result<()> {
         let workspaces =
             crate::owned_resources::WorkspacePool::new(crate::owned_resources::CONTROL_WORKSPACES)?;
@@ -561,7 +572,9 @@ impl HostAgentDaemon {
                 Ok(Ok(signed)) => match broker_control::verify(&signed, &self.verifying_key) {
                     Ok(request) => {
                         signer_current(original_exit, &admission)?;
-                        let prepared = if matches!(request, ControlRequest::Register(_)) {
+                        let prepared = if audit_sideband != OwnedAuditSideband::Unavailable
+                            && matches!(request, ControlRequest::Register(_))
+                        {
                             Some(fresh_signer_capability(signer, original_exit, &admission)?)
                         } else {
                             None
