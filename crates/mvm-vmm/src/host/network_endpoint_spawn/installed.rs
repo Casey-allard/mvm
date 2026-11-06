@@ -18,7 +18,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd},
     process::{ChildStdin, ChildStdout},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -30,7 +30,7 @@ mod bootstrap;
 mod producer;
 mod records;
 pub use audit::InstalledEndpointAudit;
-use bootstrap::{INSTALLED_BOOTSTRAP_MIN_BYTES, installed_endpoint_bootstrap_requirement};
+pub use bootstrap::{INSTALLED_BOOTSTRAP_MIN_BYTES, installed_endpoint_bootstrap_requirement};
 pub use records::InstalledTelemetryRecords;
 
 const CONFIG_LIMIT: usize = 65_536;
@@ -543,6 +543,13 @@ struct ChildAuthority {
     fenced: AtomicBool,
     pool_claimed: AtomicBool,
     audit: Option<audit::ChildAudit>,
+    guest: Mutex<GuestTransport>,
+}
+
+#[derive(Default)]
+struct GuestTransport {
+    claimed: bool,
+    original: Option<std::os::unix::net::UnixStream>,
 }
 
 /// Original child authority retained by its one local pool and bounded workers.
@@ -564,6 +571,46 @@ impl InstalledEndpointLease {
     }
     pub fn audit(&self) -> Result<InstalledEndpointAudit> {
         InstalledEndpointAudit::require(self)
+    }
+    /// Retain one cancellation clone before the original guest authentication.
+    /// This monotonic slot grants no network or audit authority.
+    pub fn bind_guest_transport(&self, stream: &std::os::unix::net::UnixStream) -> Result<()> {
+        self.check_current()?;
+        let original = stream.try_clone()?;
+        let mut guest = match self.authority.guest.lock() {
+            Ok(guest) => guest,
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                self.fence();
+                bail!("installed guest cancellation slot poisoned")
+            }
+        };
+        if self.authority.fenced.load(Ordering::Acquire) || guest.claimed {
+            bail!("installed guest cancellation slot unavailable")
+        }
+        guest.claimed = true;
+        guest.original = Some(original);
+        drop(guest);
+        self.check_current()
+    }
+    /// Monotonic admission fence and original transport wake, with socket I/O
+    /// outside the publication mutex. It provides no exit or drain receipt.
+    pub fn fence(&self) {
+        self.authority.fenced.store(true, Ordering::Release);
+        let original = {
+            let mut guest = self
+                .authority
+                .guest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guest.original.take()
+        };
+        if let Some(original) = original {
+            let _ = original.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    pub(super) fn same_authority(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.authority, &other.authority)
     }
     /// One monotonic claim, including any later authorization failure.
     pub fn claim_payload_pool(&self) -> Result<()> {
@@ -589,7 +636,7 @@ impl InstalledEndpointLease {
             Ok(())
         })();
         if result.is_err() {
-            self.authority.fenced.store(true, Ordering::Release);
+            self.fence();
         }
         result
     }
@@ -598,7 +645,7 @@ impl InstalledEndpointLease {
 pub struct InstalledEndpointChild {
     lease: InstalledEndpointLease,
     output: File,
-    config: Option<serde_json::Value>,
+    config: Option<Box<serde_json::value::RawValue>>,
     records: Option<Option<InstalledTelemetryRecords>>,
     nonce: [u8; 32],
     phase: u8,
@@ -633,7 +680,7 @@ impl InstalledEndpointChild {
             CONTROL_LIMIT,
             deadline,
         )?;
-        let prepared: Prepare = read_frame(&mut input, CONFIG_LIMIT, deadline)?;
+        let prepared: Prepare<Box<serde_json::value::RawValue>> = read_frame(&mut input, CONFIG_LIMIT, deadline)?;
         if prepared.version != 1
             || prepared.nonce != nonce
             || parent.wait_event(Instant::now())? != ProcessExitWait::TimedOut
@@ -700,12 +747,12 @@ impl InstalledEndpointChild {
             records.preflight(&excluded)?;
         }
         if let Some(audit) = &prepared.audit {
-            if prepared
-                .config
-                .get("tenant_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(audit.tenant())
-            {
+            #[derive(Deserialize)]
+            struct Tenant<'a> {
+                tenant_id: &'a str,
+            }
+            let tenant: Tenant<'_> = serde_json::from_str(prepared.config.get())?;
+            if tenant.tenant_id != audit.tenant() {
                 bail!("installed audit tenant differs from endpoint config");
             }
             audit.preflight(&audit_excluded, &prepared.projection.binding.vm_name)?;
@@ -738,6 +785,7 @@ impl InstalledEndpointChild {
                 fenced: AtomicBool::new(false),
                 pool_claimed: AtomicBool::new(false),
                 audit,
+                guest: Mutex::new(GuestTransport::default()),
             }),
         };
         let records = prepared
@@ -775,10 +823,23 @@ impl InstalledEndpointChild {
     pub fn projection(&self) -> &EndpointPartitionProjection {
         self.lease.projection()
     }
-    pub fn take_config(&mut self) -> Result<serde_json::Value> {
+    /// Move the original bounded configuration text without constructing a
+    /// generic JSON tree. Typed consumers hold their workspace before decoding.
+    pub fn take_raw_config(&mut self) -> Result<Box<serde_json::value::RawValue>> {
         self.config
             .take()
             .context("installed endpoint config already consumed")
+    }
+    /// Legacy compatibility conversion. Installed shipping consumers use
+    /// `take_raw_config` and decode directly into their bounded typed schema.
+    pub fn take_config(&mut self) -> Result<serde_json::Value> {
+        let config = self.take_raw_config()?;
+        serde_json::from_str(config.get())
+            .map_err(|_| anyhow!("invalid installed endpoint configuration"))
+    }
+    /// Deadline retained from the original installed startup exchange.
+    pub fn startup_deadline(&self) -> Instant {
+        self.startup_deadline
     }
     pub fn control_fd(&self) -> i32 {
         self.lease.authority.input.as_raw_fd()
@@ -802,7 +863,7 @@ impl InstalledEndpointChild {
             Ok(value)
         })();
         if result.is_err() {
-            self.lease.authority.fenced.store(true, Ordering::Release);
+            self.lease.fence();
         }
         result
     }

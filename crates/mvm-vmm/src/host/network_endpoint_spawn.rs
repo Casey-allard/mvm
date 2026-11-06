@@ -220,6 +220,7 @@ pub use installed::{
     INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointAudit, InstalledEndpointChild,
     InstalledEndpointLease, InstalledHostServices, InstalledTelemetryRecords,
     spawn_network_endpoint_installed, spawn_network_endpoint_installed_registered,
+    INSTALLED_BOOTSTRAP_MIN_BYTES, installed_endpoint_bootstrap_requirement,
 };
 use owned::endpoint_command;
 pub use owned::{

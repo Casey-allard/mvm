@@ -52,6 +52,12 @@ impl FlowSocket {
     pub(super) fn mapped(stream: Box<dyn super::AuthenticatedTcpPayloadIo>) -> Self {
         Self::Upstream(UpstreamPayload::Mapped(stream))
     }
+    pub(super) fn close_reader_until(&self, until: std::time::Instant) -> Result<()> {
+        match self {
+            Self::Upstream(UpstreamPayload::Mapped(stream)) => stream.close_and_join_until(until),
+            Self::Upstream(UpstreamPayload::Plain(_)) | Self::Terminated(_) => Ok(()),
+        }
+    }
     pub(super) fn mapped_clone(&self) -> Result<Option<Self>> {
         match self {
             Self::Upstream(UpstreamPayload::Mapped(stream)) => {

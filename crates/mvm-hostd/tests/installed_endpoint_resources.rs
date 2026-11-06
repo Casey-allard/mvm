@@ -19,13 +19,15 @@ fn resources_fixture_child() {
     // SAFETY: only the original fixture's pre_exec reserved protocol fd199.
     assert!(unsafe { libc::dup2(199, 1) } >= 0);
     let mut child = InstalledEndpointChild::from_stdio().unwrap();
-    let records = child.take_telemetry_records().unwrap();
-    if mode == "records-inspect" {
-        assert_eq!(records.unwrap().current_len().unwrap(), 0);
-    } else {
-        assert!(records.is_none());
+    if mode != "collector" {
+        let records = child.take_telemetry_records().unwrap();
+        if mode == "records-inspect" {
+            assert_eq!(records.unwrap().current_len().unwrap(), 0);
+        } else {
+            assert!(records.is_none());
+        }
+        assert!(child.take_telemetry_records().is_err());
     }
-    assert!(child.take_telemetry_records().is_err());
     let resources =
         mvm_hostd::installed_endpoint::InstalledEndpointResources::from_child(&mut child);
     if mode == "foreign-session" || mode == "replaced-store" {

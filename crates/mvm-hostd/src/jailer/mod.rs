@@ -374,13 +374,10 @@ pub(crate) fn confine_self_with_owned_files(
     spec: &ConfinementSpec,
     state: &std::fs::File,
     store: Option<&std::fs::File>,
+    records: bool,
 ) -> Result<(), JailerError> {
     crate::jailer::landlock::apply_with_owned_files(spec, Some(state), store)?;
-    if store.is_some() {
-        crate::jailer::seccomp::apply_with_owned_store(spec)?;
-    } else {
-        crate::jailer::seccomp::apply(spec)?;
-    }
+    crate::jailer::seccomp::apply_with_owned_files(spec, store.is_some(), records)?;
     Ok(())
 }
 

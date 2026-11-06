@@ -174,6 +174,7 @@ pub enum RecorderError {
 #[derive(Clone)]
 pub struct Recorder {
     signer: Arc<dyn AuditSigner>,
+    installed_origin: Option<crate::installed_endpoint::InstalledAuditOrigin>,
     /// Tenant used for unbound events (host / cmd / audit). Plan-
     /// bound events read tenant from the plan; this fallback is
     /// only consulted when no plan is in scope.
@@ -190,6 +191,16 @@ pub struct Recorder {
     vm_name: Option<String>,
 }
 
+/// Private linear preflight: the original canonical entry and actual
+/// workspace remain together through connection and final append.
+pub(crate) struct PreparedInstalledAudit {
+    entry: PlanAuditEntry,
+    origin: crate::installed_endpoint::InstalledAuditOrigin,
+    workspace: crate::owned_resources::WorkspacePermit,
+    category: EventCategory,
+    deadline: std::time::Instant,
+}
+
 impl Recorder {
     /// Build with an explicit signer + default tenant. Metrics
     /// wiring is off — call `with_metrics` or
@@ -198,10 +209,80 @@ impl Recorder {
     pub fn new(signer: Arc<dyn AuditSigner>, default_tenant: TenantId) -> Self {
         Self {
             signer,
+            installed_origin: None,
             default_tenant,
             metrics: None,
             vm_name: None,
         }
+    }
+
+    pub(crate) fn with_installed_origin(
+        mut self,
+        origin: crate::installed_endpoint::InstalledAuditOrigin,
+    ) -> Self {
+        self.installed_origin = Some(origin);
+        self
+    }
+
+    pub(crate) fn has_installed_origin(
+        &self,
+        audit: &mvm_vmm::host::network_endpoint_spawn::InstalledEndpointAudit,
+    ) -> bool {
+        self.installed_origin
+            .as_ref()
+            .is_some_and(|origin| origin.matches(audit))
+    }
+
+    pub(crate) fn preflight_installed_unbound(
+        &self,
+        category: EventCategory,
+        event_name: &str,
+        deadline: std::time::Instant,
+        extras: impl FnOnce() -> std::collections::BTreeMap<String, String>,
+    ) -> Result<PreparedInstalledAudit, RecorderError> {
+        if category.requires_plan_context() {
+            return Err(RecorderError::MissingPlanContext { category });
+        }
+        let origin = self
+            .installed_origin
+            .as_ref()
+            .ok_or_else(|| AuditError::Io("original installed audit origin required".into()))?;
+        // The SAME actual workspace precedes entry/label copies and remains
+        // held through the authorized connection attempt and final append.
+        let workspace = origin.acquire()?;
+        if std::time::Instant::now() >= deadline {
+            return Err(AuditError::Io("installed audit deadline expired".into()).into());
+        }
+        validate_event_prefix(category, event_name)?;
+        let mut entry = self.unbound_entry(category, event_name.to_owned(), extras());
+        // A private size template, never emitted: the largest supported UTC
+        // year/fraction widths bound the actual post-connect canonical time.
+        entry.timestamp = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+        origin.preflight(&entry)?;
+        Ok(PreparedInstalledAudit {
+            entry,
+            origin: origin.clone(),
+            workspace,
+            category,
+            deadline,
+        })
+    }
+
+    pub(crate) async fn record_installed_prepared(
+        &self,
+        mut prepared: PreparedInstalledAudit,
+    ) -> Result<(), RecorderError> {
+        let origin = self
+            .installed_origin
+            .as_ref()
+            .ok_or_else(|| AuditError::Io("original installed audit origin required".into()))?;
+        if !origin.same_signer(&prepared.origin) {
+            return Err(AuditError::Io("original installed audit signer differs".into()).into());
+        }
+        prepared.entry.timestamp = unbound_timestamp();
+        origin.emit_held(&prepared.entry, &prepared.workspace, prepared.deadline)?;
+        self.bump_metric(prepared.category);
+        Ok(())
     }
 
     /// Attribute every unbound entry to one machine by stamping it with a
@@ -356,7 +437,7 @@ impl Recorder {
             .map(|name| (LABEL_VM_NAME.to_string(), name.clone()));
         let labels = merge_extras(category, attribution.chain(extras));
         PlanAuditEntry {
-            timestamp: chrono::Utc::now(),
+            timestamp: unbound_timestamp(),
             tenant: self.default_tenant.clone(),
             plan_id: PlanId(UNBOUND_PLAN_ID.to_string()),
             plan_version: 0,
@@ -369,6 +450,10 @@ impl Recorder {
             labels,
         }
     }
+}
+
+fn unbound_timestamp() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
 }
 
 /// The label naming the machine an unbound entry describes. The same key the
@@ -601,6 +686,19 @@ pub(crate) mod tests {
                 .unwrap_err()
         });
         assert!(matches!(err, RecorderError::MissingPlanContext { .. }));
+    }
+
+    #[test]
+    fn legacy_recorder_cannot_prepare_an_installed_flow_entry() {
+        let (recorder, signer) = fixture_recorder();
+        let result = recorder.preflight_installed_unbound(
+            EventCategory::Host,
+            "host.flow.allowed",
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::collections::BTreeMap::new,
+        );
+        assert!(result.is_err());
+        assert!(signer.entries().is_empty(), "preflight performs no append");
     }
 
     #[test]

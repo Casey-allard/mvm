@@ -1,4 +1,4 @@
-use super::{PayloadMappingConfig, SpiralCorePayloadFactory, payload_mapping::AdmittedTcpFacts};
+use super::{OwnedTcpRelays, PayloadMappingConfig, SpiralCorePayloadFactory, payload_mapping::AdmittedTcpFacts};
 use crate::installed_endpoint::InstalledEndpointResources;
 use mvm_vmm::host::network_endpoint_spawn::InstalledEndpointChild;
 use std::{
@@ -38,7 +38,10 @@ fn carrier_fixture_child() {
     let pool = original.payload_pool().unwrap();
     let empty = pool.snapshot().unwrap();
     let session_id = config.flowmux_identity.as_ref().unwrap().session_id.clone();
+    let relays = OwnedTcpRelays::from_installed_resources(&original).unwrap();
     let try_tls = |stream_id| {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let reservation = relays.reserve_until(deadline).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
@@ -53,7 +56,8 @@ fn carrier_fixture_child() {
                 requested_host: "peer.example".into(),
                 requested_port: 443,
                 route: "direct",
-                deadline: Instant::now() + Duration::from_secs(1),
+                deadline,
+                owned_relay: Some(reservation.witness().unwrap()),
             },
         );
         (reader.join().unwrap().unwrap(), result.unwrap_err())

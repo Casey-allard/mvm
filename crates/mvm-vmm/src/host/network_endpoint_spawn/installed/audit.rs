@@ -154,12 +154,15 @@ impl InstalledEndpointAudit {
     }
     /// Monotonic close only: it creates no admission or cleanup authority.
     pub fn fence(&self) {
-        self.lease.authority.fenced.store(true, Ordering::Release);
+        self.lease.fence();
     }
     /// Original capability continuity only; copied projection facts cannot
     /// substitute for the same private child authority.
     pub fn same_endpoint(&self, lease: &InstalledEndpointLease) -> bool {
-        Arc::ptr_eq(&self.lease.authority, &lease.authority)
+        self.lease.same_authority(lease)
+    }
+    pub fn bind_guest_transport(&self, stream: &std::os::unix::net::UnixStream) -> Result<()> {
+        self.lease.bind_guest_transport(stream)
     }
     fn projection(&self) -> &AuditProjection {
         &self

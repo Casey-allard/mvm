@@ -48,6 +48,15 @@ struct AdmittedFlow {
     attribution: FlowAttribution,
 }
 
+enum RelayAdmission {
+    Proceed(Option<OwnedRelayAdmission>),
+    Refused,
+}
+struct OwnedRelayAdmission {
+    reservation: super::owned_relays::RelayReservation,
+    deadline: std::time::Instant,
+}
+
 impl AdmittedFlow {
     /// Render the admitted addresses as one audit label value.
     fn resolved_ips(&self) -> String {
@@ -57,6 +66,16 @@ impl AdmittedFlow {
     /// The audit-label form of the route.
     fn route_label(&self) -> String {
         self.route.as_str().to_string()
+    }
+
+    fn allowed_tcp_labels(&self, stream_id: u32) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("stream_id".to_string(), stream_id.to_string()),
+            ("class".to_string(), "tcp".to_string()),
+            ("route".to_string(), self.route_label()),
+            ("target".to_string(), self.target.clone()),
+            ("resolved_ips".to_string(), self.resolved_ips()),
+        ])
     }
 
     /// Whether this flow may be served by terminating it on the host.
@@ -83,6 +102,37 @@ fn termination_label(mode: TerminationMode) -> &'static str {
 }
 
 impl FlowMuxSession {
+    fn reserve_owned_tcp_relay(
+        &mut self,
+        stream_id: u32,
+        flow: &AdmittedFlow,
+    ) -> Result<RelayAdmission, FlowMuxError> {
+        let reservation = self
+            .owned_tcp_relays
+            .as_ref()
+            .map(|owned| {
+                let deadline = std::time::Instant::now()
+                    .checked_add(self.connect_timeout)
+                    .ok_or_else(|| std::io::Error::other("owned flow deadline overflow"))?;
+                owned
+                    .reserve_until(deadline)
+                    .map(|reservation| OwnedRelayAdmission {
+                        reservation,
+                        deadline,
+                    })
+            })
+            .transpose();
+        match reservation {
+            Ok(reservation) => Ok(RelayAdmission::Proceed(reservation)),
+            Err(_) => {
+                let _ = lock_registry(&self.registry).retire(stream_id);
+                self.send_refused(stream_id, "owned relay capacity unavailable")?;
+                self.deny_flow(stream_id, flow, "relay_capacity_unavailable");
+                Ok(RelayAdmission::Refused)
+            }
+        }
+    }
+
     /// Serve one guest `OpenTcp`.
     ///
     /// Admission first — rate, then the claim-10 gate, which is the single
@@ -231,27 +281,77 @@ impl FlowMuxSession {
         stream_id: u32,
         flow: &AdmittedFlow,
     ) -> Result<(), FlowMuxError> {
+        // The selected installed profile requires its original cooperating
+        // mapping. A policy admission alone cannot select an implicit raw
+        // transport. General/legacy FlowMux retains its existing behavior.
+        if self.installed_audit.is_some()
+            && !self
+                .payload_mapping
+                .as_ref()
+                .is_some_and(|mapping| mapping.selects(&flow.host, flow.requested_port))
+        {
+            self.send_refused(stream_id, "selected installed payload mapping required")?;
+            self.deny_flow(stream_id, flow, "installed_payload_unmapped");
+            return Ok(());
+        }
         if !self.reserve_stream(stream_id, flow)? {
             return Ok(());
         }
+        let owned = match self.reserve_owned_tcp_relay(stream_id, flow)? {
+            RelayAdmission::Proceed(owned) => owned,
+            RelayAdmission::Refused => return Ok(()),
+        };
+        let owned_deadline = owned.as_ref().map(|owned| owned.deadline);
+        let reservation = owned.map(|owned| owned.reservation);
 
         let selected_mapping = if let Some(mapping) = self
             .payload_mapping
             .as_ref()
             .filter(|mapping| mapping.selects(&flow.host, flow.requested_port))
         {
-            let deadline = std::time::Instant::now()
-                .checked_add(self.connect_timeout)
-                .ok_or_else(|| std::io::Error::other("payload setup deadline overflow"))?;
+            let deadline = if let Some(deadline) = owned_deadline {
+                deadline
+            } else {
+                std::time::Instant::now()
+                    .checked_add(self.connect_timeout)
+                    .ok_or_else(|| std::io::Error::other("payload setup deadline overflow"))?
+            };
             Some((Arc::clone(mapping), deadline))
         } else {
             None
         };
 
-        let timeout = selected_mapping
-            .as_ref()
-            .map_or(self.connect_timeout, |(_, deadline)| {
-                deadline.saturating_duration_since(std::time::Instant::now())
+        let prepared_audit = if self.installed_audit.is_some() {
+            self.check_installed_audit()?;
+            let recorder = self.recorder.as_ref().ok_or_else(|| {
+                FlowMuxError::FrameRefused("original installed recorder missing".into())
+            })?;
+            let deadline = owned_deadline.ok_or_else(|| {
+                FlowMuxError::FrameRefused("original installed flow deadline missing".into())
+            })?;
+            Some(
+                recorder
+                    .preflight_installed_unbound(
+                        EventCategory::Host,
+                        "host.flow.allowed",
+                        deadline,
+                        || flow.allowed_tcp_labels(stream_id),
+                    )
+                    .map_err(|_| {
+                        FlowMuxError::FrameRefused("installed flow audit preflight refused".into())
+                    })?,
+            )
+        } else {
+            None
+        };
+        let timeout = owned_deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or_else(|| {
+                selected_mapping
+                    .as_ref()
+                    .map_or(self.connect_timeout, |(_, deadline)| {
+                        deadline.saturating_duration_since(std::time::Instant::now())
+                    })
             });
         let upstream = match connect_first_admitted(&flow.ips, flow.port, timeout) {
             Some(stream) => stream,
@@ -263,6 +363,37 @@ impl FlowMuxSession {
                 return Ok(());
             }
         };
+        if let Some(prepared) = prepared_audit {
+            let appended = (|| {
+                self.check_installed_audit()?;
+                let recorder = self.recorder.as_ref().ok_or_else(|| {
+                    FlowMuxError::FrameRefused("original installed recorder missing".into())
+                })?;
+                let runtime = self.runtime_handle.as_ref().ok_or_else(|| {
+                    FlowMuxError::FrameRefused("installed audit runtime missing".into())
+                })?;
+                runtime
+                    .block_on(recorder.record_installed_prepared(prepared))
+                    .map_err(|_| {
+                        FlowMuxError::FrameRefused("installed flow audit append refused".into())
+                    })?;
+                self.check_installed_audit()
+            })();
+            if let Err(error) = appended {
+                let _ = upstream.shutdown(std::net::Shutdown::Both);
+                if let Some(audit) = &self.installed_audit {
+                    audit.fence();
+                }
+                return Err(error);
+            }
+        }
+        if let Some(reservation) = &reservation {
+            let guest = self
+                .owned_guest_control
+                .clone()
+                .ok_or_else(|| std::io::Error::other("owned guest control missing"))?;
+            reservation.bind_setup(&upstream, guest)?;
+        }
 
         let upstream = if let Some((mapping, deadline)) = selected_mapping {
             let guest_key = self
@@ -279,10 +410,25 @@ impl FlowMuxSession {
                 requested_port: flow.requested_port,
                 route: flow.route.as_str(),
                 deadline,
+                owned_relay: reservation
+                    .as_ref()
+                    .map(|reservation| reservation.witness())
+                    .transpose()?,
             };
             match mapping.map(upstream, facts) {
                 Ok(payload) => FlowSocket::mapped(payload),
                 Err(error) => {
+                    // A peer EOF alone is not evidence of an orderly local stop.
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+                        && let Some(stopped) = self
+                            .installed_session_control
+                            .as_ref()
+                            .and_then(|control| control.stop_error())
+                        && let Some(reservation) = &reservation
+                        && reservation.setup_was_stopped()?
+                    {
+                        return Err(stopped.into());
+                    }
                     warn!(stream_id,error=%error,"required payload mapping refused");
                     let _ = lock_registry(&self.registry).retire(stream_id);
                     self.send_refused(
@@ -296,23 +442,26 @@ impl FlowMuxSession {
         } else {
             FlowSocket::from(upstream)
         };
+        if owned_deadline.is_some_and(|until| std::time::Instant::now() >= until) {
+            let _ = upstream.shutdown(std::net::Shutdown::Both);
+            let _ = lock_registry(&self.registry).retire(stream_id);
+            self.send_refused(stream_id, "owned flow setup deadline")?;
+            self.deny_flow(stream_id, flow, "owned_setup_deadline");
+            return Ok(());
+        }
         if !self.confirm_stream(stream_id)? {
             return Ok(());
         }
         self.send_opened(stream_id)?;
-        self.spawn_tcp_relay(stream_id, upstream)?;
+        self.spawn_tcp_relay(stream_id, upstream, reservation)?;
         self.track_bound_stream(stream_id, flow);
-        self.emit_audit(
-            EventCategory::Host,
-            "host.flow.allowed",
-            BTreeMap::from([
-                ("stream_id".to_string(), stream_id.to_string()),
-                ("class".to_string(), "tcp".to_string()),
-                ("route".to_string(), flow.route_label()),
-                ("target".to_string(), flow.target.clone()),
-                ("resolved_ips".to_string(), flow.resolved_ips()),
-            ]),
-        );
+        if self.installed_audit.is_none() {
+            self.emit_audit(
+                EventCategory::Host,
+                "host.flow.allowed",
+                flow.allowed_tcp_labels(stream_id),
+            );
+        }
         Ok(())
     }
 
@@ -336,6 +485,10 @@ impl FlowMuxSession {
             self.send_refused(stream_id, "termination unavailable on this endpoint")?;
             self.deny_flow(stream_id, flow, "termination_unavailable");
             return Ok(());
+        };
+        let reservation = match self.reserve_owned_tcp_relay(stream_id, flow)? {
+            RelayAdmission::Proceed(owned) => owned.map(|owned| owned.reservation),
+            RelayAdmission::Refused => return Ok(()),
         };
 
         // Claimed before anything is built, and held by the flow's thread for
@@ -394,7 +547,7 @@ impl FlowMuxSession {
         }
 
         self.send_opened(stream_id)?;
-        self.spawn_tcp_relay(stream_id, FlowSocket::from(endpoint_side))?;
+        self.spawn_tcp_relay(stream_id, FlowSocket::from(endpoint_side), reservation)?;
         self.track_bound_stream(stream_id, flow);
         let mut labels = BTreeMap::from([
             ("stream_id".to_string(), stream_id.to_string()),

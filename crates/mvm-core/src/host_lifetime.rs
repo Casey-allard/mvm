@@ -580,3 +580,6 @@ impl HostLifetimeAnchor {
         Ok(lease)
     }
 }
+
+mod native_stack;
+pub use native_stack::{NativeThreadStackTerms, native_thread_stack_terms};

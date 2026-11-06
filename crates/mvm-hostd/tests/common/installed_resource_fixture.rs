@@ -62,9 +62,14 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
             host_plaintext_bytes: 1,
             host_codec_bytes: 0,
             host_carrier_bytes: 1,
-            host_metadata_bytes: 262144,
-            host_stack_bytes: 1,
-            cache_disk_bytes: 0,
+            host_metadata_bytes: 2 << 20,
+            host_stack_bytes: if mode == "collector" { 1 } else { 16 << 20 },
+            cache_disk_bytes: if mode == "collector" {
+                mvm_vmm::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP
+                    + mvm_core::runtime_state_protection::INSTALLED_TELEMETRY_SIDECAR_BYTES
+            } else {
+                0
+            },
             staging_disk_bytes: 0,
             workers: 1,
             max_streams: 1,
@@ -100,7 +105,7 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
     }
     let records = matches!(
         mode,
-        "records-original"
+        "collector" | "records-original"
             | "records-alias"
             | "records-inspect"
             | "audit-original"

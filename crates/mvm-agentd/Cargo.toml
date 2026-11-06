@@ -188,7 +188,7 @@ addons = [
 ]
 
 [dependencies]
-spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "ca5d9ca1266541f71cc5ab7d0b17f4acf14d06b1", optional = true }
+spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "1025d87d048b15cefd483b4c11c70a6e029cb29c", optional = true }
 mvm-core.workspace = true
 # The privilege-drop helper's library half: the descriptor hygiene every spawn
 # here applies, and the capability numbers `guest_mount` retains.

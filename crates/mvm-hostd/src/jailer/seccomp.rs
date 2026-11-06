@@ -9,9 +9,10 @@
 //! which is the audit point we want.
 
 use crate::jailer::{ConfinementSpec, JailerError};
-use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch};
-#[cfg(target_arch = "x86_64")]
-use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition};
+use seccompiler::{
+    SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    TargetArch,
+};
 use std::collections::BTreeMap;
 
 #[cfg(target_arch = "x86_64")]
@@ -341,14 +342,27 @@ fn syscall_name_to_nr(name: &str) -> Option<libc::c_long> {
 /// First installs the refusal reporter, so a call the filter refuses is named
 /// on stderr before the process dies of it rather than silently.
 pub fn apply(spec: &ConfinementSpec) -> Result<(), JailerError> {
-    apply_inner(spec, false)
+    apply_inner(spec, false, false)
 }
 
-pub(crate) fn apply_with_owned_store(spec: &ConfinementSpec) -> Result<(), JailerError> {
-    apply_inner(spec, true)
+#[cfg(test)]
+fn apply_with_owned_store(spec: &ConfinementSpec) -> Result<(), JailerError> {
+    apply_with_owned_files(spec, true, false)
 }
 
-fn apply_inner(spec: &ConfinementSpec, owned_store: bool) -> Result<(), JailerError> {
+pub(crate) fn apply_with_owned_files(
+    spec: &ConfinementSpec,
+    store: bool,
+    records: bool,
+) -> Result<(), JailerError> {
+    apply_inner(spec, store, records)
+}
+
+fn apply_inner(
+    spec: &ConfinementSpec,
+    owned_store: bool,
+    owned_records: bool,
+) -> Result<(), JailerError> {
     crate::jailer::refusal_report::install(process_label())?;
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for name in &spec.allowed_syscalls {
@@ -359,15 +373,50 @@ fn apply_inner(spec: &ConfinementSpec, owned_store: bool) -> Result<(), JailerEr
         })?;
         rules.insert(nr, vec![]);
     }
-    if owned_store {
+    if owned_store || owned_records {
         // Current-owner verification reads the effective UID after confinement.
         rules.insert(libc::SYS_geteuid, vec![]);
+    }
+    if owned_records {
+        // Records freshness reopens/checks the original state directory using
+        // the canonical local-filesystem probe. Store-only freshness currently
+        // needs metadata/current-owner, so it receives no extra FS query.
+        rules.insert(libc::SYS_fstatfs, vec![]);
+        // The canonical FD ACL check only queries presence/length. It does
+        // not read xattr bytes: require the actual NULL buffer and zero size.
+        // BPF cannot validate the attribute-name string; the original opaque
+        // writer's namespace/identity/owner/flags/ACL checks remain mandatory.
+        let conditions = [2, 3]
+            .into_iter()
+            .map(|argument| {
+                SeccompCondition::new(argument, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                    .map_err(|error| JailerError::SeccompInstall(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let presence = SeccompRule::new(conditions)
+            .map_err(|error| JailerError::SeccompInstall(error.to_string()))?;
+        rules.insert(libc::SYS_fgetxattr, vec![presence]);
+        if !owned_store && rules.contains_key(&libc::SYS_unlinkat) {
+            // AArch64's canonical file cleanup uses unlinkat. The records-only
+            // role's unlinkat allowance removes status temp files, without
+            // the explicit directory-removal flag. Preserve
+            // the legacy rule while narrowing only this selected owned role.
+            let files_only = SeccompRule::new(vec![
+                SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                    .map_err(|error| JailerError::SeccompInstall(error.to_string()))?,
+            ])
+            .map_err(|error| JailerError::SeccompInstall(error.to_string()))?;
+            rules.insert(libc::SYS_unlinkat, vec![files_only]);
+        }
+    }
+    if owned_store {
         // Store retirement removes only directories within its Landlock grant.
         #[cfg(target_arch = "x86_64")]
         {
             rules.insert(libc::SYS_rmdir, vec![]);
-            // Descriptor-relative store cleanup unlinks files and directories.
-            // Compare all native flag bits, including the upper argument bits.
+            // Rust's descriptor-relative remove_dir_all uses unlinkat for
+            // files and directories. Permit only those exact native flags;
+            // Qword comparison also rejects unknown upper argument bits.
             let removals = [0, libc::AT_REMOVEDIR as u64]
                 .into_iter()
                 .map(|flags| {

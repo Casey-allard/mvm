@@ -13,7 +13,6 @@
 //! already is and is called, not reimplemented.
 
 use std::collections::BTreeMap;
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -165,7 +164,7 @@ pub(super) struct ForwardTask {
     runtime: tokio::runtime::Handle,
     service: Arc<SubstitutionService>,
     session: Arc<Mutex<Session>>,
-    writer: Arc<Mutex<UnixStream>>,
+    writer: Arc<super::wire::SharedWriter>,
     stream_id: u32,
     request: HttpRequestStream,
     cancellation: tokio::sync::watch::Receiver<bool>,
@@ -178,7 +177,7 @@ pub(super) struct ForwardTaskBuilder {
     runtime: Option<tokio::runtime::Handle>,
     service: Option<Arc<SubstitutionService>>,
     session: Option<Arc<Mutex<Session>>>,
-    writer: Option<Arc<Mutex<UnixStream>>>,
+    writer: Option<Arc<super::wire::SharedWriter>>,
     stream_id: Option<u32>,
     request: Option<HttpRequestStream>,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
@@ -208,7 +207,7 @@ impl ForwardTaskBuilder {
         self
     }
 
-    pub(super) fn writer(mut self, value: Arc<Mutex<UnixStream>>) -> Self {
+    pub(super) fn writer(mut self, value: Arc<super::wire::SharedWriter>) -> Self {
         self.writer = Some(value);
         self
     }
@@ -334,7 +333,7 @@ pub(super) fn spawn_forward(task: ForwardTask) {
 /// memory. Each receive waits on the channel event with an idle deadline.
 async fn write_stream_response(
     session: &Mutex<Session>,
-    writer: &Mutex<UnixStream>,
+    writer: &super::wire::SharedWriter,
     stream_id: u32,
     mut response: super::super::network_endpoint_proxy::ForwardStreamResponse,
 ) -> Result<(), super::FlowMuxError> {
@@ -370,7 +369,7 @@ async fn write_stream_response(
 /// Frame a `WireResponse` as head, body chunks, and a completion.
 fn write_response(
     session: &Mutex<Session>,
-    writer: &Mutex<UnixStream>,
+    writer: &super::wire::SharedWriter,
     stream_id: u32,
     response: WireResponse,
 ) -> Result<(), super::FlowMuxError> {

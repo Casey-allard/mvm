@@ -13,10 +13,32 @@ use std::{
 pub trait AuthenticatedTcpPayloadIo: Read + Write + Send + Debug {
     fn try_clone(&self) -> io::Result<Box<dyn AuthenticatedTcpPayloadIo>>;
     fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+    fn close_and_join_until(&self, _: Instant) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "payload reader completion unavailable",
+        ))
+    }
 }
 
 /// Trusted implementation authenticates the peer before creating codec state.
 pub trait AuthenticatedTcpPayloadFactory: Send + Sync + Debug {
+    fn requires_owned_tcp_relays(&self) -> bool {
+        false
+    }
+    fn check_owned_tcp_relays(
+        &self,
+        _: &super::OwnedTcpRelays,
+        _: &AdmittedNetworkPlan,
+        _: &str,
+        _: [u8; 32],
+        _: [u8; 32],
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "factory has no original installed partition",
+        ))
+    }
     fn map(
         &self,
         socket: TcpStream,
@@ -36,8 +58,12 @@ pub struct AdmittedTcpPayload {
     route: &'static str,
     selected: CooperatingTcpPeer,
     deadline: Instant,
+    owned_relay: Option<super::owned_relays::RelayWitness>,
 }
 impl AdmittedTcpPayload {
+    pub(super) fn owned_relay(&self) -> Option<&super::owned_relays::RelayWitness> {
+        self.owned_relay.as_ref()
+    }
     pub fn plan(&self) -> &AdmittedNetworkPlan {
         &self.plan
     }
@@ -78,6 +104,7 @@ pub(super) struct AdmittedTcpFacts {
     pub requested_port: u16,
     pub route: &'static str,
     pub deadline: Instant,
+    pub owned_relay: Option<super::owned_relays::RelayWitness>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +114,23 @@ pub struct PayloadMappingConfig {
     factory: Option<Arc<dyn AuthenticatedTcpPayloadFactory>>,
 }
 impl PayloadMappingConfig {
+    pub(super) fn requires_owned_tcp_relays(&self) -> bool {
+        self.factory
+            .as_ref()
+            .is_some_and(|factory| factory.requires_owned_tcp_relays())
+    }
+    pub(super) fn check_owned_tcp_relays(
+        &self,
+        group: &super::OwnedTcpRelays,
+        session: &str,
+        host: [u8; 32],
+        guest: [u8; 32],
+    ) -> io::Result<()> {
+        self.factory
+            .as_ref()
+            .ok_or_else(|| io::Error::other("installed factory missing"))?
+            .check_owned_tcp_relays(group, &self.plan, session, host, guest)
+    }
     pub fn new(policy: &NetworkPolicy, plan: AdmittedNetworkPlan) -> anyhow::Result<Self> {
         plan.validate_for(policy, &plan.tenant_id, &plan.instance_id)?;
         let selected = policy
@@ -139,6 +183,7 @@ impl PayloadMappingConfig {
             route: facts.route,
             selected,
             deadline,
+            owned_relay: facts.owned_relay,
         };
         let mapped = self
             .factory

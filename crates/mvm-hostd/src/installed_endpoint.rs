@@ -10,55 +10,54 @@ use anyhow::{Context, Result, ensure};
 use mvm_contract::policy::network_policy::PayloadMappingProfile;
 use mvm_core::host_lifetime::EndpointStoreLocator;
 use mvm_vmm::host::network_endpoint_spawn::{
-    AdmittedNetworkPlan, InstalledEndpointChild, InstalledEndpointLease,
+    AdmittedNetworkPlan, InstalledEndpointChild, InstalledEndpointLease, InstalledTelemetryRecords,
+};
+pub use mvm_vmm::host::network_endpoint_spawn::{
+    INSTALLED_BOOTSTRAP_MIN_BYTES, installed_endpoint_bootstrap_requirement,
 };
 use std::{
     fs::File,
     io,
     os::unix::fs::MetadataExt,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
-/// Enter the installed child protocol on the parent's original pipes.
-pub fn run_installed_endpoint() -> Result<()> {
-    let mut child = InstalledEndpointChild::from_stdio()
-        .map_err(|_| anyhow::anyhow!("installed endpoint handshake failed"))?;
-    let resources = InstalledEndpointResources::from_child(&mut child)
-        .map_err(|_| anyhow::anyhow!("installed endpoint resource adoption failed"))?;
-    if let InstalledEndpointProgram::Network(config) = &resources.program
-        && let Some(telemetry) = &config.telemetry
-    {
-        let check = (|| -> Result<()> {
-            let audit = resources.lease.audit()?;
-            ensure!(
-                audit.tenant() == config.tenant_id && audit.socket() == telemetry.signer_sock,
-                "installed signer differs"
-            );
-            let records = child
-                .take_telemetry_records()?
-                .context("installed records missing")?;
-            records.check_for(&resources.lease, &telemetry.state_dir)?;
-            Ok(())
-        })();
-        check.map_err(|_| anyhow::anyhow!("installed retained telemetry adoption failed"))?;
-    }
-    anyhow::bail!("installed endpoint controller unavailable")
-}
+mod audit;
+pub(crate) use audit::InstalledAuditOrigin;
+mod session_control;
+pub(crate) use session_control::InstalledSessionControl;
+mod auxiliary;
+mod controller;
+pub use controller::{
+    OwnedEndpointRuntimeRequirements, OwnedNetworkRuntimeRequirements,
+    owned_endpoint_runtime_requirements, owned_network_runtime_requirements,
+    run_installed_endpoint,
+};
+#[cfg(test)]
+#[path = "installed_endpoint/auxiliary_tests.rs"]
+mod auxiliary_tests;
+mod typed_model;
+pub(crate) use auxiliary::InstalledEndpointComponentPermit;
+use auxiliary::{AuxiliaryLedger, Component};
 
 pub enum InstalledEndpointProgram {
-    Network(EndpointConfig),
-    TelemetryOnly(TelemetryOnlyConfig),
+    Network(Box<EndpointConfig>),
+    TelemetryOnly(Box<TelemetryOnlyConfig>),
 }
 
 /// One prepared child. Cloning its pool shares the same ledger and authority.
 pub struct InstalledEndpointResources {
+    startup_deadline: Instant,
     program: InstalledEndpointProgram,
     lease: InstalledEndpointLease,
     pool: Option<PayloadResourcePool>,
     store: Option<Arc<HeldStore>>,
+    auxiliary: Arc<AuxiliaryLedger>,
+    records: Mutex<Option<InstalledTelemetryRecords>>,
     #[cfg(target_os = "linux")]
     verification_state: File,
 }
@@ -66,30 +65,50 @@ impl InstalledEndpointResources {
     pub fn from_child(child: &mut InstalledEndpointChild) -> Result<Self> {
         let lease = child.lease();
         lease.check_current()?;
+        typed_model::require_supported_model()?;
+        let projection = lease.projection();
+        ensure!(
+            projection.limits.host_metadata_bytes
+                >= mvm_vmm::host::network_endpoint_spawn::INSTALLED_BOOTSTRAP_MIN_BYTES,
+            "installed endpoint bootstrap credit missing"
+        );
         #[cfg(target_os = "linux")]
         let verification_state = child.with_verification_state(|state| Ok(state.try_clone()?))?;
-        let config = child.take_config()?;
-        let projection = lease.projection();
+        let config = child.take_raw_config()?;
+        let bootstrap =
+            mvm_vmm::host::network_endpoint_spawn::installed_endpoint_bootstrap_requirement(
+                config.get(),
+            )
+            .map_err(|_| anyhow::anyhow!("invalid installed network configuration"))?;
+        lease.check_current()?;
+        let auxiliary = Arc::new(AuxiliaryLedger::new_with_bootstrap(
+            projection.limits.host_stack_bytes,
+            projection.limits.host_metadata_bytes,
+            bootstrap,
+        )?);
         if projection.profile == 1 {
-            let serde_json::Value::Object(mut wrapper) = config else {
-                anyhow::bail!("installed collector config is not an object")
-            };
-            ensure!(wrapper.len() == 1, "installed collector wrapper differs");
-            let config: TelemetryOnlyConfig = serde_json::from_value(
-                wrapper
-                    .remove("telemetry_only")
-                    .context("installed collector config missing")?,
-            )?;
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct CollectorConfig {
+                telemetry_only: TelemetryOnlyConfig,
+            }
+            let config = serde_json::from_str::<CollectorConfig>(config.get())
+                .map_err(|_| anyhow::anyhow!("invalid installed collector configuration"))?
+                .telemetry_only;
             ensure!(
                 config.instance_id == projection.binding.vm_name && projection.store.is_none(),
                 "installed collector binding differs"
             );
+            let records = take_original_records(child, &lease, Some(&config.telemetry))?;
             lease.check_current()?;
             return Ok(Self {
-                program: InstalledEndpointProgram::TelemetryOnly(config),
+                startup_deadline: child.startup_deadline(),
+                program: InstalledEndpointProgram::TelemetryOnly(Box::new(config)),
                 lease,
                 pool: None,
                 store: None,
+                auxiliary,
+                records: Mutex::new(records),
                 #[cfg(target_os = "linux")]
                 verification_state,
             });
@@ -98,7 +117,9 @@ impl InstalledEndpointResources {
             projection.profile == 2,
             "installed endpoint program unsupported"
         );
-        let config: EndpointConfig = serde_json::from_value(config)?;
+        let config: EndpointConfig = serde_json::from_str(config.get())
+            .map_err(|_| anyhow::anyhow!("invalid installed network configuration"))?;
+        let records = take_original_records(child, &lease, config.telemetry.as_ref())?;
         ensure!(
             config.egress_mode == EgressMode::FlowMux,
             "installed codec requires FlowMux"
@@ -132,12 +153,32 @@ impl InstalledEndpointResources {
             .context("installed guest identity missing")?
             .session_id
             .clone();
+        let (retained_records, retained_sidecars) = if let Some(telemetry) = &config.telemetry {
+            let reserved = mvm_vmm::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP;
+            ensure!(
+                telemetry.records_byte_cap <= reserved,
+                "installed telemetry cap exceeds retained reservation"
+            );
+            // The versioned parent profile reserves fixed R independently of
+            // a smaller sink cap. Config data cannot return that debt to codecs.
+            (
+                reserved,
+                mvm_core::runtime_state_protection::INSTALLED_TELEMETRY_SIDECAR_BYTES,
+            )
+        } else {
+            (0, 0)
+        };
         let limits = PayloadResourceLimits {
             max_active: projection.limits.max_streams,
             resident_bytes: projection.limits.host_codec_bytes,
             disk_bytes: projection
                 .limits
                 .cache_disk_bytes
+                // The SAME cache quota includes retained telemetry. Those
+                // bytes never become disposable-codec credit or Drained refund.
+                .checked_sub(retained_records)
+                .and_then(|bytes| bytes.checked_sub(retained_sidecars))
+                .context("installed retained telemetry disk credit missing")?
                 .checked_add(projection.limits.staging_disk_bytes)
                 .context("installed payload disk limit overflow")?,
         }
@@ -155,16 +196,16 @@ impl InstalledEndpointResources {
             store: store.clone(),
         });
         let pool = PayloadResourcePool::from_installed_parent(
-            parent,
-            plan,
-            &session,
-            projection.limits.host_carrier_bytes,
+            parent, plan, &session, projection.limits.host_carrier_bytes,
         )?;
         Ok(Self {
-            program: InstalledEndpointProgram::Network(config),
+            startup_deadline: child.startup_deadline(),
+            program: InstalledEndpointProgram::Network(Box::new(config)),
             lease,
             pool: Some(pool),
             store: Some(store),
+            auxiliary,
+            records: Mutex::new(records),
             #[cfg(target_os = "linux")]
             verification_state,
         })
@@ -177,10 +218,21 @@ impl InstalledEndpointResources {
         if let Some(store) = &self.store {
             store.check_current()?;
         }
+        // Only the actual inherited opaque writer selects its read-only ACL
+        // query shape. This private filter selection is not an FD/DTO grant.
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| {
+                self.lease.fence();
+                anyhow::anyhow!("installed records ownership poisoned")
+            })?
+            .is_some();
         crate::jailer::confine_self_with_owned_files(
             spec,
             &self.verification_state,
             self.store.as_ref().map(|store| &store.directory),
+            records,
         )?;
         self.lease.check_current()?;
         if let Some(store) = &self.store {
@@ -204,6 +256,114 @@ impl InstalledEndpointResources {
     pub(crate) fn lease(&self) -> &InstalledEndpointLease {
         &self.lease
     }
+    /// Start only the collector selected by this original authenticated child.
+    /// All allocations/threads follow the same one-shot auxiliary subdivision.
+    pub fn start_owned_collector(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<crate::telemetry_collector::OwnedEmbeddedCollector>> {
+        use crate::telemetry_collector::{
+            OwnedCollectorStart, owned_collector_requirements, owned_scanner_requested_bytes,
+            start_owned,
+        };
+        let deadline = deadline.min(self.startup_deadline);
+        ensure!(
+            Instant::now() < deadline,
+            "installed collector startup expired"
+        );
+        self.lease.check_current()?;
+        let (vm, config, redaction) = match &self.program {
+            InstalledEndpointProgram::TelemetryOnly(config) => (
+                config.instance_id.as_str(),
+                &config.telemetry,
+                &config.redaction,
+            ),
+            InstalledEndpointProgram::Network(config) => {
+                let Some(telemetry) = &config.telemetry else {
+                    return Ok(None);
+                };
+                (config.instance_id.as_str(), telemetry, &config.redaction)
+            }
+        };
+        ensure!(
+            self.lease.projection().limits.cache_disk_bytes >= config.records_byte_cap,
+            "installed retained telemetry disk credit missing"
+        );
+        let facts = owned_collector_requirements()?;
+        let metadata = facts
+            .known_metadata_bytes
+            .checked_add(owned_scanner_requested_bytes(redaction)?)
+            .context("installed collector requested workspace overflow")?;
+        let permit =
+            self.claim_component(Component::Collector, facts.known_rust_stack_bytes, metadata)?;
+        let records = match self.records.lock() {
+            Ok(mut records) => records
+                .take()
+                .context("installed original records writer unavailable")?,
+            Err(_) => {
+                self.lease.fence();
+                anyhow::bail!("installed original records writer poisoned")
+            }
+        };
+        records.check_for(&self.lease, &config.state_dir)?;
+        ensure!(
+            Instant::now() < deadline,
+            "installed collector startup expired"
+        );
+        let fingerprints = match &self.program {
+            InstalledEndpointProgram::Network(config) => {
+                crate::supervisor::network_endpoint::fingerprint_bound_secrets(config)?
+            }
+            InstalledEndpointProgram::TelemetryOnly(_) => Vec::new(),
+        };
+        Ok(Some(start_owned(OwnedCollectorStart {
+            vm,
+            config,
+            redaction,
+            fingerprints,
+            permit,
+            records,
+            audit: self.lease.audit()?,
+            deadline,
+        })?))
+    }
+    pub(crate) fn claim_relay_group(
+        &self,
+        stack: u64,
+        metadata: u64,
+    ) -> io::Result<InstalledEndpointComponentPermit> {
+        self.claim_component(Component::Relay, stack, metadata)
+    }
+    pub(crate) fn claim_codec_readers(
+        &self,
+        stack: u64,
+        metadata: u64,
+    ) -> io::Result<InstalledEndpointComponentPermit> {
+        self.claim_component(Component::CodecReaders, stack, metadata)
+    }
+    fn claim_component(
+        &self,
+        component: Component,
+        stack: u64,
+        metadata: u64,
+    ) -> io::Result<InstalledEndpointComponentPermit> {
+        self.auxiliary.reserve(component, stack, metadata, || {
+            self.lease.check_current().map_err(invalid)?;
+            if !matches!(&self.program, InstalledEndpointProgram::Network(_))
+                && !matches!(component, Component::Collector | Component::Controller)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "collector has no TCP component",
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(InstalledEndpointComponentPermit::new(
+            self.lease.clone(),
+            self.auxiliary.clone(),
+        ))
+    }
     pub fn into_parts(
         self,
     ) -> (
@@ -212,6 +372,42 @@ impl InstalledEndpointResources {
         Option<PayloadResourcePool>,
     ) {
         (self.program, self.lease, self.pool)
+    }
+}
+
+fn take_original_records(
+    child: &mut InstalledEndpointChild,
+    lease: &InstalledEndpointLease,
+    telemetry: Option<&crate::telemetry_collector::TelemetryEmbedConfig>,
+) -> Result<Option<InstalledTelemetryRecords>> {
+    if telemetry.is_none() {
+        return Ok(None);
+    }
+    let records = child.take_telemetry_records()?;
+    match (telemetry, records) {
+        (None, None) => Ok(None),
+        (Some(config), Some(records)) => {
+            let retained = mvm_vmm::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP;
+            ensure!(
+                config.records_byte_cap <= retained,
+                "installed retained record cap unsupported"
+            );
+            ensure!(
+                lease
+                    .projection()
+                    .limits
+                    .cache_disk_bytes
+                    .checked_sub(retained)
+                    .and_then(|bytes| bytes.checked_sub(
+                        mvm_core::runtime_state_protection::INSTALLED_TELEMETRY_SIDECAR_BYTES
+                    ))
+                    .is_some(),
+                "installed retained telemetry disk credit missing"
+            );
+            records.check_for(lease, &config.state_dir)?;
+            Ok(Some(records))
+        }
+        _ => anyhow::bail!("installed original records writer selection differs"),
     }
 }
 

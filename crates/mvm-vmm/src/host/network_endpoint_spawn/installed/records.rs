@@ -164,6 +164,30 @@ impl InstalledTelemetryRecords {
     pub fn current_len(&self) -> std::io::Result<u64> {
         self.file.metadata().map(|metadata| metadata.len())
     }
+    /// Refuse retirement on a partial append. The confined writer has no
+    /// truncation authority over the original retained record stream.
+    pub fn rollback_to(&mut self, length: u64) -> std::io::Result<()> {
+        if self.current_len().is_ok_and(|current| current == length) {
+            Ok(())
+        } else {
+            self.lease.fence();
+            Err(std::io::Error::other("installed records append left unverified bytes"))
+        }
+    }
+}
+
+impl std::io::Write for InstalledTelemetryRecords {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let length = self.current_len()?;
+        let cap = crate::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP;
+        if length.checked_add(bytes.len() as u64).is_none_or(|end| end > cap) {
+            return Err(std::io::Error::other("installed records append refused"));
+        }
+        self.file.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
 }
 
 #[cfg(test)]

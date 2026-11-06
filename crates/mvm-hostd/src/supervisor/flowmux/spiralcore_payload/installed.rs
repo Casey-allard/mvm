@@ -13,6 +13,8 @@ use spiralcore_transfer::{
 };
 use std::{fs::File, os::unix::fs::MetadataExt};
 
+const READER_METADATA_BYTES: u64 = 64 << 10;
+
 impl SpiralCorePayloadFactory {
     /// Consume no projected DTO as authority and never create another pool.
     pub fn from_installed_resources(
@@ -46,6 +48,18 @@ impl SpiralCorePayloadFactory {
                 "installed payload profile unqualified",
             ));
         }
+        let streams = u64::from(original.lease().projection().limits.max_streams);
+        let builder = u64::try_from(spiralcore_mvm_flowmux::READER_STACK_BYTES).map_err(invalid)?;
+        let stack = mvm_core::host_lifetime::native_thread_stack_terms(builder)
+            .map_err(invalid)?
+            .known_rust_bytes
+            .checked_mul(streams)
+            .ok_or_else(|| invalid("reader stack sum overflow"))?;
+        let metadata = READER_METADATA_BYTES
+            .checked_mul(streams)
+            .ok_or_else(|| invalid("reader metadata sum overflow"))?;
+        let reader_resources = Arc::new(original.claim_codec_readers(stack, metadata)?);
+        reader_resources.check_current()?;
         let pool = original
             .payload_pool()
             .ok_or_else(|| invalid("original payload pool missing"))?
@@ -88,15 +102,17 @@ impl SpiralCorePayloadFactory {
             session: configured.session_id.clone(),
             guest_key: decode_key(&configured.guest_verifying_key_base64)?,
             host_spki: identity.spki_sha256(),
+            host_key: key.verifying_key().to_bytes(),
             pool,
             lease: original.lease().clone(),
             locator,
             directory,
+            reader_resources,
         };
         controller.lease.check_current().map_err(invalid)?;
         Ok(Some(Self {
             identity,
-            controller: PayloadController::Installed(Box::new(controller)),
+            controller: Controller::Installed(Box::new(controller)),
         }))
     }
 }
@@ -122,10 +138,12 @@ pub(super) struct InstalledScopeController {
     session: String,
     guest_key: [u8; 32],
     host_spki: [u8; 32],
+    host_key: [u8; 32],
     pool: PayloadResourcePool,
     lease: InstalledEndpointLease,
     locator: EndpointStoreLocator,
     directory: File,
+    reader_resources: Arc<crate::installed_endpoint::InstalledEndpointComponentPermit>,
 }
 impl fmt::Debug for InstalledScopeController {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -140,6 +158,7 @@ impl InstalledScopeController {
         facts: &ScopeFacts,
         profile: NegotiatedProfile,
     ) -> io::Result<()> {
+        self.check_before_carrier(request)?;
         let selected = self
             .policy
             .select(request.requested_host(), request.requested_port());
@@ -169,6 +188,7 @@ impl InstalledScopeController {
             return Err(invalid("payload scope differs from original own admission"));
         }
         facts.canonical_bytes().map_err(invalid)?;
+        self.reader_resources.check_current()?;
         self.lease.check_current().map_err(invalid)
     }
     fn create_store(
@@ -209,11 +229,38 @@ impl InstalledScopeController {
         self.lease.check_current().map_err(invalid)?;
         Ok(path)
     }
-
     pub(super) fn reserve(
         &self,
         request: &AdmittedTcpPayload,
     ) -> io::Result<PayloadResourcePermit> {
+        self.check_before_carrier(request)?;
+        self.pool
+            .reserve_installed_profile(ResourceProfile::SmallV1)
+    }
+    pub(super) fn check_owned_tcp_relays(
+        &self,
+        group: &super::super::OwnedTcpRelays,
+        plan: &AdmittedNetworkPlan,
+        session: &str,
+        host: [u8; 32],
+        guest: [u8; 32],
+    ) -> io::Result<()> {
+        group.check_reader_partition(&self.reader_resources)?;
+        if plan != &self.plan
+            || session != self.session
+            || host != self.host_key
+            || guest != self.guest_key
+        {
+            return Err(invalid("owned relay original session differs"));
+        }
+        self.lease.check_current().map_err(invalid)
+    }
+    fn check_before_carrier(&self, request: &AdmittedTcpPayload) -> io::Result<()> {
+        self.reader_resources.check_current()?;
+        request
+            .owned_relay()
+            .ok_or_else(|| invalid("installed payload requires original relay reservation"))?
+            .check(&self.reader_resources)?;
         if request.plan() != &self.plan
             || request.session_id() != self.session
             || request.guest_key() != self.guest_key
@@ -224,11 +271,8 @@ impl InstalledScopeController {
         {
             return Err(invalid("installed payload original admission differs"));
         }
-        self.lease.check_current().map_err(invalid)?;
-        self.pool
-            .reserve_installed_profile(ResourceProfile::SmallV1)
+        self.lease.check_current().map_err(invalid)
     }
-
     pub(super) fn prepare(
         &self,
         request: &AdmittedTcpPayload,
@@ -304,14 +348,19 @@ impl InstalledScopeController {
         .map_err(invalid)?;
         remaining(deadline)?;
         PreparedPayloadSession::check_parts(&authority, &sender, &endpoint, permit)?;
+        let relay = request
+            .owned_relay()
+            .ok_or_else(|| invalid("installed reader relay witness missing"))?;
+        relay.check(&self.reader_resources)?;
+        let artifacts = vec![PayloadArtifact::Schema, PayloadArtifact::Checkpoint];
         Ok(PreparedPayloadSession {
-            artifacts: vec![PayloadArtifact::Schema, PayloadArtifact::Checkpoint],
+            artifacts,
             authority,
             sender,
             endpoint,
-            resources: pending
-                .take()
-                .ok_or_else(|| invalid("original pending payload reservation missing"))?,
+            resources: pending.take().expect("original checked pending permit"),
+            reader_resources: Some(self.reader_resources.clone()),
+            relay_witness: Some(relay.clone()),
         })
     }
 }

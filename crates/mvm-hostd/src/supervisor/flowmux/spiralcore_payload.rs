@@ -49,6 +49,22 @@ fn capabilities(selected: PayloadMappingProfile) -> Capabilities {
 
 /// Trusted local controller; received facts or TLS alone never grant a scope.
 pub trait PayloadScopeController: Send + Sync + fmt::Debug {
+    fn requires_owned_tcp_relays(&self) -> bool {
+        false
+    }
+    fn check_owned_tcp_relays(
+        &self,
+        _: &super::OwnedTcpRelays,
+        _: &mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan,
+        _: &str,
+        _: [u8; 32],
+        _: [u8; 32],
+    ) -> io::Result<()> {
+        Err(invalid("controller has no original installed partition"))
+    }
+    fn check_before_carrier(&self, _: &AdmittedTcpPayload) -> io::Result<()> {
+        Ok(())
+    }
     fn prepare(
         &self,
         request: &AdmittedTcpPayload,
@@ -64,6 +80,8 @@ pub struct PreparedPayloadSession {
     sender: ObjectSender,
     endpoint: ObjectEndpoint<ScopeAuthority>,
     resources: PayloadResourcePermit,
+    reader_resources: Option<Arc<crate::installed_endpoint::InstalledEndpointComponentPermit>>,
+    relay_witness: Option<super::owned_relays::RelayWitness>,
 }
 pub enum PayloadArtifact {
     Schema,
@@ -108,9 +126,10 @@ impl PreparedPayloadSession {
             sender,
             endpoint,
             resources,
+            reader_resources: None,
+            relay_witness: None,
         })
     }
-
     fn check_parts(
         authority: &ScopeAuthority,
         sender: &ObjectSender,
@@ -137,12 +156,19 @@ impl PreparedPayloadSession {
 #[derive(Debug)]
 pub struct SpiralCorePayloadFactory {
     identity: PinnedIdentity,
-    controller: PayloadController,
+    controller: Controller,
 }
 #[derive(Debug)]
-enum PayloadController {
+enum Controller {
     Enrolled(Arc<dyn PayloadScopeController>),
     Installed(Box<installed::InstalledScopeController>),
+}
+enum PendingScope<'a> {
+    Enrolled(&'a dyn PayloadScopeController),
+    Installed(
+        &'a installed::InstalledScopeController,
+        Option<PayloadResourcePermit>,
+    ),
 }
 impl SpiralCorePayloadFactory {
     pub fn from_host_key(
@@ -152,7 +178,7 @@ impl SpiralCorePayloadFactory {
         let identity = pinned_identity(key)?;
         Ok(Self {
             identity,
-            controller: PayloadController::Enrolled(controller),
+            controller: Controller::Enrolled(controller),
         })
     }
 }
@@ -161,6 +187,29 @@ fn pinned_identity(key: &SigningKey) -> io::Result<PinnedIdentity> {
     PinnedIdentity::from_pkcs8(encoded.as_bytes().to_vec())
 }
 impl AuthenticatedTcpPayloadFactory for SpiralCorePayloadFactory {
+    fn requires_owned_tcp_relays(&self) -> bool {
+        match &self.controller {
+            Controller::Enrolled(controller) => controller.requires_owned_tcp_relays(),
+            Controller::Installed(_) => true,
+        }
+    }
+    fn check_owned_tcp_relays(
+        &self,
+        group: &super::OwnedTcpRelays,
+        plan: &mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan,
+        session: &str,
+        host: [u8; 32],
+        guest: [u8; 32],
+    ) -> io::Result<()> {
+        match &self.controller {
+            Controller::Enrolled(controller) => {
+                controller.check_owned_tcp_relays(group, plan, session, host, guest)
+            }
+            Controller::Installed(controller) => {
+                controller.check_owned_tcp_relays(group, plan, session, host, guest)
+            }
+        }
+    }
     fn map(
         &self,
         socket: TcpStream,
@@ -169,10 +218,16 @@ impl AuthenticatedTcpPayloadFactory for SpiralCorePayloadFactory {
         let deadline = request.deadline();
         remaining(deadline)?;
         let pending = match &self.controller {
-            PayloadController::Enrolled(_) => None,
-            PayloadController::Installed(controller) => Some(controller.reserve(&request)?),
+            Controller::Enrolled(controller) => {
+                controller.check_before_carrier(&request)?;
+                PendingScope::Enrolled(controller.as_ref())
+            }
+            Controller::Installed(controller) => {
+                PendingScope::Installed(controller, Some(controller.reserve(&request)?))
+            }
         };
-        // On any setup error, close the TLS carrier before refunding credit.
+        // Tuple fields drop in order. An error or unwind while validating
+        // actual TLS facts destroys the carrier before returning its credit.
         let mut carrier = (
             TlsCarrier::connect(
                 socket,
@@ -208,12 +263,12 @@ impl AuthenticatedTcpPayloadFactory for SpiralCorePayloadFactory {
         facts.canonical_bytes().map_err(invalid)?;
         remaining(deadline)?;
         let profile = caps.negotiate(&caps).map_err(invalid)?;
-        let prepared = match &self.controller {
-            PayloadController::Enrolled(controller) => {
+        let prepared = match &mut carrier.1 {
+            PendingScope::Enrolled(controller) => {
                 controller.prepare(&request, &facts, profile, deadline)?
             }
-            PayloadController::Installed(controller) => {
-                controller.prepare(&request, &facts, profile, deadline, &mut carrier.1)?
+            PendingScope::Installed(controller, permit) => {
+                controller.prepare(&request, &facts, profile, deadline, permit)?
             }
         };
         let ready = (carrier.0, prepared);
@@ -239,28 +294,39 @@ fn assemble(
 ) -> io::Result<EnrolledPayloadStream> {
     let prepared = &ready.1;
     prepared.resources.check_current()?;
+    check_reader(
+        prepared.reader_resources.as_ref(),
+        prepared.relay_witness.as_ref(),
+    )?;
     prepared.authority.check().map_err(invalid)?;
     let caps = prepared.sender.profile().capabilities();
     let context = prepared.authority.context().clone();
-    let channel = ObjectChannel::from_authenticated(
-        ready.0,
-        &prepared.authority,
-        remaining(deadline)?,
-        role,
-        caps,
-        caps,
-    )
-    .map_err(invalid)?;
+    let time = remaining(deadline)?;
+    let channel =
+        ObjectChannel::from_authenticated(ready.0, &prepared.authority, time, role, caps, caps)
+            .map_err(invalid)?;
     let prepared = ready.1;
     let duplex = Duplex::spawn(channel, prepared.sender, prepared.endpoint, context, role)
         .map_err(invalid)?;
-    let mapped = MappedStream::from_duplex(duplex);
-    for artifact in prepared.artifacts {
+    let artifacts = prepared.artifacts;
+    let mapped = EnrolledPayloadStream {
+        inner: Arc::new(OwnedMappedPayload {
+            stream: MappedStream::from_duplex(duplex),
+            resources: prepared.resources,
+            reader_resources: prepared.reader_resources,
+            relay_witness: prepared.relay_witness,
+        }),
+    };
+    if let Some(witness) = &mapped.inner.relay_witness {
+        witness.retain_prepared(mapped.clone())?;
+    }
+    for artifact in artifacts {
         remaining(deadline)?;
+        mapped.check_current()?;
         let publication = match artifact {
-            PayloadArtifact::Schema => mapped.seed_schema_until(deadline),
-            PayloadArtifact::Checkpoint => mapped.seed_checkpoint_until(deadline),
-            PayloadArtifact::Base(bytes) => mapped.seed_base_until(bytes, deadline),
+            PayloadArtifact::Schema => mapped.inner.stream.seed_schema_until(deadline),
+            PayloadArtifact::Checkpoint => mapped.inner.stream.seed_checkpoint_until(deadline),
+            PayloadArtifact::Base(bytes) => mapped.inner.stream.seed_base_until(bytes, deadline),
         };
         if let Err(error) = publication {
             let _ = mapped.shutdown(Shutdown::Both);
@@ -271,19 +337,27 @@ fn assemble(
         let _ = mapped.shutdown(Shutdown::Both);
         return Err(error);
     }
-    prepared.resources.check_current()?;
-    Ok(EnrolledPayloadStream {
-        inner: Arc::new(OwnedMappedPayload {
-            stream: mapped,
-            resources: prepared.resources,
-        }),
-    })
+    mapped.check_current()?;
+    Ok(mapped)
 }
 struct OwnedMappedPayload {
     // Declaration order is the cleanup barrier: join the exact owned reader
     // through the last mapped stream before store cleanup/resource release.
     stream: MappedStream,
     resources: PayloadResourcePermit,
+    reader_resources: Option<Arc<crate::installed_endpoint::InstalledEndpointComponentPermit>>,
+    relay_witness: Option<super::owned_relays::RelayWitness>,
+}
+
+fn check_reader(
+    reader: Option<&Arc<crate::installed_endpoint::InstalledEndpointComponentPermit>>,
+    relay: Option<&super::owned_relays::RelayWitness>,
+) -> io::Result<()> {
+    match (reader, relay) {
+        (Some(reader), Some(relay)) => relay.check(reader),
+        (None, None) => Ok(()),
+        _ => Err(invalid("installed reader original relay witness missing")),
+    }
 }
 #[derive(Clone)]
 pub struct EnrolledPayloadStream {
@@ -294,6 +368,13 @@ impl EnrolledPayloadStream {
         self.inner.stream.shutdown(how)
     }
     fn check_current(&self) -> io::Result<()> {
+        if let Err(error) = check_reader(
+            self.inner.reader_resources.as_ref(),
+            self.inner.relay_witness.as_ref(),
+        ) {
+            let _ = self.inner.stream.shutdown(Shutdown::Both);
+            return Err(error);
+        }
         if let Err(error) = self.inner.resources.check_current() {
             let _ = self.inner.stream.shutdown(Shutdown::Both);
             return Err(error);
@@ -335,6 +416,18 @@ impl AuthenticatedTcpPayloadIo for EnrolledPayloadStream {
     }
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.shutdown(how)
+    }
+    fn close_and_join_until(&self, until: Instant) -> io::Result<()> {
+        self.inner
+            .stream
+            .close_and_join_until(until)
+            .map_err(|error| match error {
+                spiralcore_mvm_flowmux::Error::Timeout => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "payload reader completion deadline",
+                ),
+                other => invalid(other),
+            })
     }
 }
 
