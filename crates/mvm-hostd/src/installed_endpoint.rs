@@ -128,7 +128,12 @@ impl InstalledEndpointResources {
             limits,
             store: store.clone(),
         });
-        let pool = PayloadResourcePool::from_parent(parent, plan, &session)?;
+        let pool = PayloadResourcePool::from_installed_parent(
+            parent,
+            plan,
+            &session,
+            projection.limits.host_carrier_bytes,
+        )?;
         Ok(Self {
             program: InstalledEndpointProgram::Network(config),
             lease,

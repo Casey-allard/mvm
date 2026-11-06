@@ -64,6 +64,7 @@ fn close_wins_against_inflight_parent_check_without_holding_pool_ledger() {
             entered,
             release: Mutex::new(resume),
         })),
+        0,
     )
     .unwrap();
     std::thread::scope(|scope| {
@@ -91,6 +92,7 @@ fn local_fence_wins_against_inflight_parent_check_without_new_charge() {
             entered,
             release: Mutex::new(resume),
         })),
+        0,
     )
     .unwrap();
     let root = tempfile::tempdir().unwrap();

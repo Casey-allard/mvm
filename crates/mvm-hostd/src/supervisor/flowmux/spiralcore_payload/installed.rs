@@ -96,7 +96,7 @@ impl SpiralCorePayloadFactory {
         controller.lease.check_current().map_err(invalid)?;
         Ok(Some(Self {
             identity,
-            controller: Arc::new(controller),
+            controller: PayloadController::Installed(Box::new(controller)),
         }))
     }
 }
@@ -116,7 +116,7 @@ fn decode_key(encoded: &str) -> io::Result<[u8; 32]> {
         .map_err(|_| invalid("canonical endpoint key size"))
 }
 
-struct InstalledScopeController {
+pub(super) struct InstalledScopeController {
     plan: AdmittedNetworkPlan,
     policy: mvm_contract::policy::network_policy::CooperatingPayloadPolicy,
     session: String,
@@ -173,9 +173,9 @@ impl InstalledScopeController {
     }
     fn create_store(
         &self,
-        mut permit: PayloadResourcePermit,
+        permit: &mut PayloadResourcePermit,
         facts: &ScopeFacts,
-    ) -> io::Result<(PayloadResourcePermit, std::path::PathBuf)> {
+    ) -> io::Result<std::path::PathBuf> {
         let name = format!("flow-{}", hex::encode(facts.commitment().map_err(invalid)?));
         if let Err(error) = rustix::fs::mkdirat(
             &self.directory,
@@ -205,24 +205,56 @@ impl InstalledScopeController {
             }
         };
         let path = self.locator.path.join(name);
-        let permit = permit.with_owned_directory(path.clone(), directory)?;
+        permit.attach_owned_directory(path.clone(), directory)?;
         self.lease.check_current().map_err(invalid)?;
-        Ok((permit, path))
+        Ok(path)
     }
-}
-impl PayloadScopeController for InstalledScopeController {
-    fn prepare(
+
+    pub(super) fn reserve(
+        &self,
+        request: &AdmittedTcpPayload,
+    ) -> io::Result<PayloadResourcePermit> {
+        if request.plan() != &self.plan
+            || request.session_id() != self.session
+            || request.guest_key() != self.guest_key
+            || self
+                .policy
+                .select(request.requested_host(), request.requested_port())
+                != Some(request.selected())
+        {
+            return Err(invalid("installed payload original admission differs"));
+        }
+        self.lease.check_current().map_err(invalid)?;
+        self.pool
+            .reserve_installed_profile(ResourceProfile::SmallV1)
+    }
+
+    pub(super) fn prepare(
         &self,
         request: &AdmittedTcpPayload,
         facts: &ScopeFacts,
         profile: NegotiatedProfile,
         deadline: Instant,
+        pending: &mut Option<PayloadResourcePermit>,
     ) -> io::Result<PreparedPayloadSession> {
         if deadline != request.deadline() {
             return Err(invalid("payload setup deadline changed"));
         }
         remaining(deadline)?;
         self.validate(request, facts, profile)?;
+        let resources = ResourceProfile::SmallV1;
+        let permit = pending
+            .as_mut()
+            .ok_or_else(|| invalid("original pending payload reservation missing"))?;
+        if !Arc::ptr_eq(&permit.inner, &self.pool.inner)
+            || permit.profile != Some(resources)
+            || permit.carrier_bytes == 0
+        {
+            return Err(invalid(
+                "pending payload reservation differs from original pool",
+            ));
+        }
+        permit.check_current()?;
         let scopes = PinnedScopePolicy::new(1).map_err(invalid)?;
         let until = Instant::now()
             .checked_add(Duration::from_secs(300))
@@ -233,9 +265,7 @@ impl PayloadScopeController for InstalledScopeController {
         let authority = scopes
             .authorize_scope(facts, facts.acceptor_spki, Role::Initiator)
             .map_err(invalid)?;
-        let resources = ResourceProfile::SmallV1;
-        let permit = self.pool.reserve_profile(resources)?;
-        let (permit, path) = self.create_store(permit, facts)?;
+        let path = self.create_store(permit, facts)?;
         remaining(deadline)?;
         let context = authority.context();
         let checkpoint = State::seeded(32)
@@ -273,7 +303,15 @@ impl PayloadScopeController for InstalledScopeController {
         )
         .map_err(invalid)?;
         remaining(deadline)?;
-        PreparedPayloadSession::new(authority, sender, endpoint, permit)?
-            .with_artifacts(vec![PayloadArtifact::Schema, PayloadArtifact::Checkpoint])
+        PreparedPayloadSession::check_parts(&authority, &sender, &endpoint, permit)?;
+        Ok(PreparedPayloadSession {
+            artifacts: vec![PayloadArtifact::Schema, PayloadArtifact::Checkpoint],
+            authority,
+            sender,
+            endpoint,
+            resources: pending
+                .take()
+                .ok_or_else(|| invalid("original pending payload reservation missing"))?,
+        })
     }
 }

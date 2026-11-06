@@ -13,7 +13,7 @@ use std::{
 
 const FIXTURE: &str = "MVM_INSTALLED_RESOURCES_FIXTURE";
 
-pub async fn resource_exchange(mode: &str, child_args: &[&str]) {
+pub(super) async fn resource_exchange(mode: &str, child_args: &[&str]) {
     use mvm_core::host_lifetime::{
         EndpointPartitionLimits, EndpointPartitionProjection, EndpointStoreLocator,
         HostLaunchBinding, HostLeaseExpectation,
@@ -73,6 +73,9 @@ pub async fn resource_exchange(mode: &str, child_args: &[&str]) {
         let metadata = std::fs::metadata(&store_path).unwrap();
         projection.profile = 2;
         projection.limits.host_codec_bytes = 8 << 20;
+        if mode == "carrier-funded" {
+            projection.limits.host_carrier_bytes = 1 << 20;
+        }
         projection.limits.cache_disk_bytes = 16 << 20;
         projection.limits.staging_disk_bytes = 16 << 20;
         projection.limits.max_streams = 2;

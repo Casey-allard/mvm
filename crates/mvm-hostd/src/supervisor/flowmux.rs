@@ -12,6 +12,8 @@ mod ingress;
 mod open_flow;
 mod payload_mapping;
 mod spiralcore_payload;
+#[cfg(all(test, unix))]
+mod installed_carrier_tests;
 pub use payload_mapping::{
     AdmittedTcpPayload, AuthenticatedTcpPayloadFactory, AuthenticatedTcpPayloadIo,
     PayloadMappingConfig,

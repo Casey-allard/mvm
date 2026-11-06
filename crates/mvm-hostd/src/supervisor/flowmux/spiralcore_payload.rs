@@ -101,6 +101,22 @@ impl PreparedPayloadSession {
         endpoint: ObjectEndpoint<ScopeAuthority>,
         resources: PayloadResourcePermit,
     ) -> io::Result<Self> {
+        Self::check_parts(&authority, &sender, &endpoint, &resources)?;
+        Ok(Self {
+            artifacts: Vec::new(),
+            authority,
+            sender,
+            endpoint,
+            resources,
+        })
+    }
+
+    fn check_parts(
+        authority: &ScopeAuthority,
+        sender: &ObjectSender,
+        endpoint: &ObjectEndpoint<ScopeAuthority>,
+        resources: &PayloadResourcePermit,
+    ) -> io::Result<()> {
         resources.check_current()?;
         authority.check().map_err(invalid)?;
         let profile = sender.profile();
@@ -115,19 +131,18 @@ impl PreparedPayloadSession {
                 "resource reservation, enrolled scope and core profile differ",
             ));
         }
-        Ok(Self {
-            artifacts: Vec::new(),
-            authority,
-            sender,
-            endpoint,
-            resources,
-        })
+        Ok(())
     }
 }
 #[derive(Debug)]
 pub struct SpiralCorePayloadFactory {
     identity: PinnedIdentity,
-    controller: Arc<dyn PayloadScopeController>,
+    controller: PayloadController,
+}
+#[derive(Debug)]
+enum PayloadController {
+    Enrolled(Arc<dyn PayloadScopeController>),
+    Installed(Box<installed::InstalledScopeController>),
 }
 impl SpiralCorePayloadFactory {
     pub fn from_host_key(
@@ -137,7 +152,7 @@ impl SpiralCorePayloadFactory {
         let identity = pinned_identity(key)?;
         Ok(Self {
             identity,
-            controller,
+            controller: PayloadController::Enrolled(controller),
         })
     }
 }
@@ -153,13 +168,21 @@ impl AuthenticatedTcpPayloadFactory for SpiralCorePayloadFactory {
     ) -> io::Result<Box<dyn AuthenticatedTcpPayloadIo>> {
         let deadline = request.deadline();
         remaining(deadline)?;
-        let tls = TlsCarrier::connect(
-            socket,
-            &self.identity,
-            request.selected().spki_sha256,
-            &request.selected().server_name,
-            deadline,
-        )?;
+        let pending = match &self.controller {
+            PayloadController::Enrolled(_) => None,
+            PayloadController::Installed(controller) => Some(controller.reserve(&request)?),
+        };
+        // On any setup error, close the TLS carrier before refunding credit.
+        let mut carrier = (
+            TlsCarrier::connect(
+                socket,
+                &self.identity,
+                request.selected().spki_sha256,
+                &request.selected().server_name,
+                deadline,
+            )?,
+            pending,
+        );
         let plan = request.plan();
         let caps = capabilities(request.selected().profile);
         let facts = ScopeFacts {
@@ -178,20 +201,26 @@ impl AuthenticatedTcpPayloadFactory for SpiralCorePayloadFactory {
             requested_port: request.requested_port(),
             actual_peer: request.actual_peer(),
             route: request.route().into(),
-            initiator_spki: tls.local_spki_sha256(),
-            acceptor_spki: tls.peer_spki_sha256(),
-            tls_exporter: tls.exporter(),
+            initiator_spki: carrier.0.local_spki_sha256(),
+            acceptor_spki: carrier.0.peer_spki_sha256(),
+            tls_exporter: carrier.0.exporter(),
         };
         facts.canonical_bytes().map_err(invalid)?;
         remaining(deadline)?;
         let profile = caps.negotiate(&caps).map_err(invalid)?;
-        let prepared = self
-            .controller
-            .prepare(&request, &facts, profile, deadline)?;
-        if prepared.authority.binding().map_err(invalid)? != facts.binding().map_err(invalid)? {
+        let prepared = match &self.controller {
+            PayloadController::Enrolled(controller) => {
+                controller.prepare(&request, &facts, profile, deadline)?
+            }
+            PayloadController::Installed(controller) => {
+                controller.prepare(&request, &facts, profile, deadline, &mut carrier.1)?
+            }
+        };
+        let ready = (carrier.0, prepared);
+        if ready.1.authority.binding().map_err(invalid)? != facts.binding().map_err(invalid)? {
             return Err(invalid("prepared scope differs from actual admitted facts"));
         }
-        let mapped = assemble(tls, prepared, Role::Initiator, deadline)?;
+        let mapped = assemble(ready, Role::Initiator, deadline)?;
         Ok(Box::new(mapped))
     }
 }
@@ -201,20 +230,20 @@ pub fn accept_enrolled_payload(
     prepared: PreparedPayloadSession,
     deadline: Instant,
 ) -> io::Result<EnrolledPayloadStream> {
-    assemble(tls, prepared, Role::Acceptor, deadline)
+    assemble((tls, prepared), Role::Acceptor, deadline)
 }
 fn assemble(
-    tls: TlsCarrier,
-    prepared: PreparedPayloadSession,
+    ready: (TlsCarrier, PreparedPayloadSession),
     role: Role,
     deadline: Instant,
 ) -> io::Result<EnrolledPayloadStream> {
+    let prepared = &ready.1;
     prepared.resources.check_current()?;
     prepared.authority.check().map_err(invalid)?;
     let caps = prepared.sender.profile().capabilities();
     let context = prepared.authority.context().clone();
     let channel = ObjectChannel::from_authenticated(
-        tls,
+        ready.0,
         &prepared.authority,
         remaining(deadline)?,
         role,
@@ -222,6 +251,7 @@ fn assemble(
         caps,
     )
     .map_err(invalid)?;
+    let prepared = ready.1;
     let duplex = Duplex::spawn(channel, prepared.sender, prepared.endpoint, context, role)
         .map_err(invalid)?;
     let mapped = MappedStream::from_duplex(duplex);
@@ -334,6 +364,7 @@ pub struct PayloadPoolSnapshot {
 struct PoolLedger {
     closed: bool,
     used: PayloadPoolSnapshot,
+    carrier_used: u64,
     stores: Vec<OwnedPayloadStore>,
 }
 
@@ -342,6 +373,7 @@ struct PoolLedger {
 mod pool_close_tests;
 struct PoolInner {
     limits: PayloadResourceLimits,
+    carrier_limit: u64,
     parent: Option<Arc<dyn ParentPayloadReservation>>,
     ledger: std::sync::Mutex<PoolLedger>,
     retained_uncertain: std::sync::atomic::AtomicBool,
@@ -361,29 +393,40 @@ impl fmt::Debug for PayloadResourcePool {
 impl PayloadResourcePool {
     /// Explicit DEV arithmetic qualification, not a production host capacity grant.
     pub fn for_qualification(limits: PayloadResourceLimits) -> io::Result<Self> {
-        Self::new(limits, None)
+        Self::new(limits, None, 0)
     }
     pub fn from_parent(
         parent: Arc<dyn ParentPayloadReservation>,
         plan: &mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan,
         session: &str,
     ) -> io::Result<Self> {
+        Self::from_installed_parent(parent, plan, session, 0)
+    }
+    pub(crate) fn from_installed_parent(
+        parent: Arc<dyn ParentPayloadReservation>,
+        plan: &mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan,
+        session: &str,
+        carrier_limit: u64,
+    ) -> io::Result<Self> {
         parent.authorize(plan, session)?;
         parent.check_current()?;
-        Self::new(parent.limits(), Some(parent))
+        Self::new(parent.limits(), Some(parent), carrier_limit)
     }
     fn new(
         limits: PayloadResourceLimits,
         parent: Option<Arc<dyn ParentPayloadReservation>>,
+        carrier_limit: u64,
     ) -> io::Result<Self> {
         limits.validate().map_err(invalid)?;
         Ok(Self {
             inner: Arc::new(PoolInner {
                 limits,
+                carrier_limit,
                 parent,
                 ledger: std::sync::Mutex::new(PoolLedger {
                     closed: false,
                     used: PayloadPoolSnapshot::default(),
+                    carrier_used: 0,
                     stores: Vec::new(),
                 }),
                 retained_uncertain: std::sync::atomic::AtomicBool::new(false),
@@ -419,11 +462,31 @@ impl PayloadResourcePool {
         Ok(ledger.closed
             && !self.inner.fenced.load(std::sync::atomic::Ordering::Acquire)
             && ledger.used == PayloadPoolSnapshot::default()
+            && ledger.carrier_used == 0
             && ledger.stores.is_empty())
     }
     pub fn reserve_profile(
         &self,
         resources: spiralcore_transfer::resource_profile::ResourceProfile,
+    ) -> io::Result<PayloadResourcePermit> {
+        self.reserve_profile_with_carrier(resources, 0)
+    }
+    fn reserve_installed_profile(
+        &self,
+        resources: spiralcore_transfer::resource_profile::ResourceProfile,
+    ) -> io::Result<PayloadResourcePermit> {
+        // The original configured envelope is split across the existing
+        // stream slots. This is credit ownership, not a TLS allocation quote.
+        let carrier = self.inner.carrier_limit / u64::from(self.inner.limits.max_active);
+        if carrier == 0 {
+            return Err(invalid("original payload carrier credit unavailable"));
+        }
+        self.reserve_profile_with_carrier(resources, carrier)
+    }
+    fn reserve_profile_with_carrier(
+        &self,
+        resources: spiralcore_transfer::resource_profile::ResourceProfile,
+        carrier_bytes: u64,
     ) -> io::Result<PayloadResourcePermit> {
         let limits = resources.receiver_limits();
         let disk_bytes = limits
@@ -431,10 +494,13 @@ impl PayloadResourcePool {
             .checked_mul(2)
             .and_then(|bytes| bytes.checked_add(1 << 20))
             .ok_or_else(|| invalid("store charge overflow"))?;
-        let mut permit = self.reserve_charge(PayloadResourceCharge {
-            resident_bytes: resources.operation_charge().map_err(invalid)?,
-            disk_bytes,
-        })?;
+        let mut permit = self.reserve_charge_with_carrier(
+            PayloadResourceCharge {
+                resident_bytes: resources.operation_charge().map_err(invalid)?,
+                disk_bytes,
+            },
+            carrier_bytes,
+        )?;
         permit.profile = Some(resources);
         Ok(permit)
     }
@@ -444,7 +510,15 @@ impl PayloadResourcePool {
     ) -> io::Result<PayloadResourcePermit> {
         self.reserve_profile(spiralcore_transfer::resource_profile::ResourceProfile::General)
     }
+    #[cfg(test)]
     fn reserve_charge(&self, charge: PayloadResourceCharge) -> io::Result<PayloadResourcePermit> {
+        self.reserve_charge_with_carrier(charge, 0)
+    }
+    fn reserve_charge_with_carrier(
+        &self,
+        charge: PayloadResourceCharge,
+        carrier_bytes: u64,
+    ) -> io::Result<PayloadResourcePermit> {
         if charge.resident_bytes == 0 || charge.disk_bytes == 0 {
             return Err(invalid("zero payload resource charge"));
         }
@@ -472,9 +546,14 @@ impl PayloadResourcePool {
             .disk_charge
             .checked_add(charge.disk_bytes)
             .ok_or_else(|| invalid("payload disk overflow"))?;
+        let carrier = ledger
+            .carrier_used
+            .checked_add(carrier_bytes)
+            .ok_or_else(|| invalid("payload carrier overflow"))?;
         if active > self.inner.limits.max_active
             || resident > self.inner.limits.resident_bytes
             || disk > self.inner.limits.disk_bytes
+            || carrier > self.inner.carrier_limit
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -484,10 +563,12 @@ impl PayloadResourcePool {
         ledger.used.active = active;
         ledger.used.resident_charge = resident;
         ledger.used.disk_charge = disk;
+        ledger.carrier_used = carrier;
         drop(ledger);
         Ok(PayloadResourcePermit {
             inner: self.inner.clone(),
             charge,
+            carrier_bytes,
             store: None,
             uncertain: false,
             profile: None,
@@ -578,16 +659,17 @@ impl OwnedPayloadStore {
 pub struct PayloadResourcePermit {
     inner: Arc<PoolInner>,
     charge: PayloadResourceCharge,
+    carrier_bytes: u64,
     store: Option<OwnedPayloadStore>,
     uncertain: bool,
     profile: Option<spiralcore_transfer::resource_profile::ResourceProfile>,
 }
 impl PayloadResourcePermit {
-    fn with_owned_directory(
-        mut self,
+    fn attach_owned_directory(
+        &mut self,
         path: std::path::PathBuf,
         directory: std::fs::File,
-    ) -> io::Result<Self> {
+    ) -> io::Result<()> {
         if self.store.is_some() {
             self.uncertain = true;
             return Err(invalid("payload store already attached"));
@@ -595,7 +677,7 @@ impl PayloadResourcePermit {
         match OwnedPayloadStore::capture_directory(path, directory) {
             Ok(store) => {
                 self.store = Some(store);
-                Ok(self)
+                Ok(())
             }
             Err(error) => {
                 self.uncertain = true;
@@ -667,15 +749,52 @@ impl Drop for PayloadResourcePermit {
             self.inner.retain_uncertain();
             return;
         };
+        let Some(carrier) = ledger.carrier_used.checked_sub(self.carrier_bytes) else {
+            self.inner.retain_uncertain();
+            return;
+        };
         ledger.used.active = active;
         ledger.used.resident_charge = resident;
         ledger.used.disk_charge = disk;
+        ledger.carrier_used = carrier;
     }
 }
 
 #[cfg(test)]
 mod resource_pool_tests {
     use super::*;
+
+    #[test]
+    fn carrier_refusal_cannot_partially_debit_the_original_payload_pool() {
+        let pool = PayloadResourcePool::new(
+            PayloadResourceLimits {
+                max_active: 2,
+                resident_bytes: 20,
+                disk_bytes: 20,
+            },
+            None,
+            10,
+        )
+        .expect("isolated arithmetic ledger");
+        let charge = PayloadResourceCharge {
+            resident_bytes: 3,
+            disk_bytes: 4,
+        };
+        let original = pool.reserve_charge_with_carrier(charge, 7).unwrap();
+        let before = pool.snapshot().unwrap();
+        let refusal = pool
+            .reserve_charge_with_carrier(charge, 4)
+            .err()
+            .expect("original carrier capacity must refuse");
+        assert_eq!(refusal.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(pool.snapshot().unwrap(), before);
+        assert_eq!(pool.inner.ledger.lock().unwrap().carrier_used, 7);
+        pool.close_admission().unwrap();
+        assert!(!pool.drained().unwrap());
+        drop(original);
+        assert!(pool.drained().unwrap());
+    }
+
     #[test]
     fn shared_small_profile_charge_is_reserved_once_per_local_engine() {
         let pool = PayloadResourcePool::for_qualification(PayloadResourceLimits {
