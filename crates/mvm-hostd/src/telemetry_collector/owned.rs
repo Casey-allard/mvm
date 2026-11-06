@@ -76,8 +76,12 @@ pub fn owned_collector_requirements() -> anyhow::Result<OwnedCollectorRequiremen
 /// a reservation or a bound on arbitrary caller-owned Snapshot strings.
 pub const OWNED_COLLECTOR_STATUS_BYTES: usize = 4096;
 
+const OWNED_STATUS_FILE: &str =
+    mvm_vmm::host::telemetry_provisioning::TELEMETRY_COLLECTOR_STATUS_FILE;
+const OWNED_STATUS_SCRATCH: &str = "telemetry-collector-status.json.tmp";
+
 fn write_owned_status(
-    path: &std::path::Path,
+    directory: &std::fs::File,
     snapshot: &super::CollectorStatusSnapshot,
 ) -> io::Result<()> {
     let mut bytes = [0u8; OWNED_COLLECTOR_STATUS_BYTES];
@@ -93,11 +97,13 @@ fn write_owned_status(
             .map_err(|_| io::Error::other("owned telemetry status encoding refused"))?
     };
     // No path/tmp/file effect precedes complete bounded serialization.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes[..length])
-        .map_err(|_| io::Error::other("owned telemetry status write refused"))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|_| io::Error::other("owned telemetry status write refused"))
+    crate::installed_endpoint::publish_runtime_sidecar(
+        directory,
+        OWNED_STATUS_FILE,
+        OWNED_STATUS_SCRATCH,
+        &bytes[..length],
+    )
+    .map_err(|_| io::Error::other("owned telemetry status write refused"))
 }
 
 fn stop_transport(stop: &AtomicBool, active: &Mutex<Option<UnixStream>>, failed: &AtomicBool) {
@@ -264,6 +270,8 @@ pub(crate) struct OwnedCollectorStart<'a> {
     pub fingerprints: Vec<mvm_contract::stream::secret_fingerprint::SecretFingerprint>,
     pub permit: InstalledEndpointComponentPermit,
     pub records: mvm_vmm::host::network_endpoint_spawn::InstalledTelemetryRecords,
+    pub anchor: std::fs::File,
+    pub state_directory: Arc<std::fs::File>,
     pub audit: mvm_vmm::host::network_endpoint_spawn::InstalledEndpointAudit,
     pub deadline: Instant,
 }
@@ -313,8 +321,7 @@ pub(crate) fn start_owned(
             failed: failed.clone(),
         }),
     };
-    let mut anchor_file = std::fs::File::open(&input.config.host_anchor_path)
-        .context("opening owned collector anchor")?;
+    let mut anchor_file = input.anchor;
     anyhow::ensure!(
         anchor_file.metadata()?.is_file() && anchor_file.metadata()?.len() == 32,
         "owned collector anchor differs"
@@ -337,9 +344,9 @@ pub(crate) fn start_owned(
     .context("binding original owned encrypted telemetry records")?;
     let losses = Arc::new(LossCounters::default());
     let status = Arc::new(Mutex::new(CoverageStatus::Connecting));
-    let status_file = super::status_path(input.config);
+    let state_directory = input.state_directory;
     if let Err(error) = write_owned_status(
-        &status_file,
+        &state_directory,
         &super::status_snapshot(input.vm, &CoverageStatus::Connecting, HostLosses::default()),
     ) {
         permit.fence();
@@ -449,7 +456,7 @@ pub(crate) fn start_owned(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
                 if write_owned_status(
-                    &status_file,
+                    &state_directory,
                     &super::status_snapshot(&vm, &current, losses.snapshot()),
                 )
                 .is_err()
@@ -605,10 +612,11 @@ mod tests {
     #[test]
     fn owned_status_caps_before_tmp_or_current_file_effects_without_echoing_input() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("status.json");
+        let path = root.path().join(OWNED_STATUS_FILE);
+        let directory = std::fs::File::open(root.path()).unwrap();
         std::fs::write(&path, b"original status").unwrap();
         let snapshot = status_snapshot(format!("SYNTHETIC_PRIVATE_STATUS{}", "x".repeat(4096)));
-        let error = write_owned_status(&path, &snapshot).unwrap_err();
+        let error = write_owned_status(&directory, &snapshot).unwrap_err();
         assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_STATUS"));
         assert_eq!(std::fs::read(&path).unwrap(), b"original status");
         assert!(!path.with_extension("json.tmp").exists());
@@ -617,16 +625,17 @@ mod tests {
     #[test]
     fn owned_status_exact_4096_boundary_preserves_canonical_pretty_bytes() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("status.json");
+        let path = root.path().join(OWNED_STATUS_FILE);
+        let directory = std::fs::File::open(root.path()).unwrap();
         let mut snapshot = status_snapshot(String::new());
         let base = serde_json::to_vec_pretty(&snapshot).unwrap().len();
         snapshot.vm_name = "x".repeat(4096 - base);
         let expected = serde_json::to_vec_pretty(&snapshot).unwrap();
         assert_eq!(expected.len(), 4096);
-        write_owned_status(&path, &snapshot).unwrap();
+        write_owned_status(&directory, &snapshot).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
         snapshot.vm_name.push('x');
-        assert!(write_owned_status(&path, &snapshot).is_err());
+        assert!(write_owned_status(&directory, &snapshot).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), expected);
         assert!(!path.with_extension("json.tmp").exists());
     }
@@ -634,7 +643,8 @@ mod tests {
     #[test]
     fn owned_status_supported_fields_and_maximum_loss_counters_fit_the_cap() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("status.json");
+        let path = root.path().join(OWNED_STATUS_FILE);
+        let directory = std::fs::File::open(root.path()).unwrap();
         // Conservative compatibility case: every byte of the already capped
         // VM name needs six encoded bytes, all counters have maximum width,
         // and the status text exceeds the canonical static coverage codes.
@@ -650,20 +660,21 @@ mod tests {
         snapshot.losses = serde_json::from_value(losses).unwrap();
         let expected = serde_json::to_vec_pretty(&snapshot).unwrap();
         assert!(expected.len() < OWNED_COLLECTOR_STATUS_BYTES);
-        write_owned_status(&path, &snapshot).unwrap();
+        write_owned_status(&directory, &snapshot).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[test]
     fn owned_status_serialization_escape_growth_is_counted_and_io_errors_are_static() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("status.json");
+        let path = root.path().join(OWNED_STATUS_FILE);
+        let directory = std::fs::File::open(root.path()).unwrap();
         let snapshot = status_snapshot("\n".repeat(2048));
-        assert!(write_owned_status(&path, &snapshot).is_err());
+        assert!(write_owned_status(&directory, &snapshot).is_err());
         assert!(!path.exists());
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
-        let error = write_owned_status(&path, &status_snapshot("vm-1".into())).unwrap_err();
+        let error = write_owned_status(&directory, &status_snapshot("vm-1".into())).unwrap_err();
         assert!(
             !error
                 .to_string()

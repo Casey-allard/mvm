@@ -850,6 +850,27 @@ mod registered_prepare {
 
     #[test]
     fn signed_parent_starts_and_retires_canonical_audited_controller() -> Result<()> {
+        exercise_signed_controller(ControllerCase::Normal)
+    }
+
+    #[test]
+    fn signed_controller_refuses_symlinked_public_anchor_before_binding() -> Result<()> {
+        exercise_signed_controller(ControllerCase::SymlinkAnchor)
+    }
+
+    #[test]
+    fn signed_controller_refuses_status_scratch_symlink_to_records() -> Result<()> {
+        exercise_signed_controller(ControllerCase::SymlinkStatusScratch)
+    }
+
+    #[derive(Clone, Copy)]
+    enum ControllerCase {
+        Normal,
+        SymlinkAnchor,
+        SymlinkStatusScratch,
+    }
+
+    fn exercise_signed_controller(case: ControllerCase) -> Result<()> {
         use mvm_contract::policy::network_policy::{
             CooperatingPayloadPolicy, CooperatingTcpPeer, PayloadMappingProfile,
         };
@@ -934,8 +955,43 @@ mod registered_prepare {
             }
             format!("signed controller stderr: {diagnostic}")
         };
-        let mut endpoint = spawn_network_endpoint_installed_registered(params, handoff, &original)
-            .with_context(endpoint_diagnostic)?;
+        if matches!(case, ControllerCase::SymlinkAnchor) {
+            let anchor = config::mvm_keys_dir()
+                .join(mvm_vmm::host::broker_services_spawn::HOST_SIGNER_PUB);
+            let alternate = state.join("alternate-anchor");
+            std::fs::rename(&anchor, &alternate)?;
+            std::os::unix::fs::symlink(&alternate, &anchor)?;
+        }
+        let records_name = mvm_vmm::host::telemetry_provisioning::TELEMETRY_RECORDS_FILE;
+        if matches!(case, ControllerCase::SymlinkStatusScratch) {
+            let status = state.join(mvm_vmm::host::telemetry_provisioning::TELEMETRY_COLLECTOR_STATUS_FILE);
+            std::os::unix::fs::symlink(records_name, status.with_extension("json.tmp"))?;
+        }
+        let launched = spawn_network_endpoint_installed_registered(params, handoff, &original);
+        if matches!(case, ControllerCase::SymlinkAnchor) {
+            ensure!(launched.is_err(), "symlinked anchor reported Ready");
+            ensure!(
+                endpoint_diagnostic().contains("opening original collector public anchor"),
+                "wrong startup refusal: {}",
+                endpoint_diagnostic()
+            );
+            ensure!(!state.join("network.sock").exists(), "refused anchor bound listener");
+            return Ok(());
+        }
+        if matches!(case, ControllerCase::SymlinkStatusScratch) {
+            ensure!(launched.is_err(), "symlinked status scratch reported Ready");
+            ensure!(
+                endpoint_diagnostic().contains("owned telemetry status write refused"),
+                "wrong startup refusal: {}",
+                endpoint_diagnostic()
+            );
+            ensure!(
+                state.join(records_name).metadata()?.len() == 0,
+                "status publication overwrote original records"
+            );
+            return Ok(());
+        }
+        let mut endpoint = launched.with_context(endpoint_diagnostic)?;
         drop(original);
         ensure!(
             registration.shutdown().is_err(),
@@ -955,6 +1011,15 @@ mod registered_prepare {
             SigningKey::from_bytes(&[7; 32]),
             &SigningKey::from_bytes(&[9; 32]).verifying_key(),
         )?;
+
+        // The canonical launcher waits for post-handshake session publication.
+        let readiness_path = config::vm_socket_dir_at(&state)
+            .join(mvm_vmm::host::network_endpoint_spawn::SUBST_SESSION_READY_SOCKET);
+        let mut readiness = std::os::unix::net::UnixStream::connect(readiness_path)?;
+        readiness.set_read_timeout(timeout)?;
+        let mut ready = [0];
+        readiness.read_exact(&mut ready).with_context(endpoint_diagnostic)?;
+        ensure!(ready == [1], "authenticated session readiness differs");
 
         endpoint.shutdown().with_context(endpoint_diagnostic)?;
         ensure!(

@@ -374,10 +374,17 @@ pub(crate) fn confine_self_with_owned_files(
     spec: &ConfinementSpec,
     state: &std::fs::File,
     store: Option<&std::fs::File>,
+    runtime_state: Option<&std::fs::File>,
     records: bool,
 ) -> Result<(), JailerError> {
-    crate::jailer::landlock::apply_with_owned_files(spec, Some(state), store)?;
-    crate::jailer::seccomp::apply_with_owned_files(spec, store.is_some(), records)?;
+    crate::jailer::landlock::apply_with_owned_files(spec, Some(state), store, runtime_state)?;
+    use std::os::fd::AsRawFd as _;
+    crate::jailer::seccomp::apply_with_owned_files(
+        spec,
+        store.is_some(),
+        records,
+        runtime_state.map(|directory| directory.as_raw_fd()),
+    )?;
     Ok(())
 }
 

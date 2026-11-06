@@ -214,6 +214,28 @@ impl InstalledEndpointResources {
     /// this child's captured store added. Any error requires process exit.
     #[cfg(target_os = "linux")]
     pub fn confine(&self, spec: &crate::jailer::ConfinementSpec) -> Result<()> {
+        self.confine_with_runtime_state(spec, None)
+    }
+
+    pub(crate) fn open_original_state_directory(&self) -> Result<File> {
+        match self.records.lock() {
+            Ok(records) => records
+                .as_ref()
+                .context("installed original records writer unavailable")?
+                .open_original_state_directory(),
+            Err(_) => {
+                self.lease.fence();
+                anyhow::bail!("installed original records writer poisoned")
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn confine_with_runtime_state(
+        &self,
+        spec: &crate::jailer::ConfinementSpec,
+        runtime_state: Option<&File>,
+    ) -> Result<()> {
         self.lease.check_current()?;
         if let Some(store) = &self.store {
             store.check_current()?;
@@ -232,6 +254,7 @@ impl InstalledEndpointResources {
             spec,
             &self.verification_state,
             self.store.as_ref().map(|store| &store.directory),
+            runtime_state,
             records,
         )?;
         self.lease.check_current()?;
@@ -258,9 +281,11 @@ impl InstalledEndpointResources {
     }
     /// Start only the collector selected by this original authenticated child.
     /// All allocations/threads follow the same one-shot auxiliary subdivision.
-    pub fn start_owned_collector(
+    pub(crate) fn start_owned_collector(
         &self,
         deadline: Instant,
+        anchor: File,
+        state_directory: Arc<File>,
     ) -> Result<Option<crate::telemetry_collector::OwnedEmbeddedCollector>> {
         use crate::telemetry_collector::{
             OwnedCollectorStart, owned_collector_requirements, owned_scanner_requested_bytes,
@@ -323,6 +348,8 @@ impl InstalledEndpointResources {
             fingerprints,
             permit,
             records,
+            anchor,
+            state_directory,
             audit: self.lease.audit()?,
             deadline,
         })?))
@@ -373,6 +400,32 @@ impl InstalledEndpointResources {
     ) {
         (self.program, self.lease, self.pool)
     }
+}
+
+/// Publish one bounded installed status file in the held state directory.
+pub(crate) fn publish_runtime_sidecar(
+    directory: &File,
+    name: &'static str,
+    scratch: &'static str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+    use std::io::Write as _;
+
+    let descriptor = openat(
+        directory,
+        scratch,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    let mut file = File::from(descriptor);
+    let result = file.write_all(bytes).and_then(|()| {
+        renameat(directory, scratch, directory, name).map_err(Into::into)
+    });
+    if result.is_err() {
+        let _ = unlinkat(directory, scratch, AtFlags::empty());
+    }
+    result
 }
 
 fn take_original_records(

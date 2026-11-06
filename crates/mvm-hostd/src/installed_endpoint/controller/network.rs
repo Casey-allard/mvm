@@ -12,11 +12,15 @@ use crate::supervisor::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mvm_vmm::host::network_endpoint_spawn::EndpointTransport;
 use std::{
+    fs::{File, OpenOptions},
     io::{self, Write},
     net::Shutdown,
     os::{
         fd::AsRawFd,
-        unix::net::{UnixListener, UnixStream},
+        unix::{
+            fs::OpenOptionsExt,
+            net::{UnixListener, UnixStream},
+        },
     },
     path::Path,
     sync::{
@@ -122,10 +126,13 @@ fn selected_config(config: &EndpointConfig) -> Result<&Path> {
     Ok(path)
 }
 
-fn bind(path: &Path) -> Result<UnixListener> {
-    // Canonical state parents already exist and are held by the parent. Never
-    // remove/rebind an unknown socket or create a different state namespace.
-    let listener = UnixListener::bind(path)?;
+fn bind(path: &Path, directory: &File) -> Result<UnixListener> {
+    // Resolve the socket name relative to the held directory even if its
+    // canonical pathname is replaced after the authority check.
+    let name = path.file_name().context("installed socket name missing")?;
+    let pinned = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .join(name);
+    let listener = UnixListener::bind(pinned)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
@@ -204,19 +211,40 @@ pub(super) fn run(
     // No enable_all, tokio::spawn or spawn_blocking. Actual audit futures use
     // bounded synchronous original std sockets; Handle::block_on needs no driver.
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-    let marker = config.session_marker.clone();
     let authenticated = Arc::new(AtomicBool::new(false));
-    let listener = bind(path)?;
+    let anchor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&telemetry.host_anchor_path)
+        .context("opening original collector public anchor")?;
+    let anchor_metadata = anchor.metadata()?;
+    ensure!(
+        anchor_metadata.is_file() && anchor_metadata.len() == 32,
+        "installed collector public anchor shape differs"
+    );
+    let runtime_state = Arc::new(resources.open_original_state_directory()?);
+    let socket_dir = mvm_core::config::vm_socket_dir_at(&telemetry.state_dir);
+    let alternate = if socket_dir == telemetry.state_dir {
+        None
+    } else {
+        Some(mvm_vmm::host::restore_image::open_trusted_dir(&socket_dir)?)
+    };
+    let readiness_dir = alternate.as_ref().unwrap_or(&runtime_state);
+    let network_dir = if path.parent() == Some(telemetry.state_dir.as_path()) {
+        &runtime_state
+    } else {
+        readiness_dir
+    };
+    let listener = bind(path, network_dir)?;
     let readiness = config
         .session_ready_socket
         .as_deref()
-        .map(bind)
+        .map(|path| bind(path, readiness_dir))
         .transpose()?;
     #[cfg(target_os = "linux")]
     {
-        // Preserve the canonical DNS/TLS path inventory but grant no host key,
-        // secret store or unrelated audit directory. Actual signer authority is
-        // the original kernel-observed helper and existing guarded std client.
+        // Canonical DNS/TLS read inventory. Connect-only socket paths get no
+        // directory grants. Status and marker writes use the admitted state FD.
         let mut spec = crate::jailer::ConfinementSpec::network_endpoint(
             Default::default(),
             Default::default(),
@@ -225,35 +253,11 @@ pub(super) fn run(
             None,
         );
         spec.readable_paths.retain(|path| path.is_absolute());
-        spec.readable_paths.push(telemetry.host_anchor_path.clone());
         spec.read_write_paths.clear();
-        for parent in [
-            Some(telemetry.state_dir.as_path()),
-            telemetry.telemetry_sock.parent(),
-            telemetry.signer_sock.parent(),
-            audit.socket().parent(),
-            path.parent(),
-            config
-                .session_ready_socket
-                .as_deref()
-                .and_then(Path::parent),
-            marker.as_deref().and_then(Path::parent),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !spec
-                .read_write_paths
-                .iter()
-                .any(|held| parent.starts_with(held))
-            {
-                spec.read_write_paths.push(parent.to_owned());
-            }
-        }
-        resources.confine(&spec)?;
+        resources.confine_with_runtime_state(&spec, Some(&runtime_state))?;
     }
     let mut collector = resources
-        .start_owned_collector(child.startup_deadline())?
+        .start_owned_collector(child.startup_deadline(), anchor, runtime_state.clone())?
         .context("installed original collector missing")?;
     child.send_ready(Default::default(), child.startup_deadline())?;
     let mut pending = Some((params, runtime));
@@ -279,7 +283,7 @@ pub(super) fn run(
                             stream,
                             params,
                             runtime,
-                            marker.clone(),
+                            runtime_state.clone(),
                             authenticated.clone(),
                             controller.clone(),
                             session_control.clone(),
@@ -388,7 +392,7 @@ impl SessionWorker {
         stream: UnixStream,
         params: FlowMuxAccept,
         runtime: tokio::runtime::Runtime,
-        marker: Option<std::path::PathBuf>,
+        runtime_state: Arc<File>,
         authenticated: Arc<AtomicBool>,
         permit: Arc<super::super::InstalledEndpointComponentPermit>,
         control: Arc<crate::installed_endpoint::InstalledSessionControl>,
@@ -407,10 +411,15 @@ impl SessionWorker {
                 let _entered = runtime.enter();
                 let result = (|| {
                     let mut session = FlowMuxSession::accept_with(stream, params)?;
-                    if let Some(path) = marker.as_deref() {
-                        std::fs::write(path, b"1")?;
-                        std::fs::metadata(path)?;
-                    }
+                    crate::installed_endpoint::publish_runtime_sidecar(
+                        &runtime_state,
+                        mvm_vmm::host::network_endpoint_spawn::SUBST_SESSION_FILE,
+                        "substitution.session.tmp",
+                        b"1",
+                    )
+                    .inspect_err(|error| {
+                        eprintln!("installed session marker publication refused ({:?})", error.kind());
+                    })?;
                     authenticated.store(true, Ordering::Release);
                     let served = session.serve();
                     if served.is_ok() {

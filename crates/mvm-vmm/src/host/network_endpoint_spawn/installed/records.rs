@@ -161,6 +161,16 @@ impl InstalledTelemetryRecords {
         lease.check_current()?;
         self.projection.preflight(&[])
     }
+    /// Pin the directory identity admitted with the original records writer.
+    pub fn open_original_state_directory(&self) -> Result<File> {
+        self.lease.check_current()?;
+        check_state(
+            &self.projection.state_path,
+            self.projection.state_device,
+            self.projection.state_inode,
+        )
+    }
+
     pub fn current_len(&self) -> std::io::Result<u64> {
         self.file.metadata().map(|metadata| metadata.len())
     }

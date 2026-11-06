@@ -342,26 +342,28 @@ fn syscall_name_to_nr(name: &str) -> Option<libc::c_long> {
 /// First installs the refusal reporter, so a call the filter refuses is named
 /// on stderr before the process dies of it rather than silently.
 pub fn apply(spec: &ConfinementSpec) -> Result<(), JailerError> {
-    apply_inner(spec, false, false)
+    apply_inner(spec, false, false, None)
 }
 
 #[cfg(test)]
 fn apply_with_owned_store(spec: &ConfinementSpec) -> Result<(), JailerError> {
-    apply_with_owned_files(spec, true, false)
+    apply_with_owned_files(spec, true, false, None)
 }
 
 pub(crate) fn apply_with_owned_files(
     spec: &ConfinementSpec,
     store: bool,
     records: bool,
+    runtime_state: Option<std::os::fd::RawFd>,
 ) -> Result<(), JailerError> {
-    apply_inner(spec, store, records)
+    apply_inner(spec, store, records, runtime_state)
 }
 
 fn apply_inner(
     spec: &ConfinementSpec,
     owned_store: bool,
     owned_records: bool,
+    runtime_state: Option<std::os::fd::RawFd>,
 ) -> Result<(), JailerError> {
     crate::jailer::refusal_report::install(process_label())?;
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
@@ -376,6 +378,29 @@ fn apply_inner(
     if owned_store || owned_records {
         // Current-owner verification reads the effective UID after confinement.
         rules.insert(libc::SYS_geteuid, vec![]);
+    }
+    if let Some(directory) = runtime_state {
+        // x86_64's legacy profile admits rename, not renameat. Permit only
+        // descriptor-relative sidecar publication within this held state.
+        // On aarch64 the existing rename rule already maps to renameat.
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            rules.entry(libc::SYS_renameat)
+        {
+            let conditions = [0, 2]
+                .into_iter()
+                .map(|argument| {
+                    SeccompCondition::new(
+                        argument,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        directory as u64,
+                    )
+                    .map_err(|error| JailerError::SeccompInstall(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            entry.insert(vec![SeccompRule::new(conditions)
+                .map_err(|error| JailerError::SeccompInstall(error.to_string()))?]);
+        }
     }
     if owned_records {
         // Records freshness reopens/checks the original state directory using
