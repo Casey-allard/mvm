@@ -54,9 +54,10 @@ struct Custody {
     vm: Option<Box<dyn RunningVm>>,
     failure: Option<anyhow::Error>,
     endpoint: Option<crate::workload_runner::claim::EndpointHandle>,
+    endpoint_start_entered: bool,
+    native_dispatch_entered: bool,
     endpoint_retirement: Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement>,
     broker: Option<BrokerGuard>,
-    broker_cleanup_active: bool,
     launch: Option<(
         crate::runtime_evidence::RuntimeLifecycleLease,
         crate::kernel_custody::KernelBoundLaunch,
@@ -92,9 +93,10 @@ impl InstalledSlots {
                 vm: None,
                 failure: None,
                 endpoint: None,
+                endpoint_start_entered: false,
+                native_dispatch_entered: false,
                 endpoint_retirement: None,
                 broker: None,
-                broker_cleanup_active: false,
                 launch: None,
                 retired: false,
                 exit: None,
@@ -158,10 +160,7 @@ impl InstalledSlot {
             TryLockError::WouldBlock => anyhow::anyhow!("installed VM operation in progress"),
             TryLockError::Poisoned(_) => anyhow::anyhow!("installed VM custody poisoned"),
         })?;
-        anyhow::ensure!(
-            !guard.as_ref().is_some_and(|state| state.broker_cleanup_active),
-            "original broker cleanup in progress"
-        );
+        anyhow::ensure!(guard.is_some(), "original installed cleanup in progress");
         Ok(guard)
     }
 
@@ -201,17 +200,51 @@ impl InstalledSlot {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn endpoint_retained_for_test(&self) -> bool {
+        self.access()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|state| state.endpoint.is_some())
+    }
+
+    pub(super) fn begin_endpoint_start(&self) -> Result<()> {
+        let mut guard = self.access()?;
+        let state = guard.as_mut().context("installed custody unavailable")?;
+        anyhow::ensure!(
+            !state.retired && state.launch.is_none() && !state.endpoint_start_entered,
+            "original endpoint startup already attempted or unavailable"
+        );
+        state.endpoint_start_entered = true;
+        Ok(())
+    }
+
     pub(super) fn retain_endpoint(
         &self,
         endpoint: crate::workload_runner::claim::EndpointHandle,
     ) -> Result<()> {
         let (mut guard, endpoint) = self.retain_guard(endpoint)?;
+        let state = guard.as_mut().expect("checked original custody");
+        if !state.endpoint_start_entered || state.endpoint.is_some() {
+            drop(guard);
+            std::mem::forget((Arc::clone(&self.owner), endpoint));
+            anyhow::bail!("original installed endpoint custody conflicts; endpoint quarantined");
+        }
+        state.endpoint = Some(endpoint);
+        Ok(())
+    }
+
+    pub(super) fn begin_native_dispatch(&self) -> Result<()> {
+        let mut guard = self.access()?;
         let state = guard.as_mut().context("installed custody unavailable")?;
         anyhow::ensure!(
-            state.endpoint.is_none(),
-            "installed endpoint already retained"
+            !state.retired
+                && state.launch.is_none()
+                && state.endpoint.is_some()
+                && !state.native_dispatch_entered,
+            "original installed native dispatch unavailable or already attempted"
         );
-        state.endpoint = Some(endpoint);
+        state.native_dispatch_entered = true;
         Ok(())
     }
 
@@ -258,16 +291,71 @@ impl InstalledSlot {
 
     pub(super) fn stop(&self, streamer: &dyn ConsoleStreamer) -> Result<()> {
         let mut guard = self.access()?;
-        let state = guard.as_mut().context("installed custody unavailable")?;
+        let state = guard.as_ref().context("installed custody unavailable")?;
         if state.retired {
             return Ok(());
         }
-        if state.endpoint_retirement.is_none()
-            && let Some(endpoint) = state.endpoint.as_mut()
-        {
-            endpoint.close_owned_admission()?;
+        anyhow::ensure!(
+            state.launch.is_some(),
+            "installed startup still in progress"
+        );
+        // Loan the original custody as one unit. Competing operations refuse
+        // through access() until the exact state is restored.
+        let mut state = guard.take().expect("checked original custody");
+        drop(guard);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.stop_custody(&mut state, streamer)
+        }));
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                std::mem::forget((Arc::clone(&self.owner), state));
+                anyhow::bail!("installed cleanup custody poisoned; original quarantined");
+            }
+        };
+        if guard.is_some() {
+            drop(guard);
+            std::mem::forget((Arc::clone(&self.owner), state));
+            anyhow::bail!("installed cleanup custody changed; original quarantined");
         }
-        if state.exit.is_none() {
+        *guard = Some(state);
+        drop(guard);
+        result
+            .map_err(|_| anyhow::anyhow!("original installed cleanup panicked; custody retained"))?
+    }
+
+    fn stop_custody(&self, state: &mut Custody, streamer: &dyn ConsoleStreamer) -> Result<()> {
+        let (lifecycle, _) = state
+            .launch
+            .as_ref()
+            .context("installed launch custody unavailable")?;
+        if !state.native_dispatch_entered {
+            anyhow::ensure!(
+                state.failure.is_some() && state.vm.is_none() && state.exit.is_none(),
+                "original pre-dispatch failure proof unavailable"
+            );
+            anyhow::ensure!(
+                !crate::kernel_custody::has_retained_kernel(lifecycle)?,
+                "pre-dispatch kernel custody still requires native exit proof"
+            );
+        }
+        if state.endpoint_retirement.is_none() {
+            if let Some(endpoint) = state.endpoint.as_mut() {
+                endpoint.close_owned_admission()?;
+            } else if let Some(failed) = state.failure.as_mut().and_then(|failure| {
+                failure
+                    .downcast_mut::<mvm_vmm::host::network_endpoint_spawn::OwnedEndpointSpawnError>(
+                    )
+            }) {
+                failed.endpoint_mut().close_admission()?;
+            } else {
+                anyhow::ensure!(
+                    !state.endpoint_start_entered,
+                    "original attempted endpoint lacks cleanup evidence; custody retained"
+                );
+            }
+        }
+        if state.native_dispatch_entered && state.exit.is_none() {
             let stopped = if let Some(vm) = state.vm.as_deref() {
                 vm.terminate_with_kernel_exit()?
             } else {
@@ -320,42 +408,23 @@ impl InstalledSlot {
             }
             state.exit = Some(stopped);
         }
-        if state.endpoint_retirement.is_none()
-            && let Some(endpoint) = state.endpoint.as_mut()
-        {
-            endpoint.shutdown_owned()?;
-            state.endpoint_retirement = endpoint.take_owned_retirement()?;
+        if state.endpoint_retirement.is_none() {
+            if let Some(endpoint) = state.endpoint.as_mut() {
+                endpoint.shutdown_owned()?;
+                state.endpoint_retirement = endpoint.take_owned_retirement()?;
+            } else if let Some(failed) = state.failure.as_mut().and_then(|failure| {
+                failure
+                    .downcast_mut::<mvm_vmm::host::network_endpoint_spawn::OwnedEndpointSpawnError>(
+                    )
+            }) {
+                let endpoint = failed.endpoint_mut();
+                endpoint.shutdown()?;
+                state.endpoint_retirement = Some(endpoint.take_retirement()?);
+            }
         }
-        if state.broker.as_ref().is_some_and(|broker| {
-            matches!(&broker.0, super::BrokerCustody::Installed(_))
-        }) {
-            let mut broker = state.broker.take().expect("checked original broker custody");
-            state.broker_cleanup_active = true;
-            drop(guard);
-            // Signed deregistration performs bounded I/O. Keep exclusive custody,
-            // but release the Runtime mutex while the original agent handles it.
-            let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                broker.shutdown_owned()
-            }));
-            guard = match self.state.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    std::mem::forget((Arc::clone(&self.owner), broker));
-                    anyhow::bail!("installed broker cleanup custody poisoned; broker quarantined");
-                }
-            };
-            let Some(state) = guard.as_mut().filter(|state| state.broker_cleanup_active && state.broker.is_none()) else {
-                drop(guard);
-                std::mem::forget((Arc::clone(&self.owner), broker));
-                anyhow::bail!("installed broker cleanup custody changed; broker quarantined");
-            };
-            state.broker = Some(broker);
-            state.broker_cleanup_active = false;
-            stopped.map_err(|_| anyhow::anyhow!("original broker cleanup panicked; custody retained"))??;
-        } else if let Some(broker) = state.broker.as_mut() {
+        if let Some(broker) = state.broker.as_mut() {
             broker.shutdown_owned()?;
         }
-        let state = guard.as_mut().context("installed custody unavailable")?;
         streamer.stop(&self.id.0);
         let (lifecycle, _) = state
             .launch

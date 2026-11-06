@@ -187,6 +187,11 @@ pub struct OwnedRegistrationError {
     registration: OwnedVmRegistration,
 }
 impl OwnedRegistrationError {
+    /// Move the original registration into the Runtime cleanup slot.
+    pub fn into_parts(self) -> (anyhow::Error, OwnedVmRegistration) {
+        (self.reason, self.registration)
+    }
+
     pub fn registration_mut(&mut self) -> &mut OwnedVmRegistration {
         &mut self.registration
     }

@@ -78,7 +78,9 @@ pub use cold_hvf_channel::{ColdHvfChannel, NativeCompletion, OwnedRuntimeLaunch}
 struct PreparedWorkloadBoot {
     spec: mvm_vmm::driver::spec::VmmSpec,
     socks: sockets::StandingSockets,
-    endpoint: crate::workload_runner::claim::EndpointHandle,
+    endpoint: Option<crate::workload_runner::claim::EndpointHandle>,
+    #[cfg(unix)]
+    installed: Option<Arc<installed::InstalledSlot>>,
     trace: Option<mvm_core::launch_trace::LaunchTraceRecorder>,
 }
 
@@ -600,12 +602,19 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 identity: FlowMuxIdentitySource::Mint,
         };
         #[cfg(unix)]
-        let endpoint = if let Some(owner) = &inputs.config.host_lifetime {
+        let installed = if let Some(owner) = &inputs.config.host_lifetime {
+            let slot = self.installed.find(&VmId(inputs.config.name.clone()))?
+                .context("original installed slot missing")?;
+            anyhow::ensure!(slot.matches(owner), "installed launch owner differs");
+            owner.verify_config(inputs.config, self.driver.kind())?;
+            Some(slot)
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let endpoint = if let Some(slot) = &installed {
             let id = VmId(inputs.config.name.clone());
             if cmdline::uses_installed_payload_anchor(inputs.config) {
-                let slot = self.installed.find(&id)?.context("original installed slot missing")?;
-                anyhow::ensure!(slot.matches(owner), "installed launch owner differs");
-                owner.verify_config(inputs.config, self.driver.kind())?;
                 let registrar = self.installed_agent.get().context("original installed host agent missing")?;
                 let (services, capabilities) =
                     admitted_broker_bindings(inputs.config.plan_json.as_deref())?;
@@ -618,7 +627,17 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                     capability_bindings: &capabilities,
                     service_proxies: &inputs.config.service_proxies,
                 };
-                let broker = self.broker.register_installed(&request, registrar)?;
+                let broker = match self.broker.register_installed(&request, registrar) {
+                    Ok(broker) => broker,
+                    Err(error) => match error.downcast::<mvm_vmm::host::host_agent_spawn::OwnedRegistrationError>() {
+                        Ok(failed) => {
+                            let (reason, registration) = failed.into_parts();
+                            slot.retain_broker(BrokerGuard::from_owned_registration(registration))?;
+                            return Err(reason);
+                        }
+                        Err(error) => return Err(error),
+                    },
+                };
                 trace.degrade_unless("host_services", broker.services_healthy(&services));
                 slot.retain_broker(broker)?;
                 trace.mark("broker_register");
@@ -626,8 +645,10 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 let original = mvm_vmm::host::network_endpoint_spawn::InstalledHostServices::new(
                     registrar, &registration, request.host_agent_params()?,
                 )?;
+                slot.begin_endpoint_start()?;
                 guards.spawn_endpoint_installed(&id, &endpoint_inputs, inputs.config, Some(&original))?
             } else {
+                slot.begin_endpoint_start()?;
                 guards.spawn_endpoint_installed(&id, &endpoint_inputs, inputs.config, None)?
             }
         } else {
@@ -635,6 +656,17 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         };
         #[cfg(not(unix))]
         let endpoint = guards.spawn_endpoint(&VmId(inputs.config.name.clone()), &endpoint_inputs)?;
+        let identity_drive = endpoint.identity_drive().map(Path::to_path_buf);
+        let egress_uds = endpoint.egress_uds().map(Path::to_path_buf);
+        #[cfg(unix)]
+        let endpoint = if let Some(slot) = &installed {
+            slot.retain_endpoint(endpoint)?;
+            None
+        } else {
+            Some(endpoint)
+        };
+        #[cfg(not(unix))]
+        let endpoint = Some(endpoint);
         trace.mark("endpoint_spawn");
 
         let mut boot_cmdline = inputs.cmdline.clone();
@@ -663,8 +695,8 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         }
         let spec = workload_spec(&WorkloadSpecInputs {
             config: inputs.config,
-            identity_drive: endpoint.identity_drive(),
-            sockets: socks.with_egress(endpoint.egress_uds()),
+            identity_drive: identity_drive.as_deref(),
+            sockets: socks.with_egress(egress_uds.as_deref()),
             cmdline: boot_cmdline,
             console_log: socks.console_log.clone(),
         });
@@ -675,6 +707,8 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             spec,
             socks,
             endpoint,
+            #[cfg(unix)]
+            installed,
             trace: Some(trace),
         })
     }
@@ -702,19 +736,11 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         let PreparedWorkloadBoot {
             spec,
             socks,
-            endpoint,
+            mut endpoint,
+            #[cfg(unix)]
+            installed,
             trace,
         } = self.prepare_workload_boot(inputs)?;
-        let mut endpoint = Some(endpoint);
-        #[cfg(unix)]
-        let installed = if inputs.config.host_lifetime.is_some() {
-            Some(self.installed.find(&VmId(inputs.config.name.clone()))?
-                .context("original installed slot missing")?)
-        } else { None };
-        #[cfg(unix)]
-        if let Some(slot) = &installed {
-            slot.retain_endpoint(endpoint.take().context("installed endpoint missing")?)?;
-        }
         let mut trace = trace.context("prepared workload launch trace missing")?;
         let state_dir = vm_state_dir(&inputs.config.name);
         // Unconditional and best-effort. The follower can wait for a console
@@ -742,6 +768,9 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             || {
                 #[cfg(unix)]
                 {
+                    if let Some(slot) = &installed {
+                        slot.begin_native_dispatch()?;
+                    }
                     match kernel {
                         Some(kernel) => kernel.boot_custodied(&self.driver, &spec, disks),
                         None => {
