@@ -401,14 +401,27 @@ impl HostAgentDaemon {
                 "original signer exited before owned readiness"
             );
             let original_exit = ProcessExitObserver::arm(signer_pid.try_into()?)?;
+            #[cfg(not(target_os = "macos"))]
             let event = original_exit
                 .duplicate_event_descriptor()?
                 .context("original signer already exited")?;
+            #[cfg(target_os = "macos")]
+            let event = mvm_vmm::host::owned_liveness::duplicate_read_pipe(
+                signer
+                    .stdout
+                    .as_ref()
+                    .context("original signer liveness pipe absent")?,
+            )?;
             let flags = rustix::fs::fcntl_getfl(&event)?;
             rustix::fs::fcntl_setfl(&event, flags | OFlags::NONBLOCK)?;
-            // SAFETY: event is an exclusive owned duplicate of the original
-            // non-reaping kernel exit observer, held through all handler joins.
-            let signer_event = unsafe { tokio::io::unix::AsyncFd::register(event) }?;
+            // SAFETY: the platform readiness handle is owned by AsyncFd and
+            // remains stable through all handler joins.
+            let signer_event = unsafe {
+                tokio::io::unix::AsyncFd::register_with_interest(
+                    event,
+                    tokio::io::Interest::READABLE,
+                )
+            }?;
             let bytes = crate::owned_resources::read_key(&cfg.host_signer_public_key_path)?;
             let key = VerifyingKey::from_bytes(&bytes)?;
             let daemon = Self::new(cfg.tenant_id.clone(), key, cfg.max_frame_bytes)
