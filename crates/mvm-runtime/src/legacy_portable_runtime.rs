@@ -2,8 +2,7 @@
 
 use anyhow::{Context, Result, ensure};
 use mvm_core::plan::bundle::{
-    ArtifactRole, BundleResolveError, BundleResolver, FsTrustStore, VerifiedBundle,
-    select_boot_asset_members, verify_plan_bundle,
+    ArtifactRole, FsTrustStore, VerifiedBundle, select_boot_asset_members, verify_plan_bundle_bytes,
 };
 use mvm_core::vm_backend::VmStartConfig;
 use std::path::Path;
@@ -81,14 +80,6 @@ impl WorkloadVerity {
             "selected portable workload verity sidecar differs from signed bundle"
         );
         Ok(())
-    }
-}
-
-struct OriginalArchive(Vec<u8>);
-
-impl BundleResolver for OriginalArchive {
-    fn resolve(&self, _: &str) -> Result<Vec<u8>, BundleResolveError> {
-        Ok(self.0.clone())
     }
 }
 
@@ -221,8 +212,19 @@ pub(crate) fn verify_retained(
         proof.arch == mvm_core::arch::GuestArch::host(),
         "portable guest architecture mismatch"
     );
-    let original = OriginalArchive(std::fs::read(&proof.archive)?);
-    let bundle = verify_plan_bundle(&proof.pin, &original, &FsTrustStore::default_path()?)?;
+    #[cfg(unix)]
+    let exact_bytes = config
+        .host_lifetime
+        .as_ref()
+        .map(|owner| owner.portable_archive_bytes(&proof.pin))
+        .transpose()?;
+    #[cfg(not(unix))]
+    let exact_bytes = None;
+    let original = match exact_bytes {
+        Some(bytes) => mvm_core::plan::bundle::read_exact_bundle_archive(&proof.archive, bytes)?,
+        None => std::fs::read(&proof.archive)?,
+    };
+    let bundle = verify_plan_bundle_bytes(&proof.pin, &original, &FsTrustStore::default_path()?)?;
     ensure!(
         matches!(bundle.manifest.schema_version, 4 | 5)
             && bundle.manifest.members.iter().any(|member| {
@@ -330,7 +332,7 @@ pub(crate) fn verify_retained(
         rootfs: role_bytes(&bundle, ArtifactRole::Rootfs)?.to_vec(),
         workload_verity: WorkloadVerity::from_bundle(&bundle)?,
         kernel: role_bytes(&bundle, ArtifactRole::Kernel)?.to_vec(),
-        archive: original.0,
+        archive: original,
         overlay: overlay_bytes,
         verity: verity_bytes,
         initrd: initrd_bytes,
@@ -585,6 +587,41 @@ mod tests {
             overlay_roothash: config.runtime_overlay_roothash.clone().unwrap(),
             version: config.runtime_overlay_version.clone().unwrap(),
         }
+    }
+
+    #[test]
+    fn quoted_portable_attachment_checks_length_and_the_same_signed_bytes() {
+        use mvm_core::plan::bundle::verify_exact_bundle_file;
+        use std::num::NonZeroU64;
+
+        let home = tempfile::tempdir().unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        let config = fixture(home.path(), Some(2), false, 4).unwrap();
+        let proof = config.legacy_portable_runtime.unwrap();
+        let trust = FsTrustStore::default_path().unwrap();
+        let mut archive = std::fs::read(&proof.archive).unwrap();
+        let length = NonZeroU64::new(archive.len() as u64).unwrap();
+        let verified =
+            verify_exact_bundle_file(&proof.archive, &trust, &proof.pin, length).unwrap();
+        assert_eq!(verified.plan_artifact(), proof.pin);
+        let short_quote = NonZeroU64::new(length.get() - 1).unwrap();
+        let error = verify_exact_bundle_file(&proof.archive, &trust, &proof.pin, short_quote)
+            .err()
+            .expect("wrong archive length refused");
+        assert!(
+            error.to_string().contains("quoted archive length"),
+            "{error}"
+        );
+        *archive.last_mut().unwrap() ^= 1;
+        std::fs::write(&proof.archive, archive).unwrap();
+        let error = verify_exact_bundle_file(&proof.archive, &trust, &proof.pin, length)
+            .err()
+            .expect("same-length substitution refused");
+        assert!(
+            error.to_string().contains("signed archive digest"),
+            "{error}"
+        );
     }
 
     #[test]

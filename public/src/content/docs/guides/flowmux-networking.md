@@ -45,12 +45,16 @@ plan declares a typed flow that gives the endpoint ownership of that protocol.
 
 ## Startup workspace for installed payload mapping
 
-An installation that selects a portable runtime bundle for FlowMux payload
-mapping must already hold workspace for that exact signed bundle and original
-VM owner. Host admission checks this reservation before opening the selected
-bundle. Runtime uses the same reservation once to verify and snapshot the
-artifacts and bind the kernel. The workspace phase must complete before
-endpoint startup or native dispatch.
+The installed FlowMux payload mapping requires a legacy portable runtime
+bundle. The installation must already hold workspace for that exact signed
+bundle and original VM owner. Host admission checks this reservation before opening the selected
+bundle. Attachment, admission, and Runtime refuse an archive whose length
+differs from the original owner's quote before allocating its read buffer.
+Admission retains the original owner identity through dispatch. Runtime uses
+the same reservation once to verify and snapshot the artifacts and bind the
+kernel. The workspace phase must complete before endpoint startup or native
+dispatch. The archive length covers the input buffer. The installation must
+budget the additional decoded artifacts and workspace separately.
 
 A missing reservation, changed bundle, or abandoned workspace refuses the
 launch. The original installation owns cleanup of its reservation after a

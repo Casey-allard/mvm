@@ -180,7 +180,10 @@ fn fixture(
         dispatched: Arc::new(AtomicUsize::new(0)),
     };
     let backend = driver.kind();
-    let anchor = PreparedHostLifetime::bind(
+    use mvm_core::plan::{KeyId, PlanArtifact};
+    let portable_pin =
+        portable.then(|| PlanArtifact::new("a".repeat(64), &[7; 64], KeyId("test".into())));
+    let prepared = PreparedHostLifetime::bind(
         HostLifetimeInputs {
             directory: File::open(root.path()).unwrap(),
             holder,
@@ -208,8 +211,14 @@ fn fixture(
         },
         (),
     )
-    .unwrap()
-    .into_anchor();
+    .unwrap();
+    let prepared = match &portable_pin {
+        Some(pin) => prepared
+            .with_portable_archive(pin.clone(), std::num::NonZeroU64::new(4).unwrap())
+            .unwrap(),
+        None => prepared,
+    };
+    let anchor = prepared.into_anchor();
     let mut config = VmStartConfig {
         name: "original-native".into(),
         rootfs_path: rootfs.display().to_string(),
@@ -219,9 +228,7 @@ fn fixture(
     };
     anchor.bind_to_config(&mut config).unwrap();
     let mut plan = PlanFixture::new().runtime_profile("mock").build();
-    if portable {
-        use mvm_core::plan::{KeyId, PlanArtifact};
-        let pin = PlanArtifact::new("a".repeat(64), &[7; 64], KeyId("test".into()));
+    if let Some(pin) = portable_pin {
         config.legacy_portable_runtime = Some(mvm_core::vm_backend::LegacyPortableRuntimeProof {
             archive: root.path().join("missing.mvmpkg"),
             pin: pin.clone(),

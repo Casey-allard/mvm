@@ -160,6 +160,8 @@ pub struct AdmittedPlan {
     backend: Option<BackendKind>,
     dispatched: bool,
     installed_payload_mapping: Option<CooperatingPayloadPolicy>,
+    #[cfg(unix)]
+    portable_archive_owner: Option<std::sync::Weak<mvm_core::host_lifetime::HostLifetimeAnchor>>,
 }
 
 /// Re-verified host artifact behind one extension binding in the signed plan.
@@ -322,6 +324,8 @@ impl AdmittedPlan {
             backend: None,
             dispatched: false,
             installed_payload_mapping: None,
+            #[cfg(unix)]
+            portable_archive_owner: None,
         }
     }
 
@@ -450,6 +454,8 @@ pub fn admit_plan_for_run(
     posture: RunPosture,
 ) -> Result<AdmittedPlan> {
     crate::owner_access::require_selected(plan)?;
+    #[cfg(unix)]
+    let portable_archive = posture.portable_archive_admission(plan)?;
     posture.verify_runtime()?;
     let assurance_runtime = posture.assurance_runtime(plan)?;
     validate_extension_bindings(plan)?;
@@ -491,6 +497,8 @@ pub fn admit_plan_for_run(
         extensions,
         assurance_runtime,
         posture,
+        #[cfg(unix)]
+        portable_archive,
         clock,
         ledger,
         bundle_ctx,
@@ -570,6 +578,8 @@ impl VerifiedExternalPlan<'_> {
             signed,
         } = self;
         let signer_id = signed.0.signer_id.clone();
+        #[cfg(unix)]
+        let portable_archive = posture.portable_archive_admission(&verified)?;
         posture.verify_runtime()?;
         let assurance_runtime = posture.assurance_runtime(&verified)?;
         validate_extension_bindings(&verified)?;
@@ -589,6 +599,8 @@ impl VerifiedExternalPlan<'_> {
             extensions,
             assurance_runtime,
             posture,
+            #[cfg(unix)]
+            portable_archive,
             clock,
             ledger,
             bundle_ctx,
@@ -615,9 +627,17 @@ struct VerifiedAdmission<'a> {
     extensions: Vec<AdmittedExtension>,
     assurance_runtime: Option<AssuranceRuntimeBinding>,
     posture: RunPosture<'a>,
+    #[cfg(unix)]
+    portable_archive: Option<PortableArchiveAdmission>,
     clock: &'a dyn Clock,
     ledger: &'a InMemoryNonceLedger,
     bundle_ctx: Option<&'a BundleAdmissionContext<'a>>,
+}
+
+#[cfg(unix)]
+struct PortableArchiveAdmission {
+    owner: std::sync::Weak<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    resolver: mvm_core::plan::FsBundleResolver,
 }
 
 fn verify_raw_local_bundle(
@@ -721,6 +741,8 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         ledger,
         bundle_ctx,
         posture,
+        #[cfg(unix)]
+        portable_archive,
     } = parts;
     let backend = posture.backend;
 
@@ -761,11 +783,16 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
                 bundle = pin.bundle_sha256
             )
         })?;
+        let resolver = ctx.resolver;
+        #[cfg(unix)]
+        let resolver = portable_archive
+            .as_ref()
+            .map_or(resolver, |admission| &admission.resolver);
         let verified_bundle = if let Some(config) = posture.runtime_config {
             if let Some(owner) = &config.canonical_kernel {
                 mvm_core::plan::bundle::verify_canonical_plan_bundle(
                     pin,
-                    ctx.resolver,
+                    resolver,
                     ctx.trust,
                     owner,
                     config,
@@ -775,10 +802,10 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
                     &mvm_build::stage0_kernel::current_image_set_protocol_support(),
                 )
             } else {
-                verify_plan_bundle(pin, ctx.resolver, ctx.trust)
+                verify_plan_bundle(pin, resolver, ctx.trust)
             }
         } else {
-            verify_plan_bundle(pin, ctx.resolver, ctx.trust)
+            verify_plan_bundle(pin, resolver, ctx.trust)
         }
         .with_context(|| format!("bundle re-verify for pin {}", pin.bundle_sha256))?;
         if posture.raw_local_runtime {
@@ -883,6 +910,8 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         backend,
         dispatched: false,
         installed_payload_mapping,
+        #[cfg(unix)]
+        portable_archive_owner: portable_archive.map(|admission| admission.owner),
     })
 }
 
@@ -1098,6 +1127,49 @@ pub struct RunPosture<'a> {
 }
 
 impl<'a> RunPosture<'a> {
+    #[cfg(unix)]
+    fn portable_archive_admission(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> Result<Option<PortableArchiveAdmission>> {
+        if self.installed_payload_mapping.is_some() && self.backend != Some(BackendKind::Mock) {
+            let config = self.runtime_config.context(
+                "installed payload mapping requires its original runtime before admission",
+            )?;
+            anyhow::ensure!(
+                config.host_lifetime.is_some(),
+                "installed payload mapping requires its original host lifetime before admission"
+            );
+            anyhow::ensure!(
+                config.legacy_portable_runtime.is_some() && config.canonical_kernel.is_none(),
+                "installed payload mapping requires its original portable runtime before admission"
+            );
+        }
+        let Some(config) = self.runtime_config else {
+            return Ok(None);
+        };
+        let (Some(owner), Some(proof)) = (&config.host_lifetime, &config.legacy_portable_runtime)
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            plan.bundle.as_ref() == Some(&proof.pin),
+            "portable runtime differs from the signed bundle"
+        );
+        let bytes = crate::host_lifetime_parent::check_portable_startup_workspace(
+            config,
+            self.backend
+                .context("portable admission requires its original backend")?,
+            &proof.pin,
+        )?;
+        let resolver = mvm_core::plan::FsBundleResolver::default_path()?
+            .with_exact_archive(&proof.pin.bundle_sha256, bytes)?;
+        Ok(Some(PortableArchiveAdmission {
+            owner: std::sync::Arc::downgrade(owner),
+            resolver,
+        }))
+    }
+
     /// A run whose backend is in hand. The only shape that can measure a grant
     /// against the mechanisms that will really be there.
     #[must_use]
@@ -2411,6 +2483,27 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
                 .context("installed payload mapping requires its signed bundle")
                 .and_then(|pin| require_installed_mapped_runtime(&params.config, pin))
                 .map_err(|error| ("guest-runtime", error))?;
+        }
+        #[cfg(unix)]
+        {
+            let portable_owner = params
+                .config
+                .host_lifetime
+                .as_ref()
+                .filter(|_| params.config.legacy_portable_runtime.is_some())
+                .map(std::sync::Arc::downgrade);
+            match (&admitted.portable_archive_owner, portable_owner) {
+                (None, None) => {}
+                (Some(expected), Some(actual)) if expected.ptr_eq(&actual) => {}
+                _ => {
+                    return Err((
+                        "startup-workspace",
+                        anyhow::anyhow!(
+                            "admitted portable archive belongs to a different startup owner"
+                        ),
+                    ));
+                }
+            }
         }
         #[cfg(unix)]
         if installed && let Some(proof) = &params.config.legacy_portable_runtime {
@@ -5288,6 +5381,100 @@ mod tests {
         let wrong = mapping([2; 32]);
         let correct = mapping([1; 32]);
         let posture = RunPosture::on_backend(Variant::Dev, backend.kind());
+        #[cfg(unix)]
+        {
+            struct NeverRead;
+            impl BundleResolver for NeverRead {
+                fn resolve(&self, _: &str) -> Result<Vec<u8>, mvm_core::plan::BundleResolveError> {
+                    panic!("unowned installed admission reached bundle resolver");
+                }
+            }
+            let unread = BundleAdmissionContext {
+                resolver: &NeverRead,
+                trust: &trust,
+                image: None,
+            };
+            let native = RunPosture::on_backend(Variant::Dev, BackendKind::Firecracker)
+                .with_installed_payload_mapping(&correct);
+            let mut unowned = VmStartConfig::default();
+            for portable in [
+                None,
+                Some(mvm_core::vm_backend::LegacyPortableRuntimeProof {
+                    archive: dir.path().join("must-not-open.mvmpkg"),
+                    pin: pin.clone(),
+                    manifest_sha256: "a".repeat(64),
+                    arch: mvm_core::arch::GuestArch::host(),
+                }),
+            ] {
+                unowned.legacy_portable_runtime = portable;
+                let error = admit_plan_for_run(
+                    &plan,
+                    &SystemClock,
+                    &ledger,
+                    Some(dir.path()),
+                    Some(&unread),
+                    None,
+                    native.with_runtime(Some(&unowned)),
+                )
+                .expect_err("installed admission without the original owner");
+                assert!(format!("{error:#}").contains("original host lifetime before admission"));
+            }
+            use mvm_core::host_lifetime::{
+                HostLaunchBinding, HostLeaseExpectation, HostLifetimeInputs, PreparedHostLifetime,
+            };
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let state = dir.path().join(".state");
+            mvm_core::util::atomic_io::write_private_new(&state, b"held").unwrap();
+            let holder_path = dir.path().join("holder");
+            mvm_core::util::atomic_io::write_private_new(&holder_path, b"").unwrap();
+            let owner = PreparedHostLifetime::bind(
+                HostLifetimeInputs {
+                    directory: std::fs::File::open(dir.path()).unwrap(),
+                    holder: std::fs::File::open(holder_path).unwrap(),
+                    expected: HostLeaseExpectation {
+                        state_name: ".state".into(),
+                        state_bytes: 4,
+                        state_sha256: hex::decode(mvm_core::plan::bundle::sha256_hex(b"held"))
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                        absent_names: [".intent".into(), ".next".into()],
+                    },
+                    binding: HostLaunchBinding {
+                        installation: [1; 32],
+                        profile: [2; 32],
+                        generation: 1,
+                        grant_serial: 1,
+                        vm_name: "mapped-local-admission".into(),
+                        backend: BackendKind::Firecracker,
+                        cpus: 1,
+                        memory_mib: 128,
+                    },
+                },
+                (),
+            )
+            .unwrap()
+            .into_anchor();
+            let mut stripped = VmStartConfig {
+                name: "mapped-local-admission".into(),
+                cpus: 1,
+                memory_mib: 128,
+                ..Default::default()
+            };
+            owner.bind_to_config(&mut stripped).unwrap();
+            let error = admit_plan_for_run(
+                &plan,
+                &SystemClock,
+                &ledger,
+                Some(dir.path()),
+                Some(&unread),
+                None,
+                native.with_runtime(Some(&stripped)),
+            )
+            .expect_err("installed admission without the selected portable proof");
+            assert!(format!("{error:#}").contains("original portable runtime before admission"));
+        }
         let admit = |plan: &ExecutionPlan, mapping| {
             admit_plan_for_run(
                 plan,

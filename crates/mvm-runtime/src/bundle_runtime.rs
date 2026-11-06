@@ -11,7 +11,7 @@ use mvm_core::image_set::{BackendImageSupport, ImageSetMember};
 use mvm_core::plan::FsTrustStore;
 use mvm_core::plan::bundle::{
     ArtifactRole, BundleRegistry, PlanArtifact, VerifiedEmbeddedImageSet,
-    select_boot_asset_members, verify_bundle_file,
+    select_boot_asset_members, verify_bundle_file, verify_exact_bundle_file,
 };
 use mvm_core::vm_backend::{BackendKind, BundleBootAssetsPin, VmStartConfig};
 
@@ -70,7 +70,20 @@ fn attach_installed_bundle(
     };
     let registry = BundleRegistry::default_path()?;
     let trust = FsTrustStore::default_path()?;
-    let verified = verify_bundle_file(&archive, &trust).context("verifying bundle boot assets")?;
+    #[cfg(unix)]
+    let quote = config
+        .host_lifetime
+        .as_ref()
+        .zip(selected_pin)
+        .map(|(owner, pin)| owner.portable_archive_bytes(pin).map(|bytes| (pin, bytes)))
+        .transpose()?;
+    #[cfg(not(unix))]
+    let quote = None;
+    let verified = match quote {
+        Some((pin, bytes)) => verify_exact_bundle_file(&archive, &trust, pin, bytes),
+        None => verify_bundle_file(&archive, &trust),
+    }
+    .context("verifying bundle boot assets")?;
     let canonical = verified.manifest.members.iter().any(|member| {
         matches!(
             member,

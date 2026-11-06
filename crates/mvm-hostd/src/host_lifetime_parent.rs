@@ -8,7 +8,10 @@ use mvm_core::{
     plan::PlanArtifact,
     vm_backend::{BackendKind, VmStartConfig},
 };
-use std::sync::{Arc, OnceLock, Weak};
+use std::{
+    num::NonZeroU64,
+    sync::{Arc, OnceLock, Weak},
+};
 
 pub trait ParentAdmissionProvider: Send + Sync {
     /// Check that the exact owner already holds workspace qualified for the
@@ -71,13 +74,15 @@ pub(crate) fn check_portable_startup_workspace(
     config: &VmStartConfig,
     backend: BackendKind,
     pin: &PlanArtifact,
-) -> Result<()> {
+) -> Result<NonZeroU64> {
     let owner = config
         .host_lifetime
         .as_ref()
         .context("portable startup requires the original host lifetime owner")?;
     owner.verify_config(config, backend)?;
-    require_installed()?.check_portable_startup_workspace(owner, pin)
+    let bytes = owner.portable_archive_bytes(pin)?;
+    require_installed()?.check_portable_startup_workspace(owner, pin)?;
+    Ok(bytes)
 }
 
 pub(crate) fn bind_current(

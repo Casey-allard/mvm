@@ -2,7 +2,7 @@
 //! File exclusion and retained objects are not signed-plan or parent-grant authority.
 
 use crate::{
-    plan::{ExecutionPlan, Nonce, PlanId},
+    plan::{ExecutionPlan, Nonce, PlanArtifact, PlanId},
     vm_backend::{BackendKind, VmStartConfig},
 };
 use anyhow::{Context, Result, ensure};
@@ -16,6 +16,7 @@ use std::{
     fmt,
     fs::File,
     io::Read,
+    num::NonZeroU64,
     os::unix::fs::MetadataExt,
     sync::{
         Arc, Mutex,
@@ -261,6 +262,7 @@ pub struct PreparedHostLifetime {
     lease: PreparedHostLifetimeLease,
     binding: HostLaunchBinding,
     parent_owner: Box<dyn Any + Send + Sync>,
+    portable_archive: Option<(PlanArtifact, NonZeroU64)>,
 }
 
 impl PreparedHostLifetime {
@@ -296,7 +298,19 @@ impl PreparedHostLifetime {
             lease,
             binding: inputs.binding,
             parent_owner: Box::new(parent_owner),
+            portable_archive: None,
         })
+    }
+
+    /// Record the exact archive covered by the original parent's reservation.
+    /// The installed parent still checks that reservation against this owner.
+    pub fn with_portable_archive(mut self, pin: PlanArtifact, bytes: NonZeroU64) -> Result<Self> {
+        ensure!(
+            self.portable_archive.is_none(),
+            "original portable archive already selected"
+        );
+        self.portable_archive = Some((pin, bytes));
+        Ok(self)
     }
 
     pub fn into_anchor(self) -> Arc<HostLifetimeAnchor> {
@@ -304,6 +318,7 @@ impl PreparedHostLifetime {
             lease: self.lease,
             binding: self.binding,
             _parent_owner: self.parent_owner,
+            portable_archive: self.portable_archive,
             admitted: Mutex::new(None),
             current_parent: Mutex::new(None),
             native_claimed: AtomicBool::new(false),
@@ -327,6 +342,7 @@ pub struct HostLifetimeAnchor {
     lease: PreparedHostLifetimeLease,
     binding: HostLaunchBinding,
     _parent_owner: Box<dyn Any + Send + Sync>,
+    portable_archive: Option<(PlanArtifact, NonZeroU64)>,
     admitted: Mutex<Option<AdmissionBinding>>,
     current_parent: Mutex<Option<Arc<dyn CoreCurrentParentPermit>>>,
     native_claimed: AtomicBool,
@@ -367,6 +383,19 @@ impl fmt::Debug for HostLifetimeAnchor {
 }
 
 impl HostLifetimeAnchor {
+    /// The archive length fixed by the original preparation for this pin.
+    pub fn portable_archive_bytes(&self, pin: &PlanArtifact) -> Result<NonZeroU64> {
+        let (original, bytes) = self
+            .portable_archive
+            .as_ref()
+            .context("original portable archive length missing")?;
+        ensure!(
+            original == pin,
+            "portable archive differs from the original quote"
+        );
+        Ok(*bytes)
+    }
+
     /// Reserve from the same actual parent, then duplicate the original SH
     /// description. Returned projections never supply a replacement authority.
     pub fn prepare_endpoint_handoff(
@@ -521,6 +550,7 @@ impl HostLifetimeAnchor {
                 plan.bundle.as_ref() == Some(&proof.pin),
                 "portable runtime differs from the signed bundle"
             );
+            self.portable_archive_bytes(&proof.pin)?;
         }
         Ok(AdmissionBinding {
             plan_id: plan.plan_id.clone(),

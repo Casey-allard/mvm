@@ -542,7 +542,10 @@ fn portable_startup_workspace_is_single_use_and_owned_by_original_parent() {
 
     for (refuse_begin, complete) in [(false, true), (false, false), (true, false)] {
         let root = tempfile::tempdir().unwrap();
+        let pin = PlanArtifact::new("a".repeat(64), &[7; 64], KeyId("test".into()));
         let owner = PreparedHostLifetime::bind(inputs(root.path()), ())
+            .unwrap()
+            .with_portable_archive(pin.clone(), std::num::NonZeroU64::new(4).unwrap())
             .unwrap()
             .into_anchor();
         let mut config = VmStartConfig {
@@ -554,7 +557,6 @@ fn portable_startup_workspace_is_single_use_and_owned_by_original_parent() {
         owner.bind_to_config(&mut config).unwrap();
         let mut plan = PlanFixture::new().build();
         plan.resources.mem_mib = 1024;
-        let pin = PlanArtifact::new("a".repeat(64), &[7; 64], KeyId("test".into()));
         config.legacy_portable_runtime = Some(LegacyPortableRuntimeProof {
             archive: root.path().join("fixture.mvmpkg"),
             pin: pin.clone(),
@@ -628,4 +630,47 @@ fn portable_startup_workspace_is_single_use_and_owned_by_original_parent() {
             usize::from(complete)
         );
     }
+}
+
+#[cfg(feature = "host-state")]
+#[test]
+fn installed_resolver_reads_only_the_exact_quoted_archive() {
+    use mvm_core::plan::{BundleResolveError, BundleResolver, FsBundleResolver};
+    use std::{num::NonZeroU64, os::unix::fs::symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let pin = "a".repeat(64);
+    let other = "b".repeat(64);
+    let path = dir.path().join(format!("{pin}.mvmpkg"));
+    let other_path = dir.path().join(format!("{other}.mvmpkg"));
+    let resolver = FsBundleResolver::new(dir.path())
+        .with_exact_archive(&pin, NonZeroU64::new(4).unwrap())
+        .unwrap();
+
+    std::fs::write(&other_path, b"good").unwrap();
+    assert!(resolver.resolve(&other).is_err());
+    assert!(matches!(
+        resolver.resolve(&pin),
+        Err(BundleResolveError::MissingBundle { .. })
+    ));
+    symlink(&other_path, &path).unwrap();
+    assert!(resolver.resolve(&pin).is_err());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"good").unwrap();
+    assert_eq!(resolver.resolve(&pin).unwrap(), b"good");
+    for invalid in [&b"cut"[..], &b"extra"[..]] {
+        std::fs::write(&path, invalid).unwrap();
+        let error = resolver.resolve(&pin).unwrap_err();
+        assert!(
+            error.to_string().contains("quoted archive length"),
+            "{error}"
+        );
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(512 * 1024 * 1024)
+        .unwrap();
+    assert!(resolver.resolve(&pin).is_err());
 }

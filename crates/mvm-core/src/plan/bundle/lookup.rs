@@ -6,6 +6,12 @@
 //! stores under `~/.mvm`.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "host-state")]
+use std::{
+    fs::File,
+    io::{self, Read},
+    num::NonZeroU64,
+};
 
 use anyhow::Result;
 use ed25519_dalek::VerifyingKey;
@@ -52,11 +58,80 @@ pub enum BundleResolveError {
 /// publishers write the file by hand.
 pub struct FsBundleResolver {
     root: PathBuf,
+    #[cfg(feature = "host-state")]
+    exact_archive: Option<(String, NonZeroU64)>,
+}
+
+#[cfg(feature = "host-state")]
+fn check_exact_archive_size(bytes: NonZeroU64) -> io::Result<usize> {
+    if bytes.get() > super::MAX_BUNDLE_TOTAL_BYTES + 64 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "quoted archive length exceeds format bound",
+        ));
+    }
+    usize::try_from(bytes.get()).map_err(io::Error::other)
+}
+
+/// Read exactly the quoted bytes from a single regular file, refusing
+/// pathname links on Unix and lengths that differ before allocating.
+#[cfg(feature = "host-state")]
+pub fn read_exact_bundle_archive(path: &Path, bytes: NonZeroU64) -> io::Result<Vec<u8>> {
+    let length = check_exact_archive_size(bytes)?;
+    #[cfg(unix)]
+    let mut file = File::from(rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )?);
+    #[cfg(not(unix))]
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != bytes.get() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file differs from quoted archive length or is not regular",
+        ));
+    }
+    let mut archive = Vec::new();
+    archive
+        .try_reserve_exact(length)
+        .map_err(io::Error::other)?;
+    archive.resize(length, 0);
+    file.read_exact(&mut archive)?;
+    if file.read(&mut [0])? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file grew beyond quoted archive length",
+        ));
+    }
+    Ok(archive)
 }
 
 impl FsBundleResolver {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { root: dir.into() }
+        Self {
+            root: dir.into(),
+            #[cfg(feature = "host-state")]
+            exact_archive: None,
+        }
+    }
+
+    /// Restrict this resolver to the quoted installed archive.
+    #[cfg(feature = "host-state")]
+    pub fn with_exact_archive(mut self, sha256: &str, bytes: NonZeroU64) -> io::Result<Self> {
+        check_exact_archive_size(bytes)?;
+        if !crate::manifest::is_slot_hash_dirname(sha256) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid quoted archive identity",
+            ));
+        }
+        self.exact_archive = Some((sha256.to_owned(), bytes));
+        Ok(self)
     }
 
     /// Default path: `~/.mvm/bundles/`. Same shape as
@@ -75,7 +150,18 @@ impl FsBundleResolver {
 impl BundleResolver for FsBundleResolver {
     fn resolve(&self, bundle_sha256: &str) -> Result<Vec<u8>, BundleResolveError> {
         let path = self.root.join(format!("{bundle_sha256}.mvmpkg"));
-        match std::fs::read(&path) {
+        #[cfg(feature = "host-state")]
+        let read = match &self.exact_archive {
+            Some((pin, bytes)) if pin == bundle_sha256 => read_exact_bundle_archive(&path, *bytes),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bundle differs from quoted archive identity",
+            )),
+            None => std::fs::read(&path),
+        };
+        #[cfg(not(feature = "host-state"))]
+        let read = std::fs::read(&path);
+        match read {
             Ok(bytes) => Ok(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(BundleResolveError::MissingBundle {
