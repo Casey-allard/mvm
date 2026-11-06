@@ -14,6 +14,10 @@ use std::{
 const FIXTURE: &str = "MVM_INSTALLED_RESOURCES_FIXTURE";
 
 pub(super) async fn resource_exchange(mode: &str, child_args: &[&str]) {
+    exchange_with_program(mode, child_args, None).await;
+}
+
+pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpoint: Option<&str>) {
     use mvm_core::host_lifetime::{
         EndpointPartitionLimits, EndpointPartitionProjection, EndpointStoreLocator,
         HostLaunchBinding, HostLeaseExpectation,
@@ -94,10 +98,16 @@ pub(super) async fn resource_exchange(mode: &str, child_args: &[&str]) {
             std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
-    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    let mut command = if let Some(endpoint) = endpoint {
+        let mut command = tokio::process::Command::new(endpoint);
+        command.arg("--installed-partition");
+        command
+    } else {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command.args(child_args).env(FIXTURE, mode);
+        command
+    };
     command
-        .args(child_args)
-        .env(FIXTURE, mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -106,14 +116,16 @@ pub(super) async fn resource_exchange(mode: &str, child_args: &[&str]) {
         command.as_std_mut(),
         vec![directory.as_raw_fd(), holder.as_raw_fd()],
     );
-    // SAFETY: descriptor-only operations in the fixture's owned child.
-    unsafe {
-        command.as_std_mut().pre_exec(|| {
-            if libc::dup2(1, 199) < 0 || libc::dup2(2, 1) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    if endpoint.is_none() {
+        // SAFETY: descriptor-only operations in the fixture's owned child.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                if libc::dup2(1, 199) < 0 || libc::dup2(2, 1) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = command.spawn().unwrap();
     let child_stderr = child.stderr.take().unwrap();
@@ -184,6 +196,15 @@ pub(super) async fn resource_exchange(mode: &str, child_args: &[&str]) {
             65536,
         )
         .await?;
+        if endpoint.is_some() {
+            let mut first_byte = [0];
+            anyhow::ensure!(
+                output.read(&mut first_byte).await? == 0,
+                "endpoint without a controller emitted protocol output after Prepare"
+            );
+            drop(input);
+            return Ok::<(), anyhow::Error>(());
+        }
         if expected_refusal {
             let ready: Result<Value, _> = read_json_frame(&mut output, 65536).await;
             anyhow::ensure!(ready.is_err(), "refused config reported Ready");
@@ -228,9 +249,14 @@ pub(super) async fn resource_exchange(mode: &str, child_args: &[&str]) {
         "private resource exchange failed: {result:?}; child {status:?}: {}",
         String::from_utf8_lossy(&diagnostics)
     );
-    assert!(
-        status.success(),
-        "child diagnostics: {}",
-        String::from_utf8_lossy(&diagnostics)
-    );
+    let diagnostics = String::from_utf8_lossy(&diagnostics);
+    if endpoint.is_some() {
+        assert!(!status.success());
+        assert!(
+            diagnostics.contains("installed endpoint controller unavailable"),
+            "original resources were not adopted: {diagnostics}"
+        );
+    } else {
+        assert!(status.success(), "child diagnostics: {diagnostics}");
+    }
 }

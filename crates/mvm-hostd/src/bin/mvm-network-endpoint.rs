@@ -51,9 +51,22 @@ fn read_stdin_blocking() -> Result<Vec<u8>> {
 }
 
 fn main() -> Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments
+        .next()
+        .is_some_and(|flag| flag == "--installed-partition")
+    {
+        mvm_hostd::panic_hook::install("substitution-endpoint");
+        anyhow::ensure!(
+            arguments.next().is_none(),
+            "invalid installed endpoint arguments"
+        );
+        #[cfg(unix)]
+        return mvm_hostd::installed_endpoint::run_installed_endpoint();
+        #[cfg(not(unix))]
+        anyhow::bail!("installed endpoint requires Unix descriptor custody");
+    }
     mvm_vmm::host::helper_contract::exit_with_probe_answer_if_requested("mvm-network-endpoint");
-    // First statement in the process: a panic before this line would
-    // print its payload unredacted.
     mvm_hostd::panic_hook::install("substitution-endpoint");
     // A machine that outlives its launcher gets a keeper between the two: this
     // same binary, started with the VM's state directory, running the real

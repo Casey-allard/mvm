@@ -164,3 +164,78 @@ fn installed_resources_require_the_actual_child_and_return_one_shared_pool() {
     }
     let _ = prepare;
 }
+
+#[tokio::test]
+async fn canonical_endpoint_binary_enters_installed_stdio_before_legacy_input() {
+    use mvm_hostd::framing::read_json_frame;
+    use std::process::Stdio;
+
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_mvm-network-endpoint"))
+        .arg("--installed-partition")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let challenge: serde_json::Value =
+        tokio::time::timeout(Duration::from_secs(3), read_json_frame(&mut output, 1024))
+            .await
+            .expect("installed endpoint did not send Challenge while parent input was open")
+            .unwrap();
+    assert_eq!(challenge["version"], 1);
+    let nonce = challenge["nonce"]
+        .as_array()
+        .expect("installed challenge nonce");
+    assert_eq!(nonce.len(), 32);
+    assert!(
+        nonce
+            .iter()
+            .any(|byte| byte.as_u64().is_some_and(|byte| byte != 0))
+    );
+
+    // Closing before the authenticated Prepare must not report Ready.
+    drop(child.stdin.take());
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!status.success());
+    use tokio::io::AsyncReadExt;
+    let mut remaining = [0; 1];
+    let bytes = tokio::time::timeout(Duration::from_secs(1), output.read(&mut remaining))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, 0, "truncated Prepare must emit no additional frame");
+}
+
+#[tokio::test]
+async fn canonical_endpoint_binary_adopts_valid_prepare_without_unowned_ready() {
+    installed_resource_fixture::exchange_with_program(
+        "network",
+        &[],
+        Some(env!("CARGO_BIN_EXE_mvm-network-endpoint")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn canonical_endpoint_binary_refuses_mixed_installed_and_probe_arguments() {
+    let output = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_mvm-network-endpoint"))
+            .args(["--installed-partition", "--contract-version"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid installed endpoint arguments")
+    );
+}

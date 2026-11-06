@@ -22,6 +22,15 @@ use std::{
     },
 };
 
+/// Enter the installed child protocol on the parent's original pipes.
+pub fn run_installed_endpoint() -> Result<()> {
+    let mut child = InstalledEndpointChild::from_stdio()
+        .map_err(|_| anyhow::anyhow!("installed endpoint handshake failed"))?;
+    let _resources = InstalledEndpointResources::from_child(&mut child)
+        .map_err(|_| anyhow::anyhow!("installed endpoint resource adoption failed"))?;
+    anyhow::bail!("installed endpoint controller unavailable")
+}
+
 pub enum InstalledEndpointProgram {
     Network(EndpointConfig),
     TelemetryOnly(TelemetryOnlyConfig),
