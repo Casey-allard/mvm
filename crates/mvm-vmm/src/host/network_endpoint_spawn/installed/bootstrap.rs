@@ -14,13 +14,13 @@ use std::fmt;
 
 /// Overlapping fixed control/header/raw/scratch/path storage before decoding.
 /// This replaces neither actual reservation nor the separate typed node term.
-pub const INSTALLED_BOOTSTRAP_MIN_BYTES: u64 = 9 * CONFIG_LIMIT as u64;
+pub(super) const INSTALLED_BOOTSTRAP_MIN_BYTES: u64 = 9 * CONFIG_LIMIT as u64;
 
 const NODE_REQUEST_BYTES: u64 = 1024;
 
 /// Compute the checked instance workspace before typed canonical config decode.
 /// No quota, process, file, payload or admission authority is minted here.
-pub fn installed_endpoint_bootstrap_requirement(config: &str) -> Result<u64> {
+pub(super) fn installed_endpoint_bootstrap_requirement(config: &str) -> Result<u64> {
     let shape = inspect_shape(
         config.as_bytes(),
         JsonShapeLimits {
