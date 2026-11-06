@@ -20,6 +20,8 @@ use mvm_core::vm_backend::VmStartConfig;
 use std::path::{Path, PathBuf};
 
 mod namespace;
+#[cfg(unix)]
+pub(crate) mod portable_generation;
 use namespace::{check_owner, private_directory};
 
 /// Guest RPC compatibility, distinct from the host instance-control protocol.
@@ -671,6 +673,10 @@ fn runtime_selection(
 pub(crate) struct RuntimeLifecycleLease {
     directory: PathBuf,
     _lock: std::fs::File,
+    #[cfg(unix)]
+    directory_fd: std::fs::File,
+    #[cfg(unix)]
+    portable: std::sync::Mutex<portable_generation::PortableCustody>,
 }
 
 impl RuntimeLifecycleLease {
@@ -682,11 +688,39 @@ impl RuntimeLifecycleLease {
         let root = namespace::root(true)?;
         let directory = root.join(vm_name);
         private_directory(&directory)?;
+        #[cfg(unix)]
+        let (directory_fd, lock) = namespace::lock(&directory)?;
+        #[cfg(not(unix))]
         let lock = namespace::lock(&directory)?;
         Ok(Self {
             directory,
             _lock: lock,
+            #[cfg(unix)]
+            directory_fd,
+            #[cfg(unix)]
+            portable: std::sync::Mutex::default(),
         })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn retire_portable_generation(&self) -> Result<bool> {
+        let mut custody = self
+            .portable
+            .lock()
+            .map_err(|_| anyhow::anyhow!("portable generation custody poisoned"))?;
+        use portable_generation::PortableCustody;
+        match &mut *custody {
+            PortableCustody::Empty => Ok(false),
+            PortableCustody::Uncertain => {
+                anyhow::bail!("original portable generation custody uncertain")
+            }
+            PortableCustody::Owned(generation) => {
+                namespace::check_held_lock(&self.directory_fd, &self._lock)?;
+                generation.retire()?;
+                namespace::check_held_lock(&self.directory_fd, &self._lock)?;
+                Ok(true)
+            }
+        }
     }
 
     /// Publish a fresh immutable generation before any backend side effect.
@@ -710,7 +744,18 @@ impl RuntimeLifecycleLease {
             return Ok(bound);
         }
         if let VerifiedLaunchRuntime::LegacyPortable(portable) = &verified {
-            let bound = portable.snapshot_in(config, &self.directory)?;
+            #[cfg(unix)]
+            if config.host_lifetime.is_some() {
+                namespace::check_held_lock(&self.directory_fd, &self._lock)?;
+            }
+            let bound = portable.snapshot_in(
+                config,
+                &self.directory,
+                #[cfg(unix)]
+                &self.portable,
+                #[cfg(unix)]
+                &self.directory_fd,
+            )?;
             self.report_retained_best_effort();
             return Ok(bound);
         }

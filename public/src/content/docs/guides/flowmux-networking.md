@@ -56,6 +56,18 @@ kernel. The workspace phase must complete before endpoint startup or native
 dispatch. The archive length covers the input buffer. The installation must
 budget the additional decoded artifacts and workspace separately.
 
+Provision the signed image-set cache before attaching the installed mapping.
+The quoted attachment resolves those existing inputs without installing or
+replacing cache members. Runtime compares the selected files against the
+authenticated bytes with bounded read buffers. The archive length and this
+comparison do not set a peak bound for decoding or snapshot storage.
+
+Runtime holds the original lifecycle directory and lock through shutdown.
+After it verifies native exit or a pre-dispatch refusal and retires the
+endpoint, it can remove and sync the original private snapshot. The retirement
+receipt states whether Runtime verified that removal. Unknown or replaced
+entries require reconciliation under the original owner.
+
 A missing reservation, changed bundle, or abandoned workspace refuses the
 launch. The original installation owns cleanup of its reservation after a
 failure. The workspace check does not admit a destination, allocate another

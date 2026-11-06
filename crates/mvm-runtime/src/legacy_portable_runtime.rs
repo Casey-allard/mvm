@@ -5,7 +5,7 @@ use mvm_core::plan::bundle::{
     ArtifactRole, FsTrustStore, VerifiedBundle, select_boot_asset_members, verify_plan_bundle_bytes,
 };
 use mvm_core::vm_backend::VmStartConfig;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct VerifiedLegacyPortableRuntime {
@@ -14,8 +14,11 @@ pub struct VerifiedLegacyPortableRuntime {
     workload_verity: Option<WorkloadVerity>,
     kernel: Vec<u8>,
     overlay: Vec<u8>,
+    overlay_version: String,
+    overlay_roothash: String,
     verity: Vec<u8>,
     initrd: Vec<u8>,
+    initrd_version: String,
 }
 
 #[derive(Debug)]
@@ -96,12 +99,17 @@ impl VerifiedLegacyPortableRuntime {
         &self,
         config: &VmStartConfig,
         parent: &Path,
+        #[cfg(unix)] custody: &std::sync::Mutex<
+            crate::runtime_evidence::portable_generation::PortableCustody,
+        >,
+        #[cfg(unix)] parent_fd: &std::fs::File,
     ) -> Result<VmStartConfig> {
-        let generation = tempfile::Builder::new()
-            .prefix("portable-runtime-")
-            .tempdir_in(parent)?;
-        mvm_core::private_fs::set_mode(generation.path(), 0o700)?;
-        for (name, bytes) in [
+        let mut bound = config.clone();
+        let proof = bound
+            .legacy_portable_runtime
+            .as_mut()
+            .context("portable proof missing")?;
+        let members = [
             ("bundle.mvmpkg", &self.archive),
             ("rootfs", &self.rootfs),
             ("kernel", &self.kernel),
@@ -114,50 +122,69 @@ impl VerifiedLegacyPortableRuntime {
             self.workload_verity
                 .as_ref()
                 .map(|verity| ("rootfs.verity", &verity.bytes)),
-        ) {
-            let path = generation.path().join(name);
-            mvm_core::util::atomic_io::write_private_new(&path, bytes)?;
-            mvm_core::private_fs::set_mode(&path, 0o400)?;
-            mvm_core::util::atomic_io::sync_file(&path)?;
-        }
-        mvm_core::util::atomic_io::sync_dir(generation.path())?;
-        let mut bound = config.clone();
-        bound
-            .legacy_portable_runtime
-            .as_mut()
-            .context("portable proof missing")?
-            .archive = generation.path().join("bundle.mvmpkg");
-        bound.rootfs_path = generation.path().join("rootfs").display().to_string();
-        bound.verity_path = self.workload_verity.as_ref().map(|_| {
-            generation
-                .path()
-                .join("rootfs.verity")
-                .display()
-                .to_string()
-        });
+        );
+        #[cfg(unix)]
+        let installed_path = if config.host_lifetime.is_some() {
+            use crate::runtime_evidence::portable_generation::{
+                OwnedPortableGeneration, PortableCustody,
+            };
+            let mut held = custody
+                .lock()
+                .map_err(|_| anyhow::anyhow!("portable generation custody poisoned"))?;
+            ensure!(
+                matches!(*held, PortableCustody::Empty),
+                "original portable generation already retained"
+            );
+            // A failure after exclusive mkdir may leave original bytes in the
+            // namespace. Fence retirement until the exact directory is held.
+            *held = PortableCustody::Uncertain;
+            *held = PortableCustody::Owned(OwnedPortableGeneration::create(parent, parent_fd)?);
+            let PortableCustody::Owned(owner) = &mut *held else {
+                unreachable!();
+            };
+            for (name, bytes) in members.clone() {
+                owner.write_member(name, bytes)?;
+            }
+            owner.finish()?;
+            Some(owner.path())
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let installed_path: Option<PathBuf> = None;
+        let generation: PathBuf = if let Some(path) = installed_path {
+            path
+        } else {
+            let generation = tempfile::Builder::new()
+                .prefix("portable-runtime-")
+                .tempdir_in(parent)?;
+            mvm_core::private_fs::set_mode(generation.path(), 0o700)?;
+            for (name, bytes) in members {
+                let path = generation.path().join(name);
+                mvm_core::util::atomic_io::write_private_new(&path, bytes)?;
+                mvm_core::private_fs::set_mode(&path, 0o400)?;
+                mvm_core::util::atomic_io::sync_file(&path)?;
+            }
+            mvm_core::util::atomic_io::sync_dir(generation.path())?;
+            let path = generation.keep();
+            mvm_core::util::atomic_io::sync_dir(parent)?;
+            path
+        };
+        proof.archive = generation.join("bundle.mvmpkg");
+        bound.rootfs_path = generation.join("rootfs").display().to_string();
+        bound.verity_path = self
+            .workload_verity
+            .as_ref()
+            .map(|_| generation.join("rootfs.verity").display().to_string());
         bound.roothash = self
             .workload_verity
             .as_ref()
             .map(|verity| verity.roothash.clone());
-        bound.kernel_path = Some(generation.path().join("kernel").display().to_string());
-        bound.runtime_overlay_path =
-            Some(generation.path().join("overlay.ext4").display().to_string());
-        bound.runtime_overlay_verity_path = Some(
-            generation
-                .path()
-                .join("overlay.verity")
-                .display()
-                .to_string(),
-        );
-        bound.initrd_path = Some(
-            generation
-                .path()
-                .join("initramfs.cpio.gz")
-                .display()
-                .to_string(),
-        );
-        let _retained = generation.keep();
-        mvm_core::util::atomic_io::sync_dir(parent)?;
+        bound.kernel_path = Some(generation.join("kernel").display().to_string());
+        bound.runtime_overlay_path = Some(generation.join("overlay.ext4").display().to_string());
+        bound.runtime_overlay_verity_path =
+            Some(generation.join("overlay.verity").display().to_string());
+        bound.initrd_path = Some(generation.join("initramfs.cpio.gz").display().to_string());
         Ok(bound)
     }
 }
@@ -167,33 +194,129 @@ pub(crate) fn verify(
     minimum_protocol: u32,
 ) -> Result<VerifiedLegacyPortableRuntime> {
     let verified = verify_retained(config, minimum_protocol)?;
-    ensure!(
-        std::fs::read(&config.rootfs_path)? == verified.rootfs,
-        "selected portable rootfs differs from signed bundle"
-    );
-    ensure!(
-        std::fs::read(
-            config
-                .kernel_path
-                .as_deref()
-                .context("portable kernel missing")?
-        )? == verified.kernel,
-        "selected portable kernel differs from signed bundle"
-    );
-    if let Some(verity) = &verified.workload_verity {
-        verity.verify_selection(config)?;
-    } else {
-        ensure!(
-            config.verity_path.is_none() && config.roothash.is_none(),
-            "selected portable workload verity is absent from signed bundle"
-        );
-    }
+    verified.verify_workload_selection(config, installed(config))?;
     Ok(verified)
+}
+
+#[cfg(unix)]
+fn installed(config: &VmStartConfig) -> bool {
+    config.host_lifetime.is_some()
+}
+
+#[cfg(not(unix))]
+fn installed(_config: &VmStartConfig) -> bool {
+    false
+}
+
+/// Authenticate the original bundle before projecting cache paths. The
+/// installed route consumes only the preprovisioned payload files.
+pub(crate) fn select_preprovisioned_cache(
+    config: &mut VmStartConfig,
+    cache: &Path,
+    minimum_protocol: u32,
+) -> Result<()> {
+    ensure!(
+        installed(config),
+        "preprovisioned cache requires an installed owner"
+    );
+    let verified = verify_archive(config, minimum_protocol)?;
+    verified.project_cache(config, cache)?;
+    verified.verify_workload_selection(config, true)?;
+    verified.verify_boot_selection(config, true)
+}
+
+impl VerifiedLegacyPortableRuntime {
+    fn verify_workload_selection(&self, config: &VmStartConfig, installed: bool) -> Result<()> {
+        ensure!(
+            selected_file_matches(Path::new(&config.rootfs_path), &self.rootfs, installed)?,
+            "selected portable rootfs differs from signed bundle"
+        );
+        let kernel = config
+            .kernel_path
+            .as_deref()
+            .context("portable kernel missing")?;
+        ensure!(
+            selected_file_matches(Path::new(kernel), &self.kernel, installed)?,
+            "selected portable kernel differs from signed bundle"
+        );
+        if let Some(verity) = &self.workload_verity {
+            verity.verify_selection(config)?;
+        } else {
+            ensure!(
+                config.verity_path.is_none() && config.roothash.is_none(),
+                "selected portable workload verity is absent from signed bundle"
+            );
+        }
+        Ok(())
+    }
+
+    fn project_cache(&self, config: &mut VmStartConfig, cache: &Path) -> Result<()> {
+        use mvm_build::published_image_set::{MemberVersion, SetMemberCache};
+        use mvm_fs::{
+            initramfs::{INITRAMFS_IMAGE_FILE, InitramfsResolver},
+            overlay::RuntimeOverlayLayout,
+        };
+        let proof = config
+            .legacy_portable_runtime
+            .as_ref()
+            .context("portable proof missing")?;
+        let manifest = mvm_core::packs::Sha256Hex::new(proof.manifest_sha256.clone())?;
+        let cache = SetMemberCache::for_root(manifest.clone()).cache_root(cache);
+        let arch = proof.arch.to_string();
+        let overlay_version = MemberVersion::parse(&self.overlay_version)?;
+        let initrd_version = MemberVersion::parse(&self.initrd_version)?;
+        let overlay = RuntimeOverlayLayout::under(&cache, overlay_version.as_str(), &arch);
+        let initrd = InitramfsResolver::new(&cache, initrd_version.as_str())
+            .artifact_dir(&arch)
+            .join(INITRAMFS_IMAGE_FILE);
+        config.runtime_overlay_path = Some(overlay.overlay_ext4.display().to_string());
+        config.runtime_overlay_verity_path = Some(overlay.sidecar.display().to_string());
+        config.runtime_overlay_roothash = Some(self.overlay_roothash.clone());
+        config.runtime_overlay_version = Some(self.overlay_version.clone());
+        config.initrd_path = Some(initrd.display().to_string());
+        config.bundle_boot_assets = Some(mvm_core::vm_backend::BundleBootAssetsPin {
+            manifest_sha256: manifest,
+            arch: proof.arch,
+            initrd_sha256: mvm_core::packs::Sha256Hex::new(mvm_core::plan::bundle::sha256_hex(
+                &self.initrd,
+            ))?,
+        });
+        Ok(())
+    }
+
+    fn verify_boot_selection(&self, config: &VmStartConfig, installed: bool) -> Result<()> {
+        ensure!(
+            config.runtime_overlay_roothash.as_deref() == Some(self.overlay_roothash.as_str())
+                && config.runtime_overlay_version.as_deref() == Some(self.overlay_version.as_str()),
+            "portable runtime root or version differs from original payload"
+        );
+        for (selected, expected) in [
+            (config.runtime_overlay_path.as_deref(), &self.overlay),
+            (config.runtime_overlay_verity_path.as_deref(), &self.verity),
+            (config.initrd_path.as_deref(), &self.initrd),
+        ] {
+            let path = selected.context("portable runtime selection incomplete")?;
+            ensure!(
+                selected_file_matches(Path::new(path), expected, installed)?,
+                "selected portable bytes differ from authenticated original payload"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Root and kernel observations are compared separately, allowing authenticated
 /// checkpoint forks to remap an identical copy without changing its identity.
 pub(crate) fn verify_retained(
+    config: &VmStartConfig,
+    minimum_protocol: u32,
+) -> Result<VerifiedLegacyPortableRuntime> {
+    let verified = verify_archive(config, minimum_protocol)?;
+    verified.verify_boot_selection(config, installed(config))?;
+    Ok(verified)
+}
+
+fn verify_archive(
     config: &VmStartConfig,
     minimum_protocol: u32,
 ) -> Result<VerifiedLegacyPortableRuntime> {
@@ -302,20 +425,9 @@ pub(crate) fn verify_retained(
         &archives[1],
         initrd_stage.path(),
     )?;
-    ensure!(
-        config.runtime_overlay_roothash.as_deref() == Some(overlay.roothash.as_str())
-            && config.runtime_overlay_version.as_deref() == Some(overlay.version.as_str()),
-        "portable runtime root or version differs from original payload"
-    );
-    let overlay_bytes = selected_bytes(
-        config.runtime_overlay_path.as_deref(),
-        &overlay.overlay_ext4,
-    )?;
-    let verity_bytes = selected_bytes(
-        config.runtime_overlay_verity_path.as_deref(),
-        &overlay.sidecar,
-    )?;
-    let initrd_bytes = selected_bytes(config.initrd_path.as_deref(), &initrd.image_path)?;
+    let overlay_bytes = std::fs::read(&overlay.overlay_ext4)?;
+    let verity_bytes = std::fs::read(&overlay.sidecar)?;
+    let initrd_bytes = std::fs::read(&initrd.image_path)?;
     ensure!(
         role_bytes(&bundle, ArtifactRole::Initrd)? == initrd_bytes,
         "portable initrd differs from signed Initrd role"
@@ -334,18 +446,40 @@ pub(crate) fn verify_retained(
         kernel: role_bytes(&bundle, ArtifactRole::Kernel)?.to_vec(),
         archive: original,
         overlay: overlay_bytes,
+        overlay_version: overlay.version,
+        overlay_roothash: overlay.roothash,
         verity: verity_bytes,
         initrd: initrd_bytes,
+        initrd_version: initrd.version,
     })
 }
 
-fn selected_bytes(selected: Option<&str>, original: &Path) -> Result<Vec<u8>> {
-    let bytes = std::fs::read(original)?;
-    ensure!(
-        std::fs::read(selected.context("portable runtime selection incomplete")?)? == bytes,
-        "selected portable bytes differ from authenticated original payload"
-    );
-    Ok(bytes)
+fn selected_file_matches(path: &Path, expected: &[u8], installed: bool) -> Result<bool> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    if installed {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    let _ = installed;
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+    let mut buffer = [0; 8192];
+    for chunk in expected.chunks(buffer.len()) {
+        let selected = &mut buffer[..chunk.len()];
+        file.read_exact(selected)?;
+        if selected != chunk {
+            return Ok(false);
+        }
+    }
+    // Recheck end of stream after the comparison in case the file grew.
+    Ok(file.read(&mut buffer[..1])? == 0)
 }
 
 fn role_bytes(bundle: &VerifiedBundle, role: ArtifactRole) -> Result<&[u8]> {
@@ -587,6 +721,72 @@ mod tests {
             overlay_roothash: config.runtime_overlay_roothash.clone().unwrap(),
             version: config.runtime_overlay_version.clone().unwrap(),
         }
+    }
+
+    #[test]
+    fn signed_cache_projection_uses_only_preprovisioned_payload_files() {
+        let home = tempfile::tempdir().unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        let mut config = fixture(home.path(), Some(2), false, 4).unwrap();
+        let verified = verify_archive(&config, 2).unwrap();
+        let cache = home.path().join("preprovisioned");
+        verified.project_cache(&mut config, &cache).unwrap();
+        let selected = [
+            (
+                config.runtime_overlay_path.as_deref().unwrap(),
+                &verified.overlay,
+            ),
+            (
+                config.runtime_overlay_verity_path.as_deref().unwrap(),
+                &verified.verity,
+            ),
+            (config.initrd_path.as_deref().unwrap(), &verified.initrd),
+        ];
+        assert!(verified.verify_boot_selection(&config, true).is_err());
+        assert!(!cache.exists());
+        for (path, bytes) in selected {
+            let path = Path::new(path);
+            assert!(path.starts_with(&cache));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        verified.verify_boot_selection(&config, true).unwrap();
+        for (path, _) in selected {
+            let path = Path::new(path);
+            let count = if path == Path::new(config.initrd_path.as_deref().unwrap()) {
+                1
+            } else {
+                2
+            };
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                count
+            );
+        }
+        std::fs::write(config.initrd_path.as_ref().unwrap(), b"bad").unwrap();
+        assert!(verified.verify_boot_selection(&config, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_asset_comparison_binds_content_length_and_file_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        let expected = vec![17; 16_385];
+        std::fs::write(&input, &expected).unwrap();
+        assert!(selected_file_matches(&input, &expected, true).unwrap());
+        let mut changed = expected.clone();
+        *changed.last_mut().unwrap() = 0;
+        assert!(!selected_file_matches(&input, &changed, true).unwrap());
+        changed.push(0);
+        assert!(!selected_file_matches(&input, &changed, true).unwrap());
+        assert!(!selected_file_matches(&input, &expected[..8192], true).unwrap());
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&input, &link).unwrap();
+        assert!(selected_file_matches(&link, &expected, true).is_err());
+        assert!(selected_file_matches(&link, &expected, false).unwrap());
     }
 
     #[test]

@@ -487,12 +487,18 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             !crate::kernel_custody::has_retained_kernel(&lifecycle)?,
             "canonical kernel lifetime for this VM is still unresolved"
         );
-        let bound_config = lifecycle.bind(inputs.config)?;
-        let kernel_binding = crate::kernel_custody::KernelBoundLaunch::bind(
-            bound_config,
-            self.driver.kind(),
-            &lifecycle,
-        )?;
+        let kernel_binding = match lifecycle.bind(inputs.config).and_then(|bound_config| {
+            crate::kernel_custody::KernelBoundLaunch::bind(bound_config, self.driver.kind(), &lifecycle)
+        }) {
+            Ok(binding) => binding,
+            Err(error) => {
+                #[cfg(unix)]
+                if let Some(slot) = installed {
+                    return slot.retain_start(lifecycle, None, Err(error));
+                }
+                return Err(error);
+            }
+        };
         let bound_config = kernel_binding.config();
         let bound_cmdline = if bound_config.runtime_release_proof.is_some()
             || bound_config.unsigned_runtime_development
@@ -522,7 +528,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         })();
         #[cfg(unix)]
         if let Some(slot) = installed {
-            return slot.retain_start(lifecycle, kernel_binding, result);
+            return slot.retain_start(lifecycle, Some(kernel_binding), result);
         }
         result.map_err(|error| {
             cold_hvf_channel::retain_boot_error(error, (lifecycle, kernel_binding))

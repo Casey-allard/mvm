@@ -1,8 +1,8 @@
 //! Offline runtime selection from a signed, installed bundle.
 //!
 //! Cache markers are indexes, not authentication. Every launch checks the
-//! installed archives and reinstalls authenticated bytes under the original
-//! set root. Neither the CLI lock nor the network participates.
+//! installed archive. Installed quoted launches use preprovisioned payloads.
+//! Ordinary bundle attachment can install the authenticated cache members.
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -144,7 +144,7 @@ fn attach_installed_bundle(
         );
         config.kernel_path = Some(path.display().to_string());
     }
-    attach_workload_verity(config, &installed)?;
+    attach_workload_verity(config, &installed, quote.is_some())?;
     let Some(boot) = &verified.boot_assets else {
         return Ok(false);
     };
@@ -246,6 +246,15 @@ fn attach_installed_bundle(
         boot.image_set.manifest_sha256.clone(),
     );
     let cache = PathBuf::from(mvm_core::config::mvm_cache_dir());
+    if quote.is_some() {
+        config.legacy_portable_runtime = Some(proof);
+        crate::legacy_portable_runtime::select_preprovisioned_cache(
+            config,
+            &cache,
+            crate::runtime_evidence::MIN_GUEST_RPC_PROTOCOL_VERSION,
+        )?;
+        return Ok(true);
+    }
     let staging = tempfile::tempdir()?;
     let [overlay_member, initramfs_member] =
         select_boot_asset_members(&boot.image_set.manifest, boot.arch)?;
@@ -394,6 +403,7 @@ fn attach_cli_runtime(
 fn attach_workload_verity(
     config: &mut VmStartConfig,
     installed: &mvm_core::plan::bundle::InstalledBundle,
+    defer_validation: bool,
 ) -> Result<()> {
     let rootfs = installed
         .manifest
@@ -421,8 +431,10 @@ fn attach_workload_verity(
             "boot kernel differs from bundle"
         ),
     }
-    for artifact in [rootfs, kernel] {
-        verify_installed_artifact(&installed.root, artifact)?;
+    if !defer_validation {
+        for artifact in [rootfs, kernel] {
+            verify_installed_artifact(&installed.root, artifact)?;
+        }
     }
     let binding = installed
         .manifest
@@ -437,7 +449,11 @@ fn attach_workload_verity(
                 artifact.role == ArtifactRole::VerityHashSidecar,
                 "bundle verity artifact has the wrong role"
             );
-            let path = verify_installed_artifact(&installed.root, artifact)?;
+            let path = if defer_validation {
+                installed.root.join(&artifact.path)
+            } else {
+                verify_installed_artifact(&installed.root, artifact)?
+            };
             Ok::<_, anyhow::Error>((path.display().to_string(), verity.roothash.clone()))
         })
         .transpose()?;

@@ -181,25 +181,65 @@ pub(super) fn private_directory(path: &Path) -> Result<()> {
     validate_private_directory(path)
 }
 
-pub(super) fn lock(directory: &Path) -> Result<File> {
-    let path = directory.join("lifecycle.lock");
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(&path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || mvm_core::private_fs::mode_bits(&path, &metadata)? != 0o600 {
-        bail!("runtime lifecycle lock must be a private regular file");
-    }
-    check_owner(&metadata)?;
+#[cfg(unix)]
+pub(super) fn lock(directory: &Path) -> Result<(File, File)> {
+    use rustix::fs::{self, Mode, OFlags};
+    let held = File::from(fs::open(
+        directory,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    check_held_directory(directory, &held)?;
+    let file = File::from(fs::openat(
+        &held,
+        "lifecycle.lock",
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    check_held_lock(&held, &file)?;
     file.lock()?;
-    Ok(file)
+    check_held_lock(&held, &file)?;
+    check_held_directory(directory, &held)?;
+    Ok((held, file))
+}
+
+#[cfg(unix)]
+pub(super) fn check_held_directory(path: &Path, held: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let current = std::fs::symlink_metadata(path)?;
+    let original = held.metadata()?;
+    check_owner(&original)?;
+    if !original.is_dir()
+        || original.mode() & 0o7777 != 0o700
+        || (current.dev(), current.ino()) != (original.dev(), original.ino())
+    {
+        bail!("original runtime lifecycle directory was substituted");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn check_held_lock(directory: &File, lock: &File) -> Result<()> {
+    use rustix::fs::{self, AtFlags};
+    use std::os::unix::fs::MetadataExt;
+    let original = lock.metadata()?;
+    check_owner(&original)?;
+    let current = fs::statat(directory, "lifecycle.lock", AtFlags::SYMLINK_NOFOLLOW)?;
+    let held = fs::fstat(lock)?;
+    if !original.is_file()
+        || original.mode() & 0o7777 != 0o600
+        || original.nlink() != 1
+        || current.st_dev != held.st_dev
+        || current.st_ino != held.st_ino
+    {
+        bail!("original runtime lifecycle lock is not a private regular file");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(super) fn lock(_directory: &Path) -> Result<File> {
+    bail!("runtime namespaces require Unix ownership and permission semantics")
 }
 
 #[cfg(all(test, unix))]

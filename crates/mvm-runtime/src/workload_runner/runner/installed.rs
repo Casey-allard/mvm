@@ -22,6 +22,7 @@ pub(super) struct InstalledSlot {
 pub struct OwnedRetirement {
     owner: Arc<HostLifetimeAnchor>,
     endpoint: Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement>,
+    portable_runtime_removed: bool,
 }
 impl OwnedRetirement {
     pub fn binding(&self) -> &HostLaunchBinding {
@@ -34,6 +35,12 @@ impl OwnedRetirement {
     ) -> Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement> {
         self.endpoint.take()
     }
+    /// This original slot positively removed its own portable generation.
+    /// Shared preprovisioned cache storage is outside this receipt.
+    pub fn portable_runtime_removed(&self) -> bool {
+        self.portable_runtime_removed
+    }
+
     /// Exact retained reservation identity; copied fields confer no ownership.
     pub fn retains_parent_permit(
         &self,
@@ -60,8 +67,9 @@ struct Custody {
     broker: Option<BrokerGuard>,
     launch: Option<(
         crate::runtime_evidence::RuntimeLifecycleLease,
-        crate::kernel_custody::KernelBoundLaunch,
+        Option<crate::kernel_custody::KernelBoundLaunch>,
     )>,
+    portable_runtime_removed: bool,
     retired: bool,
     exit: Option<mvm_vmm::driver::traits::KernelStopOutcome>,
 }
@@ -98,6 +106,7 @@ impl InstalledSlots {
                 endpoint_retirement: None,
                 broker: None,
                 launch: None,
+                portable_runtime_removed: false,
                 retired: false,
                 exit: None,
             })),
@@ -131,6 +140,7 @@ impl InstalledSlots {
         let receipt = OwnedRetirement {
             owner: Arc::clone(&slot.owner),
             endpoint: state.endpoint_retirement.take(),
+            portable_runtime_removed: state.portable_runtime_removed,
         };
         slots.remove(index);
         Ok(receipt)
@@ -179,7 +189,7 @@ impl InstalledSlot {
     pub(super) fn retain_start(
         &self,
         lifecycle: crate::runtime_evidence::RuntimeLifecycleLease,
-        kernel: crate::kernel_custody::KernelBoundLaunch,
+        kernel: Option<crate::kernel_custody::KernelBoundLaunch>,
         outcome: Result<Box<dyn RunningVm>>,
     ) -> Result<Box<dyn RunningVm>> {
         let (mut guard, (lifecycle, kernel, outcome)) =
@@ -424,6 +434,7 @@ impl InstalledSlot {
         }
         if let Some(broker) = state.broker.as_mut() {
             broker.shutdown_owned()?;
+            state.broker = None;
         }
         streamer.stop(&self.id.0);
         let (lifecycle, _) = state
@@ -451,6 +462,7 @@ impl InstalledSlot {
                 crate::kernel_custody::release_after_process_exit(lifecycle)?;
             }
         }
+        state.portable_runtime_removed = lifecycle.retire_portable_generation()?;
         match std::fs::remove_file(marker(&self.id)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
