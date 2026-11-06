@@ -25,7 +25,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+mod audit;
 mod records;
+pub use audit::InstalledEndpointAudit;
 pub use records::InstalledTelemetryRecords;
 
 const CONFIG_LIMIT: usize = 65_536;
@@ -97,6 +99,8 @@ struct Prepare {
     config: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     telemetry_records: Option<records::RecordsProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit: Option<audit::AuditProjection>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +247,7 @@ pub fn spawn_network_endpoint_installed(
                 expected: installed.handoff.holder().expectation().clone(),
                 config,
                 telemetry_records: None,
+                audit: None,
             },
             CONFIG_LIMIT,
             deadline,
@@ -318,6 +323,7 @@ struct ChildAuthority {
     projection: EndpointPartitionProjection,
     fenced: AtomicBool,
     pool_claimed: AtomicBool,
+    audit: Option<audit::ChildAudit>,
 }
 
 /// Original child authority retained by its one local pool and bounded workers.
@@ -337,6 +343,9 @@ impl InstalledEndpointLease {
     pub fn projection(&self) -> &EndpointPartitionProjection {
         &self.authority.projection
     }
+    pub fn audit(&self) -> Result<InstalledEndpointAudit> {
+        InstalledEndpointAudit::require(self)
+    }
     /// One monotonic claim, including any later authorization failure.
     pub fn claim_payload_pool(&self) -> Result<()> {
         if self.authority.pool_claimed.swap(true, Ordering::AcqRel) {
@@ -354,6 +363,9 @@ impl InstalledEndpointLease {
                 || parent_closed(&self.authority.input)?
             {
                 bail!("installed endpoint parent admission closed")
+            }
+            if let Some(audit) = &self.authority.audit {
+                audit.check_current()?;
             }
             Ok(())
         })();
@@ -423,32 +435,74 @@ impl InstalledEndpointChild {
             .telemetry_records
             .as_ref()
             .map(records::RecordsProjection::descriptor);
+        let audit_descriptors = prepared
+            .audit
+            .as_ref()
+            .map(audit::AuditProjection::descriptors);
         let mut raw_namespace = std::collections::BTreeSet::new();
         let mut object_namespace = std::collections::BTreeSet::new();
-        for fd in descriptors.into_iter().chain(records_descriptor) {
+        for fd in descriptors
+            .into_iter()
+            .chain(records_descriptor)
+            .chain(audit_descriptors.into_iter().flatten())
+        {
             let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+            // Linux process descriptors are checked by live kernel PID below,
+            // even when the host represents them with a shared anonymous inode.
+            let process_event = cfg!(target_os = "linux")
+                && audit_descriptors
+                    .is_some_and(|audit| audit.contains(&fd) || fd == descriptors[4]);
             // SAFETY: raw metadata query only, before any inherited fd is adopted.
             if fd <= 2
                 || !raw_namespace.insert(fd)
                 || unsafe { libc::fstat(fd, &mut metadata) } != 0
-                || !object_namespace.insert((metadata.st_dev, metadata.st_ino))
+                || (!process_event && !object_namespace.insert((metadata.st_dev, metadata.st_ino)))
                 || (fd == prepared.directory && metadata.st_mode & libc::S_IFMT != libc::S_IFDIR)
                 || (fd == prepared.holder && metadata.st_mode & libc::S_IFMT != libc::S_IFREG)
             {
                 bail!("installed endpoint complete descriptor namespace differs")
             }
         }
-        if let Some(records) = &prepared.telemetry_records {
+        let mut audit_excluded = descriptors.to_vec();
+        audit_excluded.extend(records_descriptor);
+        if prepared.telemetry_records.is_some() || prepared.audit.is_some() {
             // Verify the original holder on temporary duplicates before any
-            // writer can be claimed. These dup handles never unlock its file.
+            // audit event or records writer can be adopted.
             let verified = PreparedHostLifetimeLease::bind(
                 duplicate_descriptor(prepared.directory)?,
                 duplicate_descriptor(prepared.holder)?,
                 prepared.expected.clone(),
             )?;
             verified.verify_current()?;
-            records.preflight(&descriptors)?;
         }
+        if let Some(records) = &prepared.telemetry_records {
+            let mut excluded = descriptors.to_vec();
+            excluded.extend(audit_descriptors.into_iter().flatten());
+            records.preflight(&excluded)?;
+        }
+        if let Some(audit) = &prepared.audit {
+            if prepared
+                .config
+                .get("tenant_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(audit.tenant())
+            {
+                bail!("installed audit tenant differs from endpoint config");
+            }
+            audit.preflight(&audit_excluded, &prepared.projection.binding.vm_name)?;
+            #[cfg(target_os = "linux")]
+            audit.check_linux_processes(pid)?;
+        }
+        let audit = prepared
+            .audit
+            .map(|audit| {
+                audit::ChildAudit::adopt(
+                    audit,
+                    &audit_excluded,
+                    &prepared.projection.binding.vm_name,
+                )
+            })
+            .transpose()?;
         // SAFETY: the complete preflight established distinct original inherited
         // files, and each number is adopted exactly once by this private startup.
         let directory = unsafe { File::from_raw_fd(prepared.directory) };
@@ -464,6 +518,7 @@ impl InstalledEndpointChild {
                 projection: prepared.projection,
                 fenced: AtomicBool::new(false),
                 pool_claimed: AtomicBool::new(false),
+                audit,
             }),
         };
         let records = prepared

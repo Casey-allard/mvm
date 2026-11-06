@@ -33,6 +33,7 @@ use crate::host::broker_services_spawn::{
 };
 
 mod owned;
+pub(crate) use owned::require_live_event;
 pub use owned::{
     HostAgentParentPermit, OwnedHostAgent, OwnedHostAgentInputs, OwnedHostAgentRegistrar,
     OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration, PreparedEndpointAudit,

@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 
 mod audit_capability;
 use audit_capability::receive_signer_event;
-use audit_capability::require_live_event;
+pub(crate) use audit_capability::require_live_event;
 
 /// Trusted installed DI retaining the actual aggregate helper reservation.
 pub trait HostAgentParentPermit: Send + Sync {

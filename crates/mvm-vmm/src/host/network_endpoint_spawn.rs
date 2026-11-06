@@ -217,7 +217,7 @@ pub use egress_tls::{
 mod owned;
 mod installed;
 pub use installed::{
-    INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointChild, InstalledEndpointLease,
+    INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointAudit, InstalledEndpointChild, InstalledEndpointLease,
     InstalledHostServices, InstalledTelemetryRecords, spawn_network_endpoint_installed,
 };
 pub(crate) use owned::{nonblocking as owned_pipe_nonblocking, ready as owned_pipe_ready};

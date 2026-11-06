@@ -271,3 +271,25 @@ async fn canonical_endpoint_binary_refuses_records_aliasing_holder() {
 async fn installed_records_writer_can_be_taken_only_once() {
     resource_exchange("records-inspect").await;
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn canonical_endpoint_binary_adopts_audit_events_with_original_records() {
+    installed_resource_fixture::exchange_with_program(
+        "audit-original",
+        &[],
+        Some(env!("CARGO_BIN_EXE_mvm-network-endpoint")),
+    )
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn canonical_endpoint_binary_refuses_audit_for_a_foreign_vm() {
+    installed_resource_fixture::exchange_with_program(
+        "audit-foreign",
+        &[],
+        Some(env!("CARGO_BIN_EXE_mvm-network-endpoint")),
+    )
+    .await;
+}

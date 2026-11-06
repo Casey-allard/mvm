@@ -323,6 +323,7 @@ fn pipe_exchange(mode: &str) {
             expected,
             config: serde_json::json!({"fixture":true}),
             telemetry_records: None,
+            audit: None,
         },
         CONFIG_LIMIT,
         deadline,

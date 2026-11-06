@@ -100,7 +100,11 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
     }
     let records = matches!(
         mode,
-        "records-original" | "records-alias" | "records-inspect"
+        "records-original"
+            | "records-alias"
+            | "records-inspect"
+            | "audit-original"
+            | "audit-foreign"
     )
     .then(|| {
         let name = mvm_vmm::host::telemetry_provisioning::TELEMETRY_RECORDS_FILE;
@@ -126,6 +130,29 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         });
         (records, projection)
     });
+    #[cfg(target_os = "linux")]
+    let mut audit = matches!(mode, "audit-original" | "audit-foreign").then(|| {
+        use rustix::process::{Pid, PidfdFlags, pidfd_open};
+        let pair = [(); 2].map(|()| {
+            let child = tokio::process::Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            let event = pidfd_open(Pid::from_raw(pid.try_into().unwrap()).unwrap(), PidfdFlags::empty())
+                .unwrap();
+            (child, event, pid)
+        });
+        let projection = json!({
+            "version":1, "socket":root.path().join("fixture-signer.sock"), "signer_pid":pair[0].2,
+            "tenant":"local", "vm":if mode == "audit-foreign" {"other-vm"} else {"resources-collector"},
+            "signer_event":pair[0].1.as_raw_fd(), "daemon_event":pair[1].1.as_raw_fd()
+        });
+        (pair, projection)
+    });
     let mut command = if let Some(endpoint) = endpoint {
         let mut command = tokio::process::Command::new(endpoint);
         command.arg("--installed-partition");
@@ -143,6 +170,10 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
     let mut descriptors = vec![directory.as_raw_fd(), holder.as_raw_fd()];
     if let Some((file, _)) = records.as_ref() {
         descriptors.push(file.as_raw_fd());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some((events, _)) = audit.as_ref() {
+        descriptors.extend(events.iter().map(|(_, fd, _)| fd.as_raw_fd()));
     }
     mvm_vmm::host::restore_image::inherit_descriptors(command.as_std_mut(), descriptors);
     if endpoint.is_none() {
@@ -164,7 +195,9 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         mode,
         "foreign-session" | "replaced-store" | "restored-store"
     );
-    let aliases_original = mode == "records-alias";
+    let refused_original = matches!(mode, "records-alias" | "audit-foreign");
+    #[cfg(target_os = "linux")]
+    let audit_projection = audit.as_ref().map(|(_, projection)| projection.clone());
     let mode = mode.to_owned();
     let exchange = async move {
         let challenge: Value = read_json_frame(&mut output, 1024).await?;
@@ -224,6 +257,10 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         if let Some((_, records)) = records.as_ref() {
             prepare["telemetry_records"] = records.clone();
         }
+        #[cfg(target_os = "linux")]
+        if let Some(audit) = audit_projection {
+            prepare["audit"] = audit;
+        }
         write_json_frame_bounded(&mut input, &prepare, 65536).await?;
         if endpoint.is_some() {
             let mut first_byte = [0];
@@ -264,6 +301,13 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         .await
         .unwrap()
         .unwrap();
+    #[cfg(target_os = "linux")]
+    if let Some((events, _)) = audit.as_mut() {
+        for (child, _, _) in events {
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().await.unwrap();
+        }
+    }
     use tokio::io::AsyncReadExt;
     let mut diagnostics = Vec::new();
     tokio::time::timeout(
@@ -281,7 +325,7 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
     let diagnostics = String::from_utf8_lossy(&diagnostics);
     if endpoint.is_some() {
         assert!(!status.success());
-        let expected = if aliases_original {
+        let expected = if refused_original {
             "installed endpoint handshake failed"
         } else {
             "installed endpoint controller unavailable"
