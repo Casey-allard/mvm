@@ -28,6 +28,12 @@ fn main() -> Result<()> {
     // print its payload unredacted.
     mvm_hostd::panic_hook::install("signer-helper");
     let owned = std::env::args_os().any(|arg| arg == "--installed-owned");
+    #[cfg(target_os = "macos")]
+    if owned {
+        mvm_vmm::host::owned_liveness::prepare_stdout_writer()
+            .context("prepare original signer liveness writer")?;
+    }
+
     if owned {
         mvm_hostd::parent_death::bound_owned_main_stack()
             .context("bound owned signer main stack")?;

@@ -163,12 +163,17 @@ async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<Child> {
         max_frame_bytes: cfg.max_frame_bytes,
     };
     let mut command = Command::from(mvm_core::env_hygiene::helper_command(&bin));
-    if std::env::args_os().any(|arg| arg == "--installed-owned") {
+    let owned = std::env::args_os().any(|arg| arg == "--installed-owned");
+    if owned {
         command.arg("--installed-owned");
     }
+    #[cfg(target_os = "macos")]
+    let stdout = if owned { Stdio::piped() } else { Stdio::null() };
+    #[cfg(not(target_os = "macos"))]
+    let stdout = Stdio::null();
     let mut child = command
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
@@ -418,6 +423,11 @@ fn main() -> Result<()> {
         .init();
 
     let owned = std::env::args_os().any(|arg| arg == "--installed-owned");
+    #[cfg(target_os = "macos")]
+    if owned {
+        mvm_vmm::host::owned_liveness::prepare_stdout_writer()
+            .context("prepare original daemon liveness writer")?;
+    }
     if owned {
         mvm_hostd::parent_death::bound_owned_main_stack()
             .context("bound owned host-agent main stack")?;

@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::ensure;
 use mvm_core::protocol::broker_control::DeregisterVm;
+use mvm_vmm::host::process_exit::{ProcessExitObserver, ProcessExitWait};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -10,6 +11,135 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 const JOURNAL_CAP: usize = 64 * 1024;
+
+struct OwnedSignerQuarantine {
+    _daemon: HostAgentDaemon,
+    _signer: tokio::process::Child,
+    _control: OwnedEntry,
+    _helper: OwnedEntry,
+    _parent: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    _exit: ProcessExitObserver,
+    _event: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+}
+// The canonical owned helper runs once per process. A failed handler join may
+// retain ONE whole original owner until that process exits; it may not reap the
+// signer while an admitted blocking operation still owns an in-flight request.
+static SIGNER_QUARANTINE: StdMutex<Option<OwnedSignerQuarantine>> = StdMutex::new(None);
+fn quarantine_signer(owner: OwnedSignerQuarantine) {
+    let mut retained = match SIGNER_QUARANTINE.lock() {
+        Ok(retained) => retained,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if retained.is_some() {
+        // Reentry is outside the one-helper process profile. Never grow an
+        // uncertainty history or drop/reap another owner under live handlers.
+        std::mem::forget(owner);
+        std::process::exit(1);
+    }
+    *retained = Some(owner);
+}
+
+fn signer_current(
+    original: &ProcessExitObserver,
+    admission: &crate::owned_resources::registered::RegistrationAdmission,
+) -> Result<()> {
+    if !matches!(
+        original.wait_event(std::time::Instant::now()),
+        Ok(ProcessExitWait::TimedOut)
+    ) {
+        admission.fence();
+        bail!("original signer exited or exit observation failed");
+    }
+    Ok(())
+}
+
+struct SignerCapability {
+    #[cfg(not(target_os = "macos"))]
+    original: ProcessExitObserver,
+    #[cfg(target_os = "macos")]
+    reader: std::os::fd::OwnedFd,
+}
+impl SignerCapability {
+    fn descriptor(&self) -> Result<std::os::fd::BorrowedFd<'_>> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.original
+                .event_fd()
+                .context("original signer event absent")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Ok(self.reader.as_fd())
+        }
+    }
+    fn tag(&self) -> u8 {
+        #[cfg(target_os = "macos")]
+        {
+            0xa2
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0xa1
+        }
+    }
+}
+
+fn fresh_signer_capability(
+    signer: &tokio::process::Child,
+    original: &ProcessExitObserver,
+    admission: &crate::owned_resources::registered::RegistrationAdmission,
+) -> Result<SignerCapability> {
+    signer_current(original, admission)?;
+    #[cfg(not(target_os = "macos"))]
+    let capability = SignerCapability {
+        original: ProcessExitObserver::arm(
+            signer
+                .id()
+                .context("original signer child ID missing")?
+                .try_into()?,
+        )?,
+    };
+    #[cfg(target_os = "macos")]
+    let capability = SignerCapability {
+        reader: mvm_vmm::host::owned_liveness::duplicate_read_pipe(
+            signer
+                .stdout
+                .as_ref()
+                .context("original signer liveness pipe absent")?,
+        )?,
+    };
+    signer_capability_current(&capability, admission)?;
+    signer_current(original, admission)?;
+    Ok(capability)
+}
+
+fn signer_capability_current(
+    observer: &SignerCapability,
+    admission: &crate::owned_resources::registered::RegistrationAdmission,
+) -> Result<()> {
+    let descriptor = observer.descriptor()?;
+    #[cfg(target_os = "macos")]
+    if mvm_vmm::host::owned_liveness::require_live_read_pipe(descriptor).is_err() {
+        admission.fence();
+        bail!("original signer liveness pipe fenced");
+    }
+    let mut events = [rustix::event::PollFd::new(
+        &descriptor,
+        rustix::event::PollFlags::IN,
+    )];
+    let ready = rustix::event::poll(
+        &mut events,
+        Some(&rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    );
+    if !matches!(ready, Ok(0)) {
+        admission.fence();
+        bail!("original signer capability exited or observation failed");
+    }
+    Ok(())
+}
 
 /// Owned-only bind: guard exists before any chmod/capture can fail.
 pub fn bind_owned_signer_listener(
@@ -276,12 +406,27 @@ impl HostAgentDaemon {
         mut signer: tokio::process::Child,
     ) -> Result<()> {
         let setup = (|| -> Result<_> {
+            let signer_pid = signer.id().context("original signer child ID missing")?;
+            ensure!(
+                signer.try_wait()?.is_none(),
+                "original signer exited before owned readiness"
+            );
+            let original_exit = ProcessExitObserver::arm(signer_pid.try_into()?)?;
+            let event = original_exit
+                .event_fd()
+                .context("original signer already exited")?
+                .try_clone_to_owned()?;
+            let flags = rustix::fs::fcntl_getfl(&event)?;
+            rustix::fs::fcntl_setfl(&event, flags | OFlags::NONBLOCK)?;
+            // SAFETY: event is an exclusive owned duplicate of the original
+            // non-reaping kernel exit observer, held through all handler joins.
+            let signer_event = unsafe { tokio::io::unix::AsyncFd::register(event) }?;
             let bytes = crate::owned_resources::read_key(&cfg.host_signer_public_key_path)?;
             let key = VerifyingKey::from_bytes(&bytes)?;
             let daemon = Self::new(cfg.tenant_id.clone(), key, cfg.max_frame_bytes)
                 .with_signer_helper(cfg.signer_helper_uds_path.clone())
                 .with_registration_journal(cfg.registration_journal_path()?)
-                .with_owned_lifecycle(signer.id().context("original signer child ID missing")?)?;
+                .with_owned_lifecycle(signer_pid)?;
             OwnedEntry::prepare_absent(&cfg.control_socket)?;
             let listener = daemon
                 .owned_admission
@@ -291,36 +436,86 @@ impl HostAgentDaemon {
             std::fs::set_permissions(&cfg.control_socket, std::fs::Permissions::from_mode(0o700))?;
             let control = OwnedEntry::capture(&cfg.control_socket)?;
             let helper = OwnedEntry::capture(&cfg.signer_helper_uds_path)?;
-            ensure!(
-                signer.try_wait()?.is_none(),
-                "original signer exited before owned readiness"
-            );
+            signer_current(
+                &original_exit,
+                daemon
+                    .owned_admission
+                    .as_deref()
+                    .context("owned I/O admission absent")?,
+            )?;
             let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
             let flags = rustix::fs::fcntl_getfl(&fd)?;
             rustix::fs::fcntl_setfl(&fd, flags | OFlags::NONBLOCK)?;
             // SAFETY: AsyncFd owns this exclusive duplicate until its drop;
             // OwnedFd keeps one stable live descriptor for that whole interval.
             let owner = unsafe { tokio::io::unix::AsyncFd::register(fd) }?;
-            let ready =
-                serde_json::to_vec(&serde_json::json!({"nonce":nonce,"pid":std::process::id()}))?;
+            #[cfg(target_os = "macos")]
+            {
+                let reader = signer
+                    .stdout
+                    .as_ref()
+                    .context("original signer liveness pipe absent")?;
+                mvm_vmm::host::owned_liveness::require_live_read_pipe(reader)?;
+            }
+            let ready = serde_json::json!({
+                "nonce":nonce,"pid":std::process::id(),"signer_pid":signer_pid
+            });
+            #[cfg(target_os = "macos")]
+            let ready = {
+                let mut ready = ready;
+                ready["liveness"] = serde_json::Value::String("pipe_v1".into());
+                ready
+            };
+            let ready = serde_json::to_vec(&ready)?;
             ensure!(ready.len() <= 256, "owned ready limit");
             let mut stdout = std::io::stdout().lock();
             stdout.write_all(&u32::try_from(ready.len())?.to_be_bytes())?;
             stdout.write_all(&ready)?;
             stdout.flush()?;
-            Ok((daemon, listener, control, helper, owner))
+            Ok((
+                daemon,
+                listener,
+                control,
+                helper,
+                owner,
+                original_exit,
+                signer_event,
+            ))
         })();
         match setup {
-            Ok((mut daemon, listener, mut control, mut helper, owner)) => {
-                let serving = daemon.serve_owned_control(listener, &owner).await;
+            Ok((
+                mut daemon,
+                listener,
+                mut control,
+                mut helper,
+                owner,
+                original_exit,
+                signer_event,
+            )) => {
+                let serving = daemon
+                    .serve_owned_control(listener, &owner, &signer, &original_exit, &signer_event)
+                    .await;
                 let closed = daemon.close_owned().await;
                 daemon
                     .owned_admission
                     .as_ref()
                     .context("owned I/O admission absent")?
                     .fence();
+                if let Err(error) = closed {
+                    quarantine_signer(OwnedSignerQuarantine {
+                        _daemon: daemon,
+                        _signer: signer,
+                        _control: control,
+                        _helper: helper,
+                        _parent: owner,
+                        _exit: original_exit,
+                        _event: signer_event,
+                    });
+                    return Err(error)
+                        .context("owned handler join failed; original signer retained");
+                }
                 let stopped = stop_signer(&mut signer).await;
-                serving.and(closed).and(stopped)?;
+                serving.and(stopped)?;
                 daemon.remove_owned_journal()?;
                 control.remove()?;
                 helper.remove()?;
@@ -338,6 +533,9 @@ impl HostAgentDaemon {
         &mut self,
         listener: crate::owned_resources::registered::RegisteredListener,
         owner: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+        signer: &tokio::process::Child,
+        original_exit: &ProcessExitObserver,
+        signer_event: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
     ) -> Result<()> {
         let workspaces =
             crate::owned_resources::WorkspacePool::new(crate::owned_resources::CONTROL_WORKSPACES)?;
@@ -346,14 +544,25 @@ impl HostAgentDaemon {
             .clone()
             .context("owned I/O admission absent")?;
         loop {
+            signer_current(original_exit, &admission)?;
             let mut stream = tokio::select! {
+                biased;
                 _ = admission.closed() => bail!("owned I/O admission fenced"),
+                event = signer_event.readable() => {
+                    admission.fence();
+                    let _ready = event.context("original signer exit event")?;
+                    bail!("original signer exited unexpectedly");
+                }
                 closed = owner_closed(owner) => { closed?; return Ok(()); }
                 accepted = listener.accept() => accepted.context("owned control accept")?,
             };
-            let _workspace = workspaces.acquire().await?;
-            let signed = tokio::time::timeout(
-                Duration::from_secs(1),
+            // One server-local request deadline covers the response AND the
+            // capability. The parent's own original deadline is not refreshed
+            // or serialized into this unchanged canonical control frame.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let _workspace = tokio::time::timeout_at(deadline, workspaces.acquire()).await??;
+            let signed = tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(1)),
                 crate::framing::read_json_frame_checked::<_, SignedControl>(
                     &mut stream,
                     CONTROL_MAX_FRAME_BYTES,
@@ -361,22 +570,37 @@ impl HostAgentDaemon {
                 ),
             )
             .await;
+            let mut capability = None;
             let response = match signed {
                 Ok(Ok(signed)) => match broker_control::verify(&signed, &self.verifying_key) {
-                    Ok(request) => match self.apply_owned(request).await {
-                        Ok(()) => ControlResponse::Ok,
-                        Err(error) => ControlResponse::Err {
-                            message: error.to_string(),
-                        },
-                    },
+                    Ok(request) => {
+                        signer_current(original_exit, &admission)?;
+                        let prepared = if matches!(request, ControlRequest::Register(_)) {
+                            Some(fresh_signer_capability(signer, original_exit, &admission)?)
+                        } else {
+                            None
+                        };
+                        if tokio::time::Instant::now() >= deadline {
+                            continue;
+                        }
+                        match self.apply_owned(request).await {
+                            Ok(()) => {
+                                capability = prepared;
+                                ControlResponse::Ok
+                            }
+                            Err(error) => ControlResponse::Err {
+                                message: error.to_string(),
+                            },
+                        }
+                    }
                     Err(_) => ControlResponse::Err {
                         message: "control signature rejected".into(),
                     },
                 },
                 Ok(Err(_)) | Err(_) => continue,
             };
-            let _ = tokio::time::timeout(
-                Duration::from_secs(1),
+            let written = tokio::time::timeout_at(
+                deadline,
                 crate::framing::write_json_frame_bounded(
                     &mut stream,
                     &response,
@@ -384,6 +608,19 @@ impl HostAgentDaemon {
                 ),
             )
             .await;
+            if matches!(written, Ok(Ok(())))
+                && let Some(capability) = capability
+            {
+                signer_current(original_exit, &admission)?;
+                signer_capability_current(&capability, &admission)?;
+                let descriptor = capability.descriptor()?;
+                // An ordinary peer/deadline failure after Ok does not remove an
+                // accepted registration. Its parent keeps the uncertain serial
+                // and may explicitly Deregister using the same original owner.
+                let _ = stream
+                    .send_one_fd_until(capability.tag(), descriptor, deadline)
+                    .await;
+            }
         }
     }
 

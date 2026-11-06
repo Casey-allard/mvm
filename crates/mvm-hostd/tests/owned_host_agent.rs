@@ -536,3 +536,54 @@ fn installed_runtime_broker_uses_the_original_registrar_even_without_services() 
     replacement.shutdown().unwrap();
     agent.shutdown().unwrap();
 }
+
+#[test]
+fn original_registered_audit_event_is_claimed_once_and_pins_cleanup() {
+    let fixture = Fixture::new();
+    let mut agent = OwnedHostAgent::spawn(fixture.inputs()).unwrap();
+    let registrar = agent.registrar();
+    let (state, socket) = fixture.vm("vm-1");
+    let mut registration = register(&registrar, "vm-1", &state, &socket).unwrap();
+    let audit = [ServiceId::parse("host.audit.v1").unwrap()];
+    let params = || HostAgentServicesParams {
+        workload_id: "vm-1",
+        tenant_id: Some("local"),
+        vm_name: "vm-1",
+        state_dir: &state,
+        broker_listen_socket: &socket,
+        services: &audit,
+        capability_bindings: &[],
+        service_proxies: &[],
+    };
+
+    let mut changed = params();
+    changed.workload_id = "foreign";
+    assert!(
+        registration
+            .prepare_endpoint_audit(&registrar, &changed)
+            .is_err()
+    );
+
+    let capability = registration
+        .prepare_endpoint_audit(&registrar, &params())
+        .unwrap();
+    capability.check_current().unwrap();
+    assert_eq!(capability.vm(), "vm-1");
+    assert_eq!(capability.tenant(), "local");
+    assert_eq!(
+        capability.socket(),
+        config::host_agent_signer_helper_socket("local")
+    );
+    assert!(capability.signer_pid() > 1);
+    assert!(
+        registration
+            .prepare_endpoint_audit(&registrar, &params())
+            .is_err()
+    );
+
+    assert!(registration.shutdown().is_err());
+    capability.check_current().unwrap();
+    drop(capability);
+    registration.shutdown().unwrap();
+    agent.shutdown().unwrap();
+}

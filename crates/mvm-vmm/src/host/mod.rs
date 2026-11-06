@@ -32,6 +32,8 @@ pub mod late_volumes;
 pub mod linux_env;
 pub mod network_endpoint_spawn;
 pub mod observability_target;
+#[cfg(target_os = "macos")]
+pub mod owned_liveness;
 pub mod process_exit;
 pub mod process_identity;
 pub mod process_liveness;

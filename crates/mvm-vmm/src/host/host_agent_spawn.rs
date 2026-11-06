@@ -35,7 +35,7 @@ use crate::host::broker_services_spawn::{
 mod owned;
 pub use owned::{
     HostAgentParentPermit, OwnedHostAgent, OwnedHostAgentInputs, OwnedHostAgentRegistrar,
-    OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration,
+    OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration, PreparedEndpointAudit,
     owned_host_agent_service, validate_owned_host_agent_services,
 };
 

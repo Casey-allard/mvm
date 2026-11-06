@@ -18,6 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use zeroize::Zeroizing;
 
+mod audit_capability;
+use audit_capability::receive_signer_event;
+use audit_capability::require_live_event;
+
 /// Trusted installed DI retaining the actual aggregate helper reservation.
 pub trait HostAgentParentPermit: Send + Sync {
     fn check_current(&self, tenant: &str) -> Result<()>;
@@ -96,10 +100,14 @@ struct Process {
     child: Child,
     owner: Option<ChildStdin>,
     status: Option<std::process::ExitStatus>,
+    signer_pid: Option<u32>,
+    #[cfg(target_os = "macos")]
+    liveness: Option<std::os::fd::OwnedFd>,
 }
 struct Shared {
     tenant: String,
-    socket: PathBuf,
+    control_socket: PathBuf,
+    signer_socket: PathBuf,
     key: Zeroizing<[u8; 32]>,
     parent: Arc<dyn HostAgentParentPermit>,
     holder: PreparedHostLifetimeLease,
@@ -127,6 +135,21 @@ impl Shared {
             .process
             .lock()
             .map_err(|_| anyhow::anyhow!("owned child state poisoned"))?;
+        #[cfg(target_os = "macos")]
+        {
+            let current = process
+                .liveness
+                .as_ref()
+                .context("original daemon liveness absent")
+                .and_then(|pipe| {
+                    crate::host::owned_liveness::require_live_read_pipe(pipe).map_err(Into::into)
+                });
+            if let Err(error) = current {
+                drop(process);
+                self.fence();
+                return Err(error);
+            }
+        }
         if process.status.is_none() {
             process.status = process.child.try_wait()?;
         }
@@ -157,6 +180,105 @@ pub struct OwnedVmRegistration {
     serial: u64,
     commitment: [u8; 32],
     retired: bool,
+    audit: Mutex<AuditPreparation>,
+}
+
+#[derive(Default)]
+struct AuditPreparation {
+    signer: Option<std::os::fd::OwnedFd>,
+    claimed: bool,
+    in_use: std::sync::Weak<()>,
+}
+
+/// One-shot original kernel observations bound to this actual registration.
+/// It is not a process-exit receipt, signal capability or independent grant.
+#[must_use]
+pub struct PreparedEndpointAudit {
+    shared: Arc<Shared>,
+    vm: String,
+    serial: u64,
+    signer_pid: u32,
+    signer: std::os::fd::OwnedFd,
+    daemon: std::os::fd::OwnedFd,
+    _registration_pin: Arc<()>,
+}
+impl fmt::Debug for PreparedEndpointAudit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedEndpointAudit { original_registration_bound: true }")
+    }
+}
+
+impl PreparedEndpointAudit {
+    /// Fresh admission observation; no descriptor or owner is exported.
+    pub fn check_current(&self) -> Result<()> {
+        let active = || -> Result<()> {
+            let ledger = self
+                .shared
+                .ledger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("owned registration ledger poisoned"))?;
+            ensure!(
+                !ledger.closed
+                    && !ledger.fenced
+                    && ledger.slots.get(&self.vm).is_some_and(
+                        |slot| slot.serial == self.serial && slot.phase == Phase::Active
+                    ),
+                "original audit registration is not active"
+            );
+            Ok(())
+        };
+        let result = (|| {
+            active()?;
+            self.shared.parent.check_current(&self.shared.tenant)?;
+            self.shared.holder.verify_current()?;
+            require_live_event(&self.signer)?;
+            require_live_event(&self.daemon)?;
+            active()
+        })();
+        if result.is_err() {
+            self.shared.fence();
+        }
+        result
+    }
+
+    pub fn signer_pid(&self) -> u32 {
+        self.signer_pid
+    }
+    pub fn socket(&self) -> &Path {
+        &self.shared.signer_socket
+    }
+    pub fn tenant(&self) -> &str {
+        &self.shared.tenant
+    }
+    pub fn vm(&self) -> &str {
+        &self.vm
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedReady {
+    nonce: [u8; 16],
+    pid: u32,
+    signer_pid: u32,
+    #[cfg(target_os = "macos")]
+    liveness: String,
+}
+impl OwnedReady {
+    fn validate(&self, nonce: [u8; 16], daemon_pid: u32) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        ensure!(
+            self.liveness == "pipe_v1",
+            "original daemon liveness mapping refused"
+        );
+        ensure!(
+            self.nonce == nonce
+                && self.pid == daemon_pid
+                && self.signer_pid > 1
+                && self.signer_pid != daemon_pid,
+            "owned readiness identity mismatch"
+        );
+        Ok(())
+    }
 }
 impl fmt::Debug for OwnedHostAgent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -271,6 +393,7 @@ fn signing_key() -> Result<Zeroizing<[u8; 32]>> {
 
 impl OwnedHostAgent {
     pub fn spawn(inputs: OwnedHostAgentInputs) -> Result<Self> {
+        audit_capability::require_supported_platform()?;
         mvm_core::naming::validate_vm_name(&inputs.tenant)?;
         ensure!(
             mvm_core::config::mvm_home_strict()?.as_os_str().len() <= 4096,
@@ -347,10 +470,12 @@ impl OwnedHostAgent {
         drop(descriptors);
         let owner = child.stdin.take();
         let socket = mvm_core::config::host_agent_control_socket(&inputs.tenant);
+        let signer_socket = mvm_core::config::host_agent_signer_helper_socket(&inputs.tenant);
         let mut agent = Self {
             shared: Arc::new(Shared {
                 tenant: inputs.tenant,
-                socket,
+                control_socket: socket,
+                signer_socket,
                 key,
                 parent: inputs.parent,
                 holder: inputs.holder,
@@ -359,6 +484,9 @@ impl OwnedHostAgent {
                     child,
                     owner,
                     status: None,
+                    signer_pid: None,
+                    #[cfg(target_os = "macos")]
+                    liveness: None,
                 }),
                 ledger: Mutex::new(Ledger::default()),
                 quarantined: AtomicBool::new(false),
@@ -403,28 +531,33 @@ impl OwnedHostAgent {
                     Err(error) => return Err(error).context("owned config pipe"),
                 }
             }
-            let mut header = [0; 4];
-            read_until(&mut stdout, &mut header, deadline)?;
-            let length = usize::try_from(u32::from_be_bytes(header))?;
-            ensure!((1..=256).contains(&length), "owned readiness limit");
-            let mut bytes = vec![0; length];
-            read_until(&mut stdout, &mut bytes, deadline)?;
-            #[derive(serde::Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Ready {
-                nonce: [u8; 16],
-                pid: u32,
-            }
-            let ready: Ready = serde_json::from_slice(&bytes)
+            #[cfg(not(target_os = "macos"))]
+            let bytes = {
+                let mut header = [0; 4];
+                read_until(&mut stdout, &mut header, deadline)?;
+                let length = usize::try_from(u32::from_be_bytes(header))?;
+                ensure!((1..=256).contains(&length), "owned readiness limit");
+                let mut bytes = vec![0; length];
+                read_until(&mut stdout, &mut bytes, deadline)?;
+                bytes
+            };
+            #[cfg(target_os = "macos")]
+            let bytes = crate::host::owned_liveness::read_ready_frame(&mut stdout, deadline)?;
+            let ready: OwnedReady = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("invalid owned readiness"))?;
+            ready.validate(nonce, process.child.id())?;
             ensure!(
-                ready.nonce == nonce
-                    && ready.pid == process.child.id()
-                    && process.child.try_wait()?.is_none(),
+                process.child.try_wait()?.is_none(),
                 "owned readiness identity mismatch"
             );
             self.shared.parent.check_current(&self.shared.tenant)?;
             self.shared.holder.verify_current()?;
+            #[cfg(target_os = "macos")]
+            {
+                crate::host::owned_liveness::require_live_read_pipe(&stdout)?;
+                process.liveness = Some(crate::host::owned_liveness::duplicate_read_pipe(&stdout)?);
+            }
+            process.signer_pid = Some(ready.signer_pid);
             Ok(())
         })();
         process.owner = Some(owner);
@@ -479,6 +612,7 @@ impl Drop for OwnedHostAgent {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_until(
     reader: &mut std::process::ChildStdout,
     mut output: &mut [u8],
@@ -638,10 +772,11 @@ fn owned_control(
     shared: &Shared,
     request: ControlRequest,
     registration: Option<&HostAgentServicesParams<'_>>,
-) -> Result<()> {
+) -> Result<Option<std::os::fd::OwnedFd>> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let signed = broker_control::sign(request, &shared.key)?;
-    let mut stream = crate::host::hvf_control_transport::connect_path(&shared.socket, deadline)?;
+    let mut stream =
+        crate::host::hvf_control_transport::connect_path(&shared.control_socket, deadline)?;
     shared.running()?;
     let child = shared
         .process
@@ -668,7 +803,15 @@ fn owned_control(
         deadline,
         CONTROL_MAX_FRAME_BYTES,
     )? {
-        ControlResponse::Ok => Ok(()),
+        ControlResponse::Ok => {
+            if registration.is_some() {
+                // Register may already have durable effects. Missing or invalid
+                // sideband is uncertainty, never a no-effects/refund disposition.
+                Ok(Some(receive_signer_event(&stream, deadline)?))
+            } else {
+                Ok(None)
+            }
+        }
         ControlResponse::Err { message } => bail!("owned host-agent refused control: {message}"),
     }
 }
@@ -696,6 +839,7 @@ impl OwnedHostAgentRegistrar {
     }
 
     pub fn register(&self, params: HostAgentServicesParams<'_>) -> Result<OwnedVmRegistration> {
+        audit_capability::require_supported_platform()?;
         ensure!(
             params.tenant_id == Some(self.shared.tenant.as_str()),
             "owned registration tenant mismatch"
@@ -750,13 +894,23 @@ impl OwnedHostAgentRegistrar {
             serial,
             commitment,
             retired: false,
+            audit: Mutex::new(AuditPreparation::default()),
         };
         let result = owned_control(
             &self.shared,
             ControlRequest::Register(Box::new(request)),
             Some(&params),
         )
-        .and_then(|()| self.shared.running())
+        .and_then(|event| {
+            let event = event.context("original signer event missing")?;
+            require_live_event(&event)?;
+            guard
+                .audit
+                .lock()
+                .map_err(|_| anyhow::anyhow!("audit preparation poisoned"))?
+                .signer = Some(event);
+            self.shared.running()
+        })
         .and_then(|()| self.shared.parent.check_registration(&params))
         .and_then(|()| self.shared.holder.verify_current());
         let mut ledger = self
@@ -796,9 +950,82 @@ impl OwnedHostAgentRegistrar {
     }
 }
 impl OwnedVmRegistration {
-    /// Observe the same original active registration before installed work.
-    /// This sends no request and reserves no future admission.
-    pub(crate) fn check_current_for(
+    /// Burn this registration's single endpoint handoff before preparing any
+    /// observer. Failure or Drop never permits a second independent claim.
+    pub fn prepare_endpoint_audit(
+        &self,
+        original: &OwnedHostAgentRegistrar,
+        params: &HostAgentServicesParams<'_>,
+    ) -> Result<PreparedEndpointAudit> {
+        self.check_current_for(original, params)?;
+        let (signer, registration_pin) = {
+            let mut audit = self
+                .audit
+                .lock()
+                .map_err(|_| anyhow::anyhow!("audit preparation poisoned"))?;
+            ensure!(!audit.claimed, "original endpoint audit already claimed");
+            audit.claimed = true;
+            let signer = audit
+                .signer
+                .take()
+                .context("original signer event unavailable")?;
+            let pin = Arc::new(());
+            audit.in_use = Arc::downgrade(&pin);
+            (signer, pin)
+        };
+        let (daemon, signer_pid) = {
+            // The actual Child remains unreaped under this same process
+            // mutex while the new independent observer is armed.
+            require_owned_child_custody()?;
+            let process = self
+                .shared
+                .process
+                .lock()
+                .map_err(|_| anyhow::anyhow!("owned child state poisoned"))?;
+            ensure!(
+                process.status.is_none(),
+                "original daemon already collected"
+            );
+            #[cfg(not(target_os = "macos"))]
+            let daemon = {
+                let observer = ProcessExitObserver::arm(i32::try_from(process.child.id())?)?;
+                let event = observer
+                    .event_fd()
+                    .context("original daemon already exited")?;
+                require_live_event(event)?;
+                rustix::io::fcntl_dupfd_cloexec(event, 3)?
+            };
+            #[cfg(target_os = "macos")]
+            let daemon = {
+                let reader = process
+                    .liveness
+                    .as_ref()
+                    .context("original daemon liveness absent")?;
+                crate::host::owned_liveness::require_live_read_pipe(reader)?;
+                crate::host::owned_liveness::duplicate_read_pipe(reader)?
+            };
+            (
+                daemon,
+                process
+                    .signer_pid
+                    .context("original signer readiness missing")?,
+            )
+        };
+        self.check_current_for(original, params)?;
+        let prepared = PreparedEndpointAudit {
+            shared: self.shared.clone(),
+            vm: self.vm.clone(),
+            serial: self.serial,
+            signer_pid,
+            signer,
+            daemon,
+            _registration_pin: registration_pin,
+        };
+        prepared.check_current()?;
+        Ok(prepared)
+    }
+
+    pub fn check_current_for(
         &self,
         original: &OwnedHostAgentRegistrar,
         params: &HostAgentServicesParams<'_>,
@@ -863,6 +1090,16 @@ impl OwnedVmRegistration {
             return Ok(());
         }
         {
+            // Serialize the no-live-endpoint check with token preparation;
+            // no transport or parent I/O occurs under either short mutex.
+            let audit = self
+                .audit
+                .lock()
+                .map_err(|_| anyhow::anyhow!("audit preparation poisoned"))?;
+            ensure!(
+                audit.in_use.upgrade().is_none(),
+                "original audit endpoint still live"
+            );
             let mut ledger = self
                 .shared
                 .ledger
@@ -889,6 +1126,7 @@ impl OwnedVmRegistration {
                     }),
                     None,
                 )
+                .map(|_| ())
             })
             .and_then(|()| self.shared.running());
         let mut ledger = self
@@ -913,6 +1151,15 @@ impl OwnedVmRegistration {
         }
         ledger.slots.remove(&self.vm);
         self.retired = true;
+        drop(ledger);
+        // A retained, already-retired guard must not retain an unused signer
+        // observation across later registrations. Recover poison only to close
+        // this owned fd after positive signed cleanup; never reopen admission.
+        self.audit
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .signer
+            .take();
         Ok(())
     }
 }
@@ -921,5 +1168,34 @@ impl Drop for OwnedVmRegistration {
         if !self.retired && self.shutdown().is_err() {
             self.shared.quarantine();
         }
+    }
+}
+
+#[cfg(test)]
+mod ready_tests {
+    use super::OwnedReady;
+
+    #[test]
+    fn owned_ready_rejects_foreign_nonce_daemon_and_invalid_signer_metadata() {
+        let mut ready = OwnedReady {
+            nonce: [7; 16],
+            pid: 41,
+            signer_pid: 42,
+            #[cfg(target_os = "macos")]
+            liveness: "pipe_v1".into(),
+        };
+        ready.validate([7; 16], 41).unwrap();
+        assert!(ready.validate([8; 16], 41).is_err());
+        assert!(ready.validate([7; 16], 43).is_err());
+        for signer in [0, 1, 41] {
+            ready.signer_pid = signer;
+            assert!(ready.validate([7; 16], 41).is_err());
+        }
+        assert!(
+            serde_json::from_str::<OwnedReady>(
+                r#"{"nonce":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"pid":41}"#
+            )
+            .is_err()
+        );
     }
 }
