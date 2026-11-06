@@ -322,6 +322,7 @@ fn pipe_exchange(mode: &str) {
             holder: holder.as_raw_fd(),
             expected,
             config: serde_json::json!({"fixture":true}),
+            telemetry_records: None,
         },
         CONFIG_LIMIT,
         deadline,
