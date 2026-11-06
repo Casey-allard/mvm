@@ -108,6 +108,7 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         "collector" | "records-original"
             | "records-alias"
             | "records-inspect"
+            | "records-partial"
             | "audit-original"
             | "audit-foreign"
     )
@@ -290,6 +291,11 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
             "original private challenge differs"
         );
         drop(input);
+        if mode == "records-partial" {
+            let mut byte = [0];
+            anyhow::ensure!(output.read(&mut byte).await? == 0, "partial records published Drained");
+            return Ok(());
+        }
         let drained: Value = read_json_frame(&mut output, 1024).await?;
         anyhow::ensure!(
             drained["nonce"] == challenge["nonce"],

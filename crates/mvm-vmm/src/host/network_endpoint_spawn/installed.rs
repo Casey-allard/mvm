@@ -541,6 +541,7 @@ struct ChildAuthority {
     parent: ProcessExitObserver,
     projection: EndpointPartitionProjection,
     fenced: AtomicBool,
+    cleanup_failed: AtomicBool,
     pool_claimed: AtomicBool,
     audit: Option<audit::ChildAudit>,
     guest: Mutex<GuestTransport>,
@@ -608,6 +609,10 @@ impl InstalledEndpointLease {
         if let Some(original) = original {
             let _ = original.shutdown(std::net::Shutdown::Both);
         }
+    }
+    fn fail_cleanup(&self) {
+        self.authority.cleanup_failed.store(true, Ordering::Release);
+        self.fence();
     }
     pub(super) fn same_authority(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.authority, &other.authority)
@@ -783,6 +788,7 @@ impl InstalledEndpointChild {
                 parent,
                 projection: prepared.projection,
                 fenced: AtomicBool::new(false),
+                cleanup_failed: AtomicBool::new(false),
                 pool_claimed: AtomicBool::new(false),
                 audit,
                 guest: Mutex::new(GuestTransport::default()),
@@ -898,6 +904,9 @@ impl InstalledEndpointChild {
     pub fn send_drained(&mut self, deadline: Instant) -> Result<()> {
         if self.phase != 1 || !self.parent_closed()? {
             bail!("installed endpoint drain phase differs")
+        }
+        if self.lease.authority.cleanup_failed.load(Ordering::Acquire) {
+            bail!("installed endpoint cleanup is unverified")
         }
         self.lease.authority.fenced.store(true, Ordering::Release);
         let session = self.projection().session;

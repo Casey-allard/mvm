@@ -19,6 +19,23 @@ fn resources_fixture_child() {
     // SAFETY: only the original fixture's pre_exec reserved protocol fd199.
     assert!(unsafe { libc::dup2(199, 1) } >= 0);
     let mut child = InstalledEndpointChild::from_stdio().unwrap();
+    if mode == "records-partial" {
+        use std::io::Write as _;
+        let mut records = child.take_telemetry_records().unwrap().unwrap();
+        child.take_config().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        child.send_ready(Default::default(), deadline).unwrap();
+        while !child.parent_closed().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let offset = records.current_len().unwrap();
+        // Simulate bytes already landed when the queued append failed after EOF.
+        records.write_all(b"{").unwrap();
+        assert!(records.rollback_to(offset).is_err());
+        assert!(child.send_drained(deadline).is_err());
+        std::process::exit(0);
+    }
     if mode != "collector" {
         let records = child.take_telemetry_records().unwrap();
         if mode == "records-inspect" {
@@ -294,4 +311,9 @@ async fn canonical_endpoint_binary_refuses_audit_for_a_foreign_vm() {
         Some(env!("CARGO_BIN_EXE_mvm-network-endpoint")),
     )
     .await;
+}
+
+#[tokio::test]
+async fn uncertain_records_append_after_eof_refuses_drained() {
+    resource_exchange("records-partial").await;
 }

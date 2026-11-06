@@ -170,7 +170,7 @@ impl InstalledTelemetryRecords {
         if self.current_len().is_ok_and(|current| current == length) {
             Ok(())
         } else {
-            self.lease.fence();
+            self.lease.fail_cleanup();
             Err(std::io::Error::other("installed records append left unverified bytes"))
         }
     }
