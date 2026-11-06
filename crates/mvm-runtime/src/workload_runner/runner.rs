@@ -538,6 +538,10 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         #[cfg(unix)]
         if inputs.config.host_lifetime.is_some() {
             anyhow::ensure!(
+                self.driver.supports_host_lifetime(),
+                "installed native backend unavailable"
+            );
+            anyhow::ensure!(
                 inputs.network_policy == &inputs.config.network_policy,
                 "installed endpoint policy differs from launch configuration"
             );

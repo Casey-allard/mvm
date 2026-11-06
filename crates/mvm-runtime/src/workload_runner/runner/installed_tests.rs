@@ -438,3 +438,25 @@ fn installed_pre_dispatch_failure_retains_and_retires_endpoint() {
     assert_eq!(retirement.binding(), anchor.binding());
     assert!(runner.take_owned_retirement(&id, &anchor).is_err());
 }
+
+#[test]
+fn unsupported_native_driver_refuses_before_reserving_installed_custody() {
+    let (_env, _root, driver, config, _anchor) = fixture();
+    let runner = WorkloadRunner::new(driver.inner, NoEndpoint, NoBroker);
+    let id = VmId(config.name.clone());
+    mvm_core::config::create_private_dir(&vm_state_dir(&config.name)).unwrap();
+    let redaction = RedactionPolicy::default();
+    let inputs = WorkloadLaunchInputs {
+        config: &config,
+        tenant: "local",
+        secrets: &[],
+        redaction: &redaction,
+        network_policy: &config.network_policy,
+        cmdline: "console=ttyS0".into(),
+    };
+
+    let refused = runner.start_workload(&inputs).err().expect("unsupported native backend");
+    assert!(refused.to_string().contains("installed native backend unavailable"), "{refused:#}");
+    assert!(!installed::marker(&id).exists());
+    assert!(runner.installed.find(&id).unwrap().is_none());
+}
