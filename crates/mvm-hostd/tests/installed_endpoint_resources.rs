@@ -19,6 +19,13 @@ fn resources_fixture_child() {
     // SAFETY: only the original fixture's pre_exec reserved protocol fd199.
     assert!(unsafe { libc::dup2(199, 1) } >= 0);
     let mut child = InstalledEndpointChild::from_stdio().unwrap();
+    let records = child.take_telemetry_records().unwrap();
+    if mode == "records-inspect" {
+        assert_eq!(records.unwrap().current_len().unwrap(), 0);
+    } else {
+        assert!(records.is_none());
+    }
+    assert!(child.take_telemetry_records().is_err());
     let resources =
         mvm_hostd::installed_endpoint::InstalledEndpointResources::from_child(&mut child);
     if mode == "foreign-session" || mode == "replaced-store" {
@@ -238,4 +245,29 @@ async fn canonical_endpoint_binary_refuses_mixed_installed_and_probe_arguments()
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("invalid installed endpoint arguments")
     );
+}
+
+#[tokio::test]
+async fn canonical_endpoint_binary_adopts_original_records_prepare() {
+    installed_resource_fixture::exchange_with_program(
+        "records-original",
+        &[],
+        Some(env!("CARGO_BIN_EXE_mvm-network-endpoint")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn canonical_endpoint_binary_refuses_records_aliasing_holder() {
+    installed_resource_fixture::exchange_with_program(
+        "records-alias",
+        &[],
+        Some(env!("CARGO_BIN_EXE_mvm-network-endpoint")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn installed_records_writer_can_be_taken_only_once() {
+    resource_exchange("records-inspect").await;
 }

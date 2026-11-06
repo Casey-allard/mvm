@@ -25,6 +25,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+mod records;
+pub use records::InstalledTelemetryRecords;
+
 const CONFIG_LIMIT: usize = 65_536;
 const CONTROL_LIMIT: usize = 1024;
 const STARTUP_LIMIT: Duration = Duration::from_secs(10);
@@ -92,6 +95,8 @@ struct Prepare {
     holder: i32,
     expected: HostLeaseExpectation,
     config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    telemetry_records: Option<records::RecordsProjection>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,6 +242,7 @@ pub fn spawn_network_endpoint_installed(
                 holder: installed.handoff.holder().holder().as_raw_fd(),
                 expected: installed.handoff.holder().expectation().clone(),
                 config,
+                telemetry_records: None,
             },
             CONFIG_LIMIT,
             deadline,
@@ -362,6 +368,7 @@ pub struct InstalledEndpointChild {
     lease: InstalledEndpointLease,
     output: File,
     config: Option<serde_json::Value>,
+    records: Option<Option<InstalledTelemetryRecords>>,
     nonce: [u8; 32],
     phase: u8,
     startup_deadline: Instant,
@@ -378,8 +385,8 @@ impl InstalledEndpointChild {
                 bail!("installed endpoint requires original anonymous pipe stdio")
             }
         }
-        let mut input = duplicate_stdio(libc::STDIN_FILENO)?;
-        let mut output = duplicate_stdio(libc::STDOUT_FILENO)?;
+        let mut input = duplicate_descriptor(libc::STDIN_FILENO)?;
+        let mut output = duplicate_descriptor(libc::STDOUT_FILENO)?;
         // SAFETY: getppid returns the current kernel parent, never an argv PID.
         let pid = unsafe { libc::getppid() };
         if pid <= 1 {
@@ -407,19 +414,40 @@ impl InstalledEndpointChild {
             prepared.holder,
             input.as_raw_fd(),
             output.as_raw_fd(),
+            parent
+                .event_fd()
+                .context("installed original parent event missing")?
+                .as_raw_fd(),
         ];
-        let mut identities = std::collections::BTreeSet::new();
-        for (index, fd) in descriptors.into_iter().enumerate() {
+        let records_descriptor = prepared
+            .telemetry_records
+            .as_ref()
+            .map(records::RecordsProjection::descriptor);
+        let mut raw_namespace = std::collections::BTreeSet::new();
+        let mut object_namespace = std::collections::BTreeSet::new();
+        for fd in descriptors.into_iter().chain(records_descriptor) {
             let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: no descriptor conversion precedes this complete alias check.
+            // SAFETY: raw metadata query only, before any inherited fd is adopted.
             if fd <= 2
+                || !raw_namespace.insert(fd)
                 || unsafe { libc::fstat(fd, &mut metadata) } != 0
-                || !identities.insert((metadata.st_dev, metadata.st_ino))
-                || (index == 0 && metadata.st_mode & libc::S_IFMT != libc::S_IFDIR)
-                || (index == 1 && metadata.st_mode & libc::S_IFMT != libc::S_IFREG)
+                || !object_namespace.insert((metadata.st_dev, metadata.st_ino))
+                || (fd == prepared.directory && metadata.st_mode & libc::S_IFMT != libc::S_IFDIR)
+                || (fd == prepared.holder && metadata.st_mode & libc::S_IFMT != libc::S_IFREG)
             {
-                bail!("installed endpoint descriptor namespace differs")
+                bail!("installed endpoint complete descriptor namespace differs")
             }
+        }
+        if let Some(records) = &prepared.telemetry_records {
+            // Verify the original holder on temporary duplicates before any
+            // writer can be claimed. These dup handles never unlock its file.
+            let verified = PreparedHostLifetimeLease::bind(
+                duplicate_descriptor(prepared.directory)?,
+                duplicate_descriptor(prepared.holder)?,
+                prepared.expected.clone(),
+            )?;
+            verified.verify_current()?;
+            records.preflight(&descriptors)?;
         }
         // SAFETY: the complete preflight established distinct original inherited
         // files, and each number is adopted exactly once by this private startup.
@@ -428,19 +456,30 @@ impl InstalledEndpointChild {
         let holder = unsafe { File::from_raw_fd(prepared.holder) };
         let holder = PreparedHostLifetimeLease::bind(directory, holder, prepared.expected)?;
         holder.verify_current()?;
+        let lease = InstalledEndpointLease {
+            authority: Arc::new(ChildAuthority {
+                input,
+                holder,
+                parent,
+                projection: prepared.projection,
+                fenced: AtomicBool::new(false),
+                pool_claimed: AtomicBool::new(false),
+            }),
+        };
+        let records = prepared
+            .telemetry_records
+            .map(|projection| {
+                // SAFETY: complete borrowed preflight validated a distinct
+                // inherited writer whose ownership is transferred here once.
+                let file = unsafe { File::from_raw_fd(projection.descriptor()) };
+                projection.adopt(file, lease.clone())
+            })
+            .transpose()?;
         Ok(Self {
-            lease: InstalledEndpointLease {
-                authority: Arc::new(ChildAuthority {
-                    input,
-                    holder,
-                    parent,
-                    projection: prepared.projection,
-                    fenced: AtomicBool::new(false),
-                    pool_claimed: AtomicBool::new(false),
-                }),
-            },
+            lease,
             output,
             config: Some(prepared.config),
+            records: Some(records),
             nonce,
             phase: 0,
             startup_deadline: deadline,
@@ -448,6 +487,16 @@ impl InstalledEndpointChild {
     }
     pub fn lease(&self) -> InstalledEndpointLease {
         self.lease.clone()
+    }
+    /// Claim the original records writer once, including an absent mapping.
+    pub fn take_telemetry_records(&mut self) -> Result<Option<InstalledTelemetryRecords>> {
+        self.check_parent()?;
+        let records = self
+            .records
+            .take()
+            .context("installed records already consumed")?;
+        self.check_parent()?;
+        Ok(records)
     }
     pub fn projection(&self) -> &EndpointPartitionProjection {
         self.lease.projection()
@@ -547,11 +596,11 @@ fn parent_closed(input: &File) -> Result<bool> {
     }
     Ok(result > 0) // EOF, unexpected extra bytes or invalid/hung-up pipe all fence.
 }
-fn duplicate_stdio(raw: i32) -> Result<File> {
-    // SAFETY: fixed stdio is duplicated into an original owned CLOEXEC file.
+fn duplicate_descriptor(raw: i32) -> Result<File> {
+    // SAFETY: fcntl duplicates a descriptor and returns a new CLOEXEC owner.
     let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("duplicate installed stdio");
+        return Err(std::io::Error::last_os_error()).context("duplicate installed descriptor");
     }
     // SAFETY: fcntl returned this new owned descriptor, used without buffering.
     Ok(unsafe { File::from_raw_fd(fd) })

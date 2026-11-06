@@ -64,7 +64,7 @@ use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -448,7 +448,7 @@ fn host_dir_facts(dir: &File) -> io::Result<DirFacts> {
     }
     Ok(DirFacts {
         local: st.f_flags & libc::MNT_LOCAL as u32 != 0,
-        acl_grants_access: macos_acl::grants_access(dir)?,
+        acl_grants_access: fd_acl_grants_access(dir.as_fd())?,
     })
 }
 
@@ -469,18 +469,34 @@ fn host_dir_facts(dir: &File) -> io::Result<DirFacts> {
     // `f_type` is a signed long on glibc and unsigned on musl; every magic
     // number in the list is positive either way.
     let local = linux_fs_is_local(st.f_type as u64);
+    Ok(DirFacts {
+        local,
+        acl_grants_access: fd_acl_grants_access(dir.as_fd())?,
+    })
+}
+
+/// Read the SAME platform ACL facts for a borrowed original file. This is
+/// validation only; it grants no descriptor, repairs nothing and changes none
+/// of the restore-directory refusal/fallback semantics.
+#[cfg(target_os = "macos")]
+pub(crate) fn fd_acl_grants_access(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    macos_acl::grants_access(fd)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn fd_acl_grants_access(fd: BorrowedFd<'_>) -> io::Result<bool> {
     const ACL_XATTR: &[u8] = b"system.posix_acl_access\0";
-    // SAFETY: `dir` is an open descriptor, the name is NUL-terminated, and a
+    // SAFETY: `fd` is an open descriptor, the name is NUL-terminated, and a
     // zero-sized query writes nothing.
     let size = unsafe {
         libc::fgetxattr(
-            dir.as_raw_fd(),
+            fd.as_raw_fd(),
             ACL_XATTR.as_ptr().cast(),
             std::ptr::null_mut(),
             0,
         )
     };
-    let acl_grants_access = if size >= 0 {
+    Ok(if size >= 0 {
         true
     } else {
         let error = io::Error::last_os_error();
@@ -488,10 +504,6 @@ fn host_dir_facts(dir: &File) -> io::Result<DirFacts> {
             Some(libc::ENODATA) | Some(libc::ENOTSUP) => false,
             _ => return Err(error),
         }
-    };
-    Ok(DirFacts {
-        local,
-        acl_grants_access,
     })
 }
 
@@ -516,9 +528,8 @@ fn linux_fs_is_local(magic: u64) -> bool {
 #[cfg(target_os = "macos")]
 mod macos_acl {
     use std::ffi::c_void;
-    use std::fs::File;
     use std::io;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, BorrowedFd};
 
     const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
     const ACL_FIRST_ENTRY: libc::c_int = 0;
@@ -541,7 +552,7 @@ mod macos_acl {
     /// A deny entry can only take access away, so an ACL made only of those
     /// (the kind macOS puts on a home directory) is harmless; any other entry
     /// may grant access the mode bits do not show.
-    pub(super) fn grants_access(file: &File) -> io::Result<bool> {
+    pub(super) fn grants_access(file: BorrowedFd<'_>) -> io::Result<bool> {
         // SAFETY: `file` is an open descriptor; a null result means no ACL
         // (errno ENOENT) or a failure.
         let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };

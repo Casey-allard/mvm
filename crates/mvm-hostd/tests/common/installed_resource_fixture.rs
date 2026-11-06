@@ -98,6 +98,34 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
             std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
+    let records = matches!(
+        mode,
+        "records-original" | "records-alias" | "records-inspect"
+    )
+    .then(|| {
+        let name = mvm_vmm::host::telemetry_provisioning::TELEMETRY_RECORDS_FILE;
+        let records = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.path().join(name))
+            .unwrap();
+        let state = directory.metadata().unwrap();
+        let metadata = records.metadata().unwrap();
+        let descriptor = if mode == "records-alias" {
+            holder.as_raw_fd()
+        } else {
+            records.as_raw_fd()
+        };
+        let projection = json!({
+            "version":1, "descriptor":descriptor,
+            "state_path":root.path().canonicalize().unwrap(),
+            "state_device":state.dev(), "state_inode":state.ino(),
+            "device":metadata.dev(), "inode":metadata.ino()
+        });
+        (records, projection)
+    });
     let mut command = if let Some(endpoint) = endpoint {
         let mut command = tokio::process::Command::new(endpoint);
         command.arg("--installed-partition");
@@ -112,10 +140,11 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    mvm_vmm::host::restore_image::inherit_descriptors(
-        command.as_std_mut(),
-        vec![directory.as_raw_fd(), holder.as_raw_fd()],
-    );
+    let mut descriptors = vec![directory.as_raw_fd(), holder.as_raw_fd()];
+    if let Some((file, _)) = records.as_ref() {
+        descriptors.push(file.as_raw_fd());
+    }
+    mvm_vmm::host::restore_image::inherit_descriptors(command.as_std_mut(), descriptors);
     if endpoint.is_none() {
         // SAFETY: descriptor-only operations in the fixture's owned child.
         unsafe {
@@ -135,6 +164,7 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         mode,
         "foreign-session" | "replaced-store" | "restored-store"
     );
+    let aliases_original = mode == "records-alias";
     let mode = mode.to_owned();
     let exchange = async move {
         let challenge: Value = read_json_frame(&mut output, 1024).await?;
@@ -188,14 +218,13 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
             state_sha256: Sha256::digest(b"a").into(),
             absent_names: [".state.intent".into(), ".state.next".into()],
         };
-        write_json_frame_bounded(
-            &mut input,
-            &json!({"version":1,"nonce":challenge["nonce"],
+        let mut prepare = json!({"version":1,"nonce":challenge["nonce"],
             "projection":projection,"directory":directory.as_raw_fd(),"holder":holder.as_raw_fd(),
-            "expected":expected,"config":config}),
-            65536,
-        )
-        .await?;
+            "expected":expected,"config":config});
+        if let Some((_, records)) = records.as_ref() {
+            prepare["telemetry_records"] = records.clone();
+        }
+        write_json_frame_bounded(&mut input, &prepare, 65536).await?;
         if endpoint.is_some() {
             let mut first_byte = [0];
             anyhow::ensure!(
@@ -252,9 +281,14 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
     let diagnostics = String::from_utf8_lossy(&diagnostics);
     if endpoint.is_some() {
         assert!(!status.success());
+        let expected = if aliases_original {
+            "installed endpoint handshake failed"
+        } else {
+            "installed endpoint controller unavailable"
+        };
         assert!(
-            diagnostics.contains("installed endpoint controller unavailable"),
-            "original resources were not adopted: {diagnostics}"
+            diagnostics.contains(expected),
+            "unexpected original resource result: {diagnostics}"
         );
     } else {
         assert!(status.success(), "child diagnostics: {diagnostics}");

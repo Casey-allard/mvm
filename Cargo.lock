@@ -4339,6 +4339,7 @@ dependencies = [
  "mvm-net",
  "plist",
  "rand",
+ "rustix",
  "security-framework",
  "serde",
  "serde_json",
