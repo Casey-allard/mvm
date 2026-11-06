@@ -140,7 +140,9 @@ impl BrokerRegistrar for NoBroker {
     }
 }
 
-fn fixture() -> (
+fn fixture(
+    portable: bool,
+) -> (
     mvm_core::util::test_env::TestEnv,
     tempfile::TempDir,
     NativeDriver,
@@ -217,6 +219,17 @@ fn fixture() -> (
     };
     anchor.bind_to_config(&mut config).unwrap();
     let mut plan = PlanFixture::new().runtime_profile("mock").build();
+    if portable {
+        use mvm_core::plan::{KeyId, PlanArtifact};
+        let pin = PlanArtifact::new("a".repeat(64), &[7; 64], KeyId("test".into()));
+        config.legacy_portable_runtime = Some(mvm_core::vm_backend::LegacyPortableRuntimeProof {
+            archive: root.path().join("missing.mvmpkg"),
+            pin: pin.clone(),
+            manifest_sha256: "b".repeat(64),
+            arch: mvm_core::arch::GuestArch::host(),
+        });
+        plan.bundle = Some(pin);
+    }
     plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
     config.plan_json = Some(
         serde_json::to_string(&sign_plan(
@@ -239,7 +252,7 @@ fn fixture() -> (
 
 #[test]
 fn owned_native_handle_survives_canonical_runner_start_return() {
-    let (_env, _root, driver, config, anchor) = fixture();
+    let (_env, _root, driver, config, anchor) = fixture(false);
     let dropped = Arc::clone(&driver.dropped);
     let attached = Arc::clone(&driver.attached);
     let runner = WorkloadRunner::new(driver, NoEndpoint, NoBroker);
@@ -406,7 +419,7 @@ impl ConsoleStreamer for CleanupObserver {
 
 #[test]
 fn installed_pre_dispatch_failure_retains_and_retires_endpoint() {
-    let (_env, _root, driver, config, anchor) = fixture();
+    let (_env, _root, driver, config, anchor) = fixture(false);
     let dispatched = Arc::clone(&driver.dispatched);
     let observer = Arc::new(CleanupObserver::default());
     let runner =
@@ -441,7 +454,7 @@ fn installed_pre_dispatch_failure_retains_and_retires_endpoint() {
 
 #[test]
 fn unsupported_native_driver_refuses_before_reserving_installed_custody() {
-    let (_env, _root, driver, config, _anchor) = fixture();
+    let (_env, _root, driver, config, _anchor) = fixture(false);
     let runner = WorkloadRunner::new(driver.inner, NoEndpoint, NoBroker);
     let id = VmId(config.name.clone());
     mvm_core::config::create_private_dir(&vm_state_dir(&config.name)).unwrap();
@@ -459,4 +472,35 @@ fn unsupported_native_driver_refuses_before_reserving_installed_custody() {
     assert!(refused.to_string().contains("installed native backend unavailable"), "{refused:#}");
     assert!(!installed::marker(&id).exists());
     assert!(runner.installed.find(&id).unwrap().is_none());
+}
+
+#[test]
+fn portable_startup_requires_original_workspace_before_runtime_effects() {
+    let (_env, _root, driver, config, _) = fixture(true);
+    let dispatched = Arc::clone(&driver.dispatched);
+    let runner = WorkloadRunner::new(driver, NoEndpoint, NoBroker);
+    let redaction = RedactionPolicy::default();
+    let mut stripped = config.clone();
+    stripped.legacy_portable_runtime = None;
+    for (config, reason) in [
+        (&stripped, "original admission missing or changed"),
+        (&config, "original parent startup workspace unavailable"),
+    ] {
+        let inputs = WorkloadLaunchInputs {
+            config,
+            tenant: "local",
+            secrets: &[],
+            redaction: &redaction,
+            network_policy: &config.network_policy,
+            cmdline: "console=ttyS0".into(),
+        };
+        let error = runner
+            .start_workload(&inputs)
+            .err()
+            .expect("startup refused");
+        assert!(error.to_string().contains(reason), "{error:#}");
+        assert!(!runner.installed.has_any().unwrap());
+        assert!(!installed::marker(&VmId(config.name.clone())).exists());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
 }

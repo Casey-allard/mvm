@@ -456,6 +456,19 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         self.require_caller_registration_shape(inputs.config)?;
         self.check_installed_endpoint_inputs(inputs)?;
         #[cfg(unix)]
+        let workspace = match &inputs.config.host_lifetime {
+            Some(owner) if inputs.config.legacy_portable_runtime.is_some() => {
+                Some(owner.begin_startup_workspace(inputs.config, self.driver.kind())?)
+            }
+            Some(owner) => {
+                // A clone cannot omit the admitted portable selection to skip
+                // workspace admission and begin lifecycle effects.
+                owner.check_parent_current(inputs.config, self.driver.kind())?;
+                None
+            }
+            None => None,
+        };
+        #[cfg(unix)]
         let installed = match &inputs.config.host_lifetime {
             Some(owner) => Some(self.installed.reserve(owner)?),
             None => None,
@@ -500,8 +513,13 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             network_policy: inputs.network_policy,
             cmdline: bound_cmdline,
         };
-        let result =
-            self.boot_bound_workload_guarded(inputs, Some(&kernel_binding), writable_images);
+        let result = (|| {
+            #[cfg(unix)]
+            if let Some(workspace) = workspace {
+                workspace.complete()?;
+            }
+            self.boot_bound_workload_guarded(inputs, Some(&kernel_binding), writable_images)
+        })();
         #[cfg(unix)]
         if let Some(slot) = installed {
             return slot.retain_start(lifecycle, kernel_binding, result);

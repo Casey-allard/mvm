@@ -4,12 +4,23 @@
 use crate::plan_admission::AdmittedPlan;
 use anyhow::{Context, Result};
 use mvm_core::{
-    host_lifetime::{CoreCurrentParentPermit, HostLaunchBinding},
+    host_lifetime::{CoreCurrentParentPermit, HostLaunchBinding, HostLifetimeAnchor},
+    plan::PlanArtifact,
     vm_backend::{BackendKind, VmStartConfig},
 };
 use std::sync::{Arc, OnceLock, Weak};
 
 pub trait ParentAdmissionProvider: Send + Sync {
+    /// Check that the exact owner already holds workspace qualified for the
+    /// signed bundle. Do not open the bundle, bind admission or reserve again.
+    fn check_portable_startup_workspace(
+        &self,
+        _owner: &Arc<HostLifetimeAnchor>,
+        _pin: &PlanArtifact,
+    ) -> Result<()> {
+        anyhow::bail!("original parent portable startup workspace unavailable")
+    }
+
     /// Bind one original pre-reserved parent grant to actual opaque admission.
     fn bind(
         &self,
@@ -54,6 +65,19 @@ pub fn require_installed() -> Result<Arc<dyn ParentAdmissionProvider>> {
         .get()
         .and_then(Weak::upgrade)
         .context("installed launch requires the original parent admission provider")
+}
+
+pub(crate) fn check_portable_startup_workspace(
+    config: &VmStartConfig,
+    backend: BackendKind,
+    pin: &PlanArtifact,
+) -> Result<()> {
+    let owner = config
+        .host_lifetime
+        .as_ref()
+        .context("portable startup requires the original host lifetime owner")?;
+    owner.verify_config(config, backend)?;
+    require_installed()?.check_portable_startup_workspace(owner, pin)
 }
 
 pub(crate) fn bind_current(

@@ -236,6 +236,19 @@ pub struct HostLifetimeInputs {
 /// Implementations retain the actual original reservation, not a quota DTO.
 pub trait CoreCurrentParentPermit: Send + Sync {
     fn check_current(&self, binding: &HostLaunchBinding) -> Result<()>;
+
+    /// Enter the already reserved portable verification and snapshot workspace.
+    /// The callback only changes accounting state. The original parent retains
+    /// responsibility for its reservation on refusal, panic, or abandoned startup.
+    fn begin_startup_workspace(&self, _binding: &HostLaunchBinding) -> Result<()> {
+        anyhow::bail!("original parent startup workspace unavailable")
+    }
+
+    /// Complete this phase on the same reservation, after its last use.
+    fn complete_startup_workspace(&self, _binding: &HostLaunchBinding) -> Result<()> {
+        anyhow::bail!("original parent startup workspace completion unavailable")
+    }
+
     fn prepare_endpoint_partition(
         &self,
         _binding: &HostLaunchBinding,
@@ -295,6 +308,8 @@ impl PreparedHostLifetime {
             current_parent: Mutex::new(None),
             native_claimed: AtomicBool::new(false),
             endpoint_claimed: AtomicBool::new(false),
+            startup_claimed: AtomicBool::new(false),
+            startup_complete: AtomicBool::new(false),
         })
     }
 }
@@ -304,6 +319,7 @@ struct AdmissionBinding {
     plan_id: PlanId,
     nonce: Nonce,
     body_sha256: [u8; 32],
+    legacy_portable: bool,
 }
 
 /// Shared one-shot owner, never a serializable permission or exit receipt.
@@ -315,6 +331,27 @@ pub struct HostLifetimeAnchor {
     current_parent: Mutex<Option<Arc<dyn CoreCurrentParentPermit>>>,
     native_claimed: AtomicBool,
     endpoint_claimed: AtomicBool,
+    startup_claimed: AtomicBool,
+    startup_complete: AtomicBool,
+}
+
+/// Linear custody of the original startup workspace. Dropping it leaves the
+/// original parent responsible for cleanup and does not acknowledge completion.
+#[must_use]
+pub struct RuntimeStartupWorkspace {
+    owner: Arc<HostLifetimeAnchor>,
+    permit: Arc<dyn CoreCurrentParentPermit>,
+}
+
+impl RuntimeStartupWorkspace {
+    pub fn complete(self) -> Result<()> {
+        self.owner.verify_current()?;
+        self.permit.check_current(&self.owner.binding)?;
+        self.permit
+            .complete_startup_workspace(&self.owner.binding)?;
+        self.owner.startup_complete.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 impl fmt::Debug for HostLifetimeAnchor {
@@ -450,6 +487,7 @@ impl HostLifetimeAnchor {
             plan_id: plan.plan_id.clone(),
             nonce: plan.nonce.clone(),
             body_sha256: Sha256::digest(serde_jcs::to_vec(plan)?).into(),
+            legacy_portable: config.legacy_portable_runtime.is_some(),
         };
         ensure!(
             self.projected_admission(config)? == wanted,
@@ -478,10 +516,17 @@ impl HostLifetimeAnchor {
             .context("host lifetime signed plan missing")?;
         let plan = crate::plan::plan_from_admitted_json(encoded)
             .context("host lifetime original plan projection invalid")?;
+        if let Some(proof) = &config.legacy_portable_runtime {
+            ensure!(
+                plan.bundle.as_ref() == Some(&proof.pin),
+                "portable runtime differs from the signed bundle"
+            );
+        }
         Ok(AdmissionBinding {
             plan_id: plan.plan_id.clone(),
             nonce: plan.nonce.clone(),
             body_sha256: Sha256::digest(serde_jcs::to_vec(&plan)?).into(),
+            legacy_portable: config.legacy_portable_runtime.is_some(),
         })
     }
 
@@ -551,16 +596,50 @@ impl HostLifetimeAnchor {
         config: &VmStartConfig,
         backend: BackendKind,
     ) -> Result<()> {
+        self.current_parent_permit(config, backend)?
+            .check_current(&self.binding)
+    }
+
+    fn current_parent_permit(
+        self: &Arc<Self>,
+        config: &VmStartConfig,
+        backend: BackendKind,
+    ) -> Result<Arc<dyn CoreCurrentParentPermit>> {
         self.verify_config(config, backend)?;
         self.verify_admitted_config(config)?;
-        let permit = self
-            .current_parent
+        self.current_parent
             .lock()
             .map_err(|_| anyhow::anyhow!("host parent binding poisoned"))?
             .as_ref()
             .cloned()
-            .context("original parent resource permit missing")?;
-        permit.check_current(&self.binding)
+            .context("original parent resource permit missing")
+    }
+
+    /// Start the original parent's one-shot workspace after opaque admission.
+    /// A failed callback still consumes the attempt because it may have acted.
+    pub fn begin_startup_workspace(
+        self: &Arc<Self>,
+        config: &VmStartConfig,
+        backend: BackendKind,
+    ) -> Result<RuntimeStartupWorkspace> {
+        ensure!(
+            config.legacy_portable_runtime.is_some(),
+            "original launch has no portable runtime selection"
+        );
+        let permit = self.current_parent_permit(config, backend)?;
+        permit.check_current(&self.binding)?;
+        ensure!(
+            !self.native_claimed.load(Ordering::Acquire),
+            "native lifetime already claimed"
+        );
+        self.startup_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow::anyhow!("original startup workspace already claimed"))?;
+        permit.begin_startup_workspace(&self.binding)?;
+        Ok(RuntimeStartupWorkspace {
+            owner: Arc::clone(self),
+            permit,
+        })
     }
 
     /// Exactly one backend handoff after the original admission was bound.
@@ -570,6 +649,11 @@ impl HostLifetimeAnchor {
         backend: BackendKind,
     ) -> Result<PreparedHostLifetimeLease> {
         self.check_parent_current(config, backend)?;
+        ensure!(
+            config.legacy_portable_runtime.is_none()
+                || self.startup_complete.load(Ordering::Acquire),
+            "original startup workspace did not complete"
+        );
         let lease = self.lease.duplicate()?;
         ensure!(
             self.native_claimed

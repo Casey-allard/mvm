@@ -2412,6 +2412,21 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
                 .and_then(|pin| require_installed_mapped_runtime(&params.config, pin))
                 .map_err(|error| ("guest-runtime", error))?;
         }
+        #[cfg(unix)]
+        if installed && let Some(proof) = &params.config.legacy_portable_runtime {
+            if admitted.plan().bundle.as_ref() != Some(&proof.pin) {
+                return Err((
+                    "startup-workspace",
+                    anyhow::anyhow!("portable runtime differs from the signed bundle"),
+                ));
+            }
+            crate::host_lifetime_parent::check_portable_startup_workspace(
+                &params.config,
+                backend.kind(),
+                &proof.pin,
+            )
+            .map_err(|error| ("startup-workspace", error))?;
+        }
         crate::owner_access::require_selected(admitted.plan())
             .map_err(|error| ("owner-access", error))?;
         if let Some(registry) = crate::owner_access::installed() {

@@ -292,9 +292,6 @@ fn admit_and_boot_local_inner(
         "raw local admission does not accept materialized directory images; \
          route them through instruction admission with explicit source identity"
     );
-    let sha = mvm_core::crypto::image_verify::sha256_file_cached(&req.rootfs_path)
-        .with_context(|| format!("hashing rootfs at {}", req.rootfs_path.display()))?;
-
     // An externally-signed plan takes the other admission door: verified
     // against the operator-pinned signer set, never synthesized or re-signed
     // under the host key.
@@ -303,13 +300,15 @@ fn admit_and_boot_local_inner(
             backend,
             req,
             signed,
-            &sha,
             ctx,
             mapping,
             #[cfg(unix)]
             owner,
         );
     }
+
+    let sha = mvm_core::crypto::image_verify::sha256_file_cached(&req.rootfs_path)
+        .with_context(|| format!("hashing rootfs at {}", req.rootfs_path.display()))?;
 
     // Pin the kernel into the signed plan. Deliberately the uncached digest: a
     // path+mtime-keyed cache can hand back a stale hash, which for an integrity
@@ -453,7 +452,6 @@ fn admit_signed_and_boot_local(
     backend: &AnyBackend,
     req: &LocalRunRequest,
     signed: &mvm_core::plan::SignedExecutionPlan,
-    rootfs_sha: &str,
     ctx: LocalRunContext<'_>,
     mapping: Option<&CooperatingPayloadPolicy>,
     #[cfg(unix)] owner: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
@@ -481,19 +479,6 @@ fn admit_signed_and_boot_local(
         );
     }
 
-    // The plan pins the workload image by digest; the resolved rootfs must BE
-    // that image. Synthesized plans get this by construction (synthesis stamps
-    // the hash it just measured); an externally-signed plan gets it by
-    // comparison.
-    if rootfs_sha != plan.image.sha256 {
-        anyhow::bail!(
-            "the signed plan pins image sha256 {} but the resolved rootfs at {} hashes to \
-             {rootfs_sha}; refusing to boot an image the plan does not authorize",
-            plan.image.sha256,
-            req.rootfs_path.display(),
-        );
-    }
-
     let path_string = |p: &Path| p.to_string_lossy().into_owned();
     let mut config = VmStartConfig {
         name: req.name.clone(),
@@ -517,11 +502,38 @@ fn admit_signed_and_boot_local(
         owner.bind_to_config(&mut config)?;
         owner.verify_config(&config, backend.kind())?;
     }
-    if mapping.is_some() {
-        let pin = plan
-            .bundle
-            .as_ref()
-            .context("installed payload mapping requires a signed bundle pin")?;
+    let portable_pin = mapping
+        .map(|_| {
+            plan.bundle
+                .as_ref()
+                .context("installed payload mapping requires a signed bundle pin")
+        })
+        .transpose()?;
+    #[cfg(unix)]
+    if let Some(pin) = portable_pin {
+        crate::host_lifetime_parent::check_portable_startup_workspace(
+            &config,
+            backend.kind(),
+            pin,
+        )?;
+    }
+
+    // The plan pins the workload image by digest; the resolved rootfs must BE
+    // that image. Synthesized plans get this by construction (synthesis stamps
+    // the hash it just measured); an externally-signed plan gets it by
+    // comparison.
+    let rootfs_sha = mvm_core::crypto::image_verify::sha256_file_cached(&req.rootfs_path)
+        .with_context(|| format!("hashing rootfs at {}", req.rootfs_path.display()))?;
+    if rootfs_sha != plan.image.sha256 {
+        anyhow::bail!(
+            "the signed plan pins image sha256 {} but the resolved rootfs at {} hashes to \
+             {rootfs_sha}; refusing to boot an image the plan does not authorize",
+            plan.image.sha256,
+            req.rootfs_path.display(),
+        );
+    }
+
+    if let Some(pin) = portable_pin {
         mvm_runtime::bundle_runtime::attach_pinned_legacy_runtime(
             &mut config,
             backend.name(),

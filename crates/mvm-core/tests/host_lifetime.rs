@@ -504,3 +504,128 @@ fn stale_foreign_and_replaced_parent_permits_refuse_without_changing_identity() 
         plan.nonce
     );
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn portable_startup_workspace_is_single_use_and_owned_by_original_parent() {
+    use mvm_core::{
+        host_lifetime::CoreCurrentParentPermit,
+        plan::{KeyId, PlanArtifact, sign_plan, test_support::PlanFixture},
+        vm_backend::LegacyPortableRuntimeProof,
+    };
+
+    struct WorkspacePermit {
+        binding: HostLaunchBinding,
+        begins: AtomicUsize,
+        completions: AtomicUsize,
+        refuse_begin: bool,
+    }
+    impl CoreCurrentParentPermit for WorkspacePermit {
+        fn check_current(&self, binding: &HostLaunchBinding) -> anyhow::Result<()> {
+            anyhow::ensure!(*binding == self.binding, "foreign workspace binding");
+            Ok(())
+        }
+
+        fn begin_startup_workspace(&self, binding: &HostLaunchBinding) -> anyhow::Result<()> {
+            self.check_current(binding)?;
+            self.begins.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!self.refuse_begin, "workspace refused");
+            Ok(())
+        }
+
+        fn complete_startup_workspace(&self, binding: &HostLaunchBinding) -> anyhow::Result<()> {
+            self.check_current(binding)?;
+            self.completions.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    for (refuse_begin, complete) in [(false, true), (false, false), (true, false)] {
+        let root = tempfile::tempdir().unwrap();
+        let owner = PreparedHostLifetime::bind(inputs(root.path()), ())
+            .unwrap()
+            .into_anchor();
+        let mut config = VmStartConfig {
+            name: "owned-test".into(),
+            cpus: 1,
+            memory_mib: 1024,
+            ..Default::default()
+        };
+        owner.bind_to_config(&mut config).unwrap();
+        let mut plan = PlanFixture::new().build();
+        plan.resources.mem_mib = 1024;
+        let pin = PlanArtifact::new("a".repeat(64), &[7; 64], KeyId("test".into()));
+        config.legacy_portable_runtime = Some(LegacyPortableRuntimeProof {
+            archive: root.path().join("fixture.mvmpkg"),
+            pin: pin.clone(),
+            manifest_sha256: "b".repeat(64),
+            arch: mvm_core::arch::GuestArch::host(),
+        });
+        plan.bundle = Some(pin);
+        plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+        config.plan_json = Some(
+            serde_json::to_string(&sign_plan(
+                &plan,
+                &ed25519_dalek::SigningKey::from_bytes(&[4; 32]),
+                "test",
+            ))
+            .unwrap(),
+        );
+        let permit = Arc::new(WorkspacePermit {
+            binding: owner.binding().clone(),
+            begins: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+            refuse_begin,
+        });
+        let backend = BackendKind::Firecracker;
+        assert!(owner.begin_startup_workspace(&config, backend).is_err());
+        owner.bind_admitted(&config, backend, &plan).unwrap();
+        assert!(owner.begin_startup_workspace(&config, backend).is_err());
+        owner
+            .bind_parent_permit(&config, backend, permit.clone())
+            .unwrap();
+        let mut foreign = config.clone();
+        foreign.name = "foreign".into();
+        assert!(owner.begin_startup_workspace(&foreign, backend).is_err());
+        let mut wrong_bundle = config.clone();
+        wrong_bundle
+            .legacy_portable_runtime
+            .as_mut()
+            .unwrap()
+            .pin
+            .bundle_sha256 = "c".repeat(64);
+        assert!(
+            owner
+                .begin_startup_workspace(&wrong_bundle, backend)
+                .is_err()
+        );
+        assert_eq!(permit.begins.load(Ordering::SeqCst), 0);
+        assert!(owner.claim_for_native(&config, backend).is_err());
+        let mut stripped = config.clone();
+        stripped.legacy_portable_runtime = None;
+        assert!(owner.claim_for_native(&stripped, backend).is_err());
+        assert!(owner.begin_startup_workspace(&stripped, backend).is_err());
+        let workspace = owner.begin_startup_workspace(&config, backend);
+        if refuse_begin {
+            assert!(workspace.is_err());
+        } else if complete {
+            let workspace = workspace.unwrap();
+            assert!(owner.claim_for_native(&config, backend).is_err());
+            workspace.complete().unwrap();
+        } else {
+            drop(workspace.unwrap());
+        }
+        assert!(
+            owner
+                .clone()
+                .begin_startup_workspace(&config.clone(), backend)
+                .is_err()
+        );
+        assert_eq!(owner.claim_for_native(&config, backend).is_ok(), complete);
+        assert_eq!(permit.begins.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            permit.completions.load(Ordering::SeqCst),
+            usize::from(complete)
+        );
+    }
+}

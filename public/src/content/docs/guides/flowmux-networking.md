@@ -43,6 +43,20 @@ Opaque TCP and UDP remain byte streams or datagrams. FlowMux does not pretend it
 can inspect encrypted payloads. Selective L7 behavior runs only when the signed
 plan declares a typed flow that gives the endpoint ownership of that protocol.
 
+## Startup workspace for installed payload mapping
+
+An installation that selects a portable runtime bundle for FlowMux payload
+mapping must already hold workspace for that exact signed bundle and original
+VM owner. Host admission checks this reservation before opening the selected
+bundle. Runtime uses the same reservation once to verify and snapshot the
+artifacts and bind the kernel. The workspace phase must complete before
+endpoint startup or native dispatch.
+
+A missing reservation, changed bundle, or abandoned workspace refuses the
+launch. The original installation owns cleanup of its reservation after a
+failure. The workspace check does not admit a destination, allocate another
+reservation, or change the guest protocol.
+
 ## Reaching a key-value store
 
 A workload that needs durable storage does not need a network for it:
