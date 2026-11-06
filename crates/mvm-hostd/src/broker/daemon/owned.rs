@@ -54,23 +54,11 @@ fn signer_current(
 }
 
 struct SignerCapability {
-    #[cfg(not(target_os = "macos"))]
-    original: ProcessExitObserver,
-    #[cfg(target_os = "macos")]
-    reader: std::os::fd::OwnedFd,
+    event: std::os::fd::OwnedFd,
 }
 impl SignerCapability {
-    fn descriptor(&self) -> Result<std::os::fd::BorrowedFd<'_>> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.original
-                .event_fd()
-                .context("original signer event absent")
-        }
-        #[cfg(target_os = "macos")]
-        {
-            Ok(self.reader.as_fd())
-        }
+    fn descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.event.as_fd()
     }
     fn tag(&self) -> u8 {
         #[cfg(target_os = "macos")]
@@ -91,23 +79,22 @@ fn fresh_signer_capability(
 ) -> Result<SignerCapability> {
     signer_current(original, admission)?;
     #[cfg(not(target_os = "macos"))]
-    let capability = SignerCapability {
-        original: ProcessExitObserver::arm(
-            signer
-                .id()
-                .context("original signer child ID missing")?
-                .try_into()?,
-        )?,
-    };
+    let event = ProcessExitObserver::arm(
+        signer
+            .id()
+            .context("original signer child ID missing")?
+            .try_into()?,
+    )?
+    .duplicate_event_descriptor()?
+    .context("original signer event absent")?;
     #[cfg(target_os = "macos")]
-    let capability = SignerCapability {
-        reader: mvm_vmm::host::owned_liveness::duplicate_read_pipe(
-            signer
-                .stdout
-                .as_ref()
-                .context("original signer liveness pipe absent")?,
-        )?,
-    };
+    let event = mvm_vmm::host::owned_liveness::duplicate_read_pipe(
+        signer
+            .stdout
+            .as_ref()
+            .context("original signer liveness pipe absent")?,
+    )?;
+    let capability = SignerCapability { event };
     signer_capability_current(&capability, admission)?;
     signer_current(original, admission)?;
     Ok(capability)
@@ -117,7 +104,7 @@ fn signer_capability_current(
     observer: &SignerCapability,
     admission: &crate::owned_resources::registered::RegistrationAdmission,
 ) -> Result<()> {
-    let descriptor = observer.descriptor()?;
+    let descriptor = observer.descriptor();
     #[cfg(target_os = "macos")]
     if mvm_vmm::host::owned_liveness::require_live_read_pipe(descriptor).is_err() {
         admission.fence();
@@ -413,9 +400,8 @@ impl HostAgentDaemon {
             );
             let original_exit = ProcessExitObserver::arm(signer_pid.try_into()?)?;
             let event = original_exit
-                .event_fd()
-                .context("original signer already exited")?
-                .try_clone_to_owned()?;
+                .duplicate_event_descriptor()?
+                .context("original signer already exited")?;
             let flags = rustix::fs::fcntl_getfl(&event)?;
             rustix::fs::fcntl_setfl(&event, flags | OFlags::NONBLOCK)?;
             // SAFETY: event is an exclusive owned duplicate of the original
@@ -613,7 +599,7 @@ impl HostAgentDaemon {
             {
                 signer_current(original_exit, &admission)?;
                 signer_capability_current(&capability, &admission)?;
-                let descriptor = capability.descriptor()?;
+                let descriptor = capability.descriptor();
                 // An ordinary peer/deadline failure after Ok does not remove an
                 // accepted registration. Its parent keeps the uncertain serial
                 // and may explicitly Deregister using the same original owner.

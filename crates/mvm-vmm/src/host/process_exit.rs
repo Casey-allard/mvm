@@ -116,6 +116,14 @@ impl ProcessExitObserver {
         fd.map(|fd| unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) })
     }
 
+    /// Duplicate the existing kernel observation for a poll-only consumer.
+    /// The caller still owns and reaps the original Child independently.
+    pub fn duplicate_event_descriptor(&self) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        self.event_fd()
+            .map(|event| event.try_clone_to_owned())
+            .transpose()
+    }
+
     /// Arm an observer for `pid`.
     ///
     /// The registration happens before the caller sends SIGTERM, closing the
