@@ -13,19 +13,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, ensure};
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
 
 use super::audit_client::AuditClient;
 use super::daemon::{
-    AcceptedDaemonWork, RegistrationSnapshot, open_admitted_assurance_session,
-    validate_registration,
+    AcceptedDaemonWork, MutationOperationDescriptor, RegistrationSnapshot,
+    open_admitted_assurance_session, validate_registration,
 };
 use super::handlers::host_audit_v1::HostAuditV1Handler;
 use super::handlers::{BoundHandlers, build_bound_handlers};
 use super::registry::Registry;
 use super::server::{ServiceConnectionOwner, serve_on_listener_owned};
 use super::service_proxy::ControllerServiceProxy;
+
+#[cfg(test)]
+#[path = "control_prepare/publication_tests.rs"]
+mod publication_tests;
 
 /// Internal memory custody only. A live loan leaves the original object inside
 /// this same field, so canceling its future releases only the borrowed guard.
@@ -63,30 +67,6 @@ impl<T> CustodyField<T> {
         }
     }
 
-    fn store_and_loan(
-        &self,
-        original: T,
-    ) -> std::result::Result<CustodyLoan<'_, T>, (CustodyError, T)> {
-        let Ok(mut value) = self.value.try_lock() else {
-            return Err((CustodyError::Busy, original));
-        };
-        if value.is_some() {
-            return Err((CustodyError::Busy, original));
-        }
-        *value = Some(original);
-        Ok(CustodyLoan {
-            origin: self,
-            value,
-        })
-    }
-
-    /// Tests use the same atomic capture path as production, then end only its
-    /// loan. The original remains in its field until explicit completion.
-    #[cfg(test)]
-    fn store(&self, original: T) -> Result<(), (CustodyError, T)> {
-        self.store_and_loan(original).map(drop)
-    }
-
     fn loan(&self) -> Result<CustodyLoan<'_, T>, CustodyError> {
         let value = self.value.try_lock().map_err(|_| CustodyError::Busy)?;
         if value.is_none() {
@@ -114,7 +94,6 @@ pub(crate) struct MutationCell {
     retiring_original_vm_map: CustodyField<OriginalVmMap>,
     connection_slots: Arc<Semaphore>,
     stopping: AtomicBool,
-    stopped: Notify,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +117,16 @@ pub(crate) struct InflightMutation {
     pub(crate) retiring: Option<RetiringRegistration>,
     io: [RetainedIo; 5],
     journal: Option<JournalSnapshots>,
+    operation: Option<MutationOperationDescriptor>,
+}
+
+/// Observation of one original effect, never permission to replay it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationIoStatus {
+    NotStarted,
+    Pending,
+    Succeeded,
+    Failed,
 }
 
 /// Separate effect identities prevent an old deregistration result from being
@@ -224,9 +213,57 @@ impl RetainedIo {
     fn succeeded(&self) -> bool {
         self.completed && self.failure.is_none()
     }
+
+    fn status(&self) -> MutationIoStatus {
+        if !self.started {
+            MutationIoStatus::NotStarted
+        } else if !self.completed {
+            MutationIoStatus::Pending
+        } else if self.failure.is_some() {
+            MutationIoStatus::Failed
+        } else {
+            MutationIoStatus::Succeeded
+        }
+    }
 }
 
 impl InflightMutation {
+    /// Original monotonic row within the retained cell's ledger, not authority.
+    pub(crate) fn original_row_id(&self) -> u64 {
+        self.accepted.original_row_id()
+    }
+
+    /// Preserve the original canonical caller's immutable recipe before effects.
+    /// The descriptor is data, not current activation or cleanup authority.
+    pub(crate) fn capture_operation(
+        &mut self,
+        operation: MutationOperationDescriptor,
+    ) -> Result<()> {
+        ensure!(
+            self.operation.is_none()
+                && self.journal.is_none()
+                && self.prepared.is_none()
+                && self.retiring.is_none()
+                && self.io.iter().all(|io| !io.started),
+            "capture the original operation once before service or I/O effects"
+        );
+        // Configured bindings must have their checked observation bound
+        // outside outer locks. Presence alone is not freshness or authority.
+        operation.journal_presence()?;
+        self.operation = Some(operation);
+        Ok(())
+    }
+
+    pub(crate) fn operation(&self) -> Result<&MutationOperationDescriptor> {
+        self.operation
+            .as_ref()
+            .context("original operation recipe missing")
+    }
+
+    pub(crate) fn io_status(&self, stage: MutationIoStage) -> MutationIoStatus {
+        self.io[stage.index()].status()
+    }
+
     /// Attach the original installation lease before any service or I/O effect.
     /// The canonical caller decides whether its admitted role requires a lease;
     /// this cell neither creates that authority nor moves the accepted token out.
@@ -246,6 +283,10 @@ impl InflightMutation {
     /// The canonical caller captures both full snapshots before its first I/O;
     /// neither can be replaced by a later view of partially changed state.
     pub(crate) fn capture_journal(&mut self, snapshots: JournalSnapshots) -> Result<()> {
+        ensure!(
+            self.operation.is_some(),
+            "capture the original operation before journal snapshots"
+        );
         ensure!(
             self.journal.is_none() && self.io.iter().all(|io| !io.started),
             "original journal snapshots were already captured or I/O began"
@@ -299,18 +340,6 @@ impl InflightMutation {
 pub(crate) type MapLoan<'a> = CustodyLoan<'a, OriginalVmMap>;
 pub(crate) type MutationLoan<'a> = CustodyLoan<'a, InflightMutation>;
 
-/// A rejected attempt returns its original resources; the caller must not
-/// discard them or interpret rejection as completed original work.
-pub(crate) struct MutationStartFailure {
-    pub(crate) original: InflightMutation,
-}
-
-impl fmt::Debug for MutationStartFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MutationStartFailure { original: retained }")
-    }
-}
-
 impl MutationCell {
     pub(crate) fn new(connection_slots: Arc<Semaphore>) -> Self {
         Self {
@@ -321,7 +350,6 @@ impl MutationCell {
             }),
             connection_slots,
             stopping: AtomicBool::new(false),
-            stopped: Notify::new(),
         }
     }
 
@@ -331,23 +359,10 @@ impl MutationCell {
     pub(crate) fn request_stop(&self) {
         self.stopping.store(true, Ordering::Release);
         self.connection_slots.close();
-        self.stopped.notify_waiters();
     }
 
     pub(crate) fn stop_requested(&self) -> bool {
         self.stopping.load(Ordering::Acquire) || self.connection_slots.is_closed()
-    }
-
-    pub(crate) async fn stopped(&self) {
-        loop {
-            let changed = self.stopped.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.stop_requested() {
-                return;
-            }
-            changed.await;
-        }
     }
 
     pub(crate) fn map_loan(&self) -> Result<MapLoan<'_>> {
@@ -403,29 +418,12 @@ impl MutationCell {
             retiring: None,
             io: std::array::from_fn(|_| RetainedIo::new()),
             journal: None,
+            operation: None,
         });
         Ok(CustodyLoan {
             origin: &self.inflight_mutation,
             value,
         })
-    }
-
-    pub(crate) fn begin_mutation(
-        &self,
-        permit: OwnedSemaphorePermit,
-        accepted: AcceptedDaemonWork,
-    ) -> std::result::Result<MutationLoan<'_>, MutationStartFailure> {
-        let original = InflightMutation {
-            accepted,
-            _permit: permit,
-            prepared: None,
-            retiring: None,
-            io: std::array::from_fn(|_| RetainedIo::new()),
-            journal: None,
-        };
-        self.inflight_mutation
-            .store_and_loan(original)
-            .map_err(|(_, original)| MutationStartFailure { original })
     }
 
     pub(crate) fn mutation_loan(&self) -> Result<MutationLoan<'_>> {
@@ -480,6 +478,10 @@ impl MutationCell {
         );
         validate_registration(&snapshot.tenant, &snapshot.registration)?;
         let original = loan.value_mut();
+        ensure!(
+            original.operation.is_some() && original.journal.is_some(),
+            "capture the original operation and journal before service preparation"
+        );
         ensure!(
             original.prepared.is_none(),
             "original preparation already retained"
@@ -840,6 +842,13 @@ impl LiveVmHandle {
         self.connection_owner.request_stop();
     }
 
+    /// Observe the same original stop event in controlled custody tests.
+    /// This neither requests stop nor proves service/Child collection.
+    #[cfg(test)]
+    pub(crate) fn stop_observer(&self) -> watch::Receiver<bool> {
+        self.start_stop.subscribe()
+    }
+
     /// The canonical startup caller keeps this original pair together in its
     /// retained map while Preparing. Parking never opens service admission.
     pub(crate) fn park_start(&mut self, start: StartLatch) -> Result<()> {
@@ -865,6 +874,27 @@ impl LiveVmHandle {
             .take()
             .context("original parked start latch unavailable")?
             .release()
+    }
+
+    /// Cached original-owner shape for the final short preparation check.
+    /// This performs no pathname I/O and is not readiness or authority proof;
+    /// releasing the original latch can still refuse a failed listener.
+    pub(crate) fn is_parked_at(&self, path: &Path) -> bool {
+        self.listen_socket == path
+            && self.parked_start.is_some()
+            && self.socket_identity.is_some()
+            && self.listener_spawned
+            && !self.listener_joined
+            && !*self.start_stop.borrow()
+            && !self.socket_removed
+            && self.completed.is_none()
+    }
+
+    /// Cached association to this original owner, retained after actual joins.
+    /// This performs no pathname lookup and proves neither current filesystem
+    /// ownership nor historical crash provenance, authority or collection.
+    pub(crate) fn matches_original_endpoint(&self, path: &Path) -> bool {
+        self.listen_socket == path && self.socket_identity.is_some()
     }
 
     pub(crate) fn retire(self) -> RetiringRegistration {
@@ -935,6 +965,10 @@ pub(crate) struct RetiringRegistration {
 }
 
 impl RetiringRegistration {
+    pub(crate) fn matches_original_endpoint(&self, path: &Path) -> bool {
+        self.live.matches_original_endpoint(path)
+    }
+
     pub(crate) async fn finish(&mut self) -> Result<RegistrationDrainReceipt> {
         self.live.finish_retirement().await
     }
@@ -949,12 +983,16 @@ impl StartLatch {
     /// The caller first inserts the original service under its final canonical
     /// generation/authority check. This only releases that suspended service.
     pub(crate) fn release(mut self) -> Result<()> {
-        self.start
-            .take()
-            .context("original service start latch missing")?
-            .send(())
-            .map_err(|_| anyhow::anyhow!("original suspended listener unavailable"))?;
-        self.bound.publish();
+        let publication = self.bound.reserve_publication()?;
+        let Some(start) = self.start.take() else {
+            drop(publication);
+            anyhow::bail!("original service start latch missing");
+        };
+        if start.send(()).is_err() {
+            drop(publication);
+            anyhow::bail!("original suspended listener unavailable");
+        }
+        publication.commit();
         Ok(())
     }
 }
@@ -1006,10 +1044,97 @@ mod tests {
     }
 
     #[test]
+    fn original_operation_capture_survives_unwind_and_refuses_replacement() {
+        use mvm_core::protocol::broker_control::{self, ControlRequest, DeregisterVm};
+        use mvm_core::tenant_lifecycle::{
+            LifecycleCoordinator, LifecycleGeneration, TenantLifecycleGate,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        // Storage/ledger fixture only: activation here supplies no service,
+        // native admission or original-child collection evidence.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let generation = LifecycleGeneration::new([81; 32], 1).unwrap();
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        let coordinator = LifecycleCoordinator::prepare_after_exclusion(
+            directory.path(),
+            "local",
+            generation.clone(),
+            256,
+            deadline(),
+        )
+        .unwrap();
+        coordinator
+            .activate_after_reconciliation(&generation, deadline())
+            .unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[82; 32]);
+        let mut daemon =
+            crate::broker::daemon::HostAgentDaemon::new("local", signing.verifying_key(), 65_536)
+                .with_lifecycle_coordination(directory.path(), generation.clone())
+                .unwrap();
+        let gate = TenantLifecycleGate::new(directory.path(), "local").unwrap();
+        gate.with_active(&generation, deadline(), || {
+            daemon.open_local_admission(&generation)
+        })
+        .unwrap();
+        let lane = daemon.mutation_lane();
+        let mut permit = Some(lane.clone().try_acquire_owned().unwrap());
+        let descriptor = |vm: &str| {
+            let request = ControlRequest::Deregister(DeregisterVm { vm_id: vm.into() });
+            let signed = broker_control::sign(request.clone(), &signing.to_bytes()).unwrap();
+            daemon
+                .original_operation_descriptor(request, Some(signed), None)
+                .unwrap()
+        };
+        let first = descriptor("vm-original");
+        let replacement = descriptor("vm-replacement");
+        let cell = super::MutationCell::new(Arc::new(tokio::sync::Semaphore::new(256)));
+        let mut loan = cell
+            .reserve_mutation(&mut permit, || daemon.reserve_accepted_work(&generation))
+            .unwrap();
+        loan.value_mut().capture_operation(first).unwrap();
+        let no_effect = loan
+            .value_mut()
+            .io_status(super::MutationIoStage::HelperRetirement)
+            == super::MutationIoStatus::NotStarted;
+        drop(loan);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut loan = cell.mutation_loan().unwrap();
+            assert_eq!(loan.value_mut().operation().unwrap().vm_id(), "vm-original");
+            panic!("controlled original-operation waiter unwind");
+        }));
+        let mut loan = cell.mutation_loan().unwrap();
+        let rejected = loan.value_mut().capture_operation(replacement).is_err();
+        let original = loan.value_mut().operation().unwrap();
+        let same_vm = original.vm_id() == "vm-original";
+        let same_tenant = original.tenant() == "local";
+        let same_generation = original.generation() == Some(&generation);
+        let charged = lane.available_permits();
+        // Explicitly settle the SAME no-effect original before assertions.
+        cell.complete_mutation(loan).unwrap();
+        assert!(unwound.is_err());
+        assert!(
+            rejected,
+            "a second operation cannot replace the original recipe"
+        );
+        assert!(same_vm && same_tenant && same_generation);
+        assert!(no_effect, "descriptor capture starts no helper effect");
+        assert_eq!(
+            charged, 0,
+            "unwinding cannot refund original mutation credit"
+        );
+        assert_eq!(lane.available_permits(), 1);
+        assert!(!daemon.has_accepted_work().unwrap());
+    }
+
+    // Occupied/loaned mutation rejection is tested through actual atomic
+    // reservation in daemon::token_tests, including callback/row/permit custody.
+    // These generic tests exercise the production retaining constructor/loan.
+    #[test]
     fn canceled_loan_restores_the_same_original_field_without_dropping_it() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let field = CustodyField::new();
-        field.store(original(7, &drops)).expect("retain original");
+        let field = CustodyField::retaining(original(7, &drops));
         {
             let mut loan = field.loan().expect("borrow original custody");
             assert_eq!(loan.value_mut().id, 7);
@@ -1026,33 +1151,9 @@ mod tests {
     }
 
     #[test]
-    fn occupied_field_returns_the_rejected_original_without_overwriting() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let field = CustodyField::new();
-        field
-            .store(original(7, &drops))
-            .expect("retain first owner");
-        let (_, rejected) = field
-            .store(original(8, &drops))
-            .expect_err("occupied field must fence replacement");
-        assert_eq!(rejected.id, 8);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        let mut first = field.loan().expect("original remains retained");
-        assert_eq!(first.value_mut().id, 7);
-        let (_, rejected_while_loaned) = field
-            .store(original(9, &drops))
-            .expect_err("loaned field must also fence replacement");
-        assert_eq!(rejected_while_loaned.id, 9);
-        let first = first.complete().expect("original completion");
-        drop((first, rejected, rejected_while_loaned));
-        assert_eq!(drops.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
     fn unwinding_restores_original_custody_before_an_explicit_retry() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let field = CustodyField::new();
-        field.store(original(7, &drops)).expect("retain original");
+        let field = CustodyField::retaining(original(7, &drops));
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut loan = field.loan().expect("original loan");
             assert_eq!(loan.value_mut().id, 7);
@@ -1065,6 +1166,56 @@ mod tests {
         assert_eq!(retry.value_mut().id, 7);
         drop(retry.complete().expect("original completion"));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_endpoint_association_survives_original_retirement_without_path_lookup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original.sock");
+        let other = directory.path().join("other.sock");
+        let slots = Arc::new(tokio::sync::Semaphore::new(256));
+        let unstarted = super::LiveVmHandle::unstarted(path.clone(), Arc::clone(&slots));
+        let unbound_matches = unstarted.matches_original_endpoint(&path);
+        drop(unstarted);
+
+        let cell = super::MutationCell::new(Arc::clone(&slots));
+        let start = cell
+            .install_fixture(
+                "vm-original",
+                super::ServiceFixture {
+                    listen_socket: path.clone(),
+                    registry: Arc::new(crate::broker::registry::Registry::new()),
+                    workload_id: "original-workload".into(),
+                    tenant_id: "original-tenant".into(),
+                    max_frame_bytes: 65_536,
+                    connection_slots: Arc::clone(&slots),
+                },
+            )
+            .unwrap();
+        let mut map = cell.map_loan().unwrap();
+        let live = map.value_mut().vms.get("vm-original").unwrap();
+        let live_matches = live.matches_original_endpoint(&path);
+        let live_rejects_other = !live.matches_original_endpoint(&other);
+        // The fixture retains this SAME original owner through actual joins.
+        // Production moves it into the existing retained mutation field.
+        let mut retiring = map.value_mut().vms.remove("vm-original").unwrap().retire();
+        drop(map);
+        let retiring_matches = retiring.matches_original_endpoint(&path);
+        let retiring_rejects_other = !retiring.matches_original_endpoint(&other);
+        tokio::time::timeout(std::time::Duration::from_secs(1), retiring.finish())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(start);
+        // The pathname is gone, but the original wrapper still carries its
+        // cached association. This is NOT current filesystem ownership,
+        // historical crash provenance, authority or a new collection receipt.
+        let joined_matches = retiring.matches_original_endpoint(&path);
+        assert!(!path.exists());
+        assert!(!unbound_matches);
+        assert!(live_matches && live_rejects_other);
+        assert!(retiring_matches && retiring_rejects_other && joined_matches);
+        assert_eq!(slots.available_permits(), 256);
     }
 
     #[tokio::test]
@@ -1297,6 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn canceled_io_wait_retains_and_finishes_the_same_blocking_operation() {
         let mut io = super::RetainedIo::new();
+        assert_eq!(io.status(), super::MutationIoStatus::NotStarted);
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let original_gate = Arc::clone(&gate);
         let launches = Arc::new(AtomicUsize::new(0));
@@ -1316,6 +1468,7 @@ mod tests {
             Ok(())
         })
         .expect("capture and start original operation");
+        assert_eq!(io.status(), super::MutationIoStatus::Pending);
         let began = tokio::time::timeout(std::time::Duration::from_secs(1), started).await;
         let canceled =
             tokio::time::timeout(std::time::Duration::from_millis(20), io.finish()).await;
@@ -1335,6 +1488,7 @@ mod tests {
             "a canceled waiter must not finish the held operation"
         );
         assert!(io.succeeded());
+        assert_eq!(io.status(), super::MutationIoStatus::Succeeded);
         io.finish().await.expect("cached original completion");
         assert_eq!(launches.load(Ordering::SeqCst), 1);
     }
@@ -1389,6 +1543,7 @@ mod tests {
         assert!(io.finish().await.is_err());
         assert!(!io.pending());
         assert!(!io.succeeded());
+        assert_eq!(io.status(), super::MutationIoStatus::Failed);
         let original = io.failure.as_ref().expect("retained original error") as *const _;
         assert!(io.finish().await.is_err());
         assert!(std::ptr::eq(

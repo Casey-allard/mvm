@@ -64,28 +64,3 @@ an initialization intent until the Clean resource and directory barriers are
 complete. Existing or partial homes require verified opening or explicit
 reconciliation. The receipt grants neither boot authority nor service readiness.
 Canonical CLI/SDK placement and installed-service qualification remain required.
-
-`prepare_home` distinguishes a new `Fresh` directory receipt from an
-`ExistingUnverified` held private-home identity. The existing case performs no
-initialization, repair or owner-EX acquisition, so it does not contend with a
-live host agent. Neither variant is a service-admission proof. Before any
-child-bearing native preparation or launch, the caller must use the canonical
-live-agent/lifecycle admission path; missing or legacy resource state cannot be
-promoted by this filesystem check. Pure constructors remain unchanged.
-
-## Retained startup recovery exclusion
-
-`InstallationOwner::reconcile_with_exclusion()` returns an opaque borrowed
-`RecoveryExclusion`, retaining the original owner and a fresh independent
-holders-EX lock even when the record was already Clean. Its mutable borrow
-prevents a new owner epoch until the guard is dropped. `revalidate()` checks
-the original namespace, current Clean record and retained holders-file identity.
-The existing `reconcile()` result remains informational and is not a retained
-recovery guard.
-
-This guard excludes participating resource holders only. Startup reconciliation
-still needs checked original inventory, fenced canonical lifecycle state and
-bounded descriptor-relative filesystem work. An empty inventory, absent PID or
-this lock alone does not prove legacy-resource absence, original Child
-collection or service readiness. The host-agent startup integration remains
-separate from the component's focused lock and storage tests.

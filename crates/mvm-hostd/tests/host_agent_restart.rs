@@ -35,6 +35,7 @@ const HANG_GUARD: Duration = Duration::from_secs(120);
 
 struct HostAgentFixture {
     _env: TestEnv,
+    _home_preparation: mvm_vmm::host::host_agent_installation::ProvisionedHome,
     _data_dir: TempDir,
     tenant_id: String,
     vm_name: String,
@@ -59,7 +60,20 @@ impl HostAgentFixture {
     async fn start_inner(idle_timeout_secs: Option<u64>) -> Self {
         let mut env = TestEnv::new();
         let data_dir = tempfile::tempdir().expect("temp data dir");
-        env.set("MVM_HOME", data_dir.path());
+        let tenant_id = "local".to_string();
+        // The selected home does not exist. Only the canonical exclusive
+        // new-home creator establishes Fresh, before key/config writers.
+        let home_preparation =
+            mvm_vmm::host::host_agent_installation::create_new_home_and_provision(
+                &data_dir.path().join("mvm-home"),
+                &tenant_id,
+            )
+            .expect("canonical new fixture home provisioning");
+        home_preparation
+            .verify()
+            .expect("original fixture home identity");
+        let home = home_preparation.home().to_path_buf();
+        env.set("MVM_HOME", &home);
         env.set("MVM_HOST_AGENT_PATH", HOST_AGENT_BIN);
         env.set("MVM_SIGNER_HELPER_PATH", SIGNER_HELPER_BIN);
         if let Some(secs) = idle_timeout_secs {
@@ -69,10 +83,9 @@ impl HostAgentFixture {
         let keys_dir = config::mvm_keys_dir();
         let signer = host_keypair::load_or_init_at(&keys_dir).expect("host signer");
         let key_bytes = load_host_signing_key().expect("host signer key bytes");
-        let tenant_id = "local".to_string();
         let vm_name = "vm-1".to_string();
         let control_socket = ensure_host_agent_daemon(&tenant_id).expect("start host-agent");
-        let broker_socket = data_dir.path().join("broker.sock");
+        let broker_socket = home.join("broker.sock");
         let workload_chain = config::workload_audit_path(&tenant_id, &vm_name);
         let daemon_pid_path = config::host_agent_dir(&tenant_id).join("daemon.pid");
         let worker_pid_path = config::host_agent_worker_pid(&tenant_id);
@@ -84,9 +97,7 @@ impl HostAgentFixture {
             broker_listen_socket: broker_socket.to_string_lossy().into_owned(),
             workload_chain_path: workload_chain.to_string_lossy().into_owned(),
             workload_chain_head_path: Some(
-                data_dir
-                    .path()
-                    .join("audit-signer.head")
+                home.join("audit-signer.head")
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -100,6 +111,7 @@ impl HostAgentFixture {
 
         Self {
             _env: env,
+            _home_preparation: home_preparation,
             _data_dir: data_dir,
             tenant_id,
             vm_name,

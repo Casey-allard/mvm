@@ -18,7 +18,13 @@
 //! does not bind `host.assurance.v1` gets no session, regardless of what the
 //! declaration asks for. Both must agree.
 
-use std::sync::{Arc, OnceLock};
+mod publication;
+
+use publication::PlanePublicationSlot;
+#[cfg(test)]
+pub(crate) use publication::hold_original_global_writer_for_test;
+pub(crate) use publication::{PlanePublicationError, PlanePublicationReservation};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use mvm_contract::assurance::{
@@ -164,7 +170,15 @@ pub enum SessionRefusal {
 /// stream plane, so a binary with more than one entry point can register
 /// defensively at each.
 pub fn install_host_assurance_plane(handler: Arc<HostAssuranceV1Handler>) -> bool {
-    HOST_ASSURANCE_PLANE.set(handler).is_ok()
+    HOST_ASSURANCE_PLANE.install(handler)
+}
+
+/// Reserve a short publication turn before releasing the original service.
+/// Busy or poisoned writers refuse immediately without exposing dispatch.
+pub(crate) fn reserve_host_assurance_publication(
+    handler: &Arc<HostAssuranceV1Handler>,
+) -> std::result::Result<PlanePublicationReservation<'_>, PlanePublicationError> {
+    HOST_ASSURANCE_PLANE.try_reserve(handler)
 }
 
 /// The plane [`install_host_assurance_plane`] registered.
@@ -199,7 +213,7 @@ pub fn prepare_controller_proxy(
     )
 }
 
-static HOST_ASSURANCE_PLANE: OnceLock<Arc<HostAssuranceV1Handler>> = OnceLock::new();
+static HOST_ASSURANCE_PLANE: PlanePublicationSlot = PlanePublicationSlot::new();
 
 /// Whether `plan` admits the assurance service at all.
 #[must_use]

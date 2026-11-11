@@ -41,7 +41,9 @@ use tracing::warn;
 
 use crate::audit_signer::helper_client::SignerHelperClient;
 
-use super::control_prepare::{JournalSnapshots, MutationCell, MutationIoStage, VmMapPhase};
+use super::control_prepare::{
+    InflightMutation, JournalSnapshots, MutationCell, MutationIoStage, MutationIoStatus, VmMapPhase,
+};
 use super::server::{read_frame, write_frame};
 
 /// Audit category for daemon-emitted health entries. Health probing is
@@ -57,6 +59,9 @@ const RETIRED_HOST_TOOL_SERVICE: &str = "host.tool.v1";
 /// Default control-frame cap — Register/Deregister are tiny; this bounds a
 /// hostile/garbled control message.
 const CONTROL_MAX_FRAME_BYTES: usize = 64 * 1024;
+
+/// One original monotonic cleanup grace; both request and coordinator use it.
+pub const COOPERATIVE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Default per-VM guest dispatch frame cap.
 fn default_max_frame_bytes() -> usize {
@@ -159,6 +164,11 @@ pub(crate) struct AcceptedDaemonWork {
 }
 
 impl AcceptedDaemonWork {
+    /// Monotonic identity scoped to this original ledger/cell; no authority.
+    pub(crate) fn original_row_id(&self) -> u64 {
+        self.id
+    }
+
     pub(crate) fn attach_resource(
         &self,
         lease: mvm_vmm::host::installed_owner::HolderLease,
@@ -255,6 +265,88 @@ impl AcceptedWorkDrain {
 struct DaemonLifecycleAdmission {
     gate: mvm_core::tenant_lifecycle::TenantLifecycleGate,
     generation: mvm_core::tenant_lifecycle::LifecycleGeneration,
+    home: PathBuf,
+}
+
+/// Sticky bookkeeping for the original coordinator, never cleanup authority.
+#[derive(Clone)]
+pub struct OriginalDrainRequest {
+    generation: mvm_core::tenant_lifecycle::LifecycleGeneration,
+    deadline: std::time::Instant,
+}
+
+impl OriginalDrainRequest {
+    pub fn generation(&self) -> &mvm_core::tenant_lifecycle::LifecycleGeneration {
+        &self.generation
+    }
+    pub fn deadline(&self) -> std::time::Instant {
+        self.deadline
+    }
+}
+
+struct OriginalDrainState {
+    request: std::sync::OnceLock<OriginalDrainRequest>,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+/// A handle to the SAME original daemon's drain bookkeeping, not a new owner.
+#[derive(Clone)]
+pub struct OriginalDrainController {
+    state: Arc<OriginalDrainState>,
+    generation: mvm_core::tenant_lifecycle::LifecycleGeneration,
+}
+
+impl OriginalDrainController {
+    fn checked(&self, request: &OriginalDrainRequest) -> Result<OriginalDrainRequest> {
+        anyhow::ensure!(
+            request.generation == self.generation,
+            "original drain generation changed"
+        );
+        Ok(request.clone())
+    }
+
+    /// Call only after the original caller has accepted a drain or its fencing
+    /// uncertainty. No FileGate/daemon/cell lock may surround this notification.
+    /// Rejected idle proposals must never invoke it. Re-entry keeps FIRST time.
+    pub fn request(&self, first_deadline: std::time::Instant) -> Result<OriginalDrainRequest> {
+        // This pure fixed-size initializer runs outside ALL outer locks. A
+        // contended caller joins this SAME initialization instead of parking
+        // the original coordinator after a transient Busy observation.
+        let request = self.state.request.get_or_init(|| OriginalDrainRequest {
+            generation: self.generation.clone(),
+            deadline: first_deadline,
+        });
+        let request = self.checked(request)?;
+        self.state.changed.send_replace(());
+        Ok(request)
+    }
+
+    pub fn subscribe(&self) -> OriginalDrainObserver {
+        OriginalDrainObserver {
+            controller: self.clone(),
+            changed: self.state.changed.subscribe(),
+        }
+    }
+}
+
+pub struct OriginalDrainObserver {
+    controller: OriginalDrainController,
+    changed: tokio::sync::watch::Receiver<()>,
+}
+
+impl OriginalDrainObserver {
+    /// Subscribe before observing; each wake rechecks the SAME sticky state.
+    pub async fn next(&mut self) -> Result<OriginalDrainRequest> {
+        loop {
+            if let Some(request) = self.controller.state.request.get() {
+                return self.controller.checked(request);
+            }
+            self.changed
+                .changed()
+                .await
+                .context("original drain notification closed")?;
+        }
+    }
 }
 
 /// An opaque clone of the SAME original custody cell. It supplies no new
@@ -302,7 +394,220 @@ pub struct HostAgentDaemon {
     connection_slots: Arc<tokio::sync::Semaphore>,
     custody: Arc<MutationCell>,
     registrations: HashMap<String, RegisterVm>,
+    preparing_inventory: Option<PreparingInventory>,
+    drain: Arc<OriginalDrainState>,
+    inline_control: Arc<Mutex<()>>,
+    #[cfg(test)]
+    row_gap: Option<Arc<row_identity_tests::RowGap>>,
     mailbox_workers: Option<Arc<super::mailbox_workers::MailboxWorkers>>,
+}
+
+/// Presence is an observation, never freshness or authorization evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalPresence {
+    Unconfigured,
+    Missing,
+    Present,
+}
+
+struct JournalObservation {
+    path: PathBuf,
+    presence: JournalPresence,
+    records: Option<Vec<RegisterVm>>,
+}
+
+/// Immutable original operation context retained by the original mutation.
+/// No daemon/cell/registry back-reference, serialization, cloning or Debug.
+pub(crate) struct MutationOperationDescriptor {
+    request: ControlRequest,
+    signed: Option<SignedControl>,
+    key: VerifyingKey,
+    vm_id: String,
+    tenant: String,
+    generation: Option<mvm_core::tenant_lifecycle::LifecycleGeneration>,
+    helper: Option<PathBuf>,
+    journal: Option<RegistrationJournal>,
+    presence: Option<JournalPresence>,
+    original_records: Vec<RegisterVm>,
+    resource: Option<OriginalResourceBinding>,
+}
+
+struct OriginalResourceBinding {
+    root: PathBuf,
+    key: mvm_vmm::host::installed_owner::InstallationKey,
+    epoch: u64,
+}
+
+fn same_recordset(first: &[RegisterVm], second: &[RegisterVm]) -> bool {
+    if first.len() != second.len() {
+        return false;
+    }
+    // Consume each VM once; a repeated record cannot stand in for a missing VM.
+    let mut by_vm: HashMap<_, _> = first.iter().map(|r| (r.vm_id.as_str(), r)).collect();
+    by_vm.len() == first.len()
+        && second
+            .iter()
+            .all(|record| by_vm.remove(record.vm_id.as_str()) == Some(record))
+}
+
+impl MutationOperationDescriptor {
+    pub(crate) fn vm_id(&self) -> &str {
+        &self.vm_id
+    }
+    pub(crate) fn tenant(&self) -> &str {
+        &self.tenant
+    }
+    pub(crate) fn generation(&self) -> Option<&mvm_core::tenant_lifecycle::LifecycleGeneration> {
+        self.generation.as_ref()
+    }
+    pub(crate) fn journal_presence(&self) -> Result<JournalPresence> {
+        self.presence
+            .context("configured original journal has not been observed outside locks")
+    }
+
+    fn revalidate_binding(&self, daemon: &HostAgentDaemon) -> Result<()> {
+        anyhow::ensure!(
+            self.key == daemon.verifying_key
+                && self.tenant == daemon.tenant_id
+                && self.generation.as_ref()
+                    == daemon
+                        .lifecycle_admission
+                        .as_ref()
+                        .map(|binding| &binding.generation)
+                && self.helper == daemon.signer_helper_uds_path
+                && self.journal.as_ref().map(|journal| &journal.path)
+                    == daemon
+                        .registration_journal
+                        .as_ref()
+                        .map(|journal| &journal.path),
+            "original operation context changed"
+        );
+        anyhow::ensure!(
+            match (&self.resource, &daemon.resources) {
+                (None, None) => true,
+                (Some(original), Some(current)) =>
+                    original.root == current.root
+                        && original.key == current.key
+                        && original.epoch == current.generation
+                        && self
+                            .generation
+                            .as_ref()
+                            .is_none_or(|generation| generation.resource_epoch() == original.epoch),
+                _ => false,
+            },
+            "original operation resource binding changed"
+        );
+        if let Some(signed) = &self.signed {
+            anyhow::ensure!(
+                broker_control::verify(signed, &daemon.verifying_key)? == &self.request,
+                "original signed operation changed"
+            );
+        }
+        Ok(())
+    }
+
+    fn revalidate_memory(&self, daemon: &HostAgentDaemon) -> Result<()> {
+        self.revalidate_binding(daemon)?;
+        anyhow::ensure!(
+            self.original_records.len() == daemon.registrations.len()
+                && self
+                    .original_records
+                    .iter()
+                    .all(|record| daemon.registrations.get(&record.vm_id) == Some(record)),
+            "original in-memory registration recordset changed"
+        );
+        Ok(())
+    }
+
+    /// Recovery alone may observe a partial final commit's exact candidate.
+    /// Normal mutation retains its stricter original-only memory check above.
+    fn revalidate_recovery(
+        &self,
+        daemon: &HostAgentDaemon,
+        snapshots: &JournalSnapshots,
+    ) -> Result<()> {
+        self.revalidate_binding(daemon)?;
+        self.require_original_journal()?;
+        anyhow::ensure!(
+            same_recordset(&self.original_records, &snapshots.original),
+            "retained journal original differs from its immutable recipe"
+        );
+        let mut expected_candidate: Vec<_> = self
+            .original_records
+            .iter()
+            .filter(|record| record.vm_id != self.vm_id)
+            .cloned()
+            .collect();
+        if let ControlRequest::Register(record) = &self.request {
+            expected_candidate.push(record.as_ref().clone());
+        }
+        anyhow::ensure!(
+            same_recordset(&expected_candidate, &snapshots.candidate),
+            "retained journal candidate differs from its immutable recipe"
+        );
+        let matches = |records: &[RegisterVm]| {
+            records.len() == daemon.registrations.len()
+                && records
+                    .iter()
+                    .all(|record| daemon.registrations.get(&record.vm_id) == Some(record))
+        };
+        anyhow::ensure!(
+            matches(&snapshots.original) || matches(&snapshots.candidate),
+            "current records are neither the original nor its exact candidate"
+        );
+        Ok(())
+    }
+
+    /// Called on the owned descriptor OUTSIDE daemon/FileGate turns. The
+    /// factory itself performs no filesystem operation or wait.
+    fn observe_original_journal(&mut self) -> Result<()> {
+        let Some(journal) = &self.journal else {
+            anyhow::ensure!(
+                self.presence == Some(JournalPresence::Unconfigured),
+                "journal context changed"
+            );
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.presence.is_none(),
+            "original journal observation already bound"
+        );
+        let observation = journal.observe()?;
+        anyhow::ensure!(
+            observation.path == journal.path,
+            "original journal path changed"
+        );
+        if let Some(records) = observation.records {
+            let mut records = checked_registration_records(&self.tenant, records)?;
+            records.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
+            anyhow::ensure!(
+                records == self.original_records,
+                "canonical journal no longer matches the original in-memory recordset"
+            );
+        }
+        self.presence = Some(observation.presence);
+        Ok(())
+    }
+
+    fn require_original_journal(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.journal_presence()? != JournalPresence::Missing,
+            "missing configured registration journal requires canonical fresh bootstrap or original recovery"
+        );
+        Ok(())
+    }
+}
+
+fn checked_registration_records(tenant: &str, records: Vec<RegisterVm>) -> Result<Vec<RegisterVm>> {
+    let mut identities = HashSet::new();
+    for record in &records {
+        validate_registration(tenant, record)?;
+        anyhow::ensure!(
+            identities.insert(&record.vm_id),
+            "registration journal repeats original VM identity"
+        );
+    }
+    Ok(records)
 }
 
 #[derive(Debug, Clone)]
@@ -316,11 +621,22 @@ impl RegistrationJournal {
     }
 
     fn load(&self) -> Result<Vec<RegisterVm>> {
+        let observation = self.observe()?;
+        Ok(observation.records.unwrap_or_default())
+    }
+
+    fn observe(&self) -> Result<JournalObservation> {
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let before = match std::fs::symlink_metadata(&self.path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(JournalObservation {
+                    path: self.path.clone(),
+                    presence: JournalPresence::Missing,
+                    records: None,
+                });
+            }
             Err(error) => return Err(error.into()),
         };
         anyhow::ensure!(
@@ -362,10 +678,13 @@ impl RegistrationJournal {
             bytes.len() <= CONTROL_MAX_FRAME_BYTES,
             "registration journal exceeds checked inventory bound"
         );
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Vec::new());
-        }
-        serde_json::from_slice(&bytes).context("decode bounded canonical registration journal")
+        let records = serde_json::from_slice(&bytes)
+            .context("decode bounded canonical registration journal")?;
+        Ok(JournalObservation {
+            path: self.path.clone(),
+            presence: JournalPresence::Present,
+            records: Some(records),
+        })
     }
 
     fn store<'a>(&self, registrations: impl IntoIterator<Item = &'a RegisterVm>) -> Result<()> {
@@ -407,6 +726,568 @@ impl RegistrationJournal {
         tmp_path.set_file_name(format!("{file_name}.{}.tmp", std::process::id()));
         Ok(tmp_path)
     }
+}
+
+#[derive(Clone)]
+struct PreparingInventory {
+    generation: mvm_core::tenant_lifecycle::LifecycleGeneration,
+    key: VerifyingKey,
+    resource_root: PathBuf,
+    resource_key: mvm_vmm::host::installed_owner::InstallationKey,
+    resource_epoch: u64,
+    journal: RegistrationJournal,
+    records: Vec<RegisterVm>,
+    released: bool,
+}
+
+impl PreparingInventory {
+    fn check_context(&self, daemon: &HostAgentDaemon) -> Result<()> {
+        let admission = daemon
+            .lifecycle_admission
+            .as_ref()
+            .context("startup lifecycle context absent")?;
+        let resource = daemon
+            .resources
+            .as_ref()
+            .context("startup resource binding absent")?;
+        anyhow::ensure!(
+            admission.generation == self.generation
+                && daemon.verifying_key == self.key
+                && resource.generation == self.resource_epoch
+                && resource.generation == self.generation.resource_epoch()
+                && resource.root == self.resource_root
+                && resource.key == self.resource_key
+                && daemon
+                    .registration_journal
+                    .as_ref()
+                    .map(|journal| &journal.path)
+                    == Some(&self.journal.path),
+            "original startup generation/resource/journal context changed"
+        );
+        anyhow::ensure!(
+            !daemon.custody.stop_requested() && !self.released,
+            "original startup service admission stopped or already released"
+        );
+        anyhow::ensure!(
+            daemon.registrations.len() == self.records.len()
+                && self
+                    .records
+                    .iter()
+                    .all(|record| daemon.registrations.get(&record.vm_id) == Some(record)),
+            "original full startup recordset changed"
+        );
+        Ok(())
+    }
+}
+
+fn require_nonblocking_publication(record: &RegisterVm) -> Result<()> {
+    let assurance = mvm_core::protocol::broker::ServiceId::parse("host.assurance.v1")?;
+    anyhow::ensure!(
+        !record.services_bindings.contains(&assurance),
+        "lifecycle-coordinated assurance publication is not qualified for a nonblocking gate turn"
+    );
+    Ok(())
+}
+
+/// A checked startup recordset and physical-presence observation. It supplies
+/// neither permission to activate nor a process-collection receipt.
+pub struct StartupRegistrationInventory {
+    records: Vec<RegisterVm>,
+    created: bool,
+    tenant: String,
+    resource_root: PathBuf,
+    resource_key: mvm_vmm::host::installed_owner::InstallationKey,
+    predecessor_epoch: u64,
+}
+impl StartupRegistrationInventory {
+    pub fn records(&self) -> &[RegisterVm] {
+        &self.records
+    }
+    pub fn created_fresh_journal(&self) -> bool {
+        self.created
+    }
+    /// Pure recordset/binding comparison for the actual coordinator's Active
+    /// precheck. This observation itself supplies no activation permission.
+    pub fn check_prepared(
+        &self,
+        daemon: &HostAgentDaemon,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<usize> {
+        let count = daemon.check_prepared_services(expected)?;
+        let inventory = daemon
+            .preparing_inventory
+            .as_ref()
+            .context("original preparation inventory absent")?;
+        anyhow::ensure!(
+            daemon.tenant_id == self.tenant
+                && inventory.records == self.records
+                && inventory.resource_root == self.resource_root
+                && inventory.resource_key == self.resource_key
+                && self.predecessor_epoch.checked_add(1) == Some(inventory.resource_epoch),
+            "prepared services differ from the original guard-validated startup inventory"
+        );
+        Ok(count)
+    }
+}
+
+struct OriginalBrokerSocket {
+    parent: std::fs::File,
+    relative_parent: PathBuf,
+    leaf: std::ffi::CString,
+    original: Option<libc::stat>,
+}
+
+fn original_socket_stat(
+    parent: &std::fs::File,
+    leaf: &std::ffi::CStr,
+) -> Result<Option<libc::stat>> {
+    use std::os::fd::AsRawFd;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: live held directory/name and complete writable stat output.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        // SAFETY: successful stat initialized every field.
+        let metadata = unsafe { metadata.assume_init() };
+        // SAFETY: geteuid has no arguments or credential side effects.
+        let uid = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                && metadata.st_uid == uid
+                && metadata.st_nlink == 1,
+            "original broker endpoint is not an owned single-link socket"
+        );
+        Ok(Some(metadata))
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error.into())
+        }
+    }
+}
+
+fn open_recovery_parent(home: &std::fs::File, relative: &Path) -> Result<std::fs::File> {
+    let mut parent = home.try_clone()?;
+    anyhow::ensure!(
+        relative.components().count() <= 32,
+        "broker recovery traversal exceeds profile bound"
+    );
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("broker recovery path is not a normal relative namespace");
+        };
+        parent = open_startup_child(&parent, name)?;
+    }
+    Ok(parent)
+}
+
+fn same_directory(first: &std::fs::File, second: &std::fs::File) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let a = first.metadata()?;
+    let b = second.metadata()?;
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+impl StartupRegistrationInventory {
+    /// Explicit within-home recovery profile. The complete original canonical
+    /// recordset is preflighted before any unlink. Native short-/tmp endpoints
+    /// require their separate canonical resolver; arbitrary DTO paths refuse.
+    /// Retiring stale filesystem entries is NOT Child collection evidence.
+    pub fn retire_within_home_broker_sockets(
+        &self,
+        cfg: &HostAgentConfig,
+        home: &Path,
+        exclusion: &mvm_vmm::host::installed_owner::RecoveryExclusion<'_>,
+    ) -> Result<usize> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let labels = cfg.resource_descriptor(home)?;
+        anyhow::ensure!(
+            self.tenant == cfg.tenant_id
+                && self.resource_root == labels.root
+                && self.resource_key == labels.key,
+            "original recovery installation changed"
+        );
+        exclusion.revalidate_for(&labels.root, labels.key)?;
+        anyhow::ensure!(
+            exclusion.original_predecessor()?.epoch == self.predecessor_epoch,
+            "original recovery predecessor changed"
+        );
+        if self.records.is_empty() {
+            return Ok(0);
+        }
+        let lifecycle = mvm_core::tenant_lifecycle::LifecycleCoordinator::open_existing(
+            home,
+            &cfg.tenant_id,
+            original_io_deadline(),
+        )?;
+        let state = lifecycle.snapshot(original_io_deadline())?;
+        anyhow::ensure!(
+            state.generation().resource_epoch() == self.predecessor_epoch
+                && matches!(
+                    state.phase(),
+                    mvm_core::tenant_lifecycle::LifecyclePhase::Draining
+                        | mvm_core::tenant_lifecycle::LifecyclePhase::Drained
+                )
+                && state.pending().is_empty(),
+            "original lifecycle must be fenced before socket retirement"
+        );
+        let root = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(home)?;
+        checked_startup_directory(&root)?;
+        anyhow::ensure!(
+            self.records.len() <= 256,
+            "broker recovery descriptor budget exceeded"
+        );
+        let mut paths = HashSet::new();
+        let mut sockets = Vec::with_capacity(self.records.len());
+        for record in &self.records {
+            validate_registration(&self.tenant, record)?;
+            let path = Path::new(&record.broker_listen_socket);
+            anyhow::ensure!(
+                path.is_absolute()
+                    && path.as_os_str().as_bytes().len() <= 4096
+                    && path.components().all(|component| !matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )),
+                "original broker recovery path is not bounded/normal"
+            );
+            anyhow::ensure!(
+                paths.insert(path.to_path_buf()),
+                "original broker recordset aliases an endpoint"
+            );
+            let parent = path
+                .parent()
+                .context("original broker endpoint has no parent")?;
+            let relative = parent.strip_prefix(home).context(
+                "external/short broker endpoint requires its canonical recovery profile",
+            )?;
+            let leaf = path
+                .file_name()
+                .context("original broker endpoint has no leaf")?;
+            let leaf = std::ffi::CString::new(leaf.as_bytes())?;
+            let parent = open_recovery_parent(&root, relative)?;
+            let original = original_socket_stat(&parent, &leaf)?;
+            sockets.push(OriginalBrokerSocket {
+                parent,
+                relative_parent: relative.to_path_buf(),
+                leaf,
+                original,
+            });
+        }
+        // Recheck ALL candidates before the first mutation, then recheck the
+        // same held parent/inode immediately before each descriptor-relative
+        // unlink. Partial failure keeps global Draining and the original journal.
+        let validate = |socket: &OriginalBrokerSocket| -> Result<()> {
+            exclusion.revalidate_for(&labels.root, labels.key)?;
+            let current_root = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(home)?;
+            checked_startup_directory(&current_root)?;
+            anyhow::ensure!(
+                same_directory(&root, &current_root)?,
+                "original recovery home changed"
+            );
+            let current_parent = open_recovery_parent(&root, &socket.relative_parent)?;
+            anyhow::ensure!(
+                same_directory(&socket.parent, &current_parent)?,
+                "original broker parent changed"
+            );
+            let now = original_socket_stat(&socket.parent, &socket.leaf)?;
+            anyhow::ensure!(
+                match (&socket.original, now) {
+                    (None, None) => true,
+                    (Some(old), Some(now)) => old.st_dev == now.st_dev && old.st_ino == now.st_ino,
+                    _ => false,
+                },
+                "original broker socket identity changed"
+            );
+            Ok(())
+        };
+        for socket in &sockets {
+            validate(socket)?;
+        }
+        let mut retired = 0;
+        for socket in &sockets {
+            validate(socket)?;
+            if socket.original.is_some() {
+                // SAFETY: original held parent and preflighted/rechecked leaf;
+                // actual installation EX remains borrowed through directory sync.
+                if unsafe { libc::unlinkat(socket.parent.as_raw_fd(), socket.leaf.as_ptr(), 0) }
+                    != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                socket.parent.sync_all()?;
+                retired += 1;
+            }
+        }
+        exclusion.revalidate_for(&labels.root, labels.key)?;
+        Ok(retired)
+    }
+}
+
+struct StartupDirectories {
+    home: std::fs::File,
+    tenant: std::fs::File,
+    journal_parent: std::fs::File,
+    journal_parent_path: PathBuf,
+}
+
+fn checked_startup_directory(file: &std::fs::File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    mvm_core::private_fs::require_current_owner(&metadata)?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.mode() & 0o777 == 0o700,
+        "startup directory is not original private storage"
+    );
+    Ok(())
+}
+
+fn open_startup_child(parent: &std::fs::File, name: &std::ffi::OsStr) -> Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    // SAFETY: borrowed live original directory; fixed/validated single child.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful openat returned one fresh descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    checked_startup_directory(&file)?;
+    Ok(file)
+}
+
+impl StartupDirectories {
+    fn open(home: &Path, tenant: &str, journal: &Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        anyhow::ensure!(
+            journal.file_name() == Some(std::ffi::OsStr::new("registrations.json")),
+            "startup journal requires the canonical filename"
+        );
+        let root = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(home)?;
+        checked_startup_directory(&root)?;
+        let agents = open_startup_child(&root, std::ffi::OsStr::new("host-agent"))?;
+        let tenant_dir = open_startup_child(&agents, std::ffi::OsStr::new(tenant))?;
+        let canonical_parent = mvm_core::config::host_agent_dir_at(home, tenant);
+        let parent = journal.parent().context("startup journal has no parent")?;
+        let journal_parent = if parent == canonical_parent {
+            tenant_dir.try_clone()?
+        } else if parent == home {
+            // Preserve the original private-home fixture/legacy explicit path;
+            // no arbitrary external or temporary namespace is initialized.
+            root.try_clone()?
+        } else {
+            bail!("noncanonical journal parent requires original legacy recovery");
+        };
+        Ok(Self {
+            home: root,
+            tenant: tenant_dir,
+            journal_parent,
+            journal_parent_path: parent.to_path_buf(),
+        })
+    }
+
+    fn revalidate_parent(&self) -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        checked_startup_directory(&self.home)?;
+        checked_startup_directory(&self.tenant)?;
+        let current = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.journal_parent_path)?;
+        checked_startup_directory(&current)?;
+        let original = self.journal_parent.metadata()?;
+        let current = current.metadata()?;
+        anyhow::ensure!(
+            original.dev() == current.dev() && original.ino() == current.ino(),
+            "original startup journal parent changed"
+        );
+        Ok(())
+    }
+}
+
+fn startup_entry_present(parent: &std::fs::File, name: &str) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(name)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: live original parent/name, output read only on successful stat.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error.into())
+    }
+}
+
+/// Canonical Hostd first-use journal creation. The SAME actual guard remains
+/// borrowed through validation, exclusive creation, exact readback and sync.
+/// Caller-supplied snapshots/flags, AlreadyClean, and absence alone are not proof.
+pub fn prepare_startup_registration_inventory(
+    cfg: &HostAgentConfig,
+    home: &Path,
+    exclusion: &mvm_vmm::host::installed_owner::RecoveryExclusion<'_>,
+) -> Result<StartupRegistrationInventory> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    let labels = cfg.resource_descriptor(home)?;
+    exclusion.revalidate_for(&labels.root, labels.key)?;
+    let predecessor = exclusion.original_predecessor()?;
+    let journal = RegistrationJournal::new(cfg.registration_journal_path()?);
+    let directories = StartupDirectories::open(home, &cfg.tenant_id, &journal.path)?;
+    let lifecycle = startup_entry_present(&directories.tenant, "lifecycle.json")?;
+    let lock = startup_entry_present(&directories.tenant, "lifecycle.lock")?;
+    anyhow::ensure!(
+        !startup_entry_present(&directories.tenant, ".lifecycle.intent")? && lifecycle == lock,
+        "partial or unresolved original lifecycle inventory"
+    );
+    let observation = journal.observe()?;
+    if observation.presence == JournalPresence::Present {
+        anyhow::ensure!(
+            lifecycle && lock,
+            "existing journal without canonical lifecycle requires original legacy reconciliation"
+        );
+        let mut records = checked_registration_records(
+            &cfg.tenant_id,
+            observation
+                .records
+                .context("canonical journal records absent")?,
+        )?;
+        records.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
+        directories.revalidate_parent()?;
+        exclusion.revalidate_for(&labels.root, labels.key)?;
+        return Ok(StartupRegistrationInventory {
+            records,
+            created: false,
+            tenant: cfg.tenant_id.clone(),
+            resource_root: labels.root,
+            resource_key: labels.key,
+            predecessor_epoch: predecessor.epoch,
+        });
+    }
+    anyhow::ensure!(
+        predecessor.phase == mvm_vmm::host::installed_owner::Phase::Clean
+            && predecessor.epoch == 0
+            && !lifecycle
+            && !lock,
+        "missing nonfresh registration journal requires original recovery; it is not empty"
+    );
+    let inventory = crate::host_agent_idle::checked_session_inventory(
+        home,
+        &cfg.tenant_id,
+        original_io_deadline(),
+    )?;
+    anyhow::ensure!(
+        inventory.owned_running() == 0,
+        "original canonical session inventory is not fresh"
+    );
+    directories.revalidate_parent()?;
+    exclusion.revalidate_for(&labels.root, labels.key)?;
+    let leaf = std::ffi::CString::new("registrations.json")?;
+    // SAFETY: owned validated parent; exclusive nofollow private leaf creation.
+    let fd = unsafe {
+        libc::openat(
+            directories.journal_parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful exclusive open returned one fresh original descriptor.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    mvm_core::private_fs::require_current_owner(&metadata)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1 && metadata.mode() & 0o777 == 0o600,
+        "fresh canonical journal is not private original storage"
+    );
+    file.write_all(b"[]\n")?;
+    file.sync_all()?;
+    directories.journal_parent.sync_all()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut exact = Vec::new();
+    Read::by_ref(&mut file).take(4).read_to_end(&mut exact)?;
+    anyhow::ensure!(
+        exact == b"[]\n" && file.metadata()?.len() == 3,
+        "fresh canonical journal exact readback failed"
+    );
+    let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: live original parent/name; initialized output only after success.
+    if unsafe {
+        libc::fstatat(
+            directories.journal_parent.as_raw_fd(),
+            leaf.as_ptr(),
+            current.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful stat initialized the complete object metadata.
+    let current = unsafe { current.assume_init() };
+    let mut original = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: live original descriptor and writable complete stat output.
+    if unsafe { libc::fstat(file.as_raw_fd(), original.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful fstat initialized the complete original metadata.
+    let original = unsafe { original.assume_init() };
+    anyhow::ensure!(
+        current.st_dev == original.st_dev
+            && current.st_ino == original.st_ino
+            && current.st_nlink == 1,
+        "fresh canonical journal path changed"
+    );
+    directories.revalidate_parent()?;
+    exclusion.revalidate_for(&labels.root, labels.key)?;
+    Ok(StartupRegistrationInventory {
+        records: Vec::new(),
+        created: true,
+        tenant: cfg.tenant_id.clone(),
+        resource_root: labels.root,
+        resource_key: labels.key,
+        predecessor_epoch: predecessor.epoch,
+    })
 }
 
 /// An owned copy of original verified control context. These fields are
@@ -638,6 +1519,14 @@ impl HostAgentDaemon {
             connection_slots,
             custody,
             registrations: HashMap::new(),
+            preparing_inventory: None,
+            drain: Arc::new(OriginalDrainState {
+                request: std::sync::OnceLock::new(),
+                changed: tokio::sync::watch::channel(()).0,
+            }),
+            inline_control: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            row_gap: None,
             mailbox_workers: None,
         }
     }
@@ -669,7 +1558,11 @@ impl HostAgentDaemon {
             );
             state.closed = true;
         }
-        self.lifecycle_admission = Some(DaemonLifecycleAdmission { gate, generation });
+        self.lifecycle_admission = Some(DaemonLifecycleAdmission {
+            gate,
+            generation,
+            home: home.to_path_buf(),
+        });
         Ok(self)
     }
 
@@ -679,11 +1572,147 @@ impl HostAgentDaemon {
         }
     }
 
+    pub fn drain_controller(&self) -> Result<OriginalDrainController> {
+        Ok(OriginalDrainController {
+            state: self.drain.clone(),
+            generation: self
+                .lifecycle_admission
+                .as_ref()
+                .context("original drain lifecycle absent")?
+                .generation
+                .clone(),
+        })
+    }
+
+    /// The original serial control loop and shutdown share this SAME turn.
+    /// Never hold it for an unverified frame or while waiting for client input.
+    pub fn inline_control_turn(&self) -> Arc<Mutex<()>> {
+        self.inline_control.clone()
+    }
+
+    /// The original worker calls this only after its durable generation fence
+    /// and watcher drain. Wait behind the admitted inline dispatch AND reply,
+    /// outside FileGate/daemon/cell locks. Known vacancy is not Child proof.
+    pub async fn reconcile_for_shutdown(
+        daemon: Arc<Mutex<Self>>,
+        expected_generation: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<()> {
+        let (turn, admission, cell, tenant) = {
+            let original = daemon.lock().await;
+            (
+                original.inline_control_turn(),
+                original
+                    .lifecycle_admission
+                    .clone()
+                    .context("shutdown lifecycle absent")?,
+                original.custody.clone(),
+                original.tenant_id.clone(),
+            )
+        };
+        let _inline = turn.lock().await;
+        let coordinator = mvm_core::tenant_lifecycle::LifecycleCoordinator::open_existing(
+            &admission.home,
+            &tenant,
+            original_io_deadline(),
+        )?;
+        let state = coordinator.snapshot(original_io_deadline())?;
+        anyhow::ensure!(
+            state.generation() == expected_generation
+                && state.phase() == mvm_core::tenant_lifecycle::LifecyclePhase::Draining,
+            "shutdown has no original durable Draining fence"
+        );
+        let retained = {
+            let original = daemon.lock().await;
+            anyhow::ensure!(
+                Arc::ptr_eq(&original.custody, &cell)
+                    && original.lifecycle_admission.as_ref().map(|a| &a.generation)
+                        == Some(expected_generation),
+                "shutdown reconciliation generation changed"
+            );
+            original
+                .custody
+                .has_inflight_mutation()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::WouldBlock, error))?
+        };
+        if !retained {
+            return Ok(());
+        }
+        reconcile_original_mutation(&mut DaemonAccess::Shared(daemon), None).await
+    }
+
+    /// Capture original canonical context only. A descriptor is not a grant;
+    /// configured storage observation is bound separately outside all locks.
+    pub(crate) fn original_operation_descriptor(
+        &self,
+        request: ControlRequest,
+        signed: Option<SignedControl>,
+        expected_registration: Option<RegisterVm>,
+    ) -> Result<MutationOperationDescriptor> {
+        if let Some(signed) = &signed {
+            anyhow::ensure!(
+                broker_control::verify(signed, &self.verifying_key)? == &request,
+                "signed control does not match original operation"
+            );
+        }
+        let vm_id = match &request {
+            ControlRequest::Register(record) => {
+                validate_registration(&self.tenant_id, record)?;
+                record.vm_id.clone()
+            }
+            ControlRequest::Deregister(record) => {
+                validate_vm_id(&record.vm_id)?;
+                record.vm_id.clone()
+            }
+            _ => bail!("operation is not a canonical service registration or removal"),
+        };
+        if let Some(expected) = &expected_registration {
+            anyhow::ensure!(
+                expected.vm_id == vm_id && self.registrations.get(&vm_id) == Some(expected),
+                "original registration identity changed"
+            );
+        }
+        let mut records: Vec<_> = self.registrations.values().cloned().collect();
+        records.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
+        anyhow::ensure!(
+            serde_json::to_vec(&records)?.len() <= CONTROL_MAX_FRAME_BYTES,
+            "original in-memory registration recordset exceeds bound"
+        );
+        Ok(MutationOperationDescriptor {
+            request,
+            signed,
+            key: self.verifying_key,
+            vm_id,
+            tenant: self.tenant_id.clone(),
+            generation: self
+                .lifecycle_admission
+                .as_ref()
+                .map(|binding| binding.generation.clone()),
+            helper: self.signer_helper_uds_path.clone(),
+            journal: self.registration_journal.clone(),
+            presence: self
+                .registration_journal
+                .is_none()
+                .then_some(JournalPresence::Unconfigured),
+            original_records: records,
+            resource: self
+                .resources
+                .as_ref()
+                .map(|resource| OriginalResourceBinding {
+                    root: resource.root.clone(),
+                    key: resource.key,
+                    epoch: resource.generation,
+                }),
+        })
+    }
+
     pub(crate) fn registration_snapshot(
         &self,
         registration: &RegisterVm,
     ) -> Result<RegistrationSnapshot> {
         validate_registration(&self.tenant_id, registration)?;
+        if self.lifecycle_admission.is_some() {
+            require_nonblocking_publication(registration)?;
+        }
         Ok(RegistrationSnapshot {
             registration: registration.clone(),
             tenant: self.tenant_id.clone(),
@@ -815,6 +1844,48 @@ impl HostAgentDaemon {
             .context("daemon admission sequence exhausted")?;
         state.next = id;
         state.rows.try_reserve(1)?;
+        state.rows.insert(id, None);
+        Ok(AcceptedDaemonWork {
+            owner: self.work.clone(),
+            id,
+            settled: false,
+        })
+    }
+
+    fn reserve_preparation_work(
+        &self,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<AcceptedDaemonWork> {
+        let admission = self
+            .lifecycle_admission
+            .as_ref()
+            .context("startup lifecycle context absent")?;
+        anyhow::ensure!(
+            &admission.generation == expected && !self.custody.stop_requested(),
+            "original startup context fenced"
+        );
+        anyhow::ensure!(
+            !self
+                .work
+                .unresolved
+                .load(std::sync::atomic::Ordering::Acquire),
+            "original work unresolved"
+        );
+        let mut state = self
+            .work
+            .state
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("original work state unavailable"))?;
+        anyhow::ensure!(
+            state.closed && state.rows.len() < 256,
+            "startup requires closed ordinary admission and available original credit"
+        );
+        let id = state
+            .next
+            .checked_add(1)
+            .context("original preparation sequence exhausted")?;
+        state.rows.try_reserve(1)?;
+        state.next = id;
         state.rows.insert(id, None);
         Ok(AcceptedDaemonWork {
             owner: self.work.clone(),
@@ -1076,6 +2147,290 @@ impl HostAgentDaemon {
         Ok(restored)
     }
 
+    /// Trusted coordinator-only journal preparation. This never admits a
+    /// normal Register in Preparing and never releases service start latches.
+    /// The caller retains its actual original resource owner/recovery scope.
+    pub async fn prepare_journaled_services_shared(
+        daemon: Arc<Mutex<Self>>,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<usize> {
+        let (gate, journal, key, resource, cell) = {
+            let original = daemon.lock().await;
+            let (gate, generation) = original.coordination_binding()?;
+            anyhow::ensure!(
+                &generation == expected,
+                "original startup generation changed"
+            );
+            let resource = original
+                .resources
+                .clone()
+                .context("original startup resource binding absent")?;
+            anyhow::ensure!(
+                resource.generation == expected.resource_epoch(),
+                "startup resource/lifecycle epoch mismatch"
+            );
+            (
+                gate,
+                original
+                    .registration_journal
+                    .clone()
+                    .context("trusted replay requires a configured canonical journal")?,
+                original.verifying_key,
+                resource,
+                original.custody.clone(),
+            )
+        };
+        // Filesystem observation outside daemon/FileGate. Missing is never an
+        // empty historical recordset; genuine first-use bootstrap is separate.
+        let observation = journal.observe()?;
+        anyhow::ensure!(
+            observation.presence == JournalPresence::Present,
+            "missing canonical startup journal requires original freshness/recovery reconciliation"
+        );
+        let tenant = { daemon.lock().await.tenant_id.clone() };
+        let mut records = checked_registration_records(
+            &tenant,
+            observation.records.context("canonical records absent")?,
+        )?;
+        records.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
+        for record in &records {
+            require_nonblocking_publication(record)?;
+        }
+        let inventory = PreparingInventory {
+            generation: expected.clone(),
+            key,
+            resource_root: resource.root.clone(),
+            resource_key: resource.key,
+            resource_epoch: resource.generation,
+            journal,
+            records,
+            released: false,
+        };
+        gate.with_preparing(expected, original_io_deadline(), || {
+            let mut original = daemon
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("original startup turn busy"))?;
+            anyhow::ensure!(
+                original.preparing_inventory.is_none()
+                    && original.registrations.is_empty()
+                    && !cell.has_inflight_mutation()?
+                    && !cell.stop_requested(),
+                "original startup inventory already retained or unavailable"
+            );
+            let mut map = cell.map_loan()?;
+            anyhow::ensure!(
+                map.value_mut().phase == VmMapPhase::Live && map.value_mut().vms.is_empty(),
+                "original startup map is not empty/live"
+            );
+            original
+                .registrations
+                .try_reserve(inventory.records.len())?;
+            map.value_mut().vms.try_reserve(inventory.records.len())?;
+            for record in &inventory.records {
+                original
+                    .registrations
+                    .insert(record.vm_id.clone(), record.clone());
+            }
+            original.preparing_inventory = Some(inventory.clone());
+            inventory.check_context(&original)
+        })?;
+        // Each row gets a NEW original preparation turn/caches. Its token is
+        // settled only after parked ownership transfer, BEFORE the next row.
+        for record in &inventory.records {
+            let lane = { daemon.lock().await.mutation_lane() };
+            let mut permit = Some(
+                lane.try_acquire_owned()
+                    .context("original startup mutation remains busy")?,
+            );
+            let (mut operation, snapshot) = {
+                let original = daemon.lock().await;
+                inventory.check_context(&original)?;
+                (
+                    original.original_operation_descriptor(
+                        ControlRequest::Register(Box::new(record.clone())),
+                        None,
+                        Some(record.clone()),
+                    )?,
+                    original.registration_snapshot(record)?,
+                )
+            };
+            operation.observe_original_journal()?;
+            operation.require_original_journal()?;
+            let helper = snapshot.helper.clone();
+            let mut operation = Some(operation);
+            let expected_row = gate.with_preparing(expected, original_io_deadline(), || {
+                let original = daemon
+                    .try_lock()
+                    .map_err(|_| anyhow::anyhow!("original startup reservation busy"))?;
+                inventory.check_context(&original)?;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&original.custody, &cell),
+                    "original startup cell changed"
+                );
+                let operation = operation
+                    .take()
+                    .context("original preparation already reserved")?;
+                operation.revalidate_memory(&original)?;
+                let mut mutation = cell.reserve_mutation(&mut permit, || {
+                    original.reserve_preparation_work(expected)
+                })?;
+                mutation.value_mut().capture_operation(operation)?;
+                Ok(mutation.value_mut().original_row_id())
+            })?;
+            let mut mutation = {
+                let original = daemon.lock().await;
+                inventory.check_context(&original)?;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&original.custody, &cell),
+                    "original startup cell changed"
+                );
+                let mut mutation = cell.mutation_loan()?;
+                anyhow::ensure!(
+                    mutation.value_mut().original_row_id() == expected_row,
+                    "original startup row changed before effects"
+                );
+                mutation
+            };
+            mutation.value_mut().capture_journal(JournalSnapshots {
+                original: inventory.records.clone(),
+                candidate: inventory.records.clone(),
+            })?;
+            let lease = mvm_vmm::host::installed_owner::HolderLease::acquire(
+                &resource.root,
+                resource.key,
+                resource.generation,
+            )?;
+            mutation.value_mut().attach_resource(lease)?;
+            cell.prepare_registration(&mut mutation, snapshot)?;
+            let helper_record = record.clone();
+            mutation
+                .value_mut()
+                .start_io(MutationIoStage::HelperRegistration, move || {
+                    if let Some(helper) = helper {
+                        register_helper_vm_at(&helper, &helper_record)?;
+                    }
+                    Ok(())
+                })?;
+            mutation
+                .value_mut()
+                .finish_io(MutationIoStage::HelperRegistration)
+                .await?;
+            drop(mutation);
+            let mutation = gate.with_preparing(expected, original_io_deadline(), || {
+                let original = daemon
+                    .try_lock()
+                    .map_err(|_| anyhow::anyhow!("original startup transfer busy"))?;
+                inventory.check_context(&original)?;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&original.custody, &cell),
+                    "original startup cell changed"
+                );
+                let mut mutation = cell.mutation_loan()?;
+                anyhow::ensure!(
+                    mutation.value_mut().original_row_id() == expected_row,
+                    "original startup row changed before transfer"
+                );
+                mutation
+                    .value_mut()
+                    .operation()?
+                    .revalidate_memory(&original)?;
+                let mut map = cell.map_loan()?;
+                let map = map.value_mut();
+                anyhow::ensure!(
+                    map.phase == VmMapPhase::Live && !map.vms.contains_key(&record.vm_id),
+                    "original startup identity already occupied"
+                );
+                let prepared = mutation
+                    .value_mut()
+                    .prepared
+                    .as_mut()
+                    .context("original prepared service absent")?;
+                anyhow::ensure!(
+                    prepared.registration() == record,
+                    "prepared service does not match original record"
+                );
+                let (live, latch) = prepared.take_suspended_parts()?;
+                map.vms.insert(record.vm_id.clone(), live);
+                // The original map owns Live BEFORE this fallible local step.
+                map.vms
+                    .get_mut(&record.vm_id)
+                    .expect("inserted original Live")
+                    .park_start(latch)?;
+                anyhow::ensure!(
+                    prepared.service_transferred(),
+                    "original parked transfer incomplete"
+                );
+                mutation.value_mut().prepared = None;
+                Ok(mutation)
+            })?;
+            cell.complete_mutation(mutation)?;
+        }
+        Ok(inventory.records.len())
+    }
+
+    /// Short memory-only precheck. Count is returned only AFTER exact original
+    /// recordset, resource binding and parked owner checks all succeed.
+    pub fn check_prepared_services(
+        &self,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<usize> {
+        let inventory = self
+            .preparing_inventory
+            .as_ref()
+            .context("original startup inventory absent")?;
+        anyhow::ensure!(
+            &inventory.generation == expected,
+            "original startup generation changed"
+        );
+        inventory.check_context(self)?;
+        anyhow::ensure!(
+            !self.custody.has_inflight_mutation()?,
+            "original preparation remains inflight"
+        );
+        let mut map = self.custody.map_loan()?;
+        let map = map.value_mut();
+        anyhow::ensure!(
+            map.phase == VmMapPhase::Live && map.vms.len() == inventory.records.len(),
+            "original parked map is incomplete"
+        );
+        for record in &inventory.records {
+            require_nonblocking_publication(record)?;
+            anyhow::ensure!(
+                map.vms
+                    .get(&record.vm_id)
+                    .is_some_and(|live| live.is_parked_at(Path::new(&record.broker_listen_socket))),
+                "original parked service mapping changed"
+            );
+        }
+        Ok(inventory.records.len())
+    }
+
+    /// Called by the actual coordinator AFTER its durable Active write under
+    /// the SAME FileGate. No helper/journal wait or token settlement occurs.
+    pub fn release_prepared_services(
+        &mut self,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<usize> {
+        let count = self.check_prepared_services(expected)?;
+        let inventory = self
+            .preparing_inventory
+            .as_ref()
+            .expect("checked original inventory");
+        let mut map = self.custody.map_loan()?;
+        for record in &inventory.records {
+            map.value_mut()
+                .vms
+                .get_mut(&record.vm_id)
+                .context("original parked service disappeared")?
+                .release_parked_start()?;
+        }
+        self.preparing_inventory
+            .as_mut()
+            .expect("checked original inventory")
+            .released = true;
+        Ok(count)
+    }
+
     /// Original checked journal replay with no outer daemon lock across waits.
     pub async fn restore_journaled_registrations_shared(daemon: Arc<Mutex<Self>>) -> Result<usize> {
         let journal = { daemon.lock().await.registration_journal.clone() };
@@ -1310,6 +2665,9 @@ impl HostAgentDaemon {
                 frame = tokio::time::timeout(std::time::Duration::from_secs(5),
                     read_frame::<SignedControl>(&mut stream, CONTROL_MAX_FRAME_BYTES)) => frame,
             };
+            // Verification/pre-frame waiting never owns the shutdown turn.
+            // Once admitted, retain this SAME turn through the bounded reply.
+            let mut inline_turn = None;
             let resp = match frame {
                 Ok(Ok(signed)) => match broker_control::verify(&signed, &verifying_key) {
                     Ok(req) => {
@@ -1326,6 +2684,8 @@ impl HostAgentDaemon {
                             .await;
                             continue;
                         }
+                        let turn = { daemon.lock().await.inline_control_turn() };
+                        inline_turn = Some(turn.lock_owned().await);
                         match Self::apply_signed_shared(daemon.clone(), signed).await {
                             Ok(()) => ControlResponse::Ok,
                             Err(e) => ControlResponse::Err {
@@ -1353,8 +2713,13 @@ impl HostAgentDaemon {
             ) {
                 warn!("host-agent control reply failed or expired");
             }
+            drop(inline_turn);
         }
     }
+}
+
+fn original_io_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(5)
 }
 
 /// Access is borrowed only for short in-memory turns. Async service/helper
@@ -1403,6 +2768,7 @@ struct MutationContext {
     vm_id: String,
     original: Vec<RegisterVm>,
     candidate: Vec<RegisterVm>,
+    operation: Option<MutationOperationDescriptor>,
 }
 
 impl MutationContext {
@@ -1426,6 +2792,16 @@ impl MutationContext {
             },
             "original resource context changed"
         );
+        if let Some(admission) = &self.lifecycle {
+            let resource = self
+                .resources
+                .as_ref()
+                .context("original lifecycle resource binding missing")?;
+            anyhow::ensure!(
+                resource.generation == admission.generation.resource_epoch(),
+                "resource binding does not match original lifecycle epoch"
+            );
+        }
         match (&daemon.lifecycle_admission, &self.lifecycle) {
             (None, None) => {}
             (Some(current), Some(original)) => anyhow::ensure!(
@@ -1451,6 +2827,317 @@ impl MutationContext {
     }
 }
 
+fn check_original_recovery(
+    daemon: &HostAgentDaemon,
+    cell: &Arc<MutationCell>,
+    expected_row: u64,
+    original: &InflightMutation,
+    current: Option<(&ControlRequest, &SignedControl)>,
+) -> Result<()> {
+    anyhow::ensure!(
+        Arc::ptr_eq(&daemon.custody, cell),
+        "original recovery cell changed"
+    );
+    anyhow::ensure!(
+        original.original_row_id() == expected_row,
+        "original recovery row changed"
+    );
+    let operation = original.operation()?;
+    operation.revalidate_recovery(daemon, original.journal_snapshots()?)?;
+    if let Some((request, signed)) = current {
+        anyhow::ensure!(
+            broker_control::verify(signed, &daemon.verifying_key)? == request,
+            "current cleanup signature changed"
+        );
+        let ControlRequest::Deregister(removal) = request else {
+            bail!("only current canonical removal may request retained reconciliation");
+        };
+        anyhow::ensure!(
+            removal.vm_id == operation.vm_id,
+            "current cleanup does not name the retained original VM"
+        );
+    }
+    if let Some(retiring) = &original.retiring {
+        let prior = original
+            .journal_snapshots()?
+            .original
+            .iter()
+            .find(|record| record.vm_id == operation.vm_id)
+            .context("retiring service has no original registration")?;
+        anyhow::ensure!(
+            retiring.matches_original_endpoint(Path::new(&prior.broker_listen_socket)),
+            "retiring owner is not the original endpoint association"
+        );
+    }
+    if let Some(prepared) = &original.prepared {
+        let ControlRequest::Register(registration) = &operation.request else {
+            bail!("retained preparation is not an original Register");
+        };
+        anyhow::ensure!(
+            prepared.registration() == registration.as_ref(),
+            "retained preparation does not match its original request"
+        );
+    }
+    let mut map = daemon.custody.map_loan()?;
+    for (vm, live) in &map.value_mut().vms {
+        let record = daemon
+            .registrations
+            .get(vm)
+            .context("retained live owner has no known current record")?;
+        anyhow::ensure!(
+            live.matches_original_endpoint(Path::new(&record.broker_listen_socket)),
+            "retained live owner differs from its captured endpoint association"
+        );
+    }
+    Ok(())
+}
+
+/// Reconcile the SAME retained turn as stopped historical intent. No service
+/// is reconstructed or exposed; the caller still owes its own current removal.
+async fn reconcile_original_mutation(
+    access: &mut DaemonAccess<'_>,
+    current: Option<(&ControlRequest, &SignedControl)>,
+) -> Result<()> {
+    use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecyclePhase};
+    let (admission, cell, tenant, expected_row, drain_controller) = access
+        .memory(|daemon| {
+            let mut original = daemon.custody.mutation_loan()?;
+            let expected_row = original.value_mut().original_row_id();
+            check_original_recovery(
+                daemon,
+                &daemon.custody,
+                expected_row,
+                original.value_mut(),
+                current,
+            )?;
+            Ok((
+                daemon
+                    .lifecycle_admission
+                    .clone()
+                    .context("retained cleanup requires its original lifecycle coordinator")?,
+                daemon.custody.clone(),
+                daemon.tenant_id.clone(),
+                expected_row,
+                daemon.drain_controller()?,
+            ))
+        })
+        .await?;
+    // Metadata reads/writes and every async wait stay outside daemon/cell loans.
+    let coordinator =
+        LifecycleCoordinator::open_existing(&admission.home, &tenant, original_io_deadline())?;
+    let state = coordinator.snapshot(original_io_deadline())?;
+    anyhow::ensure!(
+        state.generation() == &admission.generation && state.phase() != LifecyclePhase::Drained,
+        "retained cleanup generation is no longer drainable"
+    );
+    let proposed_deadline = std::time::Instant::now() + COOPERATIVE_DRAIN_GRACE;
+    let accepted = std::cell::Cell::new(false);
+    let fenced = coordinator.begin_drain(
+        &admission.generation,
+        state.revision(),
+        original_io_deadline(),
+        |_| {
+            access.try_memory(|daemon| {
+                let mut loan = cell.mutation_loan()?;
+                check_original_recovery(daemon, &cell, expected_row, loan.value_mut(), current)?;
+                accepted.set(true);
+                Ok(())
+            })
+        },
+    );
+    if accepted.get() && current.is_some() {
+        // No await separates an accepted fence/uncertainty from its sticky
+        // notification. A foreign signature/VM/row never reaches publication.
+        drain_controller.request(proposed_deadline)?;
+    }
+    fenced?;
+    access
+        .memory(|daemon| {
+            anyhow::ensure!(
+                Arc::ptr_eq(&daemon.custody, &cell)
+                    && daemon.lifecycle_admission.as_ref().map(|a| &a.generation)
+                        == Some(&admission.generation),
+                "original cleanup generation changed after fencing"
+            );
+            daemon.close_local_admission()
+        })
+        .await?;
+    cell.request_stop();
+    #[cfg(test)]
+    pause_row_gap(access, row_identity_tests::GapPoint::RecoveryAfterFence).await?;
+    let mut mutation = access
+        .memory(|daemon| {
+            let mut original = cell.mutation_loan()?;
+            check_original_recovery(daemon, &cell, expected_row, original.value_mut(), current)?;
+            Ok(original)
+        })
+        .await?;
+    let original = mutation.value_mut();
+
+    // A pending original task may still publish its candidate. Finish that
+    // exact task BEFORE compensation/restoration; never replay failed stages.
+    for stage in [
+        MutationIoStage::HelperRetirement,
+        MutationIoStage::HelperRegistration,
+        MutationIoStage::JournalPublication,
+    ] {
+        if original.io_status(stage) == MutationIoStatus::Pending {
+            let result = original.finish_io(stage).await;
+            if !matches!(
+                original.io_status(stage),
+                MutationIoStatus::Succeeded | MutationIoStatus::Failed
+            ) {
+                return result
+                    .and_then(|_| Err(anyhow::anyhow!("original I/O remains unresolved")));
+            }
+        }
+    }
+    if let Some(retiring) = original.retiring.as_mut() {
+        retiring.finish().await?;
+    }
+    original.retiring = None;
+    if let Some(prepared) = original.prepared.as_mut()
+        && !prepared.service_transferred()
+    {
+        prepared.cancel_services().await?;
+    }
+    // A partial commit can have transferred the original prepared Live to the
+    // SAME map. Join every original there before dropping its transferred shell.
+    {
+        let mut map = cell.map_loan()?;
+        let map = map.value_mut();
+        map.phase = VmMapPhase::Retiring;
+        for live in map.vms.values() {
+            live.request_stop();
+        }
+        for live in map.vms.values_mut() {
+            live.finish_retirement().await?;
+        }
+        map.vms.clear();
+        map.phase = VmMapPhase::Drained;
+    }
+    original.prepared = None;
+
+    if original.io_status(MutationIoStage::RollbackHelperRegistration)
+        == MutationIoStatus::NotStarted
+    {
+        let operation = original.operation()?;
+        let helper = operation.helper.clone();
+        let vm = operation.vm_id.clone();
+        original.start_io(MutationIoStage::RollbackHelperRegistration, move || {
+            if let Some(helper) = helper {
+                deregister_helper_vm_at(&helper, &vm)?;
+            }
+            Ok(())
+        })?;
+    }
+    original
+        .finish_io(MutationIoStage::RollbackHelperRegistration)
+        .await?;
+    if original.io_status(MutationIoStage::JournalRestoration) == MutationIoStatus::NotStarted {
+        let operation = original.operation()?;
+        let journal = operation.journal.clone();
+        let presence = operation.journal_presence()?;
+        let tenant = operation.tenant().to_owned();
+        let prior = original.journal_snapshots()?.original.clone();
+        let candidate = original.journal_snapshots()?.candidate.clone();
+        original.start_io(MutationIoStage::JournalRestoration, move || {
+            match (journal, presence) {
+                (None, JournalPresence::Unconfigured) => Ok(()),
+                (Some(journal), JournalPresence::Present) => {
+                    let observed = journal.observe()?;
+                    let records = observed
+                        .records
+                        .context("original journal disappeared during stopped reconciliation")?;
+                    let records = checked_registration_records(&tenant, records)?;
+                    anyhow::ensure!(
+                        same_recordset(&records, &prior) || same_recordset(&records, &candidate),
+                        "current journal is neither the original nor its exact candidate"
+                    );
+                    journal.store(prior.iter())
+                }
+                _ => bail!("unknown/missing original journal cannot become empty stopped intent"),
+            }
+        })?;
+    }
+    original
+        .finish_io(MutationIoStage::JournalRestoration)
+        .await?;
+    let mut records = HashMap::new();
+    records.try_reserve(original.journal_snapshots()?.original.len())?;
+    for record in &original.journal_snapshots()?.original {
+        records.insert(record.vm_id.clone(), record.clone());
+    }
+    let mut records = Some(records);
+    drop(mutation);
+    let mutation =
+        admission
+            .gate
+            .with_draining(&admission.generation, original_io_deadline(), || {
+                access.try_memory(|daemon| {
+                    let mut loan = cell.mutation_loan()?;
+                    let original = loan.value_mut();
+                    check_original_recovery(daemon, &cell, expected_row, original, current)?;
+                    anyhow::ensure!(
+                        original.prepared.is_none()
+                            && original.retiring.is_none()
+                            && original.io_status(MutationIoStage::RollbackHelperRegistration)
+                                == MutationIoStatus::Succeeded
+                            && original.io_status(MutationIoStage::JournalRestoration)
+                                == MutationIoStatus::Succeeded,
+                        "original service/effect cleanup remains unresolved"
+                    );
+                    let mut map = cell.map_loan()?;
+                    anyhow::ensure!(
+                        map.value_mut().phase == VmMapPhase::Drained
+                            && map.value_mut().vms.is_empty(),
+                        "original services have not actually joined"
+                    );
+                    daemon.registrations = records
+                        .take()
+                        .context("original records already restored")?;
+                    Ok(loan)
+                })
+            })?;
+    // Settle this SAME checked loan outside the FileGate/daemon lock; never
+    // reacquire an unidentified row that another caller might have replaced.
+    cell.complete_mutation(mutation)
+}
+
+fn coordinated_mutation_turn<T>(
+    admission: &DaemonLifecycleAdmission,
+    cleanup: bool,
+    tenant: &str,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecyclePhase};
+    if !cleanup {
+        return admission
+            .gate
+            .with_active(&admission.generation, original_io_deadline(), action);
+    }
+    let coordinator =
+        LifecycleCoordinator::open_existing(&admission.home, tenant, original_io_deadline())?;
+    let state = coordinator.snapshot(original_io_deadline())?;
+    anyhow::ensure!(
+        state.generation() == &admission.generation,
+        "original cleanup generation changed"
+    );
+    match state.phase() {
+        LifecyclePhase::Active => {
+            admission
+                .gate
+                .with_active(&admission.generation, original_io_deadline(), action)
+        }
+        LifecyclePhase::Draining => {
+            admission
+                .gate
+                .with_draining(&admission.generation, original_io_deadline(), action)
+        }
+        _ => bail!("current cleanup is neither Active nor the original Draining generation"),
+    }
+}
+
 async fn execute_mutation(
     mut access: DaemonAccess<'_>,
     request: ControlRequest,
@@ -1465,6 +3152,16 @@ async fn execute_mutation(
             bail!("HVF instance control requires the instance supervisor")
         }
     };
+    if cleanup
+        && access
+            .memory(|daemon| daemon.custody.has_inflight_mutation())
+            .await?
+    {
+        let signed = signed
+            .as_ref()
+            .context("retained reconciliation requires current canonical signed cleanup")?;
+        reconcile_original_mutation(&mut access, Some((&request, signed))).await?;
+    }
     let lane = access.memory(|daemon| Ok(daemon.mutation_lane())).await?;
     // Unresolved original work owns this permit. Refuse another mutation rather
     // than enqueue an unbounded waiter or mint a replacement owner.
@@ -1472,7 +3169,7 @@ async fn execute_mutation(
         lane.try_acquire_owned()
             .context("original daemon mutation remains busy")?,
     );
-    let context = access
+    let mut context = access
         .memory(|daemon| {
             validate_vm_id(&vm_id)?;
             if let Some(expected) = &expected_registration {
@@ -1508,6 +3205,11 @@ async fn execute_mutation(
                 vm_id: vm_id.clone(),
                 original,
                 candidate,
+                operation: Some(daemon.original_operation_descriptor(
+                    request.clone(),
+                    signed.clone(),
+                    expected_registration.clone(),
+                )?),
             };
             context.recheck(daemon, signed.as_ref(), cleanup)?;
             // Reserve bounded map capacity before the final short publication turn.
@@ -1516,6 +3218,14 @@ async fn execute_mutation(
             Ok(context)
         })
         .await?;
+    // Actual configured storage reads happen on the owned recipe outside both
+    // daemon and FileGate locks, before acceptance/effects.
+    let operation = context
+        .operation
+        .as_mut()
+        .context("original operation missing")?;
+    operation.observe_original_journal()?;
+    operation.require_original_journal()?;
     anyhow::ensure!(
         serde_json::to_vec_pretty(&context.candidate)?.len() < CONTROL_MAX_FRAME_BYTES,
         "candidate registration journal exceeds canonical inventory bound"
@@ -1527,11 +3237,13 @@ async fn execute_mutation(
         );
     }
     let cell = context.custody.clone();
+    let lifecycle = context.lifecycle.clone();
+    let tenant = context.tenant.clone();
     let mut reserve = || {
         access.try_memory(|daemon| {
             context.recheck(daemon, signed.as_ref(), cleanup)?;
             let reserve_accepted = || {
-                if let Some(admission) = &context.lifecycle {
+                if let Some(admission) = &lifecycle {
                     if cleanup {
                         daemon.reserve_cleanup_work(&admission.generation)
                     } else {
@@ -1541,24 +3253,40 @@ async fn execute_mutation(
                     daemon.reserve_verified_work(cleanup)
                 }
             };
-            let loan = cell.reserve_mutation(&mut permit, reserve_accepted)?;
-            // The original cell retains both originals before releasing this gate.
-            drop(loan);
-            Ok(())
+            let operation = context
+                .operation
+                .take()
+                .context("original operation already captured")?;
+            operation.revalidate_memory(daemon)?;
+            let mut loan = cell.reserve_mutation(&mut permit, reserve_accepted)?;
+            loan.value_mut().capture_operation(operation)?;
+            // Capture identity while this SAME original row remains borrowed.
+            // It is scoped to the retained Cell, not new authority or credit.
+            Ok(loan.value_mut().original_row_id())
         })
     };
-    if let Some(admission) = &context.lifecycle
-        && !cleanup
-    {
-        admission.gate.with_active(
-            &admission.generation,
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-            reserve,
-        )?;
+    let expected_row = if let Some(admission) = &lifecycle {
+        coordinated_mutation_turn(admission, cleanup, &tenant, reserve)?
     } else {
-        reserve()?;
-    }
-    let mut mutation = cell.mutation_loan()?;
+        reserve()?
+    };
+    #[cfg(test)]
+    pause_row_gap(
+        &mut access,
+        row_identity_tests::GapPoint::MutationAfterReservation,
+    )
+    .await?;
+    let mut mutation = access
+        .memory(|daemon| {
+            context.recheck(daemon, signed.as_ref(), cleanup)?;
+            let mut original = cell.mutation_loan()?;
+            anyhow::ensure!(
+                original.value_mut().original_row_id() == expected_row,
+                "original mutation row changed before effects"
+            );
+            Ok(original)
+        })
+        .await?;
     let original = mutation.value_mut();
     original.capture_journal(JournalSnapshots {
         original: context.original.clone(),
@@ -1635,6 +3363,11 @@ async fn execute_mutation(
             context.recheck(daemon, signed.as_ref(), cleanup)?;
             let mut mutation = cell.mutation_loan()?;
             let original = mutation.value_mut();
+            anyhow::ensure!(
+                original.original_row_id() == expected_row,
+                "original mutation row changed before publication"
+            );
+            original.operation()?.revalidate_memory(daemon)?;
             let mut map = cell.map_loan()?;
             let map = map.value_mut();
             anyhow::ensure!(
@@ -1660,22 +3393,16 @@ async fn execute_mutation(
             } else {
                 daemon.registrations.remove(&vm_id);
             }
-            Ok(())
+            Ok(mutation)
         })
     };
-    if let Some(admission) = &context.lifecycle
-        && !cleanup
-    {
-        admission.gate.with_active(
-            &admission.generation,
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-            commit,
-        )?;
+    let mutation = if let Some(admission) = &lifecycle {
+        coordinated_mutation_turn(admission, cleanup, &tenant, commit)?
     } else {
-        commit()?;
-    }
-    // Actual I/O completion + original-map representation precedes settlement.
-    cell.complete_mutation(cell.mutation_loan()?)
+        commit()?
+    };
+    // Settle the SAME final checked loan outside FileGate/daemon locks.
+    cell.complete_mutation(mutation)
 }
 
 /// Prepare and bind a host-agent control or signer listener, including restarts.
@@ -2720,3 +4447,30 @@ mod token_tests;
 #[cfg(test)]
 #[path = "daemon/cooperative_tests.rs"]
 mod cooperative_tests;
+
+#[cfg(test)]
+#[path = "daemon/startup_tests.rs"]
+mod startup_tests;
+
+#[cfg(test)]
+#[path = "daemon/recovery_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
+#[path = "daemon/row_identity_tests.rs"]
+mod row_identity_tests;
+
+#[cfg(test)]
+async fn pause_row_gap(
+    access: &mut DaemonAccess<'_>,
+    point: row_identity_tests::GapPoint,
+) -> Result<()> {
+    if let Some(gap) = access.memory(|daemon| Ok(daemon.row_gap.clone())).await? {
+        gap.pause(point).await;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "daemon/drain_request_tests.rs"]
+mod drain_request_tests;

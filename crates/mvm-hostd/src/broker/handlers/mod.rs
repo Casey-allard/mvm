@@ -29,7 +29,31 @@ pub struct BoundHandlers {
     pub assurance: Option<Arc<HostAssuranceV1Handler>>,
 }
 
+pub(crate) struct HandlerPublication<'a> {
+    assurance: Option<crate::assurance_session::PlanePublicationReservation<'a>>,
+}
+
+impl HandlerPublication<'_> {
+    pub(crate) fn commit(self) {
+        if let Some(assurance) = self.assurance {
+            // Already installed is canonical first-wins behavior, not refusal.
+            let _installed = assurance.commit();
+        }
+    }
+}
+
 impl BoundHandlers {
+    pub(crate) fn reserve_publication(
+        &self,
+    ) -> Result<HandlerPublication<'_>, crate::assurance_session::PlanePublicationError> {
+        let assurance = self
+            .assurance
+            .as_ref()
+            .map(crate::assurance_session::reserve_host_assurance_publication)
+            .transpose()?;
+        Ok(HandlerPublication { assurance })
+    }
+
     /// Publish the original prepared plane only after its owning registration
     /// commits. This does not admit a session or replace an existing plane.
     pub(crate) fn publish(&self) {

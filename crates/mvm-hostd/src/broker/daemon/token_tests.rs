@@ -2,6 +2,21 @@
 use super::*;
 use crate::broker::control_prepare::MutationCell;
 
+// Private test bookkeeping mirrors the actual original ledger reservation;
+// it is called only after reserve_mutation owns its vacant field.
+fn reserve_fixture_turn(owner: &Arc<AcceptedWorkOwner>) -> Result<AcceptedDaemonWork> {
+    let mut state = owner.state.try_lock().unwrap();
+    let id = state.next.checked_add(1).unwrap();
+    state.rows.try_reserve(1)?;
+    state.next = id;
+    state.rows.insert(id, None);
+    Ok(AcceptedDaemonWork {
+        owner: owner.clone(),
+        id,
+        settled: false,
+    })
+}
+
 #[test]
 fn accepted_settlement_failure_keeps_the_same_original_token() {
     let owner = Arc::new(AcceptedWorkOwner {
@@ -91,7 +106,15 @@ async fn mutation_reserves_its_original_cell_before_creating_accepted_work() {
         "retained cell must not consume another permit"
     );
     assert_eq!(callbacks.load(Ordering::SeqCst), 1);
-    assert_eq!(owner.state.try_lock().unwrap().rows.len(), 1);
+    {
+        let retained = owner.state.try_lock().unwrap();
+        assert_eq!(retained.rows.len(), 1);
+        assert!(
+            retained.rows.contains_key(&1),
+            "both rejections retain the SAME original row"
+        );
+        assert_eq!(retained.next, 1, "no replacement sequence/credit is minted");
+    }
     assert!(!owner.unresolved.load(Ordering::SeqCst));
     cell.complete_mutation(cell.mutation_loan().unwrap())
         .unwrap();
@@ -115,22 +138,18 @@ async fn mutation_keeps_its_original_resource_lease_until_explicit_settlement() 
     let epoch = installation.begin().unwrap();
     let owner = Arc::new(AcceptedWorkOwner {
         state: std::sync::Mutex::new(AcceptedWorkState {
-            next: 1,
+            next: 0,
             closed: false,
-            rows: HashMap::from([(1, None)]),
+            rows: HashMap::new(),
         }),
         unresolved: std::sync::atomic::AtomicBool::new(false),
         changed: tokio::sync::watch::channel(()).0,
     });
-    let accepted = AcceptedDaemonWork {
-        owner: owner.clone(),
-        id: 1,
-        settled: false,
-    };
     let cell = MutationCell::new(Arc::new(tokio::sync::Semaphore::new(256)));
     let lane = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut permit = Some(lane.clone().acquire_owned().await.unwrap());
     let mut loan = cell
-        .begin_mutation(lane.clone().acquire_owned().await.unwrap(), accepted)
+        .reserve_mutation(&mut permit, || reserve_fixture_turn(&owner))
         .unwrap();
     loan.value_mut()
         .attach_resource(HolderLease::acquire(&root, key, epoch.generation()).unwrap())
@@ -189,21 +208,17 @@ async fn service_drain_refuses_a_retained_or_loaned_original_mutation() {
         .unwrap();
     let owner = Arc::new(AcceptedWorkOwner {
         state: std::sync::Mutex::new(AcceptedWorkState {
-            next: 1,
+            next: 0,
             closed: false,
-            rows: HashMap::from([(1, None)]),
+            rows: HashMap::new(),
         }),
         unresolved: std::sync::atomic::AtomicBool::new(false),
         changed: tokio::sync::watch::channel(()).0,
     });
-    let accepted = AcceptedDaemonWork {
-        owner: owner.clone(),
-        id: 1,
-        settled: false,
-    };
     let lane = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut permit = Some(lane.clone().acquire_owned().await.unwrap());
     let mut original = cell
-        .begin_mutation(lane.clone().acquire_owned().await.unwrap(), accepted)
+        .reserve_mutation(&mut permit, || reserve_fixture_turn(&owner))
         .unwrap();
     {
         let live = cell

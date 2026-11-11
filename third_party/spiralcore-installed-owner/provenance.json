@@ -7,11 +7,10 @@
       "destination_path": "crates/mvm-vmm/src/host/installed_owner.rs",
       "portability_edits": [
         "Add private command-lease submodule and public typed spawn/startup re-exports; preserve the original owner/holder implementation.",
-        "Expose the original directory/platform-ACL admission guards to the sibling provisioning module at pub(super) visibility; no guard or record algorithm change.",
-        "Add a borrowed recovery-exclusion guard retaining the original owner and a fresh holders EX through caller recovery work, including AlreadyClean; preserve the original reconcile API and record format."
+        "Expose the original directory/platform-ACL admission guards to the sibling provisioning module at pub(super) visibility; no guard or record algorithm change."
       ],
       "source_sha256": "94006668298fbb172ae52e23105db51b57a44aa881ae6a84c556e0f85991100c",
-      "destination_sha256": "7591ade66fe94bdd8db24698f8b7218a4247fedd7cb0538bd16aaf4fb94580a1"
+      "destination_sha256": "87e0560948794e5683632fd79737a3a6d389366ce6e359ed51f711bf16e744a5"
     },
     {
       "source_path": "crates/spiralcore-mvm-live/src/installed_owner/tests.rs",
@@ -49,11 +48,5 @@
       "crates/mvm-vmm/tests/host_agent_installation.rs"
     ],
     "description": "Shared canonical host-agent labels and exclusive new-home provisioning with original directory handles; no record-format, checksum-domain or authority change."
-  },
-  "recovery_exclusion_extension": {
-    "files": [
-      "crates/mvm-vmm/tests/installed_owner_recovery_exclusion.rs"
-    ],
-    "description": "Original-owner borrowed guard with independently retained holders EX and namespace/record revalidation; participating resource exclusion only, not original Child collection, legacy-resource absence or readiness."
   }
 }

@@ -89,4 +89,35 @@ mod tests {
 
         assert_eq!(resolve_tenant(None), "from-config");
     }
+
+    #[test]
+    fn resolving_a_tenant_does_not_create_a_missing_home() {
+        let parent = tempfile::tempdir().expect("temporary parent");
+        let home = parent.path().join("not-created");
+        let mut env = TestEnv::new();
+        env.isolate_mvm_home(&home);
+        env.remove("MVM_TENANT");
+
+        assert_eq!(resolve_tenant(None), "local");
+        assert!(
+            !home.exists(),
+            "tenant selection must not initialize the home before provisioning"
+        );
+    }
+
+    #[test]
+    fn malformed_tenant_config_keeps_default_without_rewriting_input() {
+        let home = tempfile::tempdir().expect("temporary home");
+        let mut env = TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        env.remove("MVM_TENANT");
+        let config_dir = home.path().join("config");
+        std::fs::create_dir(&config_dir).expect("config directory");
+        let path = config_dir.join("config.toml");
+        let original = b"[tenant\nname = 'malformed'\n";
+        std::fs::write(&path, original).expect("malformed config fixture");
+
+        assert_eq!(resolve_tenant(None), "local");
+        assert_eq!(std::fs::read(path).expect("preserved config"), original);
+    }
 }

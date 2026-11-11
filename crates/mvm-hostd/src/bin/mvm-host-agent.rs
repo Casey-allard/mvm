@@ -31,11 +31,13 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 
 use mvm_hostd::audit_signer::config::SignerHelperConfig;
-use mvm_hostd::broker::daemon::{HostAgentConfig, HostAgentDaemon};
+use mvm_hostd::broker::daemon::{
+    HostAgentConfig, HostAgentDaemon, OriginalDrainController, OriginalDrainRequest,
+};
 use mvm_hostd::host_agent_idle::IdleProposal;
 use mvm_hostd::watcher_jobs::{WatcherDrainReceipt, WatcherJobOwner};
 use mvm_vmm::host::installed_owner::{
-    Epoch, HolderLease, InstallationBinding, InstallationOwner, Recovery, spawn_with_resource_lease,
+    Epoch, HolderLease, InstallationBinding, InstallationOwner, spawn_with_resource_lease,
 };
 
 #[cfg(all(test, unix))]
@@ -1111,13 +1113,14 @@ struct WorkerResources {
     home: PathBuf,
     owner: InstallationOwner,
     epoch: Epoch,
-    recovery: Recovery,
     binding: Arc<InstallationBinding>,
+    previous_lifecycle: Option<mvm_core::tenant_lifecycle::LifecycleCoordinator>,
+    startup_inventory: mvm_hostd::broker::daemon::StartupRegistrationInventory,
 }
 
 impl WorkerResources {
     fn open(cfg: &HostAgentConfig) -> Result<Self> {
-        let home = PathBuf::from(mvm_core::config::mvm_home());
+        let home = mvm_core::config::mvm_home_strict()?;
         let descriptor = cfg.resource_descriptor(&home)?;
         let mut owner = InstallationOwner::open(&descriptor.root, descriptor.key).with_context(|| {
             format!(
@@ -1125,9 +1128,89 @@ impl WorkerResources {
                 descriptor.root.display()
             )
         })?;
-        let recovery = owner
-            .reconcile()
-            .context("original host-agent resource exclusion unavailable")?;
+        // The actual owner and fresh independent holders EX remain retained
+        // across canonical journal/bootstrap validation and old-state fencing.
+        let (recovery, previous_lifecycle, startup_inventory) = {
+            let exclusion = owner
+                .reconcile_with_exclusion()
+                .context("retain original host-agent recovery exclusion")?;
+            exclusion.revalidate_for(&descriptor.root, descriptor.key)?;
+            let predecessor = exclusion.original_predecessor()?;
+            let startup_inventory =
+                mvm_hostd::broker::daemon::prepare_startup_registration_inventory(
+                    cfg, &home, &exclusion,
+                )?;
+            let previous_lifecycle = if startup_inventory.created_fresh_journal() {
+                None
+            } else {
+                use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecyclePhase};
+                let lifecycle = LifecycleCoordinator::open_existing(
+                    &home,
+                    &cfg.tenant_id,
+                    Instant::now() + LIFECYCLE_IO_BUDGET,
+                )?;
+                let snapshot = lifecycle.snapshot(Instant::now() + LIFECYCLE_IO_BUDGET)?;
+                anyhow::ensure!(
+                    snapshot.generation().resource_epoch() == predecessor.epoch,
+                    "original lifecycle/resource sequence mismatch requires reconciliation"
+                );
+                let _known_inventory = mvm_hostd::host_agent_idle::checked_session_inventory(
+                    &home,
+                    &cfg.tenant_id,
+                    Instant::now() + LIFECYCLE_IO_BUDGET,
+                )?;
+                anyhow::ensure!(
+                    snapshot.pending().is_empty(),
+                    "original launch reservations require original-owner cleanup"
+                );
+                let previous = snapshot.generation().clone();
+                let requires_retirement = snapshot.phase() != LifecyclePhase::Drained;
+                if requires_retirement {
+                    lifecycle.begin_drain(
+                        &previous,
+                        snapshot.revision(),
+                        Instant::now() + LIFECYCLE_IO_BUDGET,
+                        |state| {
+                            anyhow::ensure!(
+                                state.pending().is_empty(),
+                                "original launches remain unresolved"
+                            );
+                            Ok(())
+                        },
+                    )?;
+                }
+                // Explicit within-home profile only. Every original endpoint
+                // is preflighted before descriptor-relative retirement under
+                // this SAME actual exclusion; no normal Register unlinks it.
+                let retired_sockets =
+                    startup_inventory.retire_within_home_broker_sockets(cfg, &home, &exclusion)?;
+                tracing::info!(
+                    retired_sockets,
+                    "original within-home broker socket entries retired; not Child collection"
+                );
+                if requires_retirement {
+                    let fenced = lifecycle.snapshot(Instant::now() + LIFECYCLE_IO_BUDGET)?;
+                    exclusion.revalidate_for(&descriptor.root, descriptor.key)?;
+                    lifecycle.retire_after_resource_reconciliation(
+                        &previous,
+                        fenced.revision(),
+                        Instant::now() + LIFECYCLE_IO_BUDGET,
+                        |state| {
+                            anyhow::ensure!(
+                                state.pending().is_empty(),
+                                "original launches remain unresolved"
+                            );
+                            Ok(())
+                        },
+                    )?;
+                }
+                Some(lifecycle)
+            };
+            exclusion.revalidate_for(&descriptor.root, descriptor.key)?;
+            (exclusion.recovery(), previous_lifecycle, startup_inventory)
+        };
+        // A new epoch is issued ONLY after the actual exclusion/reconciliation
+        // scope above has completed. No predicted generation is used.
         let epoch = owner
             .begin()
             .context("begin original host-agent resource epoch")?;
@@ -1140,13 +1223,14 @@ impl WorkerResources {
             home,
             owner,
             epoch,
-            recovery,
             binding,
+            previous_lifecycle,
+            startup_inventory,
         })
     }
 }
 
-const COOPERATIVE_DRAIN_GRACE: Duration = Duration::from_secs(10);
+use mvm_hostd::broker::daemon::COOPERATIVE_DRAIN_GRACE;
 const LIFECYCLE_IO_BUDGET: Duration = Duration::from_secs(5);
 
 /// Lives outside the cancellation-prone grace future. Every original task,
@@ -1165,21 +1249,30 @@ struct WorkerCoordinator {
     services_receipt: Option<mvm_hostd::broker::daemon::DaemonServicesDrainReceipt>,
     resource_finished: bool,
     startup_journal_count: usize,
+    drain_controller: OriginalDrainController,
 }
 
 impl WorkerCoordinator {
     fn open(cfg: HostAgentConfig) -> Result<Self> {
         use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecycleGeneration};
         let verifying_key = cfg.load_verifying_key()?;
-        let resources = WorkerResources::open(&cfg)?;
+        let mut resources = WorkerResources::open(&cfg)?;
         let generation = LifecycleGeneration::new(rand::random(), resources.epoch.generation())?;
-        let lifecycle = LifecycleCoordinator::prepare_after_exclusion(
-            &resources.home,
-            &cfg.tenant_id,
-            generation.clone(),
-            256,
-            Instant::now() + LIFECYCLE_IO_BUDGET,
-        )?;
+        let lifecycle = if let Some(previous) = resources.previous_lifecycle.take() {
+            previous.prepare_generation_after_reconciliation(
+                &generation,
+                Instant::now() + LIFECYCLE_IO_BUDGET,
+            )?;
+            previous
+        } else {
+            LifecycleCoordinator::prepare_after_exclusion(
+                &resources.home,
+                &cfg.tenant_id,
+                generation.clone(),
+                256,
+                Instant::now() + LIFECYCLE_IO_BUDGET,
+            )?
+        };
         let daemon =
             HostAgentDaemon::new(cfg.tenant_id.clone(), verifying_key, cfg.max_frame_bytes)
                 .with_signer_helper(cfg.signer_helper_uds_path.clone())
@@ -1191,6 +1284,7 @@ impl WorkerCoordinator {
         // never a new signed-plan or mailbox authority.
         let startup_journal_count = daemon.checked_journal_registration_count()?;
         let accepted = daemon.accepted_work_drain()?;
+        let drain_controller = daemon.drain_controller()?;
         let custody = daemon.custody_owner();
         Ok(Self {
             cfg,
@@ -1206,61 +1300,28 @@ impl WorkerCoordinator {
             services_receipt: None,
             resource_finished: false,
             startup_journal_count,
+            drain_controller,
         })
     }
 
     fn prepare_metadata_before_spawn(&self) -> Result<()> {
         use mvm_core::tenant_lifecycle::LifecyclePhase;
-        let deadline = Instant::now() + LIFECYCLE_IO_BUDGET;
-        let snapshot = self.lifecycle.snapshot(deadline)?;
-        let _inventory = mvm_hostd::host_agent_idle::checked_session_inventory(
+        let snapshot = self
+            .lifecycle
+            .snapshot(Instant::now() + LIFECYCLE_IO_BUDGET)?;
+        anyhow::ensure!(
+            snapshot.generation() == &self.generation
+                && snapshot.phase() == LifecyclePhase::Preparing
+                && !snapshot.unresolved()
+                && snapshot.pending().is_empty(),
+            "original resource generation is not prepared before spawn"
+        );
+        let _known_inventory = mvm_hostd::host_agent_idle::checked_session_inventory(
             &self.resources.home,
             &self.cfg.tenant_id,
-            deadline,
+            Instant::now() + LIFECYCLE_IO_BUDGET,
         )?;
-        anyhow::ensure!(
-            snapshot.pending().is_empty(),
-            "original launch reservations require canonical reconciliation"
-        );
-        if snapshot.generation() == &self.generation
-            && snapshot.phase() == LifecyclePhase::Preparing
-        {
-            anyhow::ensure!(
-                !snapshot.unresolved(),
-                "new resource epoch is unresolved before spawn"
-            );
-            return Ok(());
-        }
-        let previous = snapshot.generation().clone();
-        if snapshot.phase() != LifecyclePhase::Drained {
-            self.lifecycle
-                .begin_drain(&previous, snapshot.revision(), deadline, |state| {
-                    anyhow::ensure!(
-                        state.pending().is_empty(),
-                        "original launches remain unresolved"
-                    );
-                    Ok(())
-                })?;
-            let fenced = self.lifecycle.snapshot(deadline)?;
-            // Actual original resource exclusion and Recovery are retained in
-            // self.resources. This retires only old coordination metadata; it
-            // deliberately does not call the live Child-collection API.
-            self.lifecycle.retire_after_resource_reconciliation(
-                &previous,
-                fenced.revision(),
-                deadline,
-                |state| {
-                    let _actual_resource_recovery = self.resources.recovery;
-                    anyhow::ensure!(
-                        state.pending().is_empty(),
-                        "original launches remain unresolved"
-                    );
-                    Ok(())
-                },
-            )?;
-        }
-        self.lifecycle
-            .prepare_generation_after_reconciliation(&self.generation, deadline)
+        Ok(())
     }
 
     async fn start_owned_services(&mut self) -> Result<()> {
@@ -1275,8 +1336,11 @@ impl WorkerCoordinator {
         ready_rx
             .await
             .context("original signer supervisor stopped before readiness")??;
-        let restored =
-            HostAgentDaemon::restore_journaled_registrations_shared(self.daemon.clone()).await?;
+        let restored = HostAgentDaemon::prepare_journaled_services_shared(
+            self.daemon.clone(),
+            &self.generation,
+        )
+        .await?;
         anyhow::ensure!(
             restored == self.startup_journal_count,
             "canonical journal inventory changed during startup"
@@ -1291,18 +1355,36 @@ impl WorkerCoordinator {
             &self.cfg.tenant_id,
             deadline,
         )?;
-        self.lifecycle
-            .activate_after_reconciliation(&self.generation, deadline)?;
-        let gate = mvm_core::tenant_lifecycle::TenantLifecycleGate::new(
-            &self.resources.home,
-            &self.cfg.tenant_id,
+        self.lifecycle.activate_after_reconciliation_with(
+            &self.generation,
+            deadline,
+            |_| {
+                let original = self
+                    .daemon
+                    .try_lock()
+                    .map_err(|_| anyhow::anyhow!("original startup precheck busy"))?;
+                let checked = self
+                    .resources
+                    .startup_inventory
+                    .check_prepared(&original, &self.generation)?;
+                anyhow::ensure!(
+                    checked == self.startup_journal_count,
+                    "original startup recordset changed"
+                );
+                Ok(())
+            },
+            |_| {
+                let mut original = self
+                    .daemon
+                    .try_lock()
+                    .map_err(|_| anyhow::anyhow!("original startup publication busy"))?;
+                self.resources
+                    .startup_inventory
+                    .check_prepared(&original, &self.generation)?;
+                original.release_prepared_services(&self.generation)?;
+                original.open_local_admission(&self.generation)
+            },
         )?;
-        gate.with_active(&self.generation, deadline, || {
-            self.daemon
-                .try_lock()
-                .map_err(|_| anyhow::anyhow!("original daemon readiness contended"))?
-                .open_local_admission(&self.generation)
-        })?;
         self.control = Some(ControlLoopHandle::spawn(self.daemon.clone(), listener));
         self.watchers = Some(WatcherSet::spawn(
             self.daemon.clone(),
@@ -1314,22 +1396,27 @@ impl WorkerCoordinator {
     }
 
     fn begin_drain(&self, idle: bool) -> Result<Option<Instant>> {
-        let grace_deadline = Instant::now() + COOPERATIVE_DRAIN_GRACE;
+        let proposed_deadline = Instant::now() + COOPERATIVE_DRAIN_GRACE;
         let metadata_deadline = Instant::now() + LIFECYCLE_IO_BUDGET;
+        if !idle {
+            let request = self.drain_controller.request(proposed_deadline)?;
+            self.fence_requested_drain(metadata_deadline)?;
+            return Ok(Some(request.deadline()));
+        }
         let snapshot = self.lifecycle.snapshot(metadata_deadline)?;
         anyhow::ensure!(
             snapshot.generation() == &self.generation,
             "original coordinator generation changed"
         );
-        let inventory = if idle {
-            Some(mvm_hostd::host_agent_idle::checked_session_inventory(
-                &self.resources.home,
-                &self.cfg.tenant_id,
-                metadata_deadline,
-            )?)
-        } else {
-            None
-        };
+        anyhow::ensure!(
+            snapshot.phase() == mvm_core::tenant_lifecycle::LifecyclePhase::Active,
+            "idle proposal no longer belongs to an active tenant"
+        );
+        let inventory = mvm_hostd::host_agent_idle::checked_session_inventory(
+            &self.resources.home,
+            &self.cfg.tenant_id,
+            metadata_deadline,
+        )?;
         let checked = std::cell::Cell::new(false);
         let fenced = self.lifecycle.begin_drain(
             &self.generation,
@@ -1340,22 +1427,20 @@ impl WorkerCoordinator {
                     .daemon
                     .try_lock()
                     .map_err(|_| anyhow::anyhow!("original daemon drain check contended"))?;
-                if let Some(inventory) = &inventory {
-                    daemon.require_no_injected_mailbox_owner()?;
+                daemon.require_no_injected_mailbox_owner()?;
+                anyhow::ensure!(
+                    state.pending().is_empty() && inventory.owned_running() == 0,
+                    "original canonical session work remains live"
+                );
+                anyhow::ensure!(
+                    daemon.checked_registration_count()? == 0 && !daemon.has_accepted_work()?,
+                    "original daemon work remains live"
+                );
+                if let Some(watchers) = &self.watchers {
                     anyhow::ensure!(
-                        state.pending().is_empty() && inventory.owned_running() == 0,
-                        "original canonical session work remains live"
+                        !watchers.has_inflight_jobs()?,
+                        "original watcher job remains live"
                     );
-                    anyhow::ensure!(
-                        daemon.checked_registration_count()? == 0 && !daemon.has_accepted_work()?,
-                        "original daemon work remains live"
-                    );
-                    if let Some(watchers) = &self.watchers {
-                        anyhow::ensure!(
-                            !watchers.has_inflight_jobs()?,
-                            "original watcher job remains live"
-                        );
-                    }
                 }
                 // Only staged original checks occurred. This local marker
                 // distinguishes refused idle from uncertainty after state I/O.
@@ -1364,7 +1449,7 @@ impl WorkerCoordinator {
             },
         );
         if let Err(error) = fenced {
-            if idle && !checked.get() {
+            if !checked.get() {
                 let current = self.lifecycle.snapshot(metadata_deadline)?;
                 if current.generation() == &self.generation
                     && current.phase() == mvm_core::tenant_lifecycle::LifecyclePhase::Active
@@ -1372,12 +1457,50 @@ impl WorkerCoordinator {
                     return Ok(None);
                 }
             }
+            if checked.get() {
+                self.drain_controller.request(proposed_deadline)?;
+            }
             return Err(error).context("original global drain fence unresolved");
         }
         // Global Draining is durable. The async collection path installs its
         // local fence outside the file gate, retaining this original grace even
         // if the daemon mutex is temporarily unavailable.
-        Ok(Some(grace_deadline))
+        Ok(Some(
+            self.drain_controller.request(proposed_deadline)?.deadline(),
+        ))
+    }
+
+    fn fence_requested_drain(&self, deadline: Instant) -> Result<()> {
+        use mvm_core::tenant_lifecycle::LifecyclePhase;
+        let mut state = self.lifecycle.snapshot(deadline)?;
+        loop {
+            anyhow::ensure!(
+                state.generation() == &self.generation,
+                "original coordinator generation changed"
+            );
+            match state.phase() {
+                LifecyclePhase::Draining => return Ok(()),
+                LifecyclePhase::Drained => anyhow::bail!("worker generation already retired"),
+                LifecyclePhase::Active | LifecyclePhase::Preparing => {}
+            }
+            let revision = state.revision();
+            if let Err(error) =
+                self.lifecycle
+                    .begin_drain(&self.generation, revision, deadline, |_| Ok(()))
+            {
+                state = self.lifecycle.snapshot(deadline)?;
+                if state.generation() == &self.generation
+                    && state.phase() == LifecyclePhase::Draining
+                {
+                    return Ok(());
+                }
+                if state.revision() == revision || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                continue;
+            }
+            return Ok(());
+        }
     }
 
     async fn collect_originals(&mut self) -> Result<()> {
@@ -1392,6 +1515,7 @@ impl WorkerCoordinator {
             watchers.drain().await?;
         }
         if self.services_receipt.is_none() {
+            HostAgentDaemon::reconcile_for_shutdown(self.daemon.clone(), &self.generation).await?;
             self.services_receipt = Some(self.custody.drain_services().await?);
         }
         let pending = self
@@ -1469,6 +1593,7 @@ enum WorkerExit {
 
 enum WorkerEvent {
     Idle(Result<Option<IdleProposal>>),
+    Drain(Result<OriginalDrainRequest>),
     Control(Result<()>),
 }
 
@@ -1477,8 +1602,14 @@ impl WorkerCoordinator {
         let grace = match self.begin_drain(false) {
             Ok(Some(deadline)) => deadline,
             Ok(None) | Err(_) => {
+                // The durable fence is uncertain. Stop this worker's own
+                // ingress and watcher jobs while retaining cleanup and signer custody.
+                self.custody.request_stop();
+                if let Some(watchers) = &self.watchers {
+                    watchers.request_stop();
+                }
                 tracing::error!(
-                    "original global drain fence unresolved; live service coordinator retained"
+                    "original global drain fence unresolved; local ingress stopped and coordinator retained"
                 );
                 // No publication success, exit, replacement or renewed grace
                 // is inferred from an unsuccessful global fence.
@@ -1494,6 +1625,8 @@ impl WorkerCoordinator {
         if let Err(error) = self.start_owned_services().await {
             return self.drain_error(error).await;
         }
+        let mut requested = self.drain_controller.subscribe();
+        let mut observe_requests = true;
         loop {
             let event = {
                 let control = self
@@ -1505,11 +1638,30 @@ impl WorkerCoordinator {
                     .as_mut()
                     .context("original watcher set absent")?;
                 tokio::select! {
+                    request = requested.next(), if observe_requests => WorkerEvent::Drain(request),
                     result = control.observe_exit() => WorkerEvent::Control(result),
                     proposal = watchers.idle_proposal() => WorkerEvent::Idle(proposal),
                 }
             };
             match event {
+                WorkerEvent::Drain(request) => match request {
+                    Ok(request) if request.generation() == &self.generation => {
+                        return self
+                            .drain_error(anyhow::anyhow!(
+                                "registration recovery requested worker shutdown"
+                            ))
+                            .await;
+                    }
+                    Ok(_) => {
+                        tracing::error!("foreign generation in original worker drain observer");
+                        observe_requests = false;
+                    }
+                    Err(error) => {
+                        return self
+                            .drain_error(error.context("original drain notification failed"))
+                            .await;
+                    }
+                },
                 WorkerEvent::Control(result) => {
                     let error = result.err().unwrap_or_else(|| {
                         anyhow::anyhow!("original control loop stopped unexpectedly")
@@ -1530,12 +1682,7 @@ impl WorkerCoordinator {
                             .as_mut()
                             .context("original watcher set absent")?
                             .rearm_idle()?,
-                        Err(_) => {
-                            tracing::error!(
-                                "idle fence unresolved; original live service coordinator retained"
-                            );
-                            std::future::pending::<()>().await;
-                        }
+                        Err(error) => return self.drain_error(error).await,
                     }
                 }
             }
@@ -1653,3 +1800,7 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "mvm-host-agent/worker_deadline_tests.rs"]
+mod worker_deadline_tests;
