@@ -147,6 +147,18 @@ impl LifecycleSnapshot {
 }
 
 impl LifecycleCoordinator {
+    /// Open original coordination state without creating, fencing or changing
+    /// any record. Startup callers retain actual resource exclusion separately
+    /// and must explicitly drain/reconcile this original generation before
+    /// beginning a replacement epoch. This observation supplies no authority.
+    pub fn open_existing(home: impl AsRef<Path>, tenant: &str, deadline: Instant) -> Result<Self> {
+        let gate = TenantLifecycleGate::new(home, tenant)?;
+        let lock = gate.lock(deadline)?;
+        gate.read_record()?;
+        drop(lock);
+        Ok(Self { gate })
+    }
+
     /// Fence startup after acquiring original resource exclusion and performing
     /// canonical legacy reconciliation, before spawning any child. Fresh state
     /// is Preparing. Existing generation, limits and rows

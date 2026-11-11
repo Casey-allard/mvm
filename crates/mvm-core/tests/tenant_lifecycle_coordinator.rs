@@ -33,6 +33,69 @@ fn activate(coordinator: &LifecycleCoordinator, generation: &LifecycleGeneration
 }
 
 #[test]
+fn open_existing_refuses_absence_and_missing_state_without_initializing_anything() {
+    let parent = tempfile::tempdir().expect("parent");
+    let missing = parent.path().join("absent-home");
+    assert!(LifecycleCoordinator::open_existing(&missing, "tenant-a", deadline()).is_err());
+    assert!(!missing.exists());
+
+    let home = parent.path().join("private-home");
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let coordinator = bootstrap(&home, &generation);
+    drop(coordinator);
+    let directory = mvm_core::config::host_agent_dir_at(&home, "tenant-a");
+    let state = directory.join("lifecycle.json");
+    // Locate the canonical state filename explicitly: no synthesized replacement
+    // is permitted when its original lock already exists.
+    assert!(state.is_file());
+    let original_lock = std::fs::read(directory.join("lifecycle.lock")).unwrap();
+    std::fs::remove_file(&state).unwrap();
+    assert!(LifecycleCoordinator::open_existing(&home, "tenant-a", deadline()).is_err());
+    assert!(!state.exists());
+    assert_eq!(
+        std::fs::read(directory.join("lifecycle.lock")).unwrap(),
+        original_lock
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(&state, b"{").unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(LifecycleCoordinator::open_existing(&home, "tenant-a", deadline()).is_err());
+    assert_eq!(std::fs::read(&state).unwrap(), b"{");
+}
+
+#[test]
+fn open_existing_preserves_active_original_generation_revision_and_pending_until_explicit_drain() {
+    let home = tempfile::tempdir().unwrap();
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let coordinator = bootstrap(home.path(), &generation);
+    activate(&coordinator, &generation);
+    let gate = TenantLifecycleGate::new(home.path(), "tenant-a").unwrap();
+    let reservation = gate.reserve_launch("vm-a", "plan-a", deadline()).unwrap();
+    let before = coordinator.snapshot(deadline()).unwrap();
+    let directory = mvm_core::config::host_agent_dir_at(home.path(), "tenant-a");
+    let state = directory.join("lifecycle.json");
+    let original = std::fs::read(&state).unwrap();
+    drop(coordinator);
+    let recovery =
+        LifecycleCoordinator::open_existing(home.path(), "tenant-a", deadline()).unwrap();
+    let reopened = recovery.snapshot(deadline()).unwrap();
+    assert_eq!(std::fs::read(&state).unwrap(), original);
+    assert_eq!(reopened.generation(), &generation);
+    assert_eq!(reopened.revision(), before.revision());
+    assert_eq!(reopened.phase(), LifecyclePhase::Active);
+    assert_eq!(reopened.unresolved(), before.unresolved());
+    assert_eq!(reopened.pending().len(), 1);
+    assert_eq!(reopened.pending()[0].id(), reservation.id());
+    assert_eq!(reopened.pending()[0].vm(), "vm-a");
+    assert_eq!(reopened.pending()[0].plan_id(), "plan-a");
+    recovery
+        .begin_drain(&generation, reopened.revision(), deadline(), |_| Ok(()))
+        .unwrap();
+    assert!(gate.reserve_launch("vm-b", "plan-b", deadline()).is_err());
+    assert_eq!(recovery.snapshot(deadline()).unwrap().pending().len(), 1);
+}
+
+#[test]
 fn bootstrap_is_fenced_until_checked_drain_and_reconciliation() {
     let home = tempfile::tempdir().expect("home");
     let generation = LifecycleGeneration::new([7; 32], 1).expect("generation");
