@@ -97,6 +97,9 @@ pub fn build_config(
     state_dir: &Path,
     route: HostDialRoute,
 ) -> Result<MailboxProcessConfig> {
+    grant
+        .require_implemented_local_service()
+        .map_err(|error| Error::new(ErrorKind::Unsupported, error))?;
     let secret = mint_epoch_secret(state_dir)?;
     let keys = derive_launch_keys(keys_dir, grant, &secret).inspect_err(|_| {
         let _ = shred_epoch_secret(state_dir);
@@ -127,6 +130,11 @@ fn command(bin: &Path) -> Command {
 /// the guest's mailbox port. The guest would be told to serve a port nobody
 /// dials, so the launch fails instead.
 fn require_wired(plan: &ExecutionPlan, backend: &AnyBackend) -> Result<()> {
+    if let Some(grant) = &plan.mailbox {
+        grant
+            .require_implemented_local_service()
+            .map_err(|error| Error::new(ErrorKind::Unsupported, error))?;
+    }
     if plan.mailbox.is_some() && !backend.capabilities().guest_mailbox {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -150,10 +158,11 @@ fn granted_plan(config: &VmStartConfig) -> Option<ExecutionPlan> {
 /// Refuse, before the VM boots, a config whose guest would be told to serve a
 /// mailbox this backend cannot.
 pub fn require_servable(config: &VmStartConfig, backend: &AnyBackend) -> anyhow::Result<()> {
-    match granted_plan(config) {
-        Some(plan) => Ok(require_wired(&plan, backend)?),
-        None => Ok(()),
+    if let Some(json) = config.plan_json.as_deref() {
+        let plan = mvm_core::plan::plan_from_admitted_json(json)?;
+        require_wired(&plan, backend)?;
     }
+    Ok(())
 }
 
 /// Serve the mailbox `config` grants, now that its VM `id` is up on `backend`.
@@ -290,6 +299,7 @@ mod tests {
     fn grant(dir: &Path) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes([4; 32]);
         MailboxGrant {
+            local_service: None,
             mailbox,
             authority_key: crate::mailbox_launch::authority_key_for(
                 dir,
@@ -308,6 +318,49 @@ mod tests {
         assert!(plan.mailbox.is_none());
         let started = spawn_for_launch(&plan, &backend_named("firecracker"), "no-such-vm").unwrap();
         assert_eq!(started, None);
+    }
+
+    #[test]
+    fn reliable_service_refuses_before_backend_or_helper_effects() {
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        let dir = keys_dir();
+        let mut grant = grant(dir.path());
+        grant.local_service = Some(MailboxLocalServiceGrant::reliable_v1());
+        let config = config_for(Some(grant));
+        for name in ["firecracker", "hvf", "qemu", "wasm"] {
+            let error = require_servable(&config, &backend_named(name)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reliable mailbox service is not implemented"),
+                "{name}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn reliable_config_refuses_before_minting_a_launch_secret() {
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        let keys = keys_dir();
+        let state = tempfile::tempdir().unwrap();
+        let mut grant = grant(keys.path());
+        grant.local_service = Some(MailboxLocalServiceGrant::reliable_v1());
+        assert!(build_config(keys.path(), &grant, state.path(), test_route()).is_err());
+        assert!(!mvm_core::config::vm_mailbox_secret_at(state.path()).exists());
+    }
+
+    #[test]
+    fn unknown_signed_local_service_is_not_treated_as_an_ungranted_plan() {
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        let keys = keys_dir();
+        let mut grant = grant(keys.path());
+        grant.local_service = Some(MailboxLocalServiceGrant::reliable_v1());
+        let mut config = config_for(Some(grant));
+        let mut value: serde_json::Value =
+            serde_json::from_str(config.plan_json.as_ref().unwrap()).unwrap();
+        value["mailbox"]["local_service"]["version"] = serde_json::json!(2);
+        config.plan_json = Some(serde_json::to_string(&value).unwrap());
+        assert!(require_servable(&config, &backend_named("firecracker")).is_err());
     }
 
     fn backend_named(name: &str) -> AnyBackend {

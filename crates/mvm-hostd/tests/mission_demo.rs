@@ -775,6 +775,7 @@ fn plan_and_trust(channel: &Channel, granted: bool) -> (ExecutionPlan, MailboxPo
     let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
     if granted {
         plan.mailbox = Some(mvm_contract::protocol::mailbox::MailboxGrant {
+            local_service: None,
             mailbox: address().mailbox,
             authority_key: channel.authority_key.verifying_key().to_bytes(),
             epoch: MbEpoch::new(1).unwrap(),
@@ -891,6 +892,7 @@ fn host_keys(dir: &std::path::Path, seed: u8) {
 fn granted_plan(authority_key: [u8; 32]) -> ExecutionPlan {
     let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
     plan.mailbox = Some(mvm_contract::protocol::mailbox::MailboxGrant {
+        local_service: None,
         mailbox: address().mailbox,
         authority_key,
         epoch: MbEpoch::new(1).unwrap(),

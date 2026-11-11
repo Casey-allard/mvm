@@ -261,6 +261,9 @@ pub fn derive_launch_keys(
     grant: &MailboxGrant,
     secret: &Key,
 ) -> Result<DerivedMailboxKeys> {
+    grant
+        .require_implemented_local_service()
+        .map_err(|error| Error::new(ErrorKind::Unsupported, error))?;
     let derived = derived_keys(keys_dir, &grant.mailbox, grant.epoch)?;
     // After the signing seed above, so a wrong directory never mints a root.
     let encryption_root = Key::load_or_create(&keys_dir.join(ENCRYPTION_ROOT))?;
@@ -522,6 +525,7 @@ mod tests {
     fn grant_at(dir: &Path, mailbox: [u8; 32], n: u64) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes(mailbox);
         MailboxGrant {
+            local_service: None,
             mailbox,
             authority_key: authority_key_for(dir, &mailbox, epoch(n))
                 .unwrap()
@@ -532,6 +536,17 @@ mod tests {
 
     fn grant(dir: &Path, mailbox: [u8; 32]) -> MailboxGrant {
         grant_at(dir, mailbox, 1)
+    }
+
+    #[test]
+    fn reliable_key_derivation_refuses_before_creating_an_encryption_root() {
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        let keys = keys_dir();
+        let mut grant = grant(keys.path(), [7; 32]);
+        grant.local_service = Some(MailboxLocalServiceGrant::reliable_v1());
+        assert!(!keys.path().join(ENCRYPTION_ROOT).exists());
+        assert!(derive_launch_keys(keys.path(), &grant, &test_secret()).is_err());
+        assert!(!keys.path().join(ENCRYPTION_ROOT).exists());
     }
 
     #[test]

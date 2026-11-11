@@ -619,14 +619,12 @@ pub fn provision_verb_grant() {
 /// boot whose cmdline asserts a mailbox. Runs as root, before the privilege
 /// drop, because the agent cannot create it under `/run/mvm` afterwards.
 fn provision_mailbox_dir() {
-    use crate::mailbox_outbox::{MAILBOX_CMDLINE_TOKEN, OUTBOX_PATH, provision_outbox_dir};
-    if !cmdline_has_flag(MAILBOX_CMDLINE_TOKEN) {
-        return;
-    }
+    use crate::mailbox_outbox::{OUTBOX_PATH, provision_outbox_dir_if_asserted};
     let dir = Path::new(OUTBOX_PATH)
         .parent()
         .expect("outbox has a parent");
-    if let Err(e) = provision_outbox_dir(
+    if let Err(e) = provision_outbox_dir_if_asserted(
+        &cmdline(),
         dir,
         crate::guest_mount::WORKLOAD_UID,
         crate::guest_mount::WORKLOAD_GID,

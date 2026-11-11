@@ -56,6 +56,7 @@ pub(super) fn boot_transient_vm(
 ) -> Result<BootedVm> {
     use crate::commands::vm::phase_timing::SubPhase;
 
+    mvm_hostd::mailbox_process::require_servable(attempt.start_config, attempt.backend)?;
     let phase_timing = warm_claim_marks.is_some();
     let boot_started = phase_timing.then(std::time::Instant::now);
     if let Some(marks) = warm_claim_marks.as_mut() {
@@ -164,7 +165,6 @@ pub(super) fn boot_transient_vm(
         };
 
     if !booted {
-        mvm_hostd::mailbox_process::require_servable(attempt.start_config, attempt.backend)?;
         ui::info(&format!("Booting transient VM '{vm_name}'..."));
         if mvm_runtime::catalog::descriptor(attempt.backend.kind()).is_workload
             && let Err(error) =
@@ -673,7 +673,14 @@ mod tests {
             cpus: 2,
             memory_mib: 1024,
             tenant_id: Some("tenant-a".into()),
-            plan_json: Some("{}".into()),
+            plan_json: Some(
+                serde_json::to_string(
+                    &mvm_core::plan::test_support::PlanFixture::new()
+                        .tenant("tenant-a")
+                        .build(),
+                )
+                .unwrap(),
+            ),
             ..Default::default()
         }
     }
@@ -710,6 +717,7 @@ mod tests {
             boot_transient_vm("mailbox-launch".into(), false, &mut attempt, None, &mut sub)
         };
         let granted = MailboxGrant {
+            local_service: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],
             epoch: ExecutionEpoch::new(1).unwrap(),
@@ -717,6 +725,78 @@ mod tests {
         let error = boot(Some(granted)).err().expect("the grant is refused");
         assert!(format!("{error:#}").contains("mailbox"), "{error:#}");
         assert!(boot(None).is_ok());
+    }
+
+    #[test]
+    fn reliable_refusal_precedes_warm_reaping_claim_and_snapshot_selection() {
+        use mvm_contract::protocol::mailbox::{
+            ExecutionEpoch, MailboxGrant, MailboxId, local_service::MailboxLocalServiceGrant,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        let home = tempfile::tempdir().unwrap();
+        env.isolate_mvm_home(home.path());
+        env.remove("MVM_RESIDENCY");
+        env.remove("MVM_HVF_WARM_REQUIRE_CLAIM");
+        let shells = Arc::new(AtomicUsize::new(0));
+        let seen = shells.clone();
+        let _shell = mvm_vmm::host::shell::mock::install_handler(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            mvm_vmm::host::shell::mock::MockResponse::empty()
+        });
+        for snapshot in [false, true] {
+            let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+            plan.mailbox = Some(MailboxGrant {
+                mailbox: MailboxId::from_bytes([1; 32]),
+                authority_key: [2; 32],
+                epoch: ExecutionEpoch::new(1).unwrap(),
+                local_service: Some(MailboxLocalServiceGrant::reliable_v1()),
+            });
+            let config = VmStartConfig {
+                name: "reliable-early-refusal".into(),
+                plan_json: Some(serde_json::to_string(&plan).unwrap()),
+                ..claimable_config_without_a_pool()
+            };
+            let mock = mvm_runtime::MockBackend::new();
+            let backend = AnyBackend::Mock(mock.clone());
+            let resolved = snapshot_resolved_image();
+            let mut images = Vec::new();
+            let mut attempt = BootAttempt {
+                backend: &backend,
+                start_config: &config,
+                resolved: &resolved,
+                user_named: false,
+                writable_images: &mut images,
+            };
+            let mut marks = crate::commands::vm::phase_timing::WarmClaimMarks::default();
+            let mut sub = crate::commands::vm::phase_timing::LaunchSubMarks::default();
+            let error = boot_transient_vm(
+                config.name.clone(),
+                snapshot,
+                &mut attempt,
+                Some(&mut marks),
+                &mut sub,
+            )
+            .err()
+            .expect("unimplemented mode refuses");
+            assert!(
+                format!("{error:#}").contains("reliable mailbox service is not implemented"),
+                "{error:#}"
+            );
+            assert!(
+                marks.pool_wait_started.is_none() && marks.claim_started.is_none(),
+                "admission must precede entering the warm/snapshot pipeline"
+            );
+            assert_eq!(
+                shells.load(Ordering::SeqCst),
+                0,
+                "no shell-backed restore or pool operation"
+            );
+            assert_eq!(mock.count(), 0, "no mock VM start");
+        }
     }
 
     #[test]

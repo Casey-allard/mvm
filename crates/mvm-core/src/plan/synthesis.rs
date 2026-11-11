@@ -763,6 +763,9 @@ pub fn current_local_epoch(workload: &str) -> Result<u64> {
 }
 
 pub fn synthesize_plan(input: &SynthesisInput<'_>) -> Result<ExecutionPlan> {
+    if let Some(service) = input.mailbox.and_then(|grant| grant.local_service) {
+        service.validate()?;
+    }
     let execution_epoch = current_local_epoch(input.vm_name)?;
     if let Some(grant) = &input.mailbox {
         anyhow::ensure!(
@@ -1629,6 +1632,7 @@ mod tests {
         assert!(synthesize_plan(&input("vm")).unwrap().mailbox.is_none());
 
         let grant = MailboxGrant {
+            local_service: None,
             mailbox: MailboxId::from_bytes([7; 32]),
             authority_key: [9; 32],
             epoch: ExecutionEpoch::new(1).unwrap(),
@@ -1642,6 +1646,23 @@ mod tests {
             synthesize_plan(&input("vm")).unwrap().plan_id,
             "the grant is part of the content address"
         );
+    }
+
+    #[test]
+    fn synthesis_rejects_invalid_local_service_limits_from_direct_rust_callers() {
+        use mvm_contract::protocol::mailbox::{
+            ExecutionEpoch, MailboxGrant, MailboxId, local_service::MailboxLocalServiceGrant,
+        };
+        let mut service = MailboxLocalServiceGrant::reliable_v1();
+        service.limits.payload_bytes = 0;
+        let mut inp = input("reliable-invalid");
+        inp.mailbox = Some(MailboxGrant {
+            mailbox: MailboxId::from_bytes([7; 32]),
+            authority_key: [9; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            local_service: Some(service),
+        });
+        assert!(synthesize_plan(&inp).is_err());
     }
 
     #[test]

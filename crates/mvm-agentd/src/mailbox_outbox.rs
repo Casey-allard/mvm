@@ -137,10 +137,14 @@ pub fn provision_outbox_dir_if_asserted(
     uid: u32,
     gid: u32,
 ) -> std::io::Result<bool> {
-    if !cmdline
-        .split_ascii_whitespace()
-        .any(|t| t == MAILBOX_CMDLINE_TOKEN)
-    {
+    use mvm_contract::protocol::mailbox::local_service::{
+        MailboxGuestService, parse_mailbox_service_cmdline,
+    };
+    let service = parse_mailbox_service_cmdline(cmdline).map_err(std::io::Error::other)?;
+    service
+        .require_implemented()
+        .map_err(std::io::Error::other)?;
+    if service == MailboxGuestService::Disabled {
         return Ok(false);
     }
     provision_outbox_dir(dir, uid, gid).map(|()| true)
@@ -309,6 +313,27 @@ mod tests {
                 .unwrap()
         );
         assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn reliable_or_ambiguous_mailbox_mode_creates_no_producer_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let metadata = root.path().metadata().unwrap();
+        use std::os::unix::fs::MetadataExt;
+        for cmdline in [
+            "mvm.mailbox=1 mvm.mailbox.service=1",
+            "mvm.mailbox=1 mvm.mailbox.service=2",
+            "mvm.mailbox=1 mvm.mailbox=1",
+            "mvm.mailbox=1 mvm.mailbox.service=1 mvm.mailbox.service=1",
+        ] {
+            let dir = root.path().join("mailbox");
+            assert!(
+                provision_outbox_dir_if_asserted(cmdline, &dir, metadata.uid(), metadata.gid())
+                    .is_err(),
+                "{cmdline}"
+            );
+            assert!(!dir.exists(), "unsupported mode provisioned state");
+        }
     }
 
     /// Forward every spooled message through a real stream pair, returning the

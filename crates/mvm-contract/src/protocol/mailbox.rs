@@ -9,6 +9,9 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
+pub mod local;
+pub mod local_service;
+
 /// Dedicated mailbox vsock service. Its own port, so mailbox traffic never
 /// shares a queue or credit with machine control (5252), `NetworkFlow` (5253),
 /// telemetry (5254), display (5255) or GPU (5256).
@@ -178,6 +181,20 @@ pub struct MailboxGrant {
     /// Ed25519 verifying key that must have signed any accepted capability.
     pub authority_key: [u8; 32],
     pub epoch: ExecutionEpoch,
+    /// Explicit opt-in service contract. Legacy signed bytes omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_service: Option<local_service::MailboxLocalServiceGrant>,
+}
+
+impl MailboxGrant {
+    pub fn require_implemented_local_service(
+        &self,
+    ) -> Result<(), local_service::MailboxLocalServiceError> {
+        self.local_service.map_or(
+            Ok(()),
+            local_service::MailboxLocalServiceGrant::require_implemented,
+        )
+    }
 }
 
 /// Monotonic sequence within one declared ordering scope.

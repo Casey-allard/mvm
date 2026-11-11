@@ -133,6 +133,7 @@ mod tests {
 
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         plan.mailbox = Some(mvm_contract::protocol::mailbox::MailboxGrant {
+            local_service: None,
             mailbox: mvm_contract::protocol::mailbox::MailboxId::from_bytes([4; 32]),
             authority_key: [0; 32],
             epoch: mvm_contract::protocol::mailbox::ExecutionEpoch::new(1).unwrap(),

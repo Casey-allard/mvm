@@ -11,21 +11,39 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use mvm_agentd::mailbox_outbox::{
-    MAILBOX_CMDLINE_TOKEN, MAILBOX_IO_TIMEOUT, OUTBOX_PATH, bound_socket_io, forward_outbox,
+    MAILBOX_IO_TIMEOUT, OUTBOX_PATH, bound_socket_io, forward_outbox,
 };
 use mvm_contract::protocol::mailbox::MAILBOX_PORT;
+use mvm_contract::protocol::mailbox::local_service::{
+    MailboxGuestService, parse_mailbox_service_cmdline,
+};
+
+#[cfg(test)]
+use mvm_agentd::mailbox_outbox::MAILBOX_CMDLINE_TOKEN;
 
 use crate::globals::SHUTDOWN_REQUESTED;
+#[cfg(test)]
 use crate::telemetry::cmdline_asserts;
 use crate::transport::{accept_vsock, bind_vsock_listener, unix_transport_selected};
 
 /// Spawn the mailbox listener on a boot that asserts one. Called after PID-1
 /// activation; a bind failure is logged and abandoned, never boot-fatal.
 pub(crate) fn init_mailbox() {
-    let asserted = std::fs::read_to_string("/proc/cmdline")
-        .map(|cmdline| cmdline_asserts(&cmdline, MAILBOX_CMDLINE_TOKEN))
-        .unwrap_or(false);
-    if !asserted || unix_transport_selected() {
+    let selected = std::fs::read_to_string("/proc/cmdline").and_then(|cmdline| {
+        let service = parse_mailbox_service_cmdline(&cmdline).map_err(std::io::Error::other)?;
+        service
+            .require_implemented()
+            .map_err(std::io::Error::other)?;
+        Ok(service)
+    });
+    let service = match selected {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!("mvm-guest-agent: mailbox service selection refused: {error}");
+            return;
+        }
+    };
+    if service == MailboxGuestService::Disabled || unix_transport_selected() {
         return;
     }
     let _ = mvm_agentd::detached::spawn_named("mailbox-listener", || {

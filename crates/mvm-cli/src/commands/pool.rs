@@ -1019,7 +1019,10 @@ fn warm_eligible_launch(cfg: &VmStartConfig, late_volume_slots: u8) -> bool {
         && !mvm_vmm::host::egress_shared::launch_terminates_egress_tls(cfg)
         // A standby parent boots without the `mvm.mailbox` token and its host
         // process is per launch, so a granted launch cold-boots.
-        && mvm_vmm::host::egress_bridge::mailbox_cmdline_token(cfg).is_none()
+        && cfg.plan_json.as_deref().is_none_or(|json| {
+            mvm_core::plan::plan_from_admitted_json(json)
+                .is_ok_and(|plan| plan.mailbox.is_none())
+        })
 }
 
 /// Attempt a warm-pool claim for this launch: the claimed `VmId` (the standby
@@ -1202,8 +1205,49 @@ mod tests {
             cpus: 2,
             memory_mib: 1024,
             tenant_id: Some("tenant-a".into()),
-            plan_json: Some("{}".into()),
+            plan_json: Some(
+                serde_json::to_string(
+                    &mvm_core::plan::test_support::PlanFixture::new()
+                        .tenant("tenant-a")
+                        .build(),
+                )
+                .unwrap(),
+            ),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn signed_mailbox_presence_and_malformed_plans_cannot_enter_the_warm_pool() {
+        use mvm_contract::protocol::mailbox::{
+            ExecutionEpoch, MailboxGrant, MailboxId, local_service::MailboxLocalServiceGrant,
+        };
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        let mut cfg = eligible_cfg();
+        cfg.plan_json = Some(serde_json::to_string(&plan).unwrap());
+        assert!(
+            warm_eligible_launch(&cfg, 0),
+            "valid ordinary plan remains eligible"
+        );
+        for service in [None, Some(MailboxLocalServiceGrant::reliable_v1())] {
+            plan.mailbox = Some(MailboxGrant {
+                mailbox: MailboxId::from_bytes([1; 32]),
+                authority_key: [2; 32],
+                epoch: ExecutionEpoch::new(1).unwrap(),
+                local_service: service,
+            });
+            cfg.plan_json = Some(serde_json::to_string(&plan).unwrap());
+            assert!(
+                !warm_eligible_launch(&cfg, 0),
+                "signed mailbox presence requires an admitted cold path"
+            );
+        }
+        for malformed in ["{", "{}", "null"] {
+            cfg.plan_json = Some(malformed.into());
+            assert!(
+                !warm_eligible_launch(&cfg, 0),
+                "malformed plan must not erase mailbox presence: {malformed}"
+            );
         }
     }
 

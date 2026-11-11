@@ -500,6 +500,7 @@ mod tests {
     fn mailbox_grant() -> mvm_contract::protocol::mailbox::MailboxGrant {
         use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
         MailboxGrant {
+            local_service: None,
             mailbox: MailboxId::from_bytes([7; 32]),
             authority_key: [9; 32],
             epoch: ExecutionEpoch::new(3).unwrap(),
@@ -543,6 +544,46 @@ mod tests {
         forged.0.payload = serde_json::to_vec(&payload).unwrap();
         assert!(matches!(
             verify_plan(&forged, &[("test-signer", &vk)]),
+            Err(PlanVerifyError::SignatureInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn reliable_local_service_is_signed_and_cannot_be_added_or_stripped() {
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        let (sk, vk) = fresh_key();
+        let mut plan = sample_plan();
+        let mut grant = mailbox_grant();
+        plan.mailbox = Some(grant);
+        let legacy = sign_plan(&plan, &sk, "test-signer");
+        assert!(!String::from_utf8_lossy(&legacy.0.payload).contains("local_service"));
+        grant.local_service = Some(MailboxLocalServiceGrant::reliable_v1());
+        plan.mailbox = Some(grant);
+        let reliable = sign_plan(&plan, &sk, "test-signer");
+        assert_eq!(
+            verify_plan(&reliable, &[("test-signer", &vk)])
+                .unwrap()
+                .mailbox,
+            Some(grant)
+        );
+        let mut added = legacy;
+        let mut payload: serde_json::Value = serde_json::from_slice(&added.0.payload).unwrap();
+        payload["mailbox"]["local_service"] =
+            serde_json::to_value(grant.local_service.unwrap()).unwrap();
+        added.0.payload = serde_json::to_vec(&payload).unwrap();
+        assert!(matches!(
+            verify_plan(&added, &[("test-signer", &vk)]),
+            Err(PlanVerifyError::SignatureInvalid(_))
+        ));
+        let mut stripped = reliable;
+        let mut payload: serde_json::Value = serde_json::from_slice(&stripped.0.payload).unwrap();
+        payload["mailbox"]
+            .as_object_mut()
+            .unwrap()
+            .remove("local_service");
+        stripped.0.payload = serde_json::to_vec(&payload).unwrap();
+        assert!(matches!(
+            verify_plan(&stripped, &[("test-signer", &vk)]),
             Err(PlanVerifyError::SignatureInvalid(_))
         ));
     }

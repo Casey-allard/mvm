@@ -49,7 +49,39 @@ pub fn seccomp_cmdline_token(config: &mvm_core::vm_backend::VmStartConfig) -> Op
 /// owns the vsock socket.
 pub fn mailbox_cmdline_token(config: &mvm_core::vm_backend::VmStartConfig) -> Option<String> {
     let plan = mvm_core::plan::plan_from_admitted_json(config.plan_json.as_deref()?).ok()?;
-    plan.mailbox.map(|_| "mvm.mailbox=1".to_string())
+    let grant = plan.mailbox?;
+    grant.require_implemented_local_service().ok()?;
+    match grant.local_service {
+        None => Some("mvm.mailbox=1".to_string()),
+        Some(service) => Some(format!(
+            "mvm.mailbox=1 mvm.mailbox.service={}",
+            u16::from(service.version)
+        )),
+    }
+}
+
+#[cfg(test)]
+mod mailbox_mode_tests {
+    use super::*;
+
+    #[test]
+    fn unimplemented_reliable_grant_never_silently_asserts_the_legacy_listener() {
+        use mvm_contract::protocol::mailbox::{
+            ExecutionEpoch, MailboxGrant, MailboxId, local_service::MailboxLocalServiceGrant,
+        };
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.mailbox = Some(MailboxGrant {
+            mailbox: MailboxId::from_bytes([1; 32]),
+            authority_key: [2; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            local_service: Some(MailboxLocalServiceGrant::reliable_v1()),
+        });
+        let config = mvm_core::vm_backend::VmStartConfig {
+            plan_json: Some(serde_json::to_string(&plan).unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(mailbox_cmdline_token(&config), None);
+    }
 }
 
 /// The cmdline key carrying the agent profile the guest must run under.

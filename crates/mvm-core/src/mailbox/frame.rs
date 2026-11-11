@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{decode_envelope, encode_envelope};
 
+pub mod local;
+
 /// Why a frame was not queued. Sent back to the peer verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum Refusal {

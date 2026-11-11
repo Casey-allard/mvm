@@ -195,6 +195,9 @@ pub fn bind_grant(
     limits: MailboxLimits,
     socket: &Path,
 ) -> std::io::Result<(MailboxService, GuestSealer)> {
+    grant
+        .require_implemented_local_service()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Unsupported, error))?;
     let sealer = sealer.with_grant(grant)?;
     let service = MailboxService::bind(socket, limits, trust.with_grant(grant)?)?;
     Ok((service, sealer))
@@ -544,6 +547,7 @@ mod accept_loop_tests {
         crate::audit::host_keypair::load_or_init_at(dir).unwrap();
         let mailbox = mvm_contract::protocol::mailbox::MailboxId::from_bytes([5; 32]);
         let grant = MailboxGrant {
+            local_service: None,
             mailbox,
             authority_key: crate::mailbox_launch::authority_key_for(
                 dir,
@@ -607,6 +611,7 @@ mod tests {
         let mailbox = MailboxId::from_bytes(MAILBOX);
         let epoch = ExecutionEpoch::new(epoch).unwrap();
         MailboxGrant {
+            local_service: None,
             mailbox,
             authority_key: authority_key_for(keys, &mailbox, epoch).unwrap().to_bytes(),
             epoch,
@@ -628,6 +633,21 @@ mod tests {
             .unwrap()
             .trust();
         bind_grant(&grant, policy, sealer, LAUNCH_LIMITS, socket).unwrap()
+    }
+
+    #[test]
+    fn reliable_bind_refuses_before_creating_the_host_service_socket() {
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        let keys = tempfile::tempdir().unwrap();
+        crate::audit::host_keypair::load_or_init_at(keys.path()).unwrap();
+        let mut grant = grant_at(keys.path(), 1);
+        let (policy, sealer) = derive_launch_keys(keys.path(), &grant, &test_secret())
+            .unwrap()
+            .trust();
+        grant.local_service = Some(MailboxLocalServiceGrant::reliable_v1());
+        let socket = keys.path().join("reliable.sock");
+        assert!(bind_grant(&grant, policy, sealer, LAUNCH_LIMITS, &socket).is_err());
+        assert!(!socket.exists());
     }
 
     #[test]

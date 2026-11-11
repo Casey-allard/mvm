@@ -27,6 +27,7 @@ pub fn grant_for(
     epoch: ExecutionEpoch,
 ) -> MailboxGrant {
     MailboxGrant {
+        local_service: None,
         mailbox,
         authority_key: authority.to_bytes(),
         epoch,
@@ -38,6 +39,9 @@ pub fn grant_for(
 /// epoch, so a replaced workload's grant names a new key as well as a new
 /// number. Run where the workload's name is first known.
 pub fn at_workload_epoch(grant: MailboxGrant, workload: &str) -> Result<MailboxGrant> {
+    if let Some(service) = grant.local_service {
+        service.validate()?;
+    }
     let epoch = mvm_core::plan::synthesis::current_local_epoch(workload)?;
     let epoch = ExecutionEpoch::new(epoch).context("the workload's execution epoch is zero")?;
     let authority = mvm_hostd::mailbox_launch::authority_key_for(
@@ -46,7 +50,11 @@ pub fn at_workload_epoch(grant: MailboxGrant, workload: &str) -> Result<MailboxG
         epoch,
     )
     .context("deriving the mailbox authority")?;
-    Ok(grant_for(grant.mailbox, &authority, epoch))
+    Ok(MailboxGrant {
+        authority_key: authority.to_bytes(),
+        epoch,
+        ..grant
+    })
 }
 
 /// Key in a Workload IR's `extensions` map that declares a mailbox:
@@ -153,6 +161,26 @@ mod tests {
     #[test]
     fn no_flag_grants_nothing() {
         assert!(resolve(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn epoch_remint_preserves_explicit_local_service_without_reusing_authority() {
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        use mvm_core::host_interface::workload::WorkloadLedger;
+        let home = tempfile::tempdir().unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        mvm_hostd::audit::host_keypair::load_or_init_at(&mvm_core::config::mvm_keys_dir()).unwrap();
+        let mut original = resolve(Some(&hex::encode([8; 32])), None).unwrap().unwrap();
+        original.local_service = Some(MailboxLocalServiceGrant::reliable_v1());
+        let first = at_workload_epoch(original, "reliable").unwrap();
+        let mut ledger = WorkloadLedger::load_at(home.path()).unwrap();
+        ledger.replace("reliable");
+        ledger.save_at(home.path()).unwrap();
+        let replacement = at_workload_epoch(original, "reliable").unwrap();
+        assert_eq!(replacement.local_service, original.local_service);
+        assert_eq!(replacement.epoch.get(), 2);
+        assert_ne!(replacement.authority_key, first.authority_key);
     }
 
     fn workload_with(ext: serde_json::Value) -> mvm_contract::ir::Workload {
