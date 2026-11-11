@@ -106,6 +106,12 @@ impl LifecycleGeneration {
         );
         Ok(Self { boot, sequence })
     }
+
+    /// Recorded local resource epoch only, not a canonical mailbox execution
+    /// epoch, permission or validation receipt.
+    pub fn resource_epoch(&self) -> u64 {
+        self.sequence
+    }
 }
 
 impl PendingLaunch {

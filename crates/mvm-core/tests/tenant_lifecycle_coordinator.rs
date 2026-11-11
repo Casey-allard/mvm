@@ -12,6 +12,16 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(1)
 }
 
+#[test]
+fn generation_resource_epoch_exposes_only_its_original_checked_sequence() {
+    let generation = LifecycleGeneration::new([7; 32], 17).unwrap();
+    let original = serde_json::to_vec(&generation).unwrap();
+    assert_eq!(generation.resource_epoch(), 17);
+    let restored: LifecycleGeneration = serde_json::from_slice(&original).unwrap();
+    assert_eq!(restored.resource_epoch(), 17);
+    assert_eq!(serde_json::to_vec(&generation).unwrap(), original);
+}
+
 fn bootstrap(home: &Path, generation: &LifecycleGeneration) -> LifecycleCoordinator {
     create_owned_private_dir(home).expect("private home");
     // Storage fixtures satisfy only local coordination preconditions. Production
