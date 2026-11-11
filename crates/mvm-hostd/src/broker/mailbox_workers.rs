@@ -744,6 +744,17 @@ impl MailboxWorkers {
         self.expire_terminals()?;
         Ok(lock(&self.slots)?.contains_key(vm))
     }
+    /// Conservative collision observation for an already-held lifecycle turn.
+    /// No expiry, clock, Child collection or accounting mutation occurs here.
+    pub(crate) fn try_contains(&self, vm: &str) -> io::Result<bool> {
+        let slots = self.slots.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                io::Error::new(io::ErrorKind::WouldBlock, "worker inventory is busy")
+            }
+            std::sync::TryLockError::Poisoned(_) => refused("worker inventory is poisoned"),
+        })?;
+        Ok(slots.contains_key(vm))
+    }
     fn expire_terminals(&self) -> io::Result<()> {
         let mut slots = lock(&self.slots)?;
         let expired: Vec<String> = slots
@@ -1165,6 +1176,59 @@ mod tests {
             tenant_bytes: 524_288,
             bytes_per_worker: 65_536,
         }
+    }
+    #[test]
+    fn nonblocking_collision_read_refuses_contention_poison_and_retains_terminal_slots() {
+        let budget = MailboxWorkerBudget::new(limits()).unwrap();
+        let owner =
+            Arc::new(MailboxWorkers::new("tenant", budget.clone(), Arc::new(NeverSpawn)).unwrap());
+        assert!(!owner.try_contains("vm-one").unwrap());
+        owner.handle(&request(&budget, "tenant")).unwrap();
+        assert!(owner.try_contains("vm-one").unwrap());
+        // Accounting-only terminal fixture: no Child was spawned or collected.
+        {
+            let slots = lock(&owner.slots).unwrap();
+            let mut slot = lock(slots.get("vm-one").unwrap()).unwrap();
+            slot.state = MailboxWorkerState::Collected {
+                exit: MailboxWorkerExit::Code { code: 0 },
+            };
+            slot.terminal_at =
+                Some(Instant::now() - TERMINAL_RETENTION - std::time::Duration::from_secs(1));
+        }
+        budget.collected("tenant").unwrap();
+        let usage = budget.usage().unwrap();
+        assert!(
+            owner.try_contains("vm-one").unwrap(),
+            "collision reads cannot expire retained slots"
+        );
+        assert_eq!(budget.usage().unwrap(), usage);
+
+        let held = lock(&owner.slots).unwrap();
+        let (send, recv) = mpsc::channel();
+        let other = owner.clone();
+        let thread = std::thread::spawn(move || send.send(other.try_contains("vm-one")).unwrap());
+        let observed = recv.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        thread.join().unwrap();
+        assert!(
+            observed
+                .expect("collision read blocked on another mutex guard")
+                .is_err()
+        );
+
+        let other = owner.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = other.slots.lock().unwrap();
+                panic!("controlled worker-map poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(
+            owner.try_contains("vm-one").is_err(),
+            "poison cannot become absence"
+        );
     }
     #[test]
     fn handoff_wakeup_retries_interrupted_write_worker_review_red() {

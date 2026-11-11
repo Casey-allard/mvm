@@ -29,10 +29,31 @@ pub struct BoundHandlers {
     pub assurance: Option<Arc<HostAssuranceV1Handler>>,
 }
 
+impl BoundHandlers {
+    /// Publish the original prepared plane only after its owning registration
+    /// commits. This does not admit a session or replace an existing plane.
+    pub(crate) fn publish(&self) {
+        if let Some(handler) = &self.assurance {
+            crate::assurance_session::install_host_assurance_plane(Arc::clone(handler));
+        }
+    }
+}
+
 /// Register stateless built-in handlers named by an admitted service binding.
 /// Services absent from `bindings` remain unregistered and therefore fail with
 /// `NotBound` at the registry gate.
 pub fn register_bound_handlers(registry: &mut Registry, bindings: &[ServiceId]) -> BoundHandlers {
+    let bound = build_bound_handlers(registry, bindings);
+    bound.publish();
+    bound
+}
+
+/// Build the same canonical handlers without making their assurance plane
+/// visible process-wide. The owning registration explicitly publishes at commit.
+pub(crate) fn build_bound_handlers(
+    registry: &mut Registry,
+    bindings: &[ServiceId],
+) -> BoundHandlers {
     let mut bound = BoundHandlers::default();
 
     let host_time = ServiceId::parse("host.time.v1").expect("host.time.v1 is a valid ServiceId");
@@ -55,14 +76,52 @@ pub fn register_bound_handlers(registry: &mut Registry, bindings: &[ServiceId]) 
         registry
             .register_capability(as_service, HostAssuranceV1Handler::capability_descriptor())
             .expect("built-in assurance capability descriptor is valid");
-        // Publish it process-wide so the admit path can open a session on the
-        // same instance the broker dispatches against. A second registry in one
-        // process keeps its own handler and does not displace the first — the
-        // alternative would point an opened session at a handler no workload
-        // calls, which reads as a campaign that ran and observed nothing.
-        crate::assurance_session::install_host_assurance_plane(Arc::clone(&handler));
         bound.assurance = Some(handler);
     }
 
     bound
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_assurance_plane_publication_is_explicit() {
+        const CHILD: &str = "MVM_TEST_DEFERRED_ASSURANCE_PUBLICATION";
+        if std::env::var_os(CHILD).is_none() {
+            // A selected fresh process gives this test its own OnceLock. Other
+            // broker tests may legitimately publish a plane in the parent.
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "broker::handlers::tests::deferred_assurance_plane_publication_is_explicit",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .expect("run isolated publication fixture");
+            assert!(status.success(), "isolated publication fixture failed");
+            return;
+        }
+
+        assert!(crate::assurance_session::host_assurance_plane().is_none());
+        let mut registry = Registry::new();
+        let service = ServiceId::parse(host_assurance_v1::HOST_ASSURANCE_SERVICE)
+            .expect("canonical assurance service");
+        let bound = build_bound_handlers(&mut registry, &[service]);
+        let original = bound.assurance.as_ref().expect("original bound handler");
+        assert!(
+            crate::assurance_session::host_assurance_plane().is_none(),
+            "preparation must not publish the assurance plane before commit"
+        );
+        bound.publish();
+        let published = crate::assurance_session::host_assurance_plane()
+            .expect("explicit commit publishes the plane");
+        assert!(
+            Arc::ptr_eq(original, &published),
+            "commit must publish the handler the prepared registry owns"
+        );
+    }
 }

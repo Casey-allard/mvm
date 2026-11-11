@@ -6,13 +6,351 @@
 //! sessions have persisted for the configured idle timeout the worker exits with [`IDLE_SHUTDOWN_EXIT_CODE`]
 //! so the wrapper can tear down the tree rather than restart it.
 
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::broker::daemon::HostAgentDaemon;
+use crate::watcher_jobs::{WatcherDrainError, WatcherDrainReceipt, WatcherJobOwner};
+use mvm_vmm::host::aux_bin::{CliSpawn, HostProcess};
+use mvm_vmm::host::installed_owner::{HolderLease, InstallationBinding};
+
+struct OwnedSessionReaper {
+    jobs: WatcherJobOwner,
+    resources: Arc<InstallationBinding>,
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+}
+
+impl crate::host_agent_sessions::SessionReaper for OwnedSessionReaper {
+    fn reap(&self) {
+        let result = (|| -> anyhow::Result<()> {
+            let mut command = crate::health_probe::mvmctl_command_for(
+                &HostProcess::current(),
+                CliSpawn::SessionReap,
+            )?;
+            command.args(["machine", "session", "reap"]);
+            spawn_owned_watcher_command(&self.daemon, &self.jobs, &self.resources, command)
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%error, "canonical session reap not admitted by retained watcher owner");
+        }
+    }
+}
+
+struct OwnedMachineRestarter {
+    jobs: WatcherJobOwner,
+    resources: Arc<InstallationBinding>,
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+}
+
+#[derive(Clone)]
+struct WatcherPassAdmission {
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+    resources: Arc<InstallationBinding>,
+}
+
+impl WatcherPassAdmission {
+    fn admit(&self) -> anyhow::Result<crate::broker::daemon::AcceptedDaemonWork> {
+        admit_watcher_turn(&self.daemon, &self.resources)
+    }
+}
+
+impl crate::health_probe::Restarter for OwnedMachineRestarter {
+    fn restart(&self, vm_name: &str) {
+        let result = (|| -> anyhow::Result<()> {
+            let mut command = crate::health_probe::mvmctl_command_for(
+                &HostProcess::current(),
+                CliSpawn::HealthRestart,
+            )?;
+            command.args(["machine", "restart", vm_name]);
+            spawn_owned_watcher_command(&self.daemon, &self.jobs, &self.resources, command)
+        })();
+        if let Err(error) = result {
+            tracing::warn!(vm = %vm_name, %error, "canonical health restart not admitted by retained watcher owner");
+        }
+    }
+}
+
+fn spawn_owned_watcher_command(
+    daemon: &Arc<Mutex<HostAgentDaemon>>,
+    jobs: &WatcherJobOwner,
+    resources: &InstallationBinding,
+    mut command: std::process::Command,
+) -> anyhow::Result<()> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut accepted = admit_watcher_turn(daemon, resources)?;
+    let result = (|| -> anyhow::Result<()> {
+        let lease = HolderLease::acquire(&resources.root, resources.key, resources.generation)?;
+        jobs.try_spawn(command, lease)?;
+        Ok(())
+    })();
+    // Success means the finite actor now represents this job; Err starts no
+    // Child for this command. Neither outcome is command semantic success.
+    accepted.settle()?;
+    result
+}
+
+fn admit_watcher_turn(
+    daemon: &Arc<Mutex<HostAgentDaemon>>,
+    resources: &InstallationBinding,
+) -> anyhow::Result<crate::broker::daemon::AcceptedDaemonWork> {
+    let (gate, generation) = daemon
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("original daemon unavailable for watcher admission"))?
+        .coordination_binding()?;
+    let mut accepted =
+        gate.with_active(&generation, Instant::now() + Duration::from_secs(5), || {
+            daemon
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("original daemon admission contended"))?
+                .reserve_accepted_work(&generation)
+        })?;
+    // No file gate or daemon mutex is held during resource/thread preparation.
+    let lease = match HolderLease::acquire(&resources.root, resources.key, resources.generation) {
+        Ok(lease) => lease,
+        Err(error) => {
+            accepted.settle()?; // No effect or Child has started.
+            return Err(error.into());
+        }
+    };
+    accepted.attach_resource(lease)?;
+    Ok(accepted)
+}
+
+async fn drain_watcher_jobs(
+    jobs: WatcherJobOwner,
+) -> Result<WatcherDrainReceipt, WatcherDrainError> {
+    // This original blocking job remains owned if the async caller is canceled.
+    // The worker coordinator also retains its own owner and this task's handle.
+    tokio::task::spawn_blocking(move || jobs.drain(None))
+        .await
+        .map_err(|_| WatcherDrainError::Unresolved)?
+}
+
+/// A bounded checked observation, never admission or child-collection proof.
+/// Its caller must pair it with unchanged lifecycle mutation revision and the
+/// original daemon/inflight/job-owner state before proposing an idle fence.
+pub struct CheckedSessionInventory {
+    owned_running: usize,
+    known_other_running: usize,
+}
+
+impl CheckedSessionInventory {
+    pub fn owned_running(&self) -> usize {
+        self.owned_running
+    }
+
+    pub fn known_other_running(&self) -> usize {
+        self.known_other_running
+    }
+}
+
+fn read_inventory_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    const LIMIT: usize = 65_536;
+    let before = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        before.is_file() && before.nlink() == 1,
+        "inventory is not a private regular file"
+    );
+    mvm_core::private_fs::require_current_owner(&before)?;
+    anyhow::ensure!(
+        mvm_core::private_fs::mode_bits(path, &before)? & 0o077 == 0
+            && before.len() <= LIMIT as u64,
+        "inventory file mode or size is unsupported"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let opened = file.metadata()?;
+    anyhow::ensure!(
+        opened.is_file()
+            && opened.nlink() == 1
+            && opened.len() <= LIMIT as u64
+            && opened.dev() == before.dev()
+            && opened.ino() == before.ino(),
+        "inventory file changed during open"
+    );
+    mvm_core::private_fs::require_current_owner(&opened)?;
+    anyhow::ensure!(
+        mvm_core::private_fs::mode_bits(path, &opened)? & 0o077 == 0,
+        "opened inventory file is not private"
+    );
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= LIMIT, "inventory read exceeds limit");
+    Ok(bytes)
+}
+
+fn require_inventory_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(metadata.is_dir(), "inventory directory is not plain");
+    mvm_core::private_fs::require_current_owner(&metadata)?;
+    anyhow::ensure!(
+        mvm_core::private_fs::mode_bits(path, &metadata)? == 0o700,
+        "inventory directory is not private"
+    );
+    Ok(())
+}
+
+fn checked_started_backend(
+    home: &Path,
+    vm: &str,
+) -> anyhow::Result<mvm_core::vm_backend::BackendKind> {
+    use std::os::unix::fs::MetadataExt;
+    let directory = mvm_core::config::vm_state_dir_at(home, vm);
+    let mut kind = None;
+    for descriptor in mvm_runtime::catalog::started_vm_probe_descriptors() {
+        let Some(marker) = descriptor.marker_file else {
+            continue;
+        };
+        let path = directory.join(marker);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.len() > 0
+                && metadata.len() <= 4096,
+            "backend marker is unsupported"
+        );
+        mvm_core::private_fs::require_current_owner(&metadata)?;
+        anyhow::ensure!(
+            mvm_core::private_fs::mode_bits(&path, &metadata)? & 0o022 == 0,
+            "backend marker is writable by another identity"
+        );
+        anyhow::ensure!(
+            kind.is_none_or(|previous| previous == descriptor.kind),
+            "backend ownership is ambiguous"
+        );
+        kind = Some(descriptor.kind);
+    }
+    kind.ok_or_else(|| anyhow::anyhow!("covered session backend is unknown"))
+}
+
+/// Read canonical session/plan metadata under the original captured home.
+/// Unknown, unreadable, malformed, oversized or truncated input is an error,
+/// never zero. 4096 directory entries is a scan work bound, not fleet capacity.
+pub fn checked_session_inventory(
+    home: &Path,
+    tenant: &str,
+    deadline: Instant,
+) -> anyhow::Result<CheckedSessionInventory> {
+    use crate::host_agent_lifecycle::{LifecycleCoverage, classify_admitted_plan};
+    use mvm_core::session::{SessionRecord, SessionState};
+    anyhow::ensure!(
+        home.is_absolute() && Instant::now() < deadline,
+        "inventory requires original absolute home and unexpired deadline"
+    );
+    require_inventory_directory(home)?;
+    let directory = home.join("run/sessions");
+    let mut inventory = CheckedSessionInventory {
+        owned_running: 0,
+        known_other_running: 0,
+    };
+    match std::fs::symlink_metadata(home.join("run")) {
+        Ok(_) => require_inventory_directory(&home.join("run"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "session inventory deadline expired"
+            );
+            return Ok(inventory);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "session inventory deadline expired"
+            );
+            return Ok(inventory);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "session inventory directory is not plain"
+    );
+    mvm_core::private_fs::require_current_owner(&metadata)?;
+    anyhow::ensure!(
+        mvm_core::private_fs::mode_bits(&directory, &metadata)? == 0o700,
+        "session inventory directory is not private"
+    );
+    let mut identities = std::collections::HashSet::new();
+    for (index, entry) in std::fs::read_dir(&directory)?.enumerate() {
+        anyhow::ensure!(
+            index < 4096 && Instant::now() < deadline,
+            "session inventory work or time bound exceeded"
+        );
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let record: SessionRecord = serde_json::from_slice(&read_inventory_file(&path)?)?;
+        mvm_core::session::SessionId::parse(&record.id.to_string())?;
+        chrono::DateTime::parse_from_rfc3339(&record.started_at)?;
+        if let Some(invoked) = &record.last_invoke_at {
+            chrono::DateTime::parse_from_rfc3339(invoked)?;
+        }
+        anyhow::ensure!(
+            path.file_name()
+                .is_some_and(|name| name == format!("{}.json", record.id).as_str())
+                && identities.insert(record.id.clone()),
+            "session inventory identity mismatch"
+        );
+        if record.state != SessionState::Running {
+            continue;
+        }
+        super::broker::daemon::validate_vm_id(&record.vm_name)?;
+        let vm_directory = mvm_core::config::vm_state_dir_at(home, &record.vm_name);
+        require_inventory_directory(&home.join("vms"))?;
+        require_inventory_directory(&vm_directory)?;
+        let plan_path = vm_directory.join(crate::audit::plan_persist::PLAN_FILENAME);
+        let bytes = read_inventory_file(&plan_path)?;
+        let plan = mvm_core::plan::plan_from_admitted_json(std::str::from_utf8(&bytes)?)?;
+        let coverage = classify_admitted_plan(&plan)?;
+        let admitted_kind = mvm_runtime::catalog::descriptor_for_selector(&plan.runtime_profile.0)
+            .ok_or_else(|| anyhow::anyhow!("admitted session backend is unknown"))?
+            .kind;
+        let backend = checked_started_backend(home, &record.vm_name)?;
+        anyhow::ensure!(
+            backend == admitted_kind,
+            "actual session backend does not match canonical plan"
+        );
+        if plan.tenant.0 != tenant || matches!(coverage, LifecycleCoverage::KnownOther(_)) {
+            inventory.known_other_running = inventory
+                .known_other_running
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("session inventory count overflow"))?;
+            continue;
+        }
+        inventory.owned_running = inventory
+            .owned_running
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("session inventory count overflow"))?;
+    }
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "session inventory deadline expired"
+    );
+    Ok(inventory)
+}
 
 /// Exit code the worker uses when it self-terminates due to idle timeout.
 ///
@@ -73,13 +411,25 @@ pub fn is_idle_shutdown(code: Option<i32>) -> bool {
     code == Some(IDLE_SHUTDOWN_EXIT_CODE)
 }
 
-/// Watcher task that calls `process::exit(IDLE_SHUTDOWN_EXIT_CODE)` once the
-/// daemon has had no work for `timeout`: zero VM registrations and zero
-/// sessions it watches (see [`run_session_watcher`]).
+/// Advisory idle observation. This is not admission or shutdown authority:
+/// the coordinator must revalidate inventory under the lifecycle/daemon gate.
+#[derive(Debug, Clone, Copy)]
+pub struct IdleProposal {
+    observed_at: Instant,
+}
+
+impl IdleProposal {
+    /// The original monotonic observation, never a replacement drain deadline.
+    #[must_use]
+    pub fn observed_at(self) -> Instant {
+        self.observed_at
+    }
+}
+
+/// Return an idle proposal after observing no work for `timeout`.
 ///
-/// Spawn this as a sibling task alongside the daemon's main serve loop. If
-/// `timeout` is `None` (idle-exit disabled) the function returns immediately
-/// without blocking.
+/// Compatibility entry point for owners without a cooperative stop channel.
+/// It never exits the process. A disabled watcher returns no proposal.
 ///
 /// The lock over `daemon` is held only for the `registration_count()` read and
 /// is dropped before every sleep, so it never serialises against broker request
@@ -88,19 +438,39 @@ pub async fn run_idle_watcher(
     daemon: Arc<Mutex<HostAgentDaemon>>,
     watched_sessions: Arc<AtomicUsize>,
     timeout: Option<Duration>,
-) {
+) -> Option<IdleProposal> {
+    let (_keepalive, stop) = watch::channel(false);
+    run_idle_watcher_until(daemon, watched_sessions, timeout, stop).await
+}
+
+/// Stop-aware idle observer. True or sender closure prevents new proposals.
+pub async fn run_idle_watcher_until(
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+    watched_sessions: Arc<AtomicUsize>,
+    timeout: Option<Duration>,
+    mut stop: watch::Receiver<bool>,
+) -> Option<IdleProposal> {
     let Some(timeout) = timeout else {
-        return;
+        return None;
     };
     const PROBE: Duration = Duration::from_millis(500);
     let mut zero_since: Option<Instant> = None;
     loop {
-        let registrations = {
-            let mut daemon = daemon.lock().await;
-            if let Err(error) = daemon.reap_dead_registrations() {
-                tracing::warn!(%error, "dead host-agent registration reap failed");
+        if *stop.borrow() || stop.has_changed().is_err() {
+            return None;
+        }
+        // Ownership-marker filesystem probes and actual service retirement run
+        // outside the daemon mutex. Unknown original state conservatively blocks idle.
+        if let Err(error) = HostAgentDaemon::reap_dead_registrations_shared(daemon.clone()).await {
+            tracing::warn!(%error, "dead host-agent registration reap failed");
+        }
+        let registrations = tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { return None; }
+                continue;
             }
-            daemon.registration_count()
+            original = daemon.lock() => original.registration_count(),
         };
         let count = registrations.saturating_add(watched_sessions.load(Ordering::Relaxed));
         if count > 0 {
@@ -109,9 +479,22 @@ pub async fn run_idle_watcher(
             zero_since = Some(Instant::now());
         }
         if should_idle_exit(count, zero_since, Instant::now(), Some(timeout)) {
-            std::process::exit(IDLE_SHUTDOWN_EXIT_CODE);
+            if *stop.borrow() || stop.has_changed().is_err() {
+                return None;
+            }
+            return Some(IdleProposal {
+                observed_at: Instant::now(),
+            });
         }
-        tokio::time::sleep(PROBE).await;
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return None;
+                }
+            }
+            () = tokio::time::sleep(PROBE) => {}
+        }
     }
 }
 
@@ -123,27 +506,110 @@ pub async fn run_idle_watcher(
 /// `spawn_blocking`; the watcher is moved in and back out so its record of the
 /// last sweep survives.
 pub async fn run_session_watcher(tenant: String, watched_sessions: Arc<AtomicUsize>) {
-    use crate::host_agent_sessions::{CliSessionReaper, SessionSweepWatcher, TenantSessions};
+    let (_keepalive, stop) = watch::channel(false);
+    run_session_watcher_until(tenant, watched_sessions, stop).await;
+}
+
+/// Stop new passes cooperatively and retain any already-started blocking pass.
+pub async fn run_session_watcher_until(
+    tenant: String,
+    watched_sessions: Arc<AtomicUsize>,
+    stop: watch::Receiver<bool>,
+) {
+    session_watcher_passes(
+        tenant,
+        watched_sessions,
+        stop,
+        crate::host_agent_sessions::CliSessionReaper,
+        None,
+    )
+    .await;
+}
+
+/// Original bounded cleanup jobs finish before this watcher yields a receipt.
+pub async fn run_session_watcher_owned(
+    tenant: String,
+    watched_sessions: Arc<AtomicUsize>,
+    stop: watch::Receiver<bool>,
+    jobs: WatcherJobOwner,
+    resources: Arc<InstallationBinding>,
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+) -> Result<WatcherDrainReceipt, WatcherDrainError> {
+    session_watcher_passes(
+        tenant,
+        watched_sessions,
+        stop,
+        OwnedSessionReaper {
+            jobs: jobs.clone(),
+            resources: resources.clone(),
+            daemon: daemon.clone(),
+        },
+        Some(WatcherPassAdmission {
+            daemon,
+            resources: resources.clone(),
+        }),
+    )
+    .await;
+    drain_watcher_jobs(jobs).await
+}
+
+async fn session_watcher_passes<R: crate::host_agent_sessions::SessionReaper + Send + 'static>(
+    tenant: String,
+    watched_sessions: Arc<AtomicUsize>,
+    mut stop: watch::Receiver<bool>,
+    reaper: R,
+    admission: Option<WatcherPassAdmission>,
+) {
+    use crate::host_agent_sessions::{SessionSweepWatcher, TenantSessions};
 
     const PROBE: Duration = Duration::from_secs(2);
     let mut ticker = tokio::time::interval(PROBE);
     let mut watcher = Some(SessionSweepWatcher::new(
         TenantSessions::new(tenant),
-        CliSessionReaper,
+        reaper,
     ));
     loop {
-        ticker.tick().await;
+        if *stop.borrow() || stop.has_changed().is_err() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+                continue;
+            }
+            _ = ticker.tick() => {}
+        }
         let Some(current) = watcher.take() else {
             return;
         };
+        let admission = admission.clone();
         let pass = tokio::task::spawn_blocking(move || {
             let mut current = current;
+            let accepted = match admission
+                .as_ref()
+                .map(WatcherPassAdmission::admit)
+                .transpose()
+            {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(%error, "session pass admission unavailable");
+                    return (current, usize::MAX);
+                }
+            };
             let watched = match mvm_core::session::list_sessions() {
                 Ok(records) => current.step(&records, chrono::Utc::now()),
                 Err(error) => {
                     tracing::warn!(%error, "session watcher: could not list sessions");
                     0
                 }
+            };
+            let watched = if accepted.is_some_and(|mut accepted| accepted.settle().is_err()) {
+                usize::MAX
+            } else {
+                watched
             };
             (current, watched)
         })
@@ -154,8 +620,9 @@ pub async fn run_session_watcher(tenant: String, watched_sessions: Arc<AtomicUsi
                 watcher = Some(current);
             }
             Err(error) => {
-                // Stop counting what is no longer watched, so the agent can
-                // still idle out; the client sweep remains for those sessions.
+                // This Atomic is advisory, never shutdown authority. The
+                // coordinator's checked inventory still refuses Unknown, and
+                // an abandoned original pass leaves its accepted turn charged.
                 tracing::warn!(%error, "session watcher pass failed; no longer watching sessions");
                 watched_sessions.store(0, Ordering::Relaxed);
                 return;
@@ -178,37 +645,119 @@ pub async fn run_session_watcher(tenant: String, watched_sessions: Arc<AtomicUsi
 ///
 /// [`HealthProber`]: crate::health_probe::HealthProber
 pub async fn run_health_watcher(daemon: Arc<Mutex<HostAgentDaemon>>) {
-    use crate::health_probe::{AgentExec, HealthProber, MachineRestarter, now_unix};
+    let (_keepalive, stop) = watch::channel(false);
+    run_health_watcher_until(daemon, stop).await;
+}
+
+/// Stop new probes cooperatively; await an already-started blocking pass.
+pub async fn run_health_watcher_until(
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+    stop: watch::Receiver<bool>,
+) {
+    health_watcher_passes(
+        daemon,
+        stop,
+        Arc::new(crate::health_probe::MachineRestarter),
+        None,
+    )
+    .await;
+}
+
+/// Original bounded restart jobs finish before this watcher yields a receipt.
+pub async fn run_health_watcher_owned(
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+    stop: watch::Receiver<bool>,
+    jobs: WatcherJobOwner,
+    resources: Arc<InstallationBinding>,
+) -> Result<WatcherDrainReceipt, WatcherDrainError> {
+    health_watcher_passes(
+        daemon.clone(),
+        stop,
+        Arc::new(OwnedMachineRestarter {
+            jobs: jobs.clone(),
+            resources: resources.clone(),
+            daemon: daemon.clone(),
+        }),
+        Some(WatcherPassAdmission { daemon, resources }),
+    )
+    .await;
+    drain_watcher_jobs(jobs).await
+}
+
+async fn health_watcher_passes(
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+    mut stop: watch::Receiver<bool>,
+    restarter: Arc<dyn crate::health_probe::Restarter + Send + Sync>,
+    admission: Option<WatcherPassAdmission>,
+) {
+    use crate::health_probe::{AgentExec, HealthProber, now_unix};
 
     const PROBE: Duration = Duration::from_secs(2);
     let mut ticker = tokio::time::interval(PROBE);
     let mut prober = HealthProber::new();
     loop {
-        ticker.tick().await;
+        if *stop.borrow() || stop.has_changed().is_err() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+                continue;
+            }
+            _ = ticker.tick() => {}
+        }
         // Snapshot the live set and the health-audit sink together under one
         // brief lock, then release it before the blocking pass — the sink is
         // self-contained (it does its own blocking helper round-trip inside the
         // pass), so a health append never runs under the daemon lock.
         let (vm_ids, audit) = {
             let d = daemon.lock().await;
-            (d.registered_vm_ids(), d.health_audit_sink())
+            match d.registered_vm_ids() {
+                Ok(ids) => (ids, d.health_audit_sink()),
+                Err(error) => {
+                    tracing::warn!(%error, "original VM map unavailable; health pass skipped");
+                    continue;
+                }
+            }
         };
         if vm_ids.is_empty() {
             continue;
         }
+        if *stop.borrow() || stop.has_changed().is_err() {
+            return;
+        }
         // Move the prober into the blocking pass and take it back afterwards so
         // its tracker state survives. A panic in the pass costs the tracker
-        // history but not the watcher loop. The restart spawn itself is
-        // non-blocking (fire-and-forget), so it rides along in the same
-        // blocking pass rather than needing its own task.
+        // history but not the watcher loop. Owned restart adapters reserve a
+        // finite original job and retain its Child/resource lease; the pass
+        // only reports scheduling, never successful restart or collection.
+        let restarter = restarter.clone();
+        let admission = admission.clone();
         prober = tokio::task::spawn_blocking(move || {
+            let accepted = match admission
+                .as_ref()
+                .map(WatcherPassAdmission::admit)
+                .transpose()
+            {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(%error, "health pass admission unavailable");
+                    return prober;
+                }
+            };
             let now = now_unix();
             // Scheduling (per due probe, inside `tick`) is decoupled from firing
             // (every tick, inside `act`): `tick` schedules a restart into the
             // future, and `act` fires any gate that has since elapsed. A restart
             // scheduled this pass therefore fires on a later pass, not this one.
             prober.tick(&vm_ids, now, &AgentExec, &audit);
-            prober.act(&vm_ids, now, &MachineRestarter);
+            prober.act(&vm_ids, now, restarter.as_ref());
+            if let Some(mut accepted) = accepted {
+                let _ = accepted.settle();
+            }
             prober
         })
         .await

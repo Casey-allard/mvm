@@ -23,6 +23,7 @@
 
 pub mod audit_client;
 pub mod config;
+mod control_prepare;
 pub mod controller_proxy;
 pub mod daemon;
 pub mod handlers;

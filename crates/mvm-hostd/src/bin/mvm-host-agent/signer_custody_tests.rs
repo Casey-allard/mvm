@@ -5,6 +5,20 @@ use std::os::unix::fs::PermissionsExt;
 const ENTRY: &str = "SC_SIGNER_CUSTODY_ENTRY";
 const HELPER: &str = "SC_SIGNER_CUSTODY_HELPER";
 
+fn provision_fixture(
+    config: &HostAgentConfig,
+) -> (InstallationOwner, Epoch, Arc<InstallationBinding>) {
+    let home = config.control_socket.parent().unwrap();
+    // This directory is this test's newly created TempDir, never user state.
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let descriptor = config.resource_descriptor(home).unwrap();
+    mvm_core::config::create_private_dir(descriptor.root.parent().unwrap()).unwrap();
+    let mut owner = InstallationOwner::initialize(&descriptor.root, descriptor.key).unwrap();
+    let epoch = owner.begin().unwrap();
+    let binding = Arc::new(owner.active_binding(epoch).unwrap());
+    (owner, epoch, binding)
+}
+
 #[cfg(target_os = "linux")]
 fn force_tokio_signal_fallback() {
     // Tokio 1.53.3 requests PIDFD_NONBLOCK; the canonical observer requests 0.
@@ -115,8 +129,9 @@ fn isolated_signer_custody_entry() {
         .enable_all()
         .build()
         .unwrap();
+    let (mut resource_owner, epoch, resources) = provision_fixture(&config);
     runtime.block_on(async {
-        let mut child = spawn_signer_helper(&config)
+        let mut child = spawn_signer_helper(&config, resources)
             .await
             .expect("actual production signer spawn/readiness");
         let custody = mvm_vmm::host::process_exit::require_owned_child_custody();
@@ -129,6 +144,7 @@ fn isolated_signer_custody_entry() {
         mvm_vmm::host::process_exit::require_owned_child_custody()
             .expect("custody remains valid after original collection");
     });
+    resource_owner.finish(epoch).unwrap();
 }
 
 // Fixed stand-in signer: reads the real production config and binds its actual
@@ -146,9 +162,143 @@ fn signer_helper_fixture() {
         }
     }
     let listener = std::os::unix::net::UnixListener::bind(config.uds_path).unwrap();
+    if let Some(marker) = std::env::var_os("SC_SIGNER_RPC_BLOCKED") {
+        let release = PathBuf::from(std::env::var_os("SC_SIGNER_RPC_RELEASE").unwrap());
+        for connection in listener.incoming() {
+            let mut stream = connection.unwrap();
+            if stream.read(&mut [0]).unwrap() == 0 {
+                continue; // Real readiness probe, not the canonical RPC.
+            }
+            std::fs::write(marker, b"canonical-rpc-received").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !release.exists() {
+                assert!(Instant::now() < deadline, "owned RPC fault release guard");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return;
+        }
+        return;
+    }
     for connection in listener.incoming() {
         drop(connection.unwrap());
     }
+}
+
+#[test]
+fn signer_stop_interrupts_blocked_rebind_and_collects_original() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "signer_custody_tests::isolated_blocked_rebind_entry",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ENTRY, "rpc")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated blocked rebind failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn isolated_blocked_rebind_entry() {
+    if std::env::var_os(ENTRY).is_none() {
+        return;
+    }
+    mvm_vmm::host::process_exit::require_owned_child_custody().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = directory.path().join("rpc-helper");
+    let marker = directory.path().join("rpc-blocked");
+    let release = directory.path().join("rpc-release");
+    let executable = std::env::current_exe().unwrap();
+    let quoted = executable.to_str().unwrap().replace('\'', "'\\''");
+    std::fs::write(&fixture, format!("#!/bin/sh\n{HELPER}=1 exec '{quoted}' --exact signer_custody_tests::signer_helper_fixture --nocapture --test-threads=1\n")).unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut environment = mvm_core::util::test_env::TestEnv::new();
+    environment.set("MVM_SIGNER_HELPER_PATH", &fixture);
+    environment.set("SC_SIGNER_RPC_BLOCKED", &marker);
+    environment.set("SC_SIGNER_RPC_RELEASE", &release);
+    let config = HostAgentConfig {
+        tenant_id: "blocked-rebind-fixture".into(),
+        control_socket: directory.path().join("control.sock"),
+        registration_journal_path: None,
+        host_signer_public_key_path: directory.path().join("unused-public-key"),
+        signer_helper_uds_path: directory.path().join("signer.sock"),
+        software_chain_key_path: directory.path().join("unused-chain-key"),
+        max_frame_bytes: 65_536,
+    };
+    let (mut resource_owner, epoch, resources) = provision_fixture(&config);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let mut daemon =
+            HostAgentDaemon::new(config.tenant_id.clone(), key.verifying_key(), 65_536);
+        let signed = mvm_core::protocol::broker_control::sign(
+            mvm_core::protocol::broker_control::ControlRequest::Register(Box::new(
+                mvm_core::protocol::broker_control::RegisterVm {
+                    vm_id: "vm-rpc".into(),
+                    workload_id: Some("rpc-fixture".into()),
+                    tenant_id: config.tenant_id.clone(),
+                    broker_listen_socket: directory
+                        .path()
+                        .join("vm.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                    workload_chain_path: directory
+                        .path()
+                        .join("unused-chain")
+                        .to_string_lossy()
+                        .into_owned(),
+                    workload_chain_head_path: None,
+                    audit_signer_uds_path: None,
+                    services_bindings: vec![],
+                    capability_bindings: vec![],
+                    assurance: None,
+                    service_proxies: vec![],
+                },
+            )),
+            &key.to_bytes(),
+        )
+        .unwrap();
+        daemon
+            .apply(
+                mvm_core::protocol::broker_control::verify(&signed, &key.verifying_key()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let daemon = Arc::new(Mutex::new(
+            daemon.with_signer_helper(&config.signer_helper_uds_path),
+        ));
+        let (ready, _readiness) = oneshot::channel();
+        let mut supervisor = SignerSupervisionHandle::spawn(config, daemon, ready, resources);
+        let setup_deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < setup_deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let setup_seen = marker.exists();
+        let timely = tokio::time::timeout(Duration::from_secs(2), supervisor.drain()).await;
+        let interrupted = matches!(timely, Ok(Ok(())));
+        // Always release the owned fault and collect before asserting a RED.
+        std::fs::write(&release, b"release").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), supervisor.drain())
+            .await
+            .unwrap()
+            .unwrap();
+        resource_owner.finish(epoch).unwrap();
+        assert!(setup_seen, "real canonical rebind must reach held RPC");
+        assert!(
+            interrupted,
+            "stop must interrupt held RPC and collect original signer before fixture release"
+        );
+    });
 }
 
 // These bounded test-only notifications witness the production call/collection
@@ -275,8 +425,9 @@ fn isolated_saturated_signer_entry() {
     let (collection, collected) = std::sync::mpsc::sync_channel(1);
     *CONNECT_ATTEMPT.lock().unwrap() = Some(connecting);
     *COLLECTED.lock().unwrap() = Some(collection);
+    let (mut resource_owner, epoch, resources) = provision_fixture(&config);
     runtime.block_on(async move {
-        let attempt = tokio::spawn(async move { spawn_signer_helper(&config).await });
+        let attempt = tokio::spawn(async move { spawn_signer_helper(&config, resources).await });
         let connect_seen = tokio::task::spawn_blocking(move || connected.recv_timeout(SIGNER_HELPER_READY_TIMEOUT + Duration::from_secs(2))).await.unwrap();
         attempt.abort();
         drop(attempt.await); // A successful task result must also drop its facade.
@@ -294,6 +445,7 @@ fn isolated_saturated_signer_entry() {
             Err(_) => tokio::task::spawn_blocking(move || collected.recv_timeout(Duration::from_secs(5))).await.unwrap().expect("original helper collected after releasing owned backlog"),
         };
         assert!(!status.success(), "actual fixture helper was stopped");
+        resource_owner.finish(epoch).unwrap();
         connect_seen.expect("production actor reached actual connect attempt");
         assert!(collected_before_release, "cancellation failed to interrupt saturated readiness connect; original helper collected only after releasing backlog");
     });
@@ -359,8 +511,9 @@ fn isolated_sigchld_guard_entry() {
         .enable_all()
         .build()
         .unwrap();
+    let (mut resource_owner, epoch, resources) = provision_fixture(&config);
     runtime.block_on(async {
-        match spawn_signer_helper(&config).await {
+        match spawn_signer_helper(&config, resources).await {
             Err(error) => assert!(
                 format!("{error:#}").contains("requires default SIGCHLD"),
                 "must refuse custody before trying missing helper: {error:#}"
@@ -372,4 +525,5 @@ fn isolated_sigchld_guard_entry() {
             }
         }
     });
+    resource_owner.finish(epoch).unwrap();
 }

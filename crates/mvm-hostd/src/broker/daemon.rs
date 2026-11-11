@@ -41,12 +41,8 @@ use tracing::warn;
 
 use crate::audit_signer::helper_client::SignerHelperClient;
 
-use super::audit_client::AuditClient;
-use super::handlers::host_audit_v1::HostAuditV1Handler;
-use super::handlers::register_bound_handlers;
-use super::registry::Registry;
-use super::server::{read_frame, serve_on_listener, write_frame};
-use super::service_proxy::ControllerServiceProxy;
+use super::control_prepare::{JournalSnapshots, MutationCell, MutationIoStage, VmMapPhase};
+use super::server::{read_frame, write_frame};
 
 /// Audit category for daemon-emitted health entries. Health probing is
 /// mvm-hostd lifecycle activity, so it files under the host-asserted `host`
@@ -95,7 +91,24 @@ pub struct HostAgentConfig {
     pub max_frame_bytes: usize,
 }
 
+/// Deterministic coordination labels selected from the original host config.
+/// These fields are neither capabilities nor evidence of fresh provisioning.
+pub struct HostAgentResourceDescriptor {
+    pub root: PathBuf,
+    pub key: mvm_vmm::host::installed_owner::InstallationKey,
+}
+
 impl HostAgentConfig {
+    /// Derive the versioned resource namespace without creating or repairing it.
+    /// Production opens existing provisioning; fresh fixture creation is explicit.
+    pub fn resource_descriptor(&self, home: &Path) -> Result<HostAgentResourceDescriptor> {
+        let descriptor = mvm_vmm::host::host_agent_installation::descriptor(home, &self.tenant_id)?;
+        Ok(HostAgentResourceDescriptor {
+            root: descriptor.root,
+            key: descriptor.key,
+        })
+    }
+
     /// Resolve durable recovery state. Only legacy configs derive it from the
     /// control socket; new launchers supply the persistent tenant-state path.
     pub fn registration_journal_path(&self) -> Result<PathBuf> {
@@ -124,18 +137,154 @@ impl HostAgentConfig {
     }
 }
 
-/// Per-VM live state: the bound listen socket and the serve task. Dropping it
-/// aborts the task and removes the socket — so `deregister` (and daemon
-/// teardown) unbind cleanly.
-struct VmHandle {
-    listen_socket: PathBuf,
-    serve_task: tokio::task::JoinHandle<()>,
+struct AcceptedWorkState {
+    next: u64,
+    closed: bool,
+    rows: HashMap<u64, Option<mvm_vmm::host::installed_owner::HolderLease>>,
 }
 
-impl Drop for VmHandle {
+struct AcceptedWorkOwner {
+    state: std::sync::Mutex<AcceptedWorkState>,
+    unresolved: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+/// One original daemon turn, not a capability or a child-collection result.
+/// Drop retains its row; only known no-spawn or represented original ownership
+/// permits explicit settlement. Resource acquisition/effects happen outside gates.
+pub(crate) struct AcceptedDaemonWork {
+    owner: Arc<AcceptedWorkOwner>,
+    id: u64,
+    settled: bool,
+}
+
+impl AcceptedDaemonWork {
+    pub(crate) fn attach_resource(
+        &self,
+        lease: mvm_vmm::host::installed_owner::HolderLease,
+    ) -> Result<()> {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon accepted-work state unavailable"))?;
+        let row = state
+            .rows
+            .get_mut(&self.id)
+            .context("original accepted-work row missing")?;
+        anyhow::ensure!(row.is_none(), "accepted-work resource already attached");
+        *row = Some(lease);
+        Ok(())
+    }
+
+    /// Original accepted-turn bookkeeping only, never a Child receipt.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.settled
+    }
+
+    pub(crate) fn settle(&mut self) -> Result<()> {
+        if self.settled {
+            return Ok(());
+        }
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon accepted-work state unavailable"))?;
+        let lease = state
+            .rows
+            .remove(&self.id)
+            .context("original accepted-work row missing")?;
+        self.settled = true;
+        drop(state);
+        drop(lease);
+        self.owner.changed.send_replace(());
+        Ok(())
+    }
+}
+
+impl Drop for AcceptedDaemonWork {
     fn drop(&mut self) {
-        self.serve_task.abort();
-        let _ = std::fs::remove_file(&self.listen_socket);
+        if !self.settled {
+            self.owner
+                .unresolved
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.owner.changed.send_replace(());
+        }
+    }
+}
+
+/// Retains the original accepted-turn ledger while its represented operations
+/// finish. Empty means no accepted turn remains; it is not a Child receipt.
+pub struct AcceptedWorkDrain {
+    owner: Arc<AcceptedWorkOwner>,
+}
+
+impl AcceptedWorkDrain {
+    /// Wait outside all lifecycle and daemon locks. Notification carries no
+    /// authority; each wake rechecks this original ledger and sticky errors.
+    pub async fn drain(&self) -> Result<()> {
+        let mut changed = self.owner.changed.subscribe();
+        loop {
+            anyhow::ensure!(
+                !self
+                    .owner
+                    .unresolved
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "original accepted daemon work is unresolved"
+            );
+            let empty = self
+                .owner
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original accepted-work ledger poisoned"))?
+                .rows
+                .is_empty();
+            if empty {
+                return Ok(());
+            }
+            changed
+                .changed()
+                .await
+                .context("original accepted-work notification closed")?;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DaemonLifecycleAdmission {
+    gate: mvm_core::tenant_lifecycle::TenantLifecycleGate,
+    generation: mvm_core::tenant_lifecycle::LifecycleGeneration,
+}
+
+/// An opaque clone of the SAME original custody cell. It supplies no new
+/// budget, signed permission, readiness, or process collection proof.
+#[derive(Clone)]
+pub struct DaemonCustodyOwner {
+    cell: Arc<MutationCell>,
+}
+
+/// Actual original service listener/connection joins, not OS-child collection.
+pub struct DaemonServicesDrainReceipt {
+    _private: (),
+}
+
+impl DaemonCustodyOwner {
+    pub fn request_stop(&self) {
+        self.cell.request_stop();
+    }
+
+    pub async fn drain_services(&self) -> Result<DaemonServicesDrainReceipt> {
+        self.cell.drain_services().await?;
+        Ok(DaemonServicesDrainReceipt { _private: () })
+    }
+}
+
+impl Drop for HostAgentDaemon {
+    fn drop(&mut self) {
+        self.custody.request_stop();
+        // The original map remains in its field under the coordinator's Arc,
+        // including if a borrowed retirement currently holds that field.
     }
 }
 
@@ -146,7 +295,12 @@ pub struct HostAgentDaemon {
     signer_helper_uds_path: Option<PathBuf>,
     registration_journal: Option<RegistrationJournal>,
     max_frame_bytes: usize,
-    vms: HashMap<String, VmHandle>,
+    lifecycle_admission: Option<DaemonLifecycleAdmission>,
+    work: Arc<AcceptedWorkOwner>,
+    resources: Option<Arc<mvm_vmm::host::installed_owner::InstallationBinding>>,
+    mutation_lane: Arc<tokio::sync::Semaphore>,
+    connection_slots: Arc<tokio::sync::Semaphore>,
+    custody: Arc<MutationCell>,
     registrations: HashMap<String, RegisterVm>,
     mailbox_workers: Option<Arc<super::mailbox_workers::MailboxWorkers>>,
 }
@@ -162,19 +316,56 @@ impl RegistrationJournal {
     }
 
     fn load(&self) -> Result<Vec<RegisterVm>> {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("read registration journal {}", self.path.display()));
-            }
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let before = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
         };
+        anyhow::ensure!(
+            before.is_file()
+                && before.nlink() == 1
+                && before.len() <= CONTROL_MAX_FRAME_BYTES as u64,
+            "registration journal is not a bounded canonical regular file"
+        );
+        mvm_core::private_fs::require_current_owner(&before)?;
+        // Preserve existing canonical legacy 0644 journals, but never trust a
+        // journal writable by another identity or a redirected leaf.
+        anyhow::ensure!(
+            mvm_core::private_fs::mode_bits(&self.path, &before)? & 0o022 == 0,
+            "registration journal is writable by another identity"
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&self.path)?;
+        let opened = file.metadata()?;
+        anyhow::ensure!(
+            opened.is_file()
+                && opened.nlink() == 1
+                && opened.dev() == before.dev()
+                && opened.ino() == before.ino()
+                && opened.len() <= CONTROL_MAX_FRAME_BYTES as u64,
+            "registration journal changed during checked open"
+        );
+        mvm_core::private_fs::require_current_owner(&opened)?;
+        anyhow::ensure!(
+            mvm_core::private_fs::mode_bits(&self.path, &opened)? & 0o022 == 0,
+            "opened registration journal is writable by another identity"
+        );
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(CONTROL_MAX_FRAME_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= CONTROL_MAX_FRAME_BYTES,
+            "registration journal exceeds checked inventory bound"
+        );
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok(Vec::new());
         }
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("decode registration journal {}", self.path.display()))
+        serde_json::from_slice(&bytes).context("decode bounded canonical registration journal")
     }
 
     fn store<'a>(&self, registrations: impl IntoIterator<Item = &'a RegisterVm>) -> Result<()> {
@@ -218,6 +409,124 @@ impl RegistrationJournal {
     }
 }
 
+/// An owned copy of original verified control context. These fields are
+/// coordination inputs, never a new signature/admission or a cleanup receipt.
+#[derive(Clone)]
+pub(crate) struct RegistrationSnapshot {
+    pub(crate) registration: RegisterVm,
+    pub(crate) tenant: String,
+    pub(crate) helper: Option<PathBuf>,
+    pub(crate) max_frame_bytes: usize,
+    pub(crate) connection_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// Original canonical replay snapshot. Construction does no I/O; execution
+/// belongs outside daemon/file locks and under the original mutation permit.
+pub struct SignerRegistrationReplay {
+    helper: Option<PathBuf>,
+    registrations: Vec<RegisterVm>,
+}
+
+impl SignerRegistrationReplay {
+    pub fn execute(self) -> Result<usize> {
+        let Some(path) = self.helper else {
+            return Ok(0);
+        };
+        let count = self.registrations.len();
+        for registration in self.registrations {
+            register_helper_vm_at(&path, &registration)
+                .context("replay original canonical signer registration")?;
+        }
+        Ok(count)
+    }
+}
+
+pub(crate) fn register_helper_vm_at(path: &Path, r: &RegisterVm) -> Result<()> {
+    let req = SignerHelperRequest::RegisterVm(SignerHelperRegisterVm {
+        request_id: format!("register-{}", r.vm_id),
+        vm_id: r.vm_id.clone(),
+        tenant_id: r.tenant_id.clone(),
+        workload_id: r.workload_id.clone().unwrap_or_else(|| r.vm_id.clone()),
+        workload_chain_path: r.workload_chain_path.clone(),
+        chain_head_secondary_path: r.workload_chain_head_path.clone().unwrap_or_else(|| {
+            Path::new(&r.workload_chain_path)
+                .with_extension("head")
+                .to_string_lossy()
+                .into_owned()
+        }),
+    });
+    match SignerHelperClient::new(path.to_path_buf()).send(&req)? {
+        SignerHelperResponse::Registered { .. } => Ok(()),
+        SignerHelperResponse::Err { message, .. } => {
+            bail!("signer-helper register refused: {message}")
+        }
+        other => bail!("signer-helper returned unexpected register response: {other:?}"),
+    }
+}
+
+pub(crate) fn deregister_helper_vm_at(path: &Path, vm_id: &str) -> Result<()> {
+    let req = SignerHelperRequest::DeregisterVm(SignerHelperDeregisterVm {
+        request_id: format!("deregister-{vm_id}"),
+        vm_id: vm_id.to_string(),
+    });
+    match SignerHelperClient::new(path.to_path_buf()).send(&req)? {
+        SignerHelperResponse::Deregistered { .. } => Ok(()),
+        SignerHelperResponse::Err { message, .. } => {
+            bail!("signer-helper deregister refused: {message}")
+        }
+        other => bail!("signer-helper returned unexpected deregister response: {other:?}"),
+    }
+}
+
+/// Canonical side-effect-free validation shared by legacy and staged control.
+/// The caller still verifies the original signed control and current generation.
+pub(crate) fn validate_registration(tenant_id: &str, r: &RegisterVm) -> Result<()> {
+    // The daemon is per-tenant: refuse a registration for another tenant.
+    if r.tenant_id != tenant_id {
+        bail!(
+            "register for tenant {:?} on a daemon for tenant {:?}",
+            r.tenant_id,
+            tenant_id
+        );
+    }
+    // `vm_id` names the per-VM chain file; even though the register message
+    // is host-signed, validate it as a defense-in-depth path-injection
+    // guard before it reaches any filesystem path.
+    validate_vm_id(&r.vm_id)?;
+    let host_tool = mvm_core::protocol::broker::ServiceId::parse(RETIRED_HOST_TOOL_SERVICE)
+        .expect("host.tool.v1 is a valid ServiceId");
+    anyhow::ensure!(
+        !r.services_bindings.contains(&host_tool)
+            && !r
+                .service_proxies
+                .iter()
+                .any(|proxy| proxy.service == host_tool),
+        "host.tool.v1 is no longer supported"
+    );
+    if r.service_proxies.len() > mvm_contract::protocol::broker_control::MAX_SERVICE_PROXIES {
+        bail!("registration has too many controller-backed services");
+    }
+    let mut proxy_services = HashSet::new();
+    for proxy in &r.service_proxies {
+        proxy
+            .validate()
+            .map_err(|message| anyhow::anyhow!(message))?;
+        if !r.services_bindings.contains(&proxy.service) {
+            bail!("controller-backed service is absent from signed service admission");
+        }
+        if !proxy_services.insert(proxy.service.clone()) {
+            bail!("registration repeats a controller-backed service");
+        }
+        for descriptor in &proxy.capabilities {
+            if !r.capability_bindings.contains(&descriptor.binding()) {
+                bail!("controller-backed capability is absent from signed admission");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Open the assurance session the supervisor admitted for this VM.
 ///
 /// This daemon is the process a probe reaches, so it is the only place a
@@ -230,7 +539,10 @@ impl RegistrationJournal {
 /// session whose service is not bound and a session with no audit route are
 /// each a registration that does not describe a run this daemon should serve,
 /// and the probe verb answers `NotBound` or `AuditUnavailable` either way.
-fn open_admitted_assurance_session(bound: &super::handlers::BoundHandlers, r: &RegisterVm) {
+pub(crate) fn open_admitted_assurance_session(
+    bound: &super::handlers::BoundHandlers,
+    r: &RegisterVm,
+) {
     let Some(session) = &r.assurance else { return };
     let Some(session_ref) = &session.session else {
         tracing::warn!(vm_id = %r.vm_id, "legacy assurance registration has no provider session identity; refusing to open");
@@ -301,16 +613,259 @@ impl HostAgentDaemon {
         verifying_key: VerifyingKey,
         max_frame_bytes: usize,
     ) -> Self {
+        let connection_slots = Arc::new(tokio::sync::Semaphore::new(256));
+        let custody = Arc::new(MutationCell::new(connection_slots.clone()));
         Self {
             tenant_id: tenant_id.into(),
             verifying_key,
             signer_helper_uds_path: None,
             registration_journal: None,
             max_frame_bytes,
-            vms: HashMap::new(),
+            lifecycle_admission: None,
+            work: Arc::new(AcceptedWorkOwner {
+                state: std::sync::Mutex::new(AcceptedWorkState {
+                    next: 0,
+                    closed: false,
+                    rows: HashMap::new(),
+                }),
+                unresolved: std::sync::atomic::AtomicBool::new(false),
+                changed: tokio::sync::watch::channel(()).0,
+            }),
+            resources: None,
+            mutation_lane: Arc::new(tokio::sync::Semaphore::new(1)),
+            // One per-tenant concurrent ingress budget, shared by every VM.
+            // It is distinct from mutation, worker and pending-launch limits.
+            connection_slots,
+            custody,
             registrations: HashMap::new(),
             mailbox_workers: None,
         }
+    }
+
+    /// Install original coordination metadata before serving; this does not
+    /// publish Active or grant a signed control operation.
+    pub fn with_lifecycle_coordination(
+        mut self,
+        home: &Path,
+        generation: mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<Self> {
+        let gate = mvm_core::tenant_lifecycle::TenantLifecycleGate::new(home, &self.tenant_id)?;
+        {
+            let mut state = self
+                .work
+                .state
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("original accepted-work state unavailable"))?;
+            anyhow::ensure!(
+                state.rows.is_empty(),
+                "cannot replace a live admission context"
+            );
+            anyhow::ensure!(
+                !self
+                    .work
+                    .unresolved
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "original accepted work unresolved"
+            );
+            state.closed = true;
+        }
+        self.lifecycle_admission = Some(DaemonLifecycleAdmission { gate, generation });
+        Ok(self)
+    }
+
+    pub fn custody_owner(&self) -> DaemonCustodyOwner {
+        DaemonCustodyOwner {
+            cell: self.custody.clone(),
+        }
+    }
+
+    pub(crate) fn registration_snapshot(
+        &self,
+        registration: &RegisterVm,
+    ) -> Result<RegistrationSnapshot> {
+        validate_registration(&self.tenant_id, registration)?;
+        Ok(RegistrationSnapshot {
+            registration: registration.clone(),
+            tenant: self.tenant_id.clone(),
+            helper: self.signer_helper_uds_path.clone(),
+            max_frame_bytes: self.max_frame_bytes,
+            connection_slots: self.connection_slots.clone(),
+        })
+    }
+
+    /// One original ordered mutation lane. Acquiring its permit must happen
+    /// outside lifecycle/daemon locks; the permit grants no control authority.
+    pub fn mutation_lane(&self) -> Arc<tokio::sync::Semaphore> {
+        self.mutation_lane.clone()
+    }
+
+    /// Called under the original Active file-gate turn after real readiness.
+    pub fn open_local_admission(
+        &mut self,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<()> {
+        let admission = self
+            .lifecycle_admission
+            .as_ref()
+            .context("lifecycle coordination absent")?;
+        anyhow::ensure!(
+            &admission.generation == expected,
+            "daemon generation mismatch"
+        );
+        anyhow::ensure!(
+            !self
+                .work
+                .unresolved
+                .load(std::sync::atomic::Ordering::Acquire),
+            "daemon accepted work unresolved"
+        );
+        let mut state = self
+            .work
+            .state
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("daemon accepted-work state unavailable"))?;
+        state.closed = false;
+        Ok(())
+    }
+
+    /// Publish the local fence only after global Draining was durably written.
+    pub fn close_local_admission(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.lifecycle_admission.is_some(),
+            "lifecycle coordination absent"
+        );
+        let mut state = self
+            .work
+            .state
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("daemon accepted-work state unavailable"))?;
+        state.closed = true;
+        Ok(())
+    }
+
+    pub(crate) fn coordination_binding(
+        &self,
+    ) -> Result<(
+        mvm_core::tenant_lifecycle::TenantLifecycleGate,
+        mvm_core::tenant_lifecycle::LifecycleGeneration,
+    )> {
+        let admission = self
+            .lifecycle_admission
+            .as_ref()
+            .context("lifecycle coordination absent")?;
+        Ok((admission.gate.clone(), admission.generation.clone()))
+    }
+
+    /// Reserve before effects while holding Active gate then daemon try_lock.
+    pub(crate) fn reserve_accepted_work(
+        &self,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<AcceptedDaemonWork> {
+        self.reserve_original_work(expected, false)
+    }
+
+    /// Canonical authenticated cleanup may continue during Draining. This
+    /// accounts only that original turn; callers must not use it for activation.
+    pub(crate) fn reserve_cleanup_work(
+        &self,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+    ) -> Result<AcceptedDaemonWork> {
+        self.reserve_original_work(expected, true)
+    }
+
+    fn reserve_original_work(
+        &self,
+        expected: &mvm_core::tenant_lifecycle::LifecycleGeneration,
+        cleanup: bool,
+    ) -> Result<AcceptedDaemonWork> {
+        let admission = self
+            .lifecycle_admission
+            .as_ref()
+            .context("lifecycle coordination absent")?;
+        anyhow::ensure!(
+            &admission.generation == expected,
+            "daemon generation mismatch"
+        );
+        self.reserve_verified_work(cleanup)
+    }
+
+    /// Used only after original canonical control verification (or by the
+    /// original owned daemon's already-verified internal operation).
+    fn reserve_verified_work(&self, cleanup: bool) -> Result<AcceptedDaemonWork> {
+        anyhow::ensure!(
+            cleanup
+                || !self
+                    .work
+                    .unresolved
+                    .load(std::sync::atomic::Ordering::Acquire),
+            "daemon accepted work unresolved"
+        );
+        let mut state = self
+            .work
+            .state
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("daemon accepted-work state unavailable"))?;
+        anyhow::ensure!(
+            (cleanup || !state.closed) && state.rows.len() < 256,
+            "daemon admission fenced or saturated"
+        );
+        let id = state
+            .next
+            .checked_add(1)
+            .context("daemon admission sequence exhausted")?;
+        state.next = id;
+        state.rows.try_reserve(1)?;
+        state.rows.insert(id, None);
+        Ok(AcceptedDaemonWork {
+            owner: self.work.clone(),
+            id,
+            settled: false,
+        })
+    }
+
+    /// Conservative original-owner observation, not child-collection proof.
+    pub fn has_accepted_work(&self) -> Result<bool> {
+        anyhow::ensure!(
+            !self
+                .work
+                .unresolved
+                .load(std::sync::atomic::Ordering::Acquire),
+            "daemon accepted work unresolved"
+        );
+        let state = self
+            .work
+            .state
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("daemon accepted-work state unavailable"))?;
+        Ok(!state.rows.is_empty())
+    }
+
+    /// Capture the original ledger; no new quota or generation is minted.
+    pub fn accepted_work_drain(&self) -> Result<AcceptedWorkDrain> {
+        Ok(AcceptedWorkDrain {
+            owner: self.work.clone(),
+        })
+    }
+
+    /// Original retained owner supplies this binding before serving. The
+    /// binding labels resource custody only; it is never signed permission.
+    pub fn with_resource_binding(
+        mut self,
+        binding: Arc<mvm_vmm::host::installed_owner::InstallationBinding>,
+    ) -> Self {
+        self.resources = Some(binding);
+        self
+    }
+
+    /// This component has no injected mailbox child owner by default. An
+    /// injected owner needs its actual drain receipt before whole-worker exit;
+    /// usage or registration counters cannot stand in for collection.
+    pub fn require_no_injected_mailbox_owner(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.mailbox_workers.is_none(),
+            "injected mailbox worker owner requires its original collection receipt"
+        );
+        Ok(())
     }
 
     /// Wire the daemon to a supervised resident signer helper. Registered VMs
@@ -343,18 +898,37 @@ impl HostAgentDaemon {
     }
 
     /// Whether `vm_id` is currently registered (bound + serving).
-    pub fn is_registered(&self, vm_id: &str) -> bool {
-        self.vms.contains_key(vm_id)
+    pub fn is_registered(&self, vm_id: &str) -> Result<bool> {
+        self.custody.try_contains_vm(vm_id)
     }
 
-    /// Number of live VM registrations.
+    /// Checked original-owner observation, never a Child collection receipt.
+    pub fn checked_registration_count(&self) -> Result<usize> {
+        anyhow::ensure!(
+            !self.custody.has_inflight_mutation()?,
+            "original registration mutation unresolved"
+        );
+        let mut original = self.custody.map_loan()?;
+        let map = original.value_mut();
+        anyhow::ensure!(
+            map.phase != VmMapPhase::Retiring,
+            "original service map is retiring"
+        );
+        let workers = self
+            .mailbox_workers
+            .as_ref()
+            .map(|workers| workers.registration_count())
+            .transpose()?
+            .unwrap_or(0);
+        map.vms
+            .len()
+            .checked_add(workers)
+            .context("original daemon registration count overflow")
+    }
+
+    /// Advisory count. Unknown remains conservatively non-idle.
     pub fn registration_count(&self) -> usize {
-        self.vms.len()
-            + self.mailbox_workers.as_ref().map_or(0, |workers| {
-                workers
-                    .registration_count()
-                    .unwrap_or(usize::MAX.saturating_sub(self.vms.len()))
-            })
+        self.checked_registration_count().unwrap_or(usize::MAX)
     }
 
     /// Drop registrations whose VM state no longer has a live supervisor.
@@ -363,38 +937,63 @@ impl HostAgentDaemon {
     /// backstop, the persisted registration keeps the resident daemon and its
     /// signer helper alive forever. Registrations from older clients without
     /// an ownership marker fail open while their state directory still exists.
-    pub fn reap_dead_registrations(&mut self) -> Result<usize> {
-        let dead: Vec<String> = self
+    pub async fn reap_dead_registrations(&mut self) -> Result<usize> {
+        let dead: Vec<_> = self
             .registrations
-            .iter()
-            .filter(|(_, registration)| registration_owner_is_dead(registration))
-            .map(|(vm_id, _)| vm_id.clone())
+            .values()
+            .filter(|registration| registration_owner_is_dead(registration))
+            .map(|registration| registration.vm_id.clone())
             .collect();
-
         for vm_id in &dead {
-            if self
-                .mailbox_workers
-                .as_ref()
-                .is_some_and(|workers| workers.contains(vm_id).unwrap_or(true))
-            {
-                bail!("mailbox worker owner retains registration; pruning refused");
-            }
-            self.vms.remove(vm_id);
-            self.registrations.remove(vm_id);
-            if let Err(e) = self.deregister_helper_vm(vm_id) {
-                warn!(vm_id = %vm_id, error = %e, "dead VM signer-helper deregister failed");
-            }
-        }
-        if !dead.is_empty() {
-            self.persist_registrations()?;
+            self.apply(&ControlRequest::Deregister(broker_control::DeregisterVm {
+                vm_id: vm_id.clone(),
+            }))
+            .await?;
         }
         Ok(dead.len())
     }
 
+    /// Probe the existing canonical ownership marker outside the daemon lock.
+    /// Mutation rechecks the original signed/current context separately.
+    pub async fn reap_dead_registrations_shared(daemon: Arc<Mutex<Self>>) -> Result<usize> {
+        let snapshot: Vec<_> = {
+            let original = daemon.lock().await;
+            original.registrations.values().cloned().collect()
+        };
+        let dead: Vec<_> = snapshot
+            .into_iter()
+            .filter(registration_owner_is_dead)
+            .collect();
+        let mut reaped = 0;
+        for original in dead {
+            execute_mutation(
+                DaemonAccess::Shared(daemon.clone()),
+                ControlRequest::Deregister(broker_control::DeregisterVm {
+                    vm_id: original.vm_id.clone(),
+                }),
+                None,
+                Some(original),
+            )
+            .await?;
+            reaped += 1;
+        }
+        Ok(reaped)
+    }
+
     /// Snapshot of the currently-registered VM ids (bound + serving). The
     /// health watcher reads this each pass to decide which guests to probe.
-    pub fn registered_vm_ids(&self) -> Vec<String> {
-        self.vms.keys().cloned().collect()
+    pub fn registered_vm_ids(&self) -> Result<Vec<String>> {
+        anyhow::ensure!(
+            !self.custody.has_inflight_mutation()?,
+            "original registration mutation unresolved"
+        );
+        let mut original = self.custody.map_loan()?;
+        let map = original.value_mut();
+        anyhow::ensure!(
+            map.phase == VmMapPhase::Live,
+            "original service map unavailable"
+        );
+        Ok(map.vms.keys().cloned().collect())
     }
 
     /// Snapshot the state a [`HealthAuditSink`] needs to append chain-signed
@@ -420,213 +1019,82 @@ impl HostAgentDaemon {
         }
     }
 
-    /// Apply a verified control request. Must run inside a tokio runtime (it
-    /// spawns the per-VM serve task). The control loop calls this after the
-    /// signature verifies.
-    pub fn apply(&mut self, req: &ControlRequest) -> Result<()> {
-        match req {
-            ControlRequest::MailboxWorkerV1(_) => {
-                anyhow::bail!("mailbox worker ownership is not implemented");
-            }
-            ControlRequest::HvfInstanceV1(_) => {
-                bail!("HVF instance control requires the instance supervisor")
-            }
-            ControlRequest::Register(r) => self.register(r),
-            ControlRequest::Deregister(d) => {
-                if let Some(workers) = &self.mailbox_workers {
-                    anyhow::ensure!(
-                        !workers.contains(&d.vm_id)?,
-                        "mailbox worker owner retains registration; legacy deregistration refused"
-                    );
-                }
-                // Drop = abort + unbind; idempotent on an unknown id.
-                self.vms.remove(&d.vm_id);
-                self.registrations.remove(&d.vm_id);
-                if let Err(e) = self.deregister_helper_vm(&d.vm_id) {
-                    warn!(vm_id = %d.vm_id, error = %e, "signer-helper deregister failed");
-                }
-                self.persist_registrations()?;
-                Ok(())
-            }
-        }
+    /// Apply an already-verified original control turn on an exclusively owned
+    /// daemon. Shared production callers use `apply_signed_shared`, which never
+    /// holds the daemon mutex across preparation, retirement, or helper I/O.
+    pub async fn apply(&mut self, request: &ControlRequest) -> Result<()> {
+        execute_mutation(DaemonAccess::Owned(self), request.clone(), None, None).await
     }
 
-    fn register(&mut self, r: &RegisterVm) -> Result<()> {
-        if let Some(workers) = &self.mailbox_workers {
+    /// Verify and retain the canonical signed request across the original
+    /// operation, including the final same-generation publication turn.
+    pub async fn apply_signed_shared(
+        daemon: Arc<Mutex<Self>>,
+        signed: SignedControl,
+    ) -> Result<()> {
+        let request = {
+            let original = daemon.lock().await;
+            broker_control::verify(&signed, &original.verifying_key)?.clone()
+        };
+        execute_mutation(DaemonAccess::Shared(daemon), request, Some(signed), None).await
+    }
+
+    /// A checked canonical legacy observation, never new authority or a Child
+    /// receipt. Unknown, redirected, oversized or duplicate records refuse.
+    pub fn checked_journal_registration_count(&self) -> Result<usize> {
+        let Some(journal) = &self.registration_journal else {
+            return Ok(0);
+        };
+        let records = journal.load()?;
+        let mut identities = HashSet::new();
+        for record in &records {
+            validate_registration(&self.tenant_id, record)?;
             anyhow::ensure!(
-                !workers.contains(&r.vm_id)?,
-                "mailbox worker owner retains registration; replacement refused"
+                identities.insert(&record.vm_id),
+                "registration journal repeats original VM identity"
             );
         }
-        // The daemon is per-tenant: refuse a registration for another tenant.
-        if r.tenant_id != self.tenant_id {
-            bail!(
-                "register for tenant {:?} on a daemon for tenant {:?}",
-                r.tenant_id,
-                self.tenant_id
-            );
-        }
-        // `vm_id` names the per-VM chain file; even though the register message
-        // is host-signed, validate it as a defense-in-depth path-injection
-        // guard before it reaches any filesystem path.
-        validate_vm_id(&r.vm_id)?;
-        let host_tool = mvm_core::protocol::broker::ServiceId::parse(RETIRED_HOST_TOOL_SERVICE)
-            .expect("host.tool.v1 is a valid ServiceId");
-        anyhow::ensure!(
-            !r.services_bindings.contains(&host_tool)
-                && !r
-                    .service_proxies
-                    .iter()
-                    .any(|proxy| proxy.service == host_tool),
-            "host.tool.v1 is no longer supported"
-        );
-        if r.service_proxies.len() > mvm_contract::protocol::broker_control::MAX_SERVICE_PROXIES {
-            bail!("registration has too many controller-backed services");
-        }
-        let mut proxy_services = HashSet::new();
-        for proxy in &r.service_proxies {
-            proxy
-                .validate()
-                .map_err(|message| anyhow::anyhow!(message))?;
-            if !r.services_bindings.contains(&proxy.service) {
-                bail!("controller-backed service is absent from signed service admission");
-            }
-            if !proxy_services.insert(proxy.service.clone()) {
-                bail!("registration repeats a controller-backed service");
-            }
-            for descriptor in &proxy.capabilities {
-                if !r.capability_bindings.contains(&descriptor.binding()) {
-                    bail!("controller-backed capability is absent from signed admission");
-                }
-            }
-        }
-
-        // Re-register replaces: drop the prior handle first so its socket is
-        // unbound before we rebind (idempotent rebind, fail-closed).
-        self.vms.remove(&r.vm_id);
-        self.registrations.remove(&r.vm_id);
-        if let Err(e) = self.deregister_helper_vm(&r.vm_id) {
-            warn!(vm_id = %r.vm_id, error = %e, "stale signer-helper deregister failed before re-register");
-        }
-
-        let broker_listen_socket = Path::new(&r.broker_listen_socket);
-        if let Some(parent) = broker_listen_socket.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create broker socket dir {}", parent.display()))?;
-        }
-        // Clear a stale socket so bind doesn't fail with EADDRINUSE.
-        let _ = std::fs::remove_file(broker_listen_socket);
-        let listener = UnixListener::bind(broker_listen_socket).with_context(|| {
-            format!(
-                "bind broker listen socket {}",
-                broker_listen_socket.display()
-            )
-        })?;
-
-        self.register_helper_vm(r)?;
-
-        // Per-VM registry: in daemon mode its `host.audit.v1` handler points
-        // at the resident helper with this server-derived `vm_id`; legacy
-        // per-VM broker mode still points at a per-VM audit-signer UDS.
-        let mut registry = Registry::new();
-        registry
-            .admit_capabilities(r.capability_bindings.clone())
-            .context("load host-signed capability bindings")?;
-        let local_services: Vec<_> = r
-            .services_bindings
-            .iter()
-            .filter(|service| !proxy_services.contains(*service))
-            .cloned()
-            .collect();
-        let _bound = register_bound_handlers(&mut registry, &local_services);
-        open_admitted_assurance_session(&_bound, r);
-        for binding in &r.service_proxies {
-            let proxy = Arc::new(ControllerServiceProxy::new(binding.clone())?);
-            let handler: Arc<dyn mvm_core::protocol::handler::ServiceHandler> = proxy.clone();
-            registry.register(Arc::clone(&handler));
-            registry.require_capability(binding.service.clone());
-            for descriptor in proxy.descriptors() {
-                registry
-                    .register_capability(Arc::clone(&handler), descriptor.clone())
-                    .context("register controller-backed typed capability")?;
-            }
-        }
-        let host_audit = mvm_core::protocol::broker::ServiceId::parse("host.audit.v1")
-            .expect("host.audit.v1 is a valid ServiceId");
-        if r.services_bindings.contains(&host_audit)
-            && !proxy_services.contains(&host_audit)
-            && let Some(helper) = &self.signer_helper_uds_path
-        {
-            let handler = Arc::new(HostAuditV1Handler::new(AuditClient::new_signer_helper(
-                helper.clone(),
-                r.vm_id.clone(),
-            )));
-            registry.register(handler.clone());
-            for descriptor in HostAuditV1Handler::capability_descriptors() {
-                registry
-                    .register_capability(handler.clone(), descriptor)
-                    .context("register host.audit typed capability")?;
-            }
-        } else if r.services_bindings.contains(&host_audit)
-            && !proxy_services.contains(&host_audit)
-            && let Some(signer) = &r.audit_signer_uds_path
-        {
-            let handler = Arc::new(HostAuditV1Handler::new(AuditClient::new(signer.clone())));
-            registry.register(handler.clone());
-            for descriptor in HostAuditV1Handler::capability_descriptors() {
-                registry
-                    .register_capability(handler.clone(), descriptor)
-                    .context("register host.audit typed capability")?;
-            }
-        }
-        let registry = Arc::new(registry);
-
-        let tenant = self.tenant_id.clone();
-        let workload_id = r.workload_id.clone().unwrap_or_else(|| r.vm_id.clone());
-        let mfb = self.max_frame_bytes;
-        // `workload_id` is server-derived from registration context; the guest
-        // frame carries none, and this socket only ever serves this VM.
-        let serve_task = tokio::spawn(async move {
-            if let Err(e) = serve_on_listener(listener, registry, workload_id, tenant, mfb).await {
-                warn!(error = %e, "host-agent per-VM serve loop exited");
-            }
-        });
-
-        self.vms.insert(
-            r.vm_id.clone(),
-            VmHandle {
-                listen_socket: broker_listen_socket.to_path_buf(),
-                serve_task,
-            },
-        );
-        self.registrations.insert(r.vm_id.clone(), r.clone());
-        self.persist_registrations()?;
-        Ok(())
+        Ok(records.len())
     }
 
     /// Replay the persisted live registration set after the daemon itself
     /// restarts. Each replay goes through the normal `register` path, so tenant
     /// checks, vm-id validation, socket bind, and signer-helper rebind all
     /// remain fail-closed.
-    pub fn restore_journaled_registrations(&mut self) -> Result<usize> {
+    pub async fn restore_journaled_registrations(&mut self) -> Result<usize> {
         let Some(journal) = &self.registration_journal else {
             return Ok(0);
         };
         let registrations = journal.load()?;
         let mut restored = 0usize;
         for registration in registrations {
-            self.register(&registration)
+            self.apply(&ControlRequest::Register(Box::new(registration.clone())))
+                .await
                 .with_context(|| format!("restore VM registration {}", registration.vm_id))?;
             restored += 1;
         }
         Ok(restored)
     }
 
-    fn persist_registrations(&self) -> Result<()> {
-        if let Some(journal) = &self.registration_journal {
-            journal.store(self.registrations.values())?;
+    /// Original checked journal replay with no outer daemon lock across waits.
+    pub async fn restore_journaled_registrations_shared(daemon: Arc<Mutex<Self>>) -> Result<usize> {
+        let journal = { daemon.lock().await.registration_journal.clone() };
+        let Some(journal) = journal else {
+            return Ok(0);
+        };
+        let registrations = journal.load()?;
+        let mut restored = 0;
+        for registration in registrations {
+            execute_mutation(
+                DaemonAccess::Shared(daemon.clone()),
+                ControlRequest::Register(Box::new(registration)),
+                None,
+                None,
+            )
+            .await?;
+            restored += 1;
         }
-        Ok(())
+        Ok(restored)
     }
 
     /// Re-register every live VM with a freshly restarted signer helper.
@@ -636,58 +1104,15 @@ impl HostAgentDaemon {
     /// UDS path, replaying these registrations reopens each per-VM chain from
     /// disk and restores helper routing without rebinding guest-facing sockets.
     pub fn rebind_signer_helper_registrations(&self) -> Result<usize> {
-        if self.signer_helper_uds_path.is_none() {
-            return Ok(0);
-        }
-        let mut rebound = 0usize;
-        for registration in self.registrations.values() {
-            self.register_helper_vm(registration)
-                .with_context(|| format!("re-register signer-helper VM {}", registration.vm_id))?;
-            rebound += 1;
-        }
-        Ok(rebound)
+        self.signer_registration_replay().execute()
     }
 
-    fn register_helper_vm(&self, r: &RegisterVm) -> Result<()> {
-        let Some(path) = &self.signer_helper_uds_path else {
-            return Ok(());
-        };
-        let req = SignerHelperRequest::RegisterVm(SignerHelperRegisterVm {
-            request_id: format!("register-{}", r.vm_id),
-            vm_id: r.vm_id.clone(),
-            tenant_id: r.tenant_id.clone(),
-            workload_id: r.workload_id.clone().unwrap_or_else(|| r.vm_id.clone()),
-            workload_chain_path: r.workload_chain_path.clone(),
-            chain_head_secondary_path: r.workload_chain_head_path.clone().unwrap_or_else(|| {
-                Path::new(&r.workload_chain_path)
-                    .with_extension("head")
-                    .to_string_lossy()
-                    .into_owned()
-            }),
-        });
-        match SignerHelperClient::new(path.clone()).send(&req)? {
-            SignerHelperResponse::Registered { .. } => Ok(()),
-            SignerHelperResponse::Err { message, .. } => {
-                bail!("signer-helper register refused: {message}")
-            }
-            other => bail!("signer-helper returned unexpected register response: {other:?}"),
-        }
-    }
-
-    fn deregister_helper_vm(&self, vm_id: &str) -> Result<()> {
-        let Some(path) = &self.signer_helper_uds_path else {
-            return Ok(());
-        };
-        let req = SignerHelperRequest::DeregisterVm(SignerHelperDeregisterVm {
-            request_id: format!("deregister-{vm_id}"),
-            vm_id: vm_id.to_string(),
-        });
-        match SignerHelperClient::new(path.clone()).send(&req)? {
-            SignerHelperResponse::Deregistered { .. } => Ok(()),
-            SignerHelperResponse::Err { message, .. } => {
-                bail!("signer-helper deregister refused: {message}")
-            }
-            other => bail!("signer-helper returned unexpected deregister response: {other:?}"),
+    /// Capture only immutable original data while locked. Helper socket I/O
+    /// and its finite blocking task are retained by the caller outside locks.
+    pub fn signer_registration_replay(&self) -> SignerRegistrationReplay {
+        SignerRegistrationReplay {
+            helper: self.signer_helper_uds_path.clone(),
+            registrations: self.registrations.values().cloned().collect(),
         }
     }
 
@@ -701,12 +1126,60 @@ impl HostAgentDaemon {
     /// replay helper registrations after a helper restart.
     pub async fn run_shared(daemon: Arc<Mutex<Self>>, control_socket: &Path) -> Result<()> {
         let listener = bind_host_agent_listener(control_socket, 0o700)?;
+        Self::run_shared_on_listener(daemon, listener).await
+    }
 
+    /// Consume an already-bound original listener only when its coordinator
+    /// starts acceptance. Owning a bound listener is distinct from admitting a
+    /// control request; startup can stage readiness before calling this loop.
+    pub async fn run_shared_on_listener(
+        daemon: Arc<Mutex<Self>>,
+        listener: UnixListener,
+    ) -> Result<()> {
+        let (_keepalive, stopped) = tokio::sync::watch::channel(false);
+        Self::run_shared_on_listener_until(daemon, listener, stopped).await
+    }
+
+    /// Stop cancels only unverified ingress. Once an original mutation is
+    /// accepted it is retained; sticky uncertainty keeps this SAME listener
+    /// available for canonical cleanup/query instead of inventing completion.
+    pub async fn run_shared_on_listener_until(
+        daemon: Arc<Mutex<Self>>,
+        listener: UnixListener,
+        mut stopped: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let mut accepted_changes = {
+            let daemon = daemon.lock().await;
+            Some(daemon.work.changed.subscribe())
+        };
         loop {
-            let (mut stream, _addr) = listener
-                .accept()
-                .await
-                .context("host-agent control accept failed")?;
+            let stop_requested = *stopped.borrow() || stopped.has_changed().is_err();
+            if stop_requested {
+                let daemon = daemon.lock().await;
+                let known_settled = daemon.mailbox_workers.is_none()
+                    && matches!(daemon.has_accepted_work(), Ok(false));
+                if known_settled {
+                    return Ok(());
+                }
+            }
+            let accepted = tokio::select! {
+                biased;
+                _ = async {
+                    if stop_requested {
+                        if let Some(changed) = accepted_changes.as_mut() {
+                            if changed.changed().await.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } else {
+                        let _ = stopped.changed().await;
+                    }
+                } => continue,
+                accepted = listener.accept() => accepted,
+            };
+            let (mut stream, _addr) = accepted.context("host-agent control accept failed")?;
             let workers = { daemon.lock().await.mailbox_workers.clone() };
             if let Some(workers) = workers {
                 // Reservation bounds pending connections, frames and blocking
@@ -715,6 +1188,7 @@ impl HostAgentDaemon {
                     continue;
                 };
                 let daemon = daemon.clone();
+                let control_stop = stopped.clone();
                 tokio::spawn(async move {
                     let frame = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
@@ -725,12 +1199,16 @@ impl HostAgentDaemon {
                         return;
                     };
                     let key = { daemon.lock().await.verifying_key };
+                    let closing = *control_stop.borrow() || control_stop.has_changed().is_err();
                     if matches!(signed.request, ControlRequest::MailboxWorkerV1(_)) {
                         let verified = workers.now_unix_ms().ok().and_then(|now| {
                             mvm_core::protocol::mailbox_worker_control::verify_request(
                                 &signed, &key, now,
                             )
                             .ok()
+                            .filter(|request| !closing || matches!(request.operation,
+                                mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Query { .. }
+                                    | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Stop { .. }))
                             .cloned()
                         });
                         let Ok(mut stream) = stream.into_std() else {
@@ -782,12 +1260,21 @@ impl HostAgentDaemon {
                     } else {
                         let _permit = permit;
                         let response = match broker_control::verify(&signed, &key) {
-                            Ok(request) => match daemon.lock().await.apply(request) {
-                                Ok(()) => ControlResponse::Ok,
-                                Err(error) => ControlResponse::Err {
-                                    message: error.to_string(),
-                                },
-                            },
+                            Ok(request)
+                                if closing && !matches!(request, ControlRequest::Deregister(_)) =>
+                            {
+                                ControlResponse::Err {
+                                    message: "host-agent activation is draining".into(),
+                                }
+                            }
+                            Ok(_request) => {
+                                match Self::apply_signed_shared(daemon.clone(), signed).await {
+                                    Ok(()) => ControlResponse::Ok,
+                                    Err(error) => ControlResponse::Err {
+                                        message: error.to_string(),
+                                    },
+                                }
+                            }
                             Err(_) => ControlResponse::Err {
                                 message: "control signature rejected".into(),
                             },
@@ -805,13 +1292,41 @@ impl HostAgentDaemon {
                 let daemon = daemon.lock().await;
                 daemon.verifying_key
             };
-            let resp = match read_frame::<SignedControl>(&mut stream, CONTROL_MAX_FRAME_BYTES).await
-            {
-                Ok(signed) => match broker_control::verify(&signed, &verifying_key) {
+            let frame = tokio::select! {
+                biased;
+                _ = async {
+                    if stop_requested {
+                        if let Some(changed) = accepted_changes.as_mut() {
+                            if changed.changed().await.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } else {
+                        let _ = stopped.changed().await;
+                    }
+                } => continue,
+                frame = tokio::time::timeout(std::time::Duration::from_secs(5),
+                    read_frame::<SignedControl>(&mut stream, CONTROL_MAX_FRAME_BYTES)) => frame,
+            };
+            let resp = match frame {
+                Ok(Ok(signed)) => match broker_control::verify(&signed, &verifying_key) {
                     Ok(req) => {
+                        let closing = *stopped.borrow() || stopped.has_changed().is_err();
                         let req = req.clone();
-                        let mut daemon = daemon.lock().await;
-                        match daemon.apply(&req) {
+                        if closing && !matches!(req, ControlRequest::Deregister(_)) {
+                            let response = ControlResponse::Err {
+                                message: "host-agent activation is draining".into(),
+                            };
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                write_frame(&mut stream, &response),
+                            )
+                            .await;
+                            continue;
+                        }
+                        match Self::apply_signed_shared(daemon.clone(), signed).await {
                             Ok(()) => ControlResponse::Ok,
                             Err(e) => ControlResponse::Err {
                                 message: e.to_string(),
@@ -822,16 +1337,345 @@ impl HostAgentDaemon {
                         message: format!("control signature rejected: {e}"),
                     },
                 },
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(error = %e, "host-agent control frame read failed");
                     continue;
                 }
+                Err(_) => continue,
             };
-            if let Err(e) = write_frame(&mut stream, &resp).await {
-                warn!(error = %e, "host-agent control reply failed");
+            if !matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    write_frame(&mut stream, &resp)
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                warn!("host-agent control reply failed or expired");
             }
         }
     }
+}
+
+/// Access is borrowed only for short in-memory turns. Async service/helper
+/// waits borrow the stable mutation cell, never an outer daemon mutex guard.
+enum DaemonAccess<'a> {
+    Owned(&'a mut HostAgentDaemon),
+    Shared(Arc<Mutex<HostAgentDaemon>>),
+}
+
+impl DaemonAccess<'_> {
+    async fn memory<T>(
+        &mut self,
+        action: impl FnOnce(&mut HostAgentDaemon) -> Result<T>,
+    ) -> Result<T> {
+        match self {
+            Self::Owned(daemon) => action(daemon),
+            Self::Shared(daemon) => action(&mut *daemon.lock().await),
+        }
+    }
+
+    fn try_memory<T>(
+        &mut self,
+        action: impl FnOnce(&mut HostAgentDaemon) -> Result<T>,
+    ) -> Result<T> {
+        match self {
+            Self::Owned(daemon) => action(daemon),
+            Self::Shared(daemon) => {
+                let mut original = daemon
+                    .try_lock()
+                    .map_err(|_| anyhow::anyhow!("original daemon turn is busy"))?;
+                action(&mut original)
+            }
+        }
+    }
+}
+
+struct MutationContext {
+    tenant: String,
+    key: VerifyingKey,
+    helper: Option<PathBuf>,
+    journal: Option<RegistrationJournal>,
+    lifecycle: Option<DaemonLifecycleAdmission>,
+    resources: Option<Arc<mvm_vmm::host::installed_owner::InstallationBinding>>,
+    custody: Arc<MutationCell>,
+    registration: Option<RegistrationSnapshot>,
+    vm_id: String,
+    original: Vec<RegisterVm>,
+    candidate: Vec<RegisterVm>,
+}
+
+impl MutationContext {
+    fn recheck(
+        &self,
+        daemon: &HostAgentDaemon,
+        signed: Option<&SignedControl>,
+        cleanup: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            daemon.tenant_id == self.tenant
+                && daemon.verifying_key == self.key
+                && Arc::ptr_eq(&daemon.custody, &self.custody),
+            "original daemon context changed"
+        );
+        anyhow::ensure!(
+            match (&daemon.resources, &self.resources) {
+                (None, None) => true,
+                (Some(current), Some(original)) => Arc::ptr_eq(current, original),
+                _ => false,
+            },
+            "original resource context changed"
+        );
+        match (&daemon.lifecycle_admission, &self.lifecycle) {
+            (None, None) => {}
+            (Some(current), Some(original)) => anyhow::ensure!(
+                current.generation == original.generation,
+                "original daemon generation changed"
+            ),
+            _ => bail!("original lifecycle context changed"),
+        }
+        if let Some(signed) = signed {
+            broker_control::verify(signed, &daemon.verifying_key)?;
+        }
+        anyhow::ensure!(
+            cleanup || !self.custody.stop_requested(),
+            "original service admission stopped"
+        );
+        if let Some(workers) = &daemon.mailbox_workers {
+            anyhow::ensure!(
+                !workers.try_contains(&self.vm_id)?,
+                "original mailbox worker retains this VM identity"
+            );
+        }
+        Ok(())
+    }
+}
+
+async fn execute_mutation(
+    mut access: DaemonAccess<'_>,
+    request: ControlRequest,
+    signed: Option<SignedControl>,
+    expected_registration: Option<RegisterVm>,
+) -> Result<()> {
+    let (vm_id, cleanup) = match &request {
+        ControlRequest::Register(registration) => (registration.vm_id.clone(), false),
+        ControlRequest::Deregister(deregistration) => (deregistration.vm_id.clone(), true),
+        ControlRequest::MailboxWorkerV1(_) => bail!("mailbox worker ownership is not implemented"),
+        ControlRequest::HvfInstanceV1(_) => {
+            bail!("HVF instance control requires the instance supervisor")
+        }
+    };
+    let lane = access.memory(|daemon| Ok(daemon.mutation_lane())).await?;
+    // Unresolved original work owns this permit. Refuse another mutation rather
+    // than enqueue an unbounded waiter or mint a replacement owner.
+    let mut permit = Some(
+        lane.try_acquire_owned()
+            .context("original daemon mutation remains busy")?,
+    );
+    let context = access
+        .memory(|daemon| {
+            validate_vm_id(&vm_id)?;
+            if let Some(expected) = &expected_registration {
+                anyhow::ensure!(
+                    daemon.registrations.get(&vm_id) == Some(expected),
+                    "canonical ownership probe no longer names this registration"
+                );
+            }
+            let registration = match &request {
+                ControlRequest::Register(registration) => {
+                    Some(daemon.registration_snapshot(registration)?)
+                }
+                _ => None,
+            };
+            let original: Vec<_> = daemon.registrations.values().cloned().collect();
+            let mut candidate: Vec<_> = original
+                .iter()
+                .filter(|record| record.vm_id != vm_id)
+                .cloned()
+                .collect();
+            if let ControlRequest::Register(registration) = &request {
+                candidate.push(registration.as_ref().clone());
+            }
+            let context = MutationContext {
+                tenant: daemon.tenant_id.clone(),
+                key: daemon.verifying_key,
+                helper: daemon.signer_helper_uds_path.clone(),
+                journal: daemon.registration_journal.clone(),
+                lifecycle: daemon.lifecycle_admission.clone(),
+                resources: daemon.resources.clone(),
+                custody: daemon.custody.clone(),
+                registration,
+                vm_id: vm_id.clone(),
+                original,
+                candidate,
+            };
+            context.recheck(daemon, signed.as_ref(), cleanup)?;
+            // Reserve bounded map capacity before the final short publication turn.
+            daemon.registrations.try_reserve(1)?;
+            context.custody.map_loan()?.value_mut().vms.try_reserve(1)?;
+            Ok(context)
+        })
+        .await?;
+    anyhow::ensure!(
+        serde_json::to_vec_pretty(&context.candidate)?.len() < CONTROL_MAX_FRAME_BYTES,
+        "candidate registration journal exceeds canonical inventory bound"
+    );
+    if context.lifecycle.is_some() {
+        anyhow::ensure!(
+            context.resources.is_some(),
+            "original lifecycle resource binding missing"
+        );
+    }
+    let cell = context.custody.clone();
+    let mut reserve = || {
+        access.try_memory(|daemon| {
+            context.recheck(daemon, signed.as_ref(), cleanup)?;
+            let reserve_accepted = || {
+                if let Some(admission) = &context.lifecycle {
+                    if cleanup {
+                        daemon.reserve_cleanup_work(&admission.generation)
+                    } else {
+                        daemon.reserve_accepted_work(&admission.generation)
+                    }
+                } else {
+                    daemon.reserve_verified_work(cleanup)
+                }
+            };
+            let loan = cell.reserve_mutation(&mut permit, reserve_accepted)?;
+            // The original cell retains both originals before releasing this gate.
+            drop(loan);
+            Ok(())
+        })
+    };
+    if let Some(admission) = &context.lifecycle
+        && !cleanup
+    {
+        admission.gate.with_active(
+            &admission.generation,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            reserve,
+        )?;
+    } else {
+        reserve()?;
+    }
+    let mut mutation = cell.mutation_loan()?;
+    let original = mutation.value_mut();
+    original.capture_journal(JournalSnapshots {
+        original: context.original.clone(),
+        candidate: context.candidate.clone(),
+    })?;
+    if let Some(binding) = &context.resources {
+        let lease = mvm_vmm::host::installed_owner::HolderLease::acquire(
+            &binding.root,
+            binding.key,
+            binding.generation,
+        )?;
+        original.attach_resource(lease)?;
+    }
+    // Move exactly one original service directly between its two retained
+    // fields before any await. Queries remain Unknown while it is in flight.
+    {
+        let mut map = cell.map_loan()?;
+        let map = map.value_mut();
+        anyhow::ensure!(
+            cleanup || map.phase == VmMapPhase::Live,
+            "original service map is retiring"
+        );
+        if let Some(live) = map.vms.remove(&vm_id) {
+            original.retiring = Some(live.retire());
+        }
+    }
+    if let Some(retiring) = original.retiring.as_mut() {
+        retiring.finish().await?;
+    }
+    original.retiring = None;
+    let helper = context.helper.clone();
+    let retired_vm = vm_id.clone();
+    original.start_io(MutationIoStage::HelperRetirement, move || {
+        if let Some(helper) = helper {
+            deregister_helper_vm_at(&helper, &retired_vm)?;
+        }
+        Ok(())
+    })?;
+    original
+        .finish_io(MutationIoStage::HelperRetirement)
+        .await?;
+    if let Some(snapshot) = context.registration.as_ref() {
+        let registration = snapshot.registration.clone();
+        cell.prepare_registration(&mut mutation, snapshot.clone())?;
+        let original = mutation.value_mut();
+        let helper = context.helper.clone();
+        original.start_io(MutationIoStage::HelperRegistration, move || {
+            if let Some(helper) = helper {
+                register_helper_vm_at(&helper, &registration)?;
+            }
+            Ok(())
+        })?;
+        original
+            .finish_io(MutationIoStage::HelperRegistration)
+            .await?;
+    }
+    let original = mutation.value_mut();
+    let candidate = original.journal_snapshots()?.candidate.clone();
+    let journal = context.journal.clone();
+    original.start_io(MutationIoStage::JournalPublication, move || {
+        if let Some(journal) = journal {
+            journal.store(candidate.iter())?;
+        }
+        Ok(())
+    })?;
+    original
+        .finish_io(MutationIoStage::JournalPublication)
+        .await?;
+    // FileGate must never be acquired under a borrowed cell loan. Originals
+    // remain physically retained in their field while this guard is released.
+    drop(mutation);
+    let mut commit = || {
+        access.try_memory(|daemon| {
+            context.recheck(daemon, signed.as_ref(), cleanup)?;
+            let mut mutation = cell.mutation_loan()?;
+            let original = mutation.value_mut();
+            let mut map = cell.map_loan()?;
+            let map = map.value_mut();
+            anyhow::ensure!(
+                cleanup || map.phase == VmMapPhase::Live,
+                "original map activation fenced"
+            );
+            anyhow::ensure!(
+                !map.vms.contains_key(&vm_id),
+                "another original service occupies this identity"
+            );
+            if let Some(prepared) = original.prepared.as_mut() {
+                let registration = prepared.registration().clone();
+                let (live, start) = prepared.take_suspended_parts()?;
+                map.vms.insert(vm_id.clone(), live);
+                daemon.registrations.insert(vm_id.clone(), registration);
+                // Actual original map ownership precedes any dispatch exposure.
+                start.release()?;
+                anyhow::ensure!(
+                    prepared.service_transferred(),
+                    "service ownership transfer incomplete"
+                );
+                original.prepared = None;
+            } else {
+                daemon.registrations.remove(&vm_id);
+            }
+            Ok(())
+        })
+    };
+    if let Some(admission) = &context.lifecycle
+        && !cleanup
+    {
+        admission.gate.with_active(
+            &admission.generation,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            commit,
+        )?;
+    } else {
+        commit()?;
+    }
+    // Actual I/O completion + original-map representation precedes settlement.
+    cell.complete_mutation(cell.mutation_loan()?)
 }
 
 /// Prepare and bind a host-agent control or signer listener, including restarts.
@@ -883,7 +1727,7 @@ fn registration_owner_is_dead(registration: &RegisterVm) -> bool {
 
 /// Validate a `vm_id` is safe to embed in a filesystem path: a non-empty DNS-
 /// label-shaped token (alphanumeric plus `-`/`_`), no separators, no traversal.
-fn validate_vm_id(vm_id: &str) -> Result<()> {
+pub(crate) fn validate_vm_id(vm_id: &str) -> Result<()> {
     if vm_id.is_empty() || vm_id.len() > 63 {
         bail!("vm_id must be 1..=63 chars, got {}", vm_id.len());
     }
@@ -990,8 +1834,115 @@ mod tests {
         HostAgentDaemon::new(tenant, vk, 64 * 1024)
     }
 
+    #[tokio::test]
+    async fn bound_control_listener_waits_for_owned_acceptance_loop() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind_host_agent_listener(&socket, 0o700).unwrap();
+        let daemon = Arc::new(Mutex::new(daemon("local")));
+        let mut client = tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(&socket))
+            .await
+            .unwrap()
+            .unwrap();
+        let signed = broker_control::sign(
+            register_control(register(directory.path(), "vm-bound", "local", None)),
+            &[5; 32],
+        )
+        .unwrap();
+        write_frame(&mut client, &signed).await.unwrap();
+        assert_eq!(daemon.lock().await.registration_count(), 0);
+
+        let serving = tokio::spawn(HostAgentDaemon::run_shared_on_listener(
+            daemon.clone(),
+            listener,
+        ));
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_frame::<ControlResponse>(&mut client, CONTROL_MAX_FRAME_BYTES),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(response, ControlResponse::Ok));
+        assert_eq!(daemon.lock().await.registration_count(), 1);
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn stopped_control_listener_releases_a_partial_unauthenticated_frame() {
+        use tokio::io::AsyncWriteExt;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let listener = bind_host_agent_listener(&socket, 0o700).unwrap();
+        let daemon = Arc::new(Mutex::new(daemon("local")));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let serving = tokio::spawn(HostAgentDaemon::run_shared_on_listener_until(
+            daemon.clone(),
+            listener,
+            stopped,
+        ));
+        let mut client = UnixStream::connect(&socket).await.unwrap();
+        // An incomplete actual length prefix is never a verified mutation.
+        client.write_all(&[0]).await.unwrap();
+        tokio::task::yield_now().await;
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_millis(500), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(daemon.lock().await.registration_count(), 0);
+    }
+
     #[test]
-    fn hvf_instance_control_is_refused_without_registration_side_effects() {
+    fn checked_registration_journal_refuses_oversized_or_redirected_inventory() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let journal = directory.path().join("registrations.json");
+        let observer = daemon("local").with_registration_journal(&journal);
+        assert_eq!(observer.checked_journal_registration_count().unwrap(), 0);
+        std::fs::write(&journal, vec![b' '; CONTROL_MAX_FRAME_BYTES + 1]).unwrap();
+        assert!(observer.checked_journal_registration_count().is_err());
+        std::fs::remove_file(&journal).unwrap();
+        let target = directory.path().join("other.json");
+        std::fs::write(&target, b"[]").unwrap();
+        symlink(&target, &journal).unwrap();
+        assert!(observer.checked_journal_registration_count().is_err());
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::write(&journal, b"[]").unwrap();
+        assert_eq!(observer.checked_journal_registration_count().unwrap(), 0);
+        let registration = register(directory.path(), "vm-inventory", "local", None);
+        std::fs::write(
+            &journal,
+            serde_json::to_vec(&vec![registration.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observer.checked_journal_registration_count().unwrap(), 1);
+        std::fs::write(
+            &journal,
+            serde_json::to_vec(&vec![registration.clone(), registration]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            observer.checked_journal_registration_count().is_err(),
+            "duplicate original VM identity is Unknown"
+        );
+        let foreign = register(directory.path(), "vm-inventory", "other-tenant", None);
+        std::fs::write(&journal, serde_json::to_vec(&vec![foreign]).unwrap()).unwrap();
+        assert!(
+            observer.checked_journal_registration_count().is_err(),
+            "foreign canonical tenant is Unknown"
+        );
+        std::fs::write(&journal, b"[").unwrap();
+        assert!(
+            observer.checked_journal_registration_count().is_err(),
+            "truncated canonical inventory is Unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn hvf_instance_control_is_refused_without_registration_side_effects() {
         use mvm_core::protocol::hvf_control::{HvfInstance, HvfInstanceControl};
         let mut daemon = daemon("local");
         let request = ControlRequest::HvfInstanceV1(HvfInstanceControl::StopHvfInstance {
@@ -1002,8 +1953,8 @@ mod tests {
             connection_nonce: [4; 32],
             issued_at_secs: 100,
         });
-        assert!(daemon.apply(&request).is_err());
-        assert!(daemon.vms.is_empty());
+        assert!(daemon.apply(&request).await.is_err());
+        assert_eq!(daemon.checked_registration_count().unwrap(), 0);
         assert!(daemon.registrations.is_empty());
     }
 
@@ -1068,7 +2019,12 @@ mod tests {
         );
     }
 
-    fn register(dir: &Path, vm: &str, tenant: &str, signer: Option<PathBuf>) -> RegisterVm {
+    pub(super) fn register(
+        dir: &Path,
+        vm: &str,
+        tenant: &str,
+        signer: Option<PathBuf>,
+    ) -> RegisterVm {
         RegisterVm {
             vm_id: vm.into(),
             workload_id: Some(format!("wl-{vm}")),
@@ -1177,15 +2133,16 @@ mod tests {
         let reg = register(dir.path(), "vm-1", "local", None);
         let sock = PathBuf::from(&reg.broker_listen_socket);
 
-        d.apply(&register_control(reg)).unwrap();
-        assert!(d.is_registered("vm-1"));
+        d.apply(&register_control(reg)).await.unwrap();
+        assert!(d.is_registered("vm-1").unwrap());
         assert!(sock.exists(), "broker socket bound");
 
         d.apply(&ControlRequest::Deregister(DeregisterVm {
             vm_id: "vm-1".into(),
         }))
+        .await
         .unwrap();
-        assert!(!d.is_registered("vm-1"));
+        assert!(!d.is_registered("vm-1").unwrap());
         // Drop runs synchronously on remove → socket file gone.
         assert!(!sock.exists(), "broker socket unbound");
     }
@@ -1205,9 +2162,9 @@ mod tests {
         .unwrap();
         let sock = PathBuf::from(&reg.broker_listen_socket);
 
-        d.apply(&register_control(reg)).unwrap();
+        d.apply(&register_control(reg)).await.unwrap();
 
-        assert_eq!(d.reap_dead_registrations().unwrap(), 1);
+        assert_eq!(d.reap_dead_registrations().await.unwrap(), 1);
         assert_eq!(d.registration_count(), 0);
         assert!(!sock.exists(), "dead registration must unbind its socket");
         assert!(
@@ -1233,10 +2190,10 @@ mod tests {
         )
         .unwrap();
 
-        d.apply(&register_control(reg)).unwrap();
+        d.apply(&register_control(reg)).await.unwrap();
 
-        assert_eq!(d.reap_dead_registrations().unwrap(), 0);
-        assert!(d.is_registered("live-vm"));
+        assert_eq!(d.reap_dead_registrations().await.unwrap(), 0);
+        assert!(d.is_registered("live-vm").unwrap());
     }
 
     #[tokio::test]
@@ -1245,10 +2202,10 @@ mod tests {
         let mut d = daemon("local");
         let reg = register(dir.path(), "legacy-vm", "local", None);
 
-        d.apply(&register_control(reg)).unwrap();
+        d.apply(&register_control(reg)).await.unwrap();
 
-        assert_eq!(d.reap_dead_registrations().unwrap(), 0);
-        assert!(d.is_registered("legacy-vm"));
+        assert_eq!(d.reap_dead_registrations().await.unwrap(), 0);
+        assert!(d.is_registered("legacy-vm").unwrap());
     }
 
     #[test]
@@ -1295,6 +2252,7 @@ mod tests {
             "local",
             None,
         )))
+        .await
         .unwrap();
         assert_eq!(
             RegistrationJournal::new(journal_path.clone())
@@ -1307,6 +2265,7 @@ mod tests {
         d.apply(&ControlRequest::Deregister(DeregisterVm {
             vm_id: "vm-1".into(),
         }))
+        .await
         .unwrap();
         assert!(
             RegistrationJournal::new(journal_path.clone())
@@ -1325,15 +2284,18 @@ mod tests {
 
         {
             let mut first = daemon("local").with_registration_journal(&journal_path);
-            first.apply(&register_control(reg)).unwrap();
-            assert!(first.is_registered("vm-1"));
+            first.apply(&register_control(reg)).await.unwrap();
+            assert!(first.is_registered("vm-1").unwrap());
             assert!(sock.exists(), "first daemon bound broker socket");
         }
         assert!(!sock.exists(), "dropping daemon unbinds broker socket");
 
         let mut restarted = daemon("local").with_registration_journal(&journal_path);
-        assert_eq!(restarted.restore_journaled_registrations().unwrap(), 1);
-        assert!(restarted.is_registered("vm-1"));
+        assert_eq!(
+            restarted.restore_journaled_registrations().await.unwrap(),
+            1
+        );
+        assert!(restarted.is_registered("vm-1").unwrap());
         assert!(sock.exists(), "restarted daemon rebound broker socket");
     }
 
@@ -1381,7 +2343,7 @@ mod tests {
         let broker_socket = PathBuf::from(&reg.broker_listen_socket);
         {
             let mut original = daemon("local").with_registration_journal(&journal);
-            original.apply(&register_control(reg)).unwrap();
+            original.apply(&register_control(reg)).await.unwrap();
         }
         assert!(journal.exists());
         assert!(!broker_socket.exists());
@@ -1393,8 +2355,11 @@ mod tests {
         std::fs::write(&socket_journal, b"not the authoritative journal").unwrap();
         let mut restarted = daemon("local")
             .with_registration_journal(relocated.registration_journal_path().unwrap());
-        assert_eq!(restarted.restore_journaled_registrations().unwrap(), 1);
-        assert!(restarted.is_registered("vm-1"));
+        assert_eq!(
+            restarted.restore_journaled_registrations().await.unwrap(),
+            1
+        );
+        assert!(restarted.is_registered("vm-1").unwrap());
         assert!(broker_socket.exists());
         assert_eq!(
             std::fs::read(&socket_journal).unwrap(),
@@ -1410,8 +2375,9 @@ mod tests {
 
         for vm in ["vm-1", "vm-2", "vm-3"] {
             d.apply(&register_control(register(dir.path(), vm, "local", None)))
+                .await
                 .unwrap();
-            assert!(d.is_registered(vm), "{vm} registered");
+            assert!(d.is_registered(vm).unwrap(), "{vm} registered");
         }
 
         assert_eq!(d.registration_count(), 3);
@@ -1420,13 +2386,14 @@ mod tests {
         d.apply(&ControlRequest::Deregister(DeregisterVm {
             vm_id: "vm-2".into(),
         }))
+        .await
         .unwrap();
 
         assert_eq!(d.registration_count(), 2);
         assert_eq!(d.registrations.len(), 2);
-        assert!(d.is_registered("vm-1"));
-        assert!(!d.is_registered("vm-2"));
-        assert!(d.is_registered("vm-3"));
+        assert!(d.is_registered("vm-1").unwrap());
+        assert!(!d.is_registered("vm-2").unwrap());
+        assert!(d.is_registered("vm-3").unwrap());
     }
 
     #[tokio::test]
@@ -1440,20 +2407,21 @@ mod tests {
                 "acme",
                 None
             )))
+            .await
             .is_err(),
             "cross-tenant register refused"
         );
         let mut bad = register(dir.path(), "ok", "local", None);
         bad.vm_id = "../escape".into();
         assert!(
-            d.apply(&register_control(bad)).is_err(),
+            d.apply(&register_control(bad)).await.is_err(),
             "unsafe vm_id refused"
         );
         assert_eq!(d.registration_count(), 0);
     }
 
-    #[test]
-    fn register_refuses_controller_capability_absent_from_signed_admission() {
+    #[tokio::test]
+    async fn register_refuses_controller_capability_absent_from_signed_admission() {
         let dir = tempfile::tempdir().unwrap();
         let mut daemon = daemon("local");
         let mut registration = register(dir.path(), "vm-1", "local", None);
@@ -1475,6 +2443,7 @@ mod tests {
 
         let error = daemon
             .apply(&register_control(registration))
+            .await
             .expect_err("an unsigned controller capability must be refused");
 
         assert!(
@@ -1485,8 +2454,8 @@ mod tests {
         assert_eq!(daemon.registration_count(), 0);
     }
 
-    #[test]
-    fn legacy_tool_service_binding_cannot_register_a_vm() {
+    #[tokio::test]
+    async fn legacy_tool_service_binding_cannot_register_a_vm() {
         let dir = tempfile::tempdir().unwrap();
         let mut daemon = daemon("local");
         let mut registration = register(dir.path(), "vm-legacy-tool", "local", None);
@@ -1495,6 +2464,7 @@ mod tests {
             .push(ServiceId::parse(RETIRED_HOST_TOOL_SERVICE).unwrap());
         let error = daemon
             .apply(&register_control(registration))
+            .await
             .expect_err("legacy tool service must be refused");
         assert!(
             error
@@ -1515,7 +2485,7 @@ mod tests {
         let mut d = daemon("local");
         let reg = register(dir.path(), "vm-1", "local", None);
         let sock = PathBuf::from(&reg.broker_listen_socket);
-        d.apply(&register_control(reg)).unwrap();
+        d.apply(&register_control(reg)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // A guest dials the VM's broker socket. Its `correlation_id` is its own
@@ -1550,7 +2520,7 @@ mod tests {
         let mut reg = register(dir.path(), "vm-time", "local", None);
         reg.services_bindings = vec![ServiceId::parse("host.time.v1").unwrap()];
         let sock = PathBuf::from(&reg.broker_listen_socket);
-        d.apply(&register_control(reg)).unwrap();
+        d.apply(&register_control(reg)).await.unwrap();
 
         let mut time_client = UnixStream::connect(&sock).await.unwrap();
         let time_call = ServiceCall {
@@ -1592,8 +2562,8 @@ mod tests {
         reg_b.services_bindings = vec![ServiceId::parse("host.audit.v1").unwrap()];
         let chain_b = PathBuf::from(&reg_b.workload_chain_path);
 
-        d.apply(&register_control(reg_a)).unwrap();
-        d.apply(&register_control(reg_b)).unwrap();
+        d.apply(&register_control(reg_a)).await.unwrap();
+        d.apply(&register_control(reg_b)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = UnixStream::connect(&sock_a).await.unwrap();
@@ -1635,7 +2605,7 @@ mod tests {
         reg.services_bindings = vec![ServiceId::parse("host.audit.v1").unwrap()];
         let sock = PathBuf::from(&reg.broker_listen_socket);
         let chain = PathBuf::from(&reg.workload_chain_path);
-        d.apply(&register_control(reg)).unwrap();
+        d.apply(&register_control(reg)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let before = emit_audit(&sock, "before-restart").await;
@@ -1707,7 +2677,7 @@ mod tests {
         let mut d = HostAgentDaemon::new("local", vk, 64 * 1024).with_signer_helper(&helper_sock);
         let reg = register(dir.path(), "vm-a", "local", None);
         let chain = PathBuf::from(&reg.workload_chain_path);
-        d.apply(&register_control(reg)).unwrap();
+        d.apply(&register_control(reg)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The append does blocking helper I/O, so run it off the reactor.
@@ -1742,3 +2712,11 @@ mod tests {
         helper_task.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "daemon/token_tests.rs"]
+mod token_tests;
+
+#[cfg(test)]
+#[path = "daemon/cooperative_tests.rs"]
+mod cooperative_tests;

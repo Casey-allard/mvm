@@ -32,6 +32,11 @@ use tokio::sync::{Mutex, oneshot};
 
 use mvm_hostd::audit_signer::config::SignerHelperConfig;
 use mvm_hostd::broker::daemon::{HostAgentConfig, HostAgentDaemon};
+use mvm_hostd::host_agent_idle::IdleProposal;
+use mvm_hostd::watcher_jobs::{WatcherDrainReceipt, WatcherJobOwner};
+use mvm_vmm::host::installed_owner::{
+    Epoch, HolderLease, InstallationBinding, InstallationOwner, Recovery, spawn_with_resource_lease,
+};
 
 #[cfg(all(test, unix))]
 #[path = "mvm-host-agent/signer_custody_tests.rs"]
@@ -230,6 +235,7 @@ impl Drop for SignerChild {
 
 struct OriginalSignerChild {
     child: std::process::Child,
+    parent_lease: Option<HolderLease>,
     completion: Option<oneshot::Sender<SignerOutcome>>,
     status: Option<std::process::ExitStatus>,
     custody_uncertain: bool,
@@ -283,6 +289,12 @@ impl OriginalSignerChild {
     }
     fn finish(&mut self, status: std::process::ExitStatus) {
         self.status = Some(status);
+        self.parent_lease.take();
+        tracing::info!(
+            event = "signer_original_child_collected",
+            status = %status,
+            "mvm-signer-helper original Child collected"
+        );
         #[cfg(test)]
         signer_custody_tests::record_collection(status);
         if let Some(completion) = self.completion.take() {
@@ -415,32 +427,47 @@ fn probe_signer_socket(
     })
 }
 
-fn run_signer_actor(
+struct SignerActorStart {
     bin: PathBuf,
     uds_path: PathBuf,
     bytes: Vec<u8>,
-    mut wake: std::os::unix::net::UnixStream,
+    resources: Arc<InstallationBinding>,
     startup_deadline: Instant,
+}
+
+fn run_signer_actor(
+    start: SignerActorStart,
+    mut wake: std::os::unix::net::UnixStream,
     ready: oneshot::Sender<SignerReadiness>,
     completion: oneshot::Sender<SignerOutcome>,
 ) {
     use mvm_vmm::host::process_exit::{ProcessExitObserver, wait_process_exit_events};
     use std::os::fd::AsFd;
-    let spawned = (|| -> std::io::Result<std::process::Child> {
+    let SignerActorStart {
+        bin,
+        uds_path,
+        bytes,
+        resources,
+        startup_deadline,
+    } = start;
+    let spawned = (|| -> std::io::Result<(std::process::Child, HolderLease)> {
         mvm_vmm::host::process_exit::require_owned_child_custody()?;
         if signer_stop_requested(&mut wake)? || Instant::now() >= startup_deadline {
             return Err(std::io::Error::other(
                 "signer startup canceled before spawn",
             ));
         }
-        mvm_core::env_hygiene::helper_command(&bin)
+        let mut command = mvm_core::env_hygiene::helper_command(&bin);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let lease = HolderLease::acquire(&resources.root, resources.key, resources.generation)
+            .map_err(std::io::Error::other)?;
+        spawn_with_resource_lease(command, lease)
     })();
-    let child = match spawned {
-        Ok(child) => child,
+    let (child, parent_lease) = match spawned {
+        Ok(originals) => originals,
         Err(error) => {
             let _ = completion.send(SignerOutcome::NotStarted);
             let _ = ready.send(SignerReadiness::NotStarted(error.to_string()));
@@ -449,6 +476,7 @@ fn run_signer_actor(
     };
     let mut owner = OriginalSignerChild {
         child,
+        parent_lease: Some(parent_lease),
         completion: Some(completion),
         status: None,
         custody_uncertain: false,
@@ -519,7 +547,10 @@ fn run_signer_actor(
     // An unconfirmed wait retains the guard here instead of returning/retrying.
 }
 
-async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<SignerChild> {
+async fn spawn_signer_helper(
+    cfg: &HostAgentConfig,
+    resources: Arc<InstallationBinding>,
+) -> Result<SignerChild> {
     let startup_deadline = Instant::now() + SIGNER_HELPER_READY_TIMEOUT;
     let bin = signer_helper_bin_path()?;
     let helper_cfg = SignerHelperConfig {
@@ -548,11 +579,14 @@ async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<SignerChild> {
         .spawn(move || {
             let _runtime = runtime.enter();
             run_signer_actor(
-                bin,
-                uds,
-                bytes,
+                SignerActorStart {
+                    bin,
+                    uds_path: uds,
+                    bytes,
+                    resources,
+                    startup_deadline,
+                },
                 wake,
-                startup_deadline,
                 ready_tx,
                 completion_tx,
             )
@@ -593,15 +627,134 @@ fn signer_helper_bin_path() -> Result<PathBuf> {
     Ok(current.with_file_name("mvm-signer-helper"))
 }
 
+struct SignerDrainReceipt;
+
+struct SignerSupervisionHandle {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<SignerDrainReceipt>>,
+    receipt: Option<SignerDrainReceipt>,
+    unresolved: bool,
+    active_stop: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
+}
+
+impl SignerSupervisionHandle {
+    fn spawn(
+        cfg: HostAgentConfig,
+        daemon: Arc<Mutex<HostAgentDaemon>>,
+        first_ready: oneshot::Sender<Result<()>>,
+        resources: Arc<InstallationBinding>,
+    ) -> Self {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let active_stop = Arc::new(std::sync::Mutex::new(None));
+        let task = tokio::spawn(supervise_signer_helper(
+            cfg,
+            daemon,
+            first_ready,
+            resources,
+            stopped,
+            active_stop.clone(),
+        ));
+        Self {
+            stop,
+            task: Some(task),
+            receipt: None,
+            unresolved: false,
+            active_stop,
+        }
+    }
+
+    fn request_stop(&self) {
+        self.stop.send_replace(true);
+        if let Some(control) = self
+            .active_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            // Same-end owned control, never a PID or opposite lifeline clone.
+            // This also interrupts a supervisor blocked in canonical helper RPC.
+            let _ = control.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    async fn drain(&mut self) -> Result<()> {
+        self.request_stop();
+        if let Some(task) = self.task.as_mut() {
+            let result = task.await;
+            self.task = None;
+            match result {
+                Ok(receipt) => self.receipt = Some(receipt),
+                Err(_) => self.unresolved = true,
+            }
+        }
+        anyhow::ensure!(
+            self.receipt.is_some() && !self.unresolved,
+            "original signer drain remains unresolved"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for SignerSupervisionHandle {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+fn stop_requested(stop: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *stop.borrow() || stop.has_changed().is_err()
+}
+
+async fn wait_for_stop(stop: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if stop_requested(stop) || stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn supervise_signer_helper(
     cfg: HostAgentConfig,
     daemon: Arc<Mutex<HostAgentDaemon>>,
     first_ready: oneshot::Sender<Result<()>>,
-) {
+    resources: Arc<InstallationBinding>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    active_stop: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>,
+) -> SignerDrainReceipt {
     let mut first_ready = Some(first_ready);
     loop {
-        match spawn_signer_helper(&cfg).await {
+        if stop_requested(&stop) {
+            return SignerDrainReceipt;
+        }
+        match spawn_signer_helper(&cfg, resources.clone()).await {
             Ok(mut child) => {
+                if child.readiness_error.is_none() {
+                    match child
+                        .lifeline
+                        .as_ref()
+                        .map(std::os::unix::net::UnixStream::try_clone)
+                        .transpose()
+                    {
+                        Ok(control) => {
+                            *active_stop
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = control
+                        }
+                        Err(error) => {
+                            child.readiness_error =
+                                Some(format!("signer stop control unavailable: {error}"));
+                            child.request_stop();
+                        }
+                    }
+                }
+                if stop_requested(&stop) {
+                    child.request_stop();
+                    if child.wait().await.is_err() {
+                        let _retained_owner = child;
+                        std::future::pending::<()>().await;
+                    }
+                    return SignerDrainReceipt;
+                }
                 if let Some(reason) = child.readiness_error.take() {
                     tracing::warn!(tenant_id = %cfg.tenant_id, %reason, "signer startup unresolved; retaining original owner before retry");
                     if let Err(error) = child.wait().await
@@ -613,12 +766,28 @@ async fn supervise_signer_helper(
                         unreachable!("unresolved signer owner cannot restart");
                     }
                     // Only the actor's actual collected status permits retry.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::select! {
+                        biased;
+                        () = wait_for_stop(&mut stop) => return SignerDrainReceipt,
+                        () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
                     continue;
                 }
-                let rebound = {
-                    let daemon = daemon.lock().await;
-                    daemon.rebind_signer_helper_registrations()
+                let lane = { daemon.lock().await.mutation_lane() };
+                // The same original lane orders replay against prepared
+                // registration/journal mutations. No daemon lock covers RPC.
+                let rebound = match lane.acquire_owned().await {
+                    Ok(permit) => {
+                        let replay = { daemon.lock().await.signer_registration_replay() };
+                        tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            replay.execute()
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("original signer replay task failed"))
+                        .and_then(|result| result)
+                    }
+                    Err(_) => Err(anyhow::anyhow!("original mutation lane closed")),
                 };
                 match rebound {
                     Ok(count) => {
@@ -649,14 +818,31 @@ async fn supervise_signer_helper(
                         }
                         if let Some(tx) = first_ready.take() {
                             let _ = tx.send(Err(e));
-                            return;
+                            return SignerDrainReceipt;
                         }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tokio::select! {
+                            biased;
+                            () = wait_for_stop(&mut stop) => return SignerDrainReceipt,
+                            () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
                         continue;
                     }
                 }
 
-                match child.wait().await {
+                let exit = tokio::select! {
+                    biased;
+                    () = wait_for_stop(&mut stop) => None,
+                    status = child.wait() => Some(status),
+                };
+                let Some(exit) = exit else {
+                    child.request_stop();
+                    if child.wait().await.is_err() {
+                        let _retained_owner = child;
+                        std::future::pending::<()>().await;
+                    }
+                    return SignerDrainReceipt;
+                };
+                match exit {
                     Ok(status) => tracing::warn!(
                         tenant_id = %cfg.tenant_id,
                         status = %status,
@@ -672,7 +858,7 @@ async fn supervise_signer_helper(
             Err(e) => {
                 if let Some(tx) = first_ready.take() {
                     let _ = tx.send(Err(e));
-                    return;
+                    return SignerDrainReceipt;
                 }
                 tracing::warn!(
                     tenant_id = %cfg.tenant_id,
@@ -681,59 +867,687 @@ async fn supervise_signer_helper(
                 );
             }
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        active_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        tokio::select! {
+            biased;
+            () = wait_for_stop(&mut stop) => return SignerDrainReceipt,
+            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
     }
 }
 
-async fn run_worker_once(cfg: HostAgentConfig) -> Result<()> {
-    let verifying_key = cfg.load_verifying_key()?;
-    tracing::info!(
-        tenant_id = %cfg.tenant_id,
-        control_socket = %cfg.control_socket.display(),
-        signer_helper_uds_path = %cfg.signer_helper_uds_path.display(),
-        "mvm-host-agent worker starting"
-    );
+/// Retains all three original tasks and their finite cleanup-job owners.
+/// Joining is cancellation-safe: completed handles are cached before the next
+/// await, so expiry of the coordinator grace never drops or re-polls a task.
+struct WatcherSet {
+    stop: tokio::sync::watch::Sender<bool>,
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+    watched_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    idle_timeout: Option<Duration>,
+    idle: Option<tokio::task::JoinHandle<Option<IdleProposal>>>,
+    sessions: Option<
+        tokio::task::JoinHandle<
+            Result<WatcherDrainReceipt, mvm_hostd::watcher_jobs::WatcherDrainError>,
+        >,
+    >,
+    health: Option<
+        tokio::task::JoinHandle<
+            Result<WatcherDrainReceipt, mvm_hostd::watcher_jobs::WatcherDrainError>,
+        >,
+    >,
+    session_jobs: WatcherJobOwner,
+    health_jobs: WatcherJobOwner,
+    session_receipt: Option<WatcherDrainReceipt>,
+    health_receipt: Option<WatcherDrainReceipt>,
+    failure: Option<String>,
+}
 
-    let registration_journal = cfg.registration_journal_path()?;
-    let daemon = Arc::new(Mutex::new(
-        HostAgentDaemon::new(cfg.tenant_id.clone(), verifying_key, cfg.max_frame_bytes)
-            .with_signer_helper(cfg.signer_helper_uds_path.clone())
-            .with_registration_journal(registration_journal),
-    ));
-    let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(supervise_signer_helper(
-        cfg.clone(),
-        daemon.clone(),
-        ready_tx,
-    ));
-    ready_rx
+impl WatcherSet {
+    fn spawn(
+        daemon: Arc<Mutex<HostAgentDaemon>>,
+        tenant: String,
+        resources: Arc<InstallationBinding>,
+    ) -> Self {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let watched_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let idle_timeout = mvm_hostd::host_agent_idle::idle_timeout();
+        let session_jobs = WatcherJobOwner::new();
+        let health_jobs = WatcherJobOwner::new();
+        let idle = tokio::spawn(mvm_hostd::host_agent_idle::run_idle_watcher_until(
+            daemon.clone(),
+            watched_sessions.clone(),
+            idle_timeout,
+            stopped.clone(),
+        ));
+        let sessions = tokio::spawn(mvm_hostd::host_agent_idle::run_session_watcher_owned(
+            tenant,
+            watched_sessions.clone(),
+            stopped.clone(),
+            session_jobs.clone(),
+            resources.clone(),
+            daemon.clone(),
+        ));
+        let health = tokio::spawn(mvm_hostd::host_agent_idle::run_health_watcher_owned(
+            daemon.clone(),
+            stopped,
+            health_jobs.clone(),
+            resources,
+        ));
+        Self {
+            stop,
+            daemon,
+            watched_sessions,
+            idle_timeout,
+            idle: Some(idle),
+            sessions: Some(sessions),
+            health: Some(health),
+            session_jobs,
+            health_jobs,
+            session_receipt: None,
+            health_receipt: None,
+            failure: None,
+        }
+    }
+
+    async fn idle_proposal(&mut self) -> Result<Option<IdleProposal>> {
+        let Some(idle) = self.idle.as_mut() else {
+            return std::future::pending().await;
+        };
+        let result = idle.await;
+        self.idle = None;
+        result.map_err(|_| anyhow::anyhow!("idle observer failed without a completion receipt"))
+    }
+
+    fn rearm_idle(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.idle.is_none() && !*self.stop.borrow(),
+            "idle observer cannot restart"
+        );
+        self.idle = Some(tokio::spawn(
+            mvm_hostd::host_agent_idle::run_idle_watcher_until(
+                self.daemon.clone(),
+                self.watched_sessions.clone(),
+                self.idle_timeout,
+                self.stop.subscribe(),
+            ),
+        ));
+        Ok(())
+    }
+
+    fn request_stop(&self) {
+        // Fence actual job reservations before broadcasting loop cancellation.
+        self.session_jobs.request_stop();
+        self.health_jobs.request_stop();
+        self.stop.send_replace(true);
+    }
+
+    fn has_inflight_jobs(&self) -> Result<bool> {
+        Ok(self.session_jobs.has_inflight_job()? || self.health_jobs.has_inflight_job()?)
+    }
+
+    async fn drain(&mut self) -> Result<()> {
+        self.request_stop();
+        if let Some(idle) = self.idle.as_mut() {
+            let result = idle.await;
+            self.idle = None;
+            if result.is_err() {
+                self.failure
+                    .get_or_insert_with(|| "idle watcher task failed".into());
+            }
+        }
+        if let Some(sessions) = self.sessions.as_mut() {
+            let result = sessions.await;
+            self.sessions = None;
+            match result {
+                Ok(Ok(receipt)) => self.session_receipt = Some(receipt),
+                _ => {
+                    self.failure
+                        .get_or_insert_with(|| "session watcher collection unresolved".into());
+                }
+            }
+        }
+        if let Some(health) = self.health.as_mut() {
+            let result = health.await;
+            self.health = None;
+            match result {
+                Ok(Ok(receipt)) => self.health_receipt = Some(receipt),
+                _ => {
+                    self.failure
+                        .get_or_insert_with(|| "health watcher collection unresolved".into());
+                }
+            }
+        }
+        anyhow::ensure!(
+            self.failure.is_none(),
+            "watcher drain remains unresolved: {:?}",
+            self.failure
+        );
+        anyhow::ensure!(
+            self.session_receipt.is_some() && self.health_receipt.is_some(),
+            "original watcher receipts absent"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for WatcherSet {
+    fn drop(&mut self) {
+        // Cancellation requests stop; it is never a collection receipt. The
+        // finite job actors retain their original children and resource leases.
+        self.request_stop();
+    }
+}
+
+/// The listener loop stays owned while Draining still permits canonical
+/// cleanup/query operations. Stopping it never aborts an accepted mutation.
+struct ControlLoopHandle {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    completed: bool,
+    failed: bool,
+    terminal_error: Option<String>,
+}
+
+impl ControlLoopHandle {
+    fn spawn(daemon: Arc<Mutex<HostAgentDaemon>>, listener: tokio::net::UnixListener) -> Self {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(HostAgentDaemon::run_shared_on_listener_until(
+            daemon, listener, stopped,
+        ));
+        Self {
+            stop,
+            task: Some(task),
+            completed: false,
+            failed: false,
+            terminal_error: None,
+        }
+    }
+
+    async fn observe_exit(&mut self) -> Result<()> {
+        if let Some(task) = self.task.as_mut() {
+            let result = task.await;
+            self.task = None;
+            match result {
+                Ok(result) => {
+                    self.completed = true;
+                    self.terminal_error = result.err().map(|error| error.to_string());
+                }
+                Err(_) => self.failed = true,
+            }
+        }
+        anyhow::ensure!(
+            self.completed && !self.failed,
+            "original control loop completion unresolved"
+        );
+        if let Some(error) = &self.terminal_error {
+            anyhow::bail!("original control loop failed: {error}");
+        }
+        Ok(())
+    }
+
+    async fn drain(&mut self) -> Result<()> {
+        self.stop.send_replace(true);
+        let _operation_result = self.observe_exit().await;
+        // A joined loop may have returned an operation error. Its completion
+        // is separate from that error; accepted effects have their own ledger.
+        anyhow::ensure!(
+            self.completed && !self.failed,
+            "original control loop completion unresolved"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ControlLoopHandle {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+    }
+}
+
+struct WorkerResources {
+    home: PathBuf,
+    owner: InstallationOwner,
+    epoch: Epoch,
+    recovery: Recovery,
+    binding: Arc<InstallationBinding>,
+}
+
+impl WorkerResources {
+    fn open(cfg: &HostAgentConfig) -> Result<Self> {
+        let home = PathBuf::from(mvm_core::config::mvm_home());
+        let descriptor = cfg.resource_descriptor(&home)?;
+        let mut owner = InstallationOwner::open(&descriptor.root, descriptor.key).with_context(|| {
+            format!(
+                "open existing canonical host-agent provisioning at {}; missing or legacy provisioning requires canonical reconciliation",
+                descriptor.root.display()
+            )
+        })?;
+        let recovery = owner
+            .reconcile()
+            .context("original host-agent resource exclusion unavailable")?;
+        let epoch = owner
+            .begin()
+            .context("begin original host-agent resource epoch")?;
+        let binding = Arc::new(owner.active_binding(epoch)?);
+        tracing::info!(
+            resource_recovery = ?recovery,
+            "host-agent resource fence reconciled; this is not original child collection"
+        );
+        Ok(Self {
+            home,
+            owner,
+            epoch,
+            recovery,
+            binding,
+        })
+    }
+}
+
+const COOPERATIVE_DRAIN_GRACE: Duration = Duration::from_secs(10);
+const LIFECYCLE_IO_BUDGET: Duration = Duration::from_secs(5);
+
+/// Lives outside the cancellation-prone grace future. Every original task,
+/// resource epoch and metadata writer remains owned after timeout or error.
+struct WorkerCoordinator {
+    cfg: HostAgentConfig,
+    resources: WorkerResources,
+    lifecycle: mvm_core::tenant_lifecycle::LifecycleCoordinator,
+    generation: mvm_core::tenant_lifecycle::LifecycleGeneration,
+    daemon: Arc<Mutex<HostAgentDaemon>>,
+    signer: Option<SignerSupervisionHandle>,
+    watchers: Option<WatcherSet>,
+    control: Option<ControlLoopHandle>,
+    accepted: mvm_hostd::broker::daemon::AcceptedWorkDrain,
+    custody: mvm_hostd::broker::daemon::DaemonCustodyOwner,
+    services_receipt: Option<mvm_hostd::broker::daemon::DaemonServicesDrainReceipt>,
+    resource_finished: bool,
+    startup_journal_count: usize,
+}
+
+impl WorkerCoordinator {
+    fn open(cfg: HostAgentConfig) -> Result<Self> {
+        use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecycleGeneration};
+        let verifying_key = cfg.load_verifying_key()?;
+        let resources = WorkerResources::open(&cfg)?;
+        let generation = LifecycleGeneration::new(rand::random(), resources.epoch.generation())?;
+        let lifecycle = LifecycleCoordinator::prepare_after_exclusion(
+            &resources.home,
+            &cfg.tenant_id,
+            generation.clone(),
+            256,
+            Instant::now() + LIFECYCLE_IO_BUDGET,
+        )?;
+        let daemon =
+            HostAgentDaemon::new(cfg.tenant_id.clone(), verifying_key, cfg.max_frame_bytes)
+                .with_signer_helper(cfg.signer_helper_uds_path.clone())
+                .with_registration_journal(cfg.registration_journal_path()?)
+                .with_resource_binding(resources.binding.clone())
+                .with_lifecycle_coordination(&resources.home, generation.clone())?;
+        // No async task or Child exists yet. The original resource EX owner
+        // excludes the previous daemon; this is a checked legacy observation,
+        // never a new signed-plan or mailbox authority.
+        let startup_journal_count = daemon.checked_journal_registration_count()?;
+        let accepted = daemon.accepted_work_drain()?;
+        let custody = daemon.custody_owner();
+        Ok(Self {
+            cfg,
+            resources,
+            lifecycle,
+            generation,
+            daemon: Arc::new(Mutex::new(daemon)),
+            signer: None,
+            watchers: None,
+            control: None,
+            accepted,
+            custody,
+            services_receipt: None,
+            resource_finished: false,
+            startup_journal_count,
+        })
+    }
+
+    fn prepare_metadata_before_spawn(&self) -> Result<()> {
+        use mvm_core::tenant_lifecycle::LifecyclePhase;
+        let deadline = Instant::now() + LIFECYCLE_IO_BUDGET;
+        let snapshot = self.lifecycle.snapshot(deadline)?;
+        let _inventory = mvm_hostd::host_agent_idle::checked_session_inventory(
+            &self.resources.home,
+            &self.cfg.tenant_id,
+            deadline,
+        )?;
+        anyhow::ensure!(
+            snapshot.pending().is_empty(),
+            "original launch reservations require canonical reconciliation"
+        );
+        if snapshot.generation() == &self.generation
+            && snapshot.phase() == LifecyclePhase::Preparing
+        {
+            anyhow::ensure!(
+                !snapshot.unresolved(),
+                "new resource epoch is unresolved before spawn"
+            );
+            return Ok(());
+        }
+        let previous = snapshot.generation().clone();
+        if snapshot.phase() != LifecyclePhase::Drained {
+            self.lifecycle
+                .begin_drain(&previous, snapshot.revision(), deadline, |state| {
+                    anyhow::ensure!(
+                        state.pending().is_empty(),
+                        "original launches remain unresolved"
+                    );
+                    Ok(())
+                })?;
+            let fenced = self.lifecycle.snapshot(deadline)?;
+            // Actual original resource exclusion and Recovery are retained in
+            // self.resources. This retires only old coordination metadata; it
+            // deliberately does not call the live Child-collection API.
+            self.lifecycle.retire_after_resource_reconciliation(
+                &previous,
+                fenced.revision(),
+                deadline,
+                |state| {
+                    let _actual_resource_recovery = self.resources.recovery;
+                    anyhow::ensure!(
+                        state.pending().is_empty(),
+                        "original launches remain unresolved"
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+        self.lifecycle
+            .prepare_generation_after_reconciliation(&self.generation, deadline)
+    }
+
+    async fn start_owned_services(&mut self) -> Result<()> {
+        self.prepare_metadata_before_spawn()?;
+        let (ready_tx, ready_rx) = oneshot::channel();
+        self.signer = Some(SignerSupervisionHandle::spawn(
+            self.cfg.clone(),
+            self.daemon.clone(),
+            ready_tx,
+            self.resources.binding.clone(),
+        ));
+        ready_rx
+            .await
+            .context("original signer supervisor stopped before readiness")??;
+        let restored =
+            HostAgentDaemon::restore_journaled_registrations_shared(self.daemon.clone()).await?;
+        anyhow::ensure!(
+            restored == self.startup_journal_count,
+            "canonical journal inventory changed during startup"
+        );
+        // Stage the real bound listener before Active; no accept loop exists
+        // yet, and local activation remains closed throughout preparation.
+        let listener =
+            mvm_hostd::broker::daemon::bind_host_agent_listener(&self.cfg.control_socket, 0o700)?;
+        let deadline = Instant::now() + LIFECYCLE_IO_BUDGET;
+        let _inventory = mvm_hostd::host_agent_idle::checked_session_inventory(
+            &self.resources.home,
+            &self.cfg.tenant_id,
+            deadline,
+        )?;
+        self.lifecycle
+            .activate_after_reconciliation(&self.generation, deadline)?;
+        let gate = mvm_core::tenant_lifecycle::TenantLifecycleGate::new(
+            &self.resources.home,
+            &self.cfg.tenant_id,
+        )?;
+        gate.with_active(&self.generation, deadline, || {
+            self.daemon
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("original daemon readiness contended"))?
+                .open_local_admission(&self.generation)
+        })?;
+        self.control = Some(ControlLoopHandle::spawn(self.daemon.clone(), listener));
+        self.watchers = Some(WatcherSet::spawn(
+            self.daemon.clone(),
+            self.cfg.tenant_id.clone(),
+            self.resources.binding.clone(),
+        ));
+        tracing::info!(tenant_id = %self.cfg.tenant_id, registrations = restored, "host-agent original services Active");
+        Ok(())
+    }
+
+    fn begin_drain(&self, idle: bool) -> Result<Option<Instant>> {
+        let grace_deadline = Instant::now() + COOPERATIVE_DRAIN_GRACE;
+        let metadata_deadline = Instant::now() + LIFECYCLE_IO_BUDGET;
+        let snapshot = self.lifecycle.snapshot(metadata_deadline)?;
+        anyhow::ensure!(
+            snapshot.generation() == &self.generation,
+            "original coordinator generation changed"
+        );
+        let inventory = if idle {
+            Some(mvm_hostd::host_agent_idle::checked_session_inventory(
+                &self.resources.home,
+                &self.cfg.tenant_id,
+                metadata_deadline,
+            )?)
+        } else {
+            None
+        };
+        let checked = std::cell::Cell::new(false);
+        let fenced = self.lifecycle.begin_drain(
+            &self.generation,
+            snapshot.revision(),
+            metadata_deadline,
+            |state| {
+                let daemon = self
+                    .daemon
+                    .try_lock()
+                    .map_err(|_| anyhow::anyhow!("original daemon drain check contended"))?;
+                if let Some(inventory) = &inventory {
+                    daemon.require_no_injected_mailbox_owner()?;
+                    anyhow::ensure!(
+                        state.pending().is_empty() && inventory.owned_running() == 0,
+                        "original canonical session work remains live"
+                    );
+                    anyhow::ensure!(
+                        daemon.checked_registration_count()? == 0 && !daemon.has_accepted_work()?,
+                        "original daemon work remains live"
+                    );
+                    if let Some(watchers) = &self.watchers {
+                        anyhow::ensure!(
+                            !watchers.has_inflight_jobs()?,
+                            "original watcher job remains live"
+                        );
+                    }
+                }
+                // Only staged original checks occurred. This local marker
+                // distinguishes refused idle from uncertainty after state I/O.
+                checked.set(true);
+                Ok(())
+            },
+        );
+        if let Err(error) = fenced {
+            if idle && !checked.get() {
+                let current = self.lifecycle.snapshot(metadata_deadline)?;
+                if current.generation() == &self.generation
+                    && current.phase() == mvm_core::tenant_lifecycle::LifecyclePhase::Active
+                {
+                    return Ok(None);
+                }
+            }
+            return Err(error).context("original global drain fence unresolved");
+        }
+        // Global Draining is durable. The async collection path installs its
+        // local fence outside the file gate, retaining this original grace even
+        // if the daemon mutex is temporarily unavailable.
+        Ok(Some(grace_deadline))
+    }
+
+    async fn collect_originals(&mut self) -> Result<()> {
+        // Usage counters cannot stand in for the injected owner's actual
+        // receipt. This production path currently has no injected child owner.
+        {
+            let mut daemon = self.daemon.lock().await;
+            daemon.close_local_admission()?;
+            daemon.require_no_injected_mailbox_owner()?;
+        }
+        if let Some(watchers) = self.watchers.as_mut() {
+            watchers.drain().await?;
+        }
+        if self.services_receipt.is_none() {
+            self.services_receipt = Some(self.custody.drain_services().await?);
+        }
+        let pending = self
+            .lifecycle
+            .snapshot(Instant::now() + LIFECYCLE_IO_BUDGET)?;
+        anyhow::ensure!(
+            pending.generation() == &self.generation
+                && pending.phase() == mvm_core::tenant_lifecycle::LifecyclePhase::Draining
+                && pending.pending().is_empty(),
+            "original launch cleanup remains unresolved"
+        );
+        // Keep the original cleanup/query listener and signer alive if any
+        // previously accepted turn is still unresolved. Final loop ownership
+        // rechecks again after stopping acceptance to cover a late cleanup turn.
+        self.accepted.drain().await?;
+        if let Some(control) = self.control.as_mut() {
+            control.drain().await?;
+        }
+        self.accepted.drain().await?;
+        if let Some(signer) = self.signer.as_mut() {
+            signer.drain().await?;
+        }
+        if !self.resource_finished {
+            self.resources
+                .owner
+                .finish(self.resources.epoch)
+                .context("original host-agent resource holders remain unresolved")?;
+            self.resource_finished = true;
+        }
+        // This is the live-owner path. Historical crash retirement uses the
+        // distinct resource-reconciliation API, never this collection method.
+        self.lifecycle.finish_drain_after_collection(
+            &self.generation,
+            Instant::now() + LIFECYCLE_IO_BUDGET,
+            |_| Ok(()),
+        )?;
+        Ok(())
+    }
+
+    async fn finish_after_fence(&mut self, grace_deadline: Instant) {
+        if let Some(watchers) = &self.watchers {
+            watchers.request_stop();
+        }
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(grace_deadline),
+            self.collect_originals(),
+        )
         .await
-        .context("mvm-signer-helper supervisor stopped before readiness")??;
-    let restored = {
-        let mut daemon = daemon.lock().await;
-        daemon.restore_journaled_registrations()
-    }?;
-    tracing::info!(
-        tenant_id = %cfg.tenant_id,
-        registrations = restored,
-        "mvm-host-agent registration journal restored"
-    );
-    let watched_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    tokio::spawn(mvm_hostd::host_agent_idle::run_idle_watcher(
-        daemon.clone(),
-        watched_sessions.clone(),
-        mvm_hostd::host_agent_idle::idle_timeout(),
-    ));
-    tokio::spawn(mvm_hostd::host_agent_idle::run_session_watcher(
-        cfg.tenant_id.clone(),
-        watched_sessions,
-    ));
-    tokio::spawn(mvm_hostd::host_agent_idle::run_health_watcher(
-        daemon.clone(),
-    ));
-    HostAgentDaemon::run_shared(daemon, &cfg.control_socket).await?;
+        {
+            Ok(Ok(())) => return,
+            Ok(Err(_)) | Err(_) => {
+                // The original grace is not renewed. This is a distinct
+                // bounded metadata I/O budget, not another cleanup grace.
+                let persisted = self
+                    .lifecycle
+                    .mark_unresolved(&self.generation, Instant::now() + LIFECYCLE_IO_BUDGET)
+                    .is_ok();
+                tracing::error!(
+                    persisted,
+                    "host-agent shutdown unresolved; original coordinator retained"
+                );
+            }
+        }
+        // Cancellation-safe owners cache actual completed joins/statuses. Wait
+        // those same owners after grace, without a timer/restart/credit refund.
+        if self.collect_originals().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
-    Ok(())
+enum WorkerExit {
+    Idle,
+}
+
+enum WorkerEvent {
+    Idle(Result<Option<IdleProposal>>),
+    Control(Result<()>),
+}
+
+impl WorkerCoordinator {
+    async fn drain_error(&mut self, error: anyhow::Error) -> Result<WorkerExit> {
+        let grace = match self.begin_drain(false) {
+            Ok(Some(deadline)) => deadline,
+            Ok(None) | Err(_) => {
+                tracing::error!(
+                    "original global drain fence unresolved; live service coordinator retained"
+                );
+                // No publication success, exit, replacement or renewed grace
+                // is inferred from an unsuccessful global fence.
+                std::future::pending::<()>().await;
+                unreachable!("retained unresolved global fence cannot return");
+            }
+        };
+        self.finish_after_fence(grace).await;
+        Err(error)
+    }
+
+    async fn run(&mut self) -> Result<WorkerExit> {
+        if let Err(error) = self.start_owned_services().await {
+            return self.drain_error(error).await;
+        }
+        loop {
+            let event = {
+                let control = self
+                    .control
+                    .as_mut()
+                    .context("original control loop absent")?;
+                let watchers = self
+                    .watchers
+                    .as_mut()
+                    .context("original watcher set absent")?;
+                tokio::select! {
+                    result = control.observe_exit() => WorkerEvent::Control(result),
+                    proposal = watchers.idle_proposal() => WorkerEvent::Idle(proposal),
+                }
+            };
+            match event {
+                WorkerEvent::Control(result) => {
+                    let error = result.err().unwrap_or_else(|| {
+                        anyhow::anyhow!("original control loop stopped unexpectedly")
+                    });
+                    return self.drain_error(error).await;
+                }
+                WorkerEvent::Idle(Err(error)) => return self.drain_error(error).await,
+                WorkerEvent::Idle(Ok(None)) => continue,
+                WorkerEvent::Idle(Ok(Some(proposal))) => {
+                    let _original_idle_observation = proposal.observed_at();
+                    match self.begin_drain(true) {
+                        Ok(Some(deadline)) => {
+                            self.finish_after_fence(deadline).await;
+                            return Ok(WorkerExit::Idle);
+                        }
+                        Ok(None) => self
+                            .watchers
+                            .as_mut()
+                            .context("original watcher set absent")?
+                            .rearm_idle()?,
+                        Err(_) => {
+                            tracing::error!(
+                                "idle fence unresolved; original live service coordinator retained"
+                            );
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_worker_once(cfg: HostAgentConfig) -> Result<WorkerExit> {
+    let mut coordinator = WorkerCoordinator::open(cfg)?;
+    // The owner is outside every cancellation-prone grace/operation future.
+    // Returning is possible only after the coordinator's actual drain path.
+    coordinator.run().await
 }
 
 async fn supervise_worker(cfg: HostAgentConfig, raw_cfg: Vec<u8>) -> Result<()> {
@@ -829,7 +1643,11 @@ fn main() -> Result<()> {
         .build()
         .context("mvm-host-agent supervisor tokio runtime build failed")?;
     if is_worker_mode() {
-        runtime.block_on(run_worker_once(cfg))?;
+        match runtime.block_on(run_worker_once(cfg))? {
+            WorkerExit::Idle => {
+                std::process::exit(mvm_hostd::host_agent_idle::IDLE_SHUTDOWN_EXIT_CODE)
+            }
+        }
     } else {
         runtime.block_on(supervise_worker(cfg, raw))?;
     }
