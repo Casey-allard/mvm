@@ -34,6 +34,16 @@ be read or parsed, rather than silently omitting stopped entries or metadata.
 A missing registry remains a valid empty initial registry. Bulk-stop target
 discovery stays best-effort and excludes registry-only entries.
 
+On Unix, local launch, persistent definition creation, persistent start and
+image-rootfs materialization prepare the selected `MVM_HOME` before their
+configuration, key, cache or definition writes. An absent home is exclusively
+created with private permissions and the canonical `local` resource-owner
+record. `MVM_TENANT` remains an audit label and does not change that namespace.
+Constructing a `LocalBackend` creates no home. An existing private home is held
+without repairing or initializing missing owner metadata; child-bearing startup
+still needs canonical admission and explicit reconciliation of legacy state.
+Filesystem preparation alone does not start a service or grant guest access.
+
 `input_journal` owns the encrypted machine-exec journal and its per-machine
 lock for execution, checkpoint cursors, and replay. An absent journal is an
 empty history; an unreadable journal or dangling journal symlink is an error.

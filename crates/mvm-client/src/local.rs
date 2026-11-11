@@ -305,6 +305,20 @@ impl LocalBackend {
     }
 }
 
+/// Prepare filesystem custody for the SDK's existing canonical local tenant
+/// before effectful configuration/cache/definition work. This is not native
+/// child admission or service readiness; existing homes remain unverified.
+#[cfg(unix)]
+pub(crate) fn prepare_local_home() -> Result<mvm_vmm::host::host_agent_installation::HomePreparation>
+{
+    let home = mvm_core::config::mvm_home_strict().map_err(backend_err)?;
+    mvm_vmm::host::host_agent_installation::prepare_home(
+        &home,
+        mvm_core::plan::synthesis::DEFAULT_TENANT,
+    )
+    .map_err(|error| backend_err(format!("preparing canonical local home: {error}")))
+}
+
 /// Restore a machine's sealed snapshot and admit its guest, or refuse it.
 ///
 /// From just before the restore until the guest is admitted or refused, an
@@ -915,6 +929,8 @@ pub fn set_machine_expiry(name: &str, expires_at: Option<String>) -> Result<()> 
 ///
 /// `cache_key` names the cache slot under `~/.mvm/cache/local-run/`.
 pub async fn materialize_image_rootfs(image_ref: &str, cache_key: &str) -> Result<PathBuf> {
+    #[cfg(unix)]
+    let _home = prepare_local_home()?;
     resolve_local_rootfs(
         &RootfsSource::Oci {
             image_ref: image_ref.to_string(),

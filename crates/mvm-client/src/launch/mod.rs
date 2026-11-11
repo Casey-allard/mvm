@@ -826,6 +826,8 @@ impl LocalBackend {
     /// requests persist their definition first, then boot from it — both
     /// through the one canonical signed-admission seam.
     pub async fn launch(&self, request: LaunchRequest) -> Result<LaunchOutcome> {
+        #[cfg(unix)]
+        let _home = crate::local::prepare_local_home()?;
         if let LaunchSource::RegistryPack { pin } = &request.source {
             let backend = self.launch_backend(request.backend.as_deref())?;
             built_pack::resolve_built_pack_image(pin, backend.name(), &request.profile)
@@ -868,6 +870,8 @@ impl LocalBackend {
             });
         }
         let name = persistent_name(request)?;
+        #[cfg(unix)]
+        let _home = crate::local::prepare_local_home()?;
         let (spec, _) = self.create_definition(request, &name)?;
         Ok(MachineState {
             id: MachineId(name.clone()),
@@ -1239,6 +1243,8 @@ impl LocalBackend {
             });
         }
         ensure_spec_bootable_in_process(&spec)?;
+        #[cfg(unix)]
+        let _home = crate::local::prepare_local_home()?;
         self.validate_sidecar_refs(name)?;
         let mut spec = spec;
         let (_, backend) = self.boot_spec(&mut spec, None, false, None).await?;

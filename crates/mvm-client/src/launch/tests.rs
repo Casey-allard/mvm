@@ -26,6 +26,12 @@ struct Isolated {
 impl Isolated {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private existing fixture home");
+        }
         let mut env = TestEnv::new();
         env.isolate_mvm_home(dir.path());
         Self { _env: env, dir }
@@ -139,6 +145,37 @@ async fn listed_names(client: &LocalBackend) -> Vec<String> {
 }
 
 // ── Transient lifecycle ─────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn fresh_sdk_definition_prepares_only_its_canonical_local_tenant() {
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let parent = parent.path().canonicalize().expect("canonical parent");
+    let home = parent.join("fresh-sdk-home");
+    let mut env = TestEnv::new();
+    env.isolate_mvm_home(&home);
+    env.set("MVM_TENANT", "not-the-sdk-tenant");
+    let rootfs = parent.join("rootfs.ext4");
+    std::fs::write(&rootfs, b"hashable-rootfs-bytes\n").expect("rootfs fixture");
+    let client = mock_client();
+    assert!(!home.exists(), "constructing a client must remain pure");
+    let request = persistent_request(&rootfs.to_string_lossy(), "fresh-definition")
+        .build()
+        .expect("request");
+
+    let machine = client
+        .create_from_request(&request)
+        .expect("persist definition without a guest");
+    assert_eq!(machine.status, MachineStatus::Stopped);
+    let labels = mvm_vmm::host::host_agent_installation::descriptor(&home, LOCAL_TENANT)
+        .expect("selected private home");
+    let owner = mvm_vmm::host::installed_owner::InstallationOwner::open(&labels.root, labels.key)
+        .expect("fresh SDK home must be provisioned before definition writers");
+    let snapshot = owner.snapshot().expect("original Clean resource record");
+    assert_eq!(snapshot.phase, mvm_vmm::host::installed_owner::Phase::Clean);
+    assert_eq!(snapshot.epoch, 0);
+    assert!(!home.join("host-agent/not-the-sdk-tenant").exists());
+}
 
 #[tokio::test]
 async fn transient_launch_boots_admitted_and_audited() {
