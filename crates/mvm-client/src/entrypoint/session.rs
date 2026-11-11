@@ -83,11 +83,16 @@ pub fn start_session(
     let mut record = SessionRecord::new_running(&booted.vm.vm_name, slot, mode);
     record.idle_timeout_secs = idle_timeout_secs;
     record.ephemeral = ephemeral;
-    if let Err(e) = session::write_session(&record) {
+    if let Err(e) = booted.publish_running(&record) {
         let err = anyhow::anyhow!("registering session: {e}");
         // The boot was admitted, so its session ends here, as a failed start.
         match stop_session_vm(&booted.vm) {
-            Ok(()) => crate::admission::emit_failed(&booted.admission, "session-register", &err),
+            Ok(()) => {
+                if let Err(settlement) = booted.settle_after_backend_cleanup() {
+                    tracing::warn!(error = %format!("{settlement:#}"), "stopped session launch remains pending reconciliation");
+                }
+                crate::admission::emit_failed(&booted.admission, "session-register", &err);
+            }
             Err(stop) => crate::launch::record_unsealed_end(
                 Some((&booted.admission.emitter, booted.admission.admitted.plan())),
                 crate::launch::UnsealedEnd::new(
@@ -257,6 +262,13 @@ pub fn call_session(
 /// # Errors
 /// A malformed id, no such session, or one that is not running.
 pub fn kill_session(raw_id: &str) -> Result<SessionRecord> {
+    kill_session_with(raw_id, stop_session_vm)
+}
+
+fn kill_session_with(
+    raw_id: &str,
+    stop: impl FnOnce(&SessionVm) -> Result<()>,
+) -> Result<SessionRecord> {
     let record = session_for_stop(raw_id)?;
     let id = record.id.clone();
     session::update_session(&id, |r| {
@@ -264,7 +276,7 @@ pub fn kill_session(raw_id: &str) -> Result<SessionRecord> {
         Ok(())
     })
     .context("updating session record before kill")?;
-    end_session_vm(&record.vm_name);
+    end_session_vm_with(&record.vm_name, stop);
     audit_emit(
         LocalAuditKind::SessionKill,
         Some(&record.vm_name),
@@ -306,6 +318,10 @@ pub fn session_for_stop(raw_id: &str) -> Result<SessionRecord> {
 /// Best-effort throughout: one session's failure never stops the sweep.
 #[must_use]
 pub fn reap_expired_sessions() -> Vec<SessionId> {
+    reap_expired_sessions_with(stop_session_vm)
+}
+
+fn reap_expired_sessions_with(mut stop: impl FnMut(&SessionVm) -> Result<()>) -> Vec<SessionId> {
     let now = chrono::Utc::now();
     let candidates = match session::list_expired_session_ids(now) {
         Ok(ids) => ids,
@@ -324,7 +340,7 @@ pub fn reap_expired_sessions() -> Vec<SessionId> {
                 continue;
             }
         };
-        end_session_vm(&record.vm_name);
+        end_session_vm_with(&record.vm_name, &mut stop);
         forget_call_lock(&id);
         reaped.push(id);
     }
@@ -646,7 +662,16 @@ mod tests {
         session::write_session(&stale).expect("write");
         mvm_hostd::audit::plan_persist::write_plan("vm-sealed", &plan).expect("persist plan");
 
-        assert_eq!(reap_expired_sessions(), vec![stale.id.clone()]);
+        // This audit unit supplies an acknowledged mock backend stop. It does
+        // not boot a VM or infer collection from a host-default backend.
+        assert_eq!(
+            reap_expired_sessions_with(|vm| {
+                assert_eq!(vm.vm_name, stale.vm_name);
+                assert_eq!(session_info(stale.id.as_str())?.state, SessionState::Reaped);
+                Ok(())
+            }),
+            vec![stale.id.clone()]
+        );
         let chain = std::fs::read_to_string(mvm_hostd::audit::emitter::audit_path_for_tenant(
             &mvm_core::config::mvm_audit_dir(),
             &plan.tenant.0,
@@ -693,7 +718,15 @@ mod tests {
         let plan = admitted_session_plan("vm-killed-sealed");
         let record = running("vm-killed-sealed", SessionMode::Prod);
 
-        kill_session(record.id.as_str()).expect("killed");
+        kill_session_with(record.id.as_str(), |vm| {
+            assert_eq!(vm.vm_name, record.vm_name);
+            assert_eq!(
+                session_info(record.id.as_str())?.state,
+                SessionState::Killed
+            );
+            Ok(())
+        })
+        .expect("mock backend acknowledged stop");
 
         assert_eq!(
             seal_reasons(&plan),
@@ -731,12 +764,57 @@ mod tests {
     }
 
     #[test]
+    fn public_kill_and_reap_leave_missing_original_backends_unsealed() {
+        for reap in [false, true] {
+            let _home = isolated();
+            let vm = if reap {
+                "public-reap-no-backend"
+            } else {
+                "public-kill-no-backend"
+            };
+            let plan = admitted_session_plan(vm);
+            let mut record = running(vm, SessionMode::Prod);
+            assert!(mvm_runtime::AnyBackend::for_started_vm(vm).is_none());
+            if reap {
+                record.idle_timeout_secs = 60;
+                record.started_at = (chrono::Utc::now() - chrono::Duration::seconds(900))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                session::write_session(&record).expect("expired session");
+                assert_eq!(reap_expired_sessions(), vec![record.id.clone()]);
+            } else {
+                kill_session(record.id.as_str()).expect("kill recorded");
+            }
+            let signer = mvm_hostd::audit::host_keypair::load_or_init().expect("signer");
+            let report = mvm_hostd::audit::session::verify_session(
+                &mvm_core::config::mvm_audit_dir(),
+                &plan.tenant.0,
+                &plan.plan_id.0,
+                &signer.verifying,
+            );
+            assert_eq!(report.verdict, mvm_hostd::audit::session::Verdict::Unsealed);
+            let chain = std::fs::read_to_string(mvm_hostd::audit::emitter::audit_path_for_tenant(
+                &mvm_core::config::mvm_audit_dir(),
+                &plan.tenant.0,
+            ))
+            .expect("audit chain");
+            assert!(chain.contains("plan.teardown_failed"));
+            assert!(chain.contains("stop-failed"));
+            assert!(chain.contains("original session backend unavailable"));
+            assert!(!chain.contains("session.sealed"));
+        }
+    }
+
+    #[test]
     fn a_session_with_no_persisted_plan_records_why_it_has_no_seal() {
         let _home = isolated();
         let plan = admitted_session_plan("vm-other");
         let record = running("vm-no-plan", SessionMode::Prod);
 
-        kill_session(record.id.as_str()).expect("killed");
+        kill_session_with(record.id.as_str(), |vm| {
+            assert_eq!(vm.vm_name, record.vm_name);
+            Ok(())
+        })
+        .expect("mock backend acknowledged stop");
 
         let chain = std::fs::read_to_string(mvm_hostd::audit::emitter::audit_path_for_tenant(
             &mvm_core::config::mvm_audit_dir(),

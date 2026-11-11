@@ -889,7 +889,8 @@ pub(crate) fn stop_session_vm(vm: &SessionVm) -> Result<()> {
     // The marker in the VM's state dir names the backend that actually
     // launched it. Falling back to the host default would send the stop to
     // the wrong VMM and leave the guest running.
-    let backend = AnyBackend::for_started_vm(&vm.vm_name).unwrap_or_else(AnyBackend::auto_select);
+    let backend =
+        AnyBackend::for_started_vm(&vm.vm_name).context("original session backend unavailable")?;
     backend.stop(&VmId(vm.vm_name.clone())).map(|_| ())
 }
 
@@ -900,6 +901,31 @@ mod caller_registration_live_hvf;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_original_session_backend_never_selects_the_host_default() {
+        let mut environment = mvm_core::util::test_env::TestEnv::new();
+        let home = tempfile::tempdir().expect("owned isolated home");
+        environment.isolate_mvm_home(home.path());
+        let vm_name = "owned-missing-backend-fixture";
+        mvm_core::config::create_private_dir(mvm_core::config::vm_state_dir(vm_name))
+            .expect("owned empty VM namespace");
+        assert!(
+            AnyBackend::for_started_vm(vm_name).is_none(),
+            "fixture must have no original backend marker"
+        );
+        match stop_session_vm(&SessionVm {
+            vm_name: vm_name.into(),
+        }) {
+            Ok(()) => {
+                panic!("missing-backend fallback acknowledged stop without any original backend")
+            }
+            Err(error) => assert!(
+                format!("{error:#}").contains("original session backend unavailable"),
+                "missing-backend stop must refuse before selecting a host-default driver: {error:#}"
+            ),
+        }
+    }
 
     #[test]
     fn legacy_hvf_refuses_before_launch_but_owned_hvf_passes_gate() {

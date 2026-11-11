@@ -758,6 +758,12 @@ pub struct FileLock {
 }
 
 impl FileLock {
+    /// Metadata of the actual opened lock inode, for identity validation.
+    /// This exposes neither the descriptor nor permission to release its lock.
+    pub fn metadata(&self) -> std::io::Result<fs::Metadata> {
+        self._file.metadata()
+    }
+
     /// Acquire an exclusive lock for operations on `path`.
     ///
     /// Creates `<path>.lock` if it doesn't exist, then acquires an exclusive

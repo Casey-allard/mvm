@@ -55,6 +55,8 @@ pub mod framing;
 pub mod health_probe;
 /// Idle-registration self-termination logic for the `mvm-host-agent` worker.
 pub mod host_agent_idle;
+/// Canonical plan coverage shared by admission and checked inventory.
+pub mod host_agent_lifecycle;
 #[cfg(unix)]
 pub mod watcher_jobs;
 /// Session idle-timeout enforcement by the host agent, for the backends with

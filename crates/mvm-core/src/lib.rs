@@ -76,6 +76,8 @@ pub mod kernel_format;
 pub mod launch_trace;
 /// Canonical mailbox codec, cryptography, capability checks, and replay seam.
 pub mod mailbox;
+/// Private bounded coordination for admitted tenant launches and daemon drain.
+pub mod tenant_lifecycle;
 /// Shared backoff for polls that wait on a condition.
 pub mod poll_backoff;
 /// Per-VM host bounds on a VMM process through a transient systemd scope on

@@ -14,9 +14,15 @@
 //! entire result on failure; observer housekeeping is not a completion proof.
 
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use mvm_core::session::{SessionId, SessionMode};
+use mvm_core::tenant_lifecycle::{LaunchReservation, TenantLifecycleGate};
+use mvm_core::vm_backend::BackendKind;
+use mvm_hostd::host_agent_lifecycle::{
+    LifecycleCoverage as LaunchOwnership, classify_admitted_plan,
+};
 
 use super::admission::EntrypointAdmission;
 use super::boot::{
@@ -59,6 +65,106 @@ pub struct BootedEntrypoint {
     pub vm: SessionVm,
     /// The admitted plan and its audit emitter.
     pub admission: AdmissionContext,
+    lifecycle: RefCell<LaunchLifecycle>,
+}
+
+enum LaunchLifecycle {
+    Covered(LaunchReservation),
+    KnownOther(BackendKind),
+}
+
+fn launch_ownership(context: &AdmissionContext) -> Result<LaunchOwnership> {
+    classify_admitted_plan(context.admitted.plan())
+}
+
+fn lifecycle_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(1)
+}
+
+fn reserve_launch_lifecycle(
+    context: &AdmissionContext,
+    ensure_daemon: impl FnOnce(&str) -> Result<()>,
+) -> Result<LaunchLifecycle> {
+    match launch_ownership(context)? {
+        LaunchOwnership::Covered => {
+            let plan = context.admitted.plan();
+            ensure_daemon(&plan.tenant.0)?;
+            let gate = TenantLifecycleGate::new(mvm_core::config::mvm_home(), &plan.tenant.0)?;
+            Ok(LaunchLifecycle::Covered(gate.reserve_launch(
+                &plan.workload.0,
+                &plan.plan_id.0,
+                lifecycle_deadline(),
+            )?))
+        }
+        LaunchOwnership::KnownOther(backend) => Ok(LaunchLifecycle::KnownOther(backend)),
+    }
+}
+
+impl LaunchLifecycle {
+    fn verify_original(
+        &self,
+        context: &AdmissionContext,
+        record: &mvm_core::session::SessionRecord,
+    ) -> Result<LaunchOwnership> {
+        let plan = context.admitted.plan();
+        anyhow::ensure!(
+            record.vm_name == plan.workload.0,
+            "session does not match the original admitted VM"
+        );
+        match (self, launch_ownership(context)?) {
+            (Self::Covered(reservation), LaunchOwnership::Covered) => {
+                anyhow::ensure!(
+                    reservation.plan_id() == plan.plan_id.0,
+                    "session reservation belongs to another admitted plan"
+                );
+                Ok(LaunchOwnership::Covered)
+            }
+            (Self::KnownOther(original), LaunchOwnership::KnownOther(current))
+                if *original == current =>
+            {
+                Ok(LaunchOwnership::KnownOther(current))
+            }
+            _ => anyhow::bail!("session lifecycle does not match its original admitted ownership"),
+        }
+    }
+
+    fn publish(
+        &mut self,
+        context: &AdmissionContext,
+        record: &mvm_core::session::SessionRecord,
+    ) -> Result<()> {
+        self.verify_original(context, record)?;
+        match self {
+            Self::Covered(reservation) => reservation.publish_running(record, lifecycle_deadline()),
+            Self::KnownOther(_) => mvm_core::session::write_session(record),
+        }
+    }
+}
+
+impl BootedEntrypoint {
+    pub(super) fn publish_running(&self, record: &mvm_core::session::SessionRecord) -> Result<()> {
+        self.lifecycle
+            .try_borrow_mut()
+            .context("original lifecycle is already in use")?
+            .publish(&self.admission, record)
+    }
+
+    pub(super) fn settle_after_backend_cleanup(&self) -> Result<()> {
+        match &mut *self
+            .lifecycle
+            .try_borrow_mut()
+            .context("original lifecycle is already in use")?
+        {
+            LaunchLifecycle::Covered(reservation) => {
+                anyhow::ensure!(
+                    reservation.plan_id() == self.admission.admitted.plan().plan_id.0,
+                    "cleanup reservation belongs to another admitted plan"
+                );
+                reservation.settle_after_original_cleanup(lifecycle_deadline(), || Ok(()))
+            }
+            LaunchLifecycle::KnownOther(_) => Ok(()),
+        }
+    }
 }
 
 /// Caller-owned host result, retained before any ABI/JSON mapping. A failed
@@ -590,9 +696,17 @@ pub fn boot_entrypoint_vm(
     } = vm;
     let backend_name = admission.backend_name().to_string();
     let admitted: RefCell<Option<AdmissionContext>> = RefCell::new(None);
+    let lifecycle = RefCell::new(None);
     let admit = |inputs: AdmitInputs<'_>| -> Result<Option<SessionAuditSubstrate>> {
         let entry = admission.admit(inputs)?;
         *admitted.borrow_mut() = Some(entry.context);
+        *lifecycle.borrow_mut() = Some(reserve_launch_lifecycle(
+            admitted
+                .borrow()
+                .as_ref()
+                .context("original entrypoint admission is absent")?,
+            |tenant| mvm_runtime::ensure_host_agent_daemon(tenant).map(|_| ()),
+        )?);
         Ok(Some(entry.substrate))
     };
     let boot = SessionBoot::builder(slot, vm_name)
@@ -611,10 +725,18 @@ pub fn boot_entrypoint_vm(
                 tear_down_session_vm(vm);
                 anyhow::bail!("the entrypoint VM booted without an admitted plan");
             };
+            let Some(lifecycle) = lifecycle.borrow_mut().take() else {
+                tear_down_session_vm(vm);
+                let error =
+                    anyhow::anyhow!("entrypoint VM booted without its admitted lifecycle binding");
+                emit_failed(&context, "lifecycle-binding", &error);
+                return Err(error);
+            };
             emit_launched(&context, &backend_name, true);
             Ok(BootedEntrypoint {
                 vm,
                 admission: context,
+                lifecycle: RefCell::new(lifecycle),
             })
         }
         Err(e) => {
@@ -710,7 +832,20 @@ fn run_entrypoint_call_recording(
         CallLifecycle::Transient => SessionMode::Prod,
         CallLifecycle::KeepAlive { mode } => mode,
     };
-    let session_id = register_call_session(&vm_name, slot, mode);
+    let session_id = match register_call_session(&booted, slot, mode) {
+        Ok(id) => id,
+        Err(refusal) => {
+            let stopped = end_transient_call(&booted, &backend_name, CallEnd::NOT_RUN, observer);
+            let refusal = match &stopped {
+                Ok(()) => match booted.settle_after_backend_cleanup() {
+                    Ok(()) => refusal,
+                    Err(settlement) => refusal.context(format!("VM stop acknowledged; pending launch settlement remains uncertain: {settlement:#}")),
+                },
+                Err(_) => refusal,
+            };
+            return finish_transient_result(Err(refusal), stopped, None);
+        }
+    };
     // Agent-wait teardown is best-effort and does not return its stop result.
     // On failure retain the session record: removing it would hide a VM whose
     // stop is unconfirmed. This path emits no stop-acknowledgement observation.
@@ -893,18 +1028,34 @@ fn close_call_session_checked(
     Ok(())
 }
 
-/// Register a session record for a call. `None` when the record could not be
-/// written: the call still runs, it just is not visible to `session ls`.
-fn register_call_session(vm_name: &str, workload_id: &str, mode: SessionMode) -> Option<SessionId> {
-    let record = mvm_core::session::SessionRecord::new_running(vm_name, workload_id, mode);
+/// Covered publication failure fences dispatch and follows the original stop
+/// path. Known-other calls retain their existing optional session visibility.
+fn register_call_session(
+    booted: &BootedEntrypoint,
+    workload_id: &str,
+    mode: SessionMode,
+) -> Result<Option<SessionId>> {
+    let record =
+        mvm_core::session::SessionRecord::new_running(&booted.vm.vm_name, workload_id, mode);
     let id = record.id.clone();
-    match mvm_core::session::write_session(&record) {
-        Ok(()) => Some(id),
-        Err(e) => {
-            tracing::warn!(err = %e, "failed to register entrypoint call session");
-            None
-        }
+    if matches!(
+        booted
+            .lifecycle
+            .try_borrow()
+            .context("original lifecycle is already in use")?
+            .verify_original(&booted.admission, &record)?,
+        LaunchOwnership::KnownOther(_)
+    ) {
+        return match mvm_core::session::write_session(&record) {
+            Ok(()) => Ok(Some(id)),
+            Err(error) => {
+                tracing::warn!(err = %error, "failed to register entrypoint call session");
+                Ok(None)
+            }
+        };
     }
+    booted.publish_running(&record)?;
+    Ok(Some(id))
 }
 
 /// Remove a call's session record — unless something already moved it off
@@ -1158,10 +1309,130 @@ mod tests {
         (env, home)
     }
 
+    fn fixture_booted(admission: AdmissionContext) -> BootedEntrypoint {
+        use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecycleGeneration};
+        let home = mvm_core::config::mvm_home();
+        mvm_core::private_fs::create_owned_private_dir(&home).expect("private fixture home");
+        let generation = LifecycleGeneration::new([7; 32], 1).expect("fixture generation");
+        let coordinator = LifecycleCoordinator::prepare_after_exclusion(
+            &home,
+            &admission.admitted.plan().tenant.0,
+            generation.clone(),
+            256,
+            lifecycle_deadline(),
+        )
+        .expect("fixture coordination storage");
+        coordinator
+            .activate_after_reconciliation(&generation, lifecycle_deadline())
+            .expect("fixture Active state");
+        let lifecycle =
+            reserve_launch_lifecycle(&admission, |_| Ok(())).expect("fixture reservation");
+        BootedEntrypoint {
+            vm: SessionVm {
+                vm_name: admission.admitted.plan().workload.0.clone(),
+            },
+            admission,
+            lifecycle: RefCell::new(lifecycle),
+        }
+    }
+
+    fn fixture_call(vm: &str) -> BootedEntrypoint {
+        let keys = tempfile::tempdir().expect("keys");
+        let audit = tempfile::tempdir().expect("audit");
+        fixture_booted(crate::admission::admit_plan_tests::admitted_into(
+            keys.path(),
+            audit.path(),
+            vm,
+        ))
+    }
+
+    #[test]
+    fn missing_lifecycle_never_publishes_a_call_session() {
+        let _home = isolated();
+        let rootfs_dir = tempfile::tempdir().expect("rootfs");
+        let rootfs = rootfs_dir.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"original covered admission").expect("rootfs fixture");
+        let keys = tempfile::tempdir().expect("keys");
+        let audit = tempfile::tempdir().expect("audit");
+        let ledger = mvm_hostd::plan_admission::InMemoryNonceLedger::new();
+        let context =
+            crate::admission::admit_plan_for_boot(crate::admission::AdmitPlanForBootParams {
+                vm_name: "uncoordinated-vm",
+                keys_dir: Some(keys.path()),
+                audit_dir: Some(audit.path()),
+                ..crate::admission::admit_plan_tests::pinning_params(&rootfs, &ledger)
+            })
+            .expect("canonical admission without VM activation");
+        let plan = context.admitted.plan();
+        assert_eq!(
+            mvm_runtime::catalog::descriptor_for_selector(&plan.runtime_profile.0)
+                .expect("known admitted backend")
+                .kind,
+            mvm_core::vm_backend::BackendKind::Firecracker
+        );
+        let published = reserve_launch_lifecycle(&context, |_| Ok(()));
+        assert!(
+            published.is_err(),
+            "a Running session cannot be published without its original lifecycle reservation"
+        );
+        let record = mvm_core::session::SessionRecord::new_running(
+            &plan.workload.0,
+            "slot",
+            SessionMode::Prod,
+        );
+        assert!(
+            LaunchLifecycle::KnownOther(BackendKind::Mock)
+                .publish(&context, &record)
+                .is_err(),
+            "a cached KnownOther label cannot bypass original Covered admission"
+        );
+    }
+
+    #[test]
+    fn known_other_mock_keeps_publication_without_starting_a_host_agent() {
+        let _home = isolated();
+        let rootfs_dir = tempfile::tempdir().expect("rootfs");
+        let rootfs = rootfs_dir.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"original known-other admission").expect("rootfs fixture");
+        let keys = tempfile::tempdir().expect("keys");
+        let audit = tempfile::tempdir().expect("audit");
+        let ledger = mvm_hostd::plan_admission::InMemoryNonceLedger::new();
+        let context =
+            crate::admission::admit_plan_for_boot(crate::admission::AdmitPlanForBootParams {
+                vm_name: "known-other-vm",
+                backend_name: "mock",
+                keys_dir: Some(keys.path()),
+                audit_dir: Some(audit.path()),
+                ..crate::admission::admit_plan_tests::pinning_params(&rootfs, &ledger)
+            })
+            .expect("canonical mock admission");
+        let lifecycle = reserve_launch_lifecycle(&context, |_| {
+            panic!("KnownOther must not establish a daemon")
+        })
+        .expect("known-other lifecycle");
+        let booted = BootedEntrypoint {
+            vm: SessionVm {
+                vm_name: context.admitted.plan().workload.0.clone(),
+            },
+            admission: context,
+            lifecycle: RefCell::new(lifecycle),
+        };
+        register_call_session(&booted, "slot", SessionMode::Prod)
+            .expect("original ungated publication")
+            .expect("visible session");
+        assert!(
+            !mvm_core::config::host_agent_dir(&booted.admission.admitted.plan().tenant.0).exists(),
+            "known-other publication must not initialize daemon lifecycle storage"
+        );
+    }
+
     #[test]
     fn a_call_session_is_registered_running_and_removed_after() {
         let _home = isolated();
-        let id = register_call_session("call-vm", "slot", SessionMode::Prod).expect("registered");
+        let booted = fixture_call("call-vm");
+        let id = register_call_session(&booted, "slot", SessionMode::Prod)
+            .expect("registered")
+            .expect("visible session");
         let record = mvm_core::session::read_session(&id)
             .expect("read")
             .expect("present");
@@ -1177,7 +1448,10 @@ mod tests {
     #[test]
     fn a_killed_call_session_keeps_its_record() {
         let _home = isolated();
-        let id = register_call_session("call-vm", "slot", SessionMode::Prod).expect("registered");
+        let booted = fixture_call("call-vm");
+        let id = register_call_session(&booted, "slot", SessionMode::Prod)
+            .expect("registered")
+            .expect("visible session");
         mvm_core::session::update_session(&id, |r| {
             r.state = SessionState::Killed;
             Ok(())
@@ -1195,7 +1469,10 @@ mod tests {
     #[test]
     fn bumping_a_session_counts_the_call_and_stamps_it() {
         let _home = isolated();
-        let id = register_call_session("call-vm", "slot", SessionMode::Prod).expect("registered");
+        let booted = fixture_call("call-vm");
+        let id = register_call_session(&booted, "slot", SessionMode::Prod)
+            .expect("registered")
+            .expect("visible session");
         bump_invoke_count(&id);
         let record = mvm_core::session::read_session(&id)
             .expect("read")
@@ -1322,18 +1599,15 @@ mod tests {
         let _home = isolated();
         let keys_dir = tempfile::tempdir().expect("keys dir");
         let audit_dir = tempfile::tempdir().expect("audit dir");
-        let booted = BootedEntrypoint {
-            vm: SessionVm {
-                vm_name: "observed-stop".into(),
-            },
-            admission: crate::admission::admit_plan_tests::admitted_into(
-                keys_dir.path(),
-                audit_dir.path(),
-                "observed-stop",
-            ),
-        };
+        let booted = fixture_booted(crate::admission::admit_plan_tests::admitted_into(
+            keys_dir.path(),
+            audit_dir.path(),
+            "observed-stop",
+        ));
         emit_launched(&booted.admission, "mock", true);
-        let session_id = register_call_session("observed-stop", "slot", SessionMode::Prod).unwrap();
+        let session_id = register_call_session(&booted, "slot", SessionMode::Prod)
+            .unwrap()
+            .unwrap();
         let stop_completed = std::cell::Cell::new(false);
         let mut observer = StopObserver {
             expected: &booted.admission.admitted,
@@ -1374,19 +1648,15 @@ mod tests {
         let _home = isolated();
         let keys_dir = tempfile::tempdir().expect("keys dir");
         let audit_dir = tempfile::tempdir().expect("audit dir");
-        let booted = BootedEntrypoint {
-            vm: SessionVm {
-                vm_name: "unconfirmed-stop".into(),
-            },
-            admission: crate::admission::admit_plan_tests::admitted_into(
-                keys_dir.path(),
-                audit_dir.path(),
-                "unconfirmed-stop",
-            ),
-        };
+        let booted = fixture_booted(crate::admission::admit_plan_tests::admitted_into(
+            keys_dir.path(),
+            audit_dir.path(),
+            "unconfirmed-stop",
+        ));
         emit_launched(&booted.admission, "mock", true);
-        let session_id =
-            register_call_session("unconfirmed-stop", "slot", SessionMode::Prod).unwrap();
+        let session_id = register_call_session(&booted, "slot", SessionMode::Prod)
+            .unwrap()
+            .unwrap();
         let stop_completed = std::cell::Cell::new(false);
         let mut observer = StopObserver {
             expected: &booted.admission.admitted,
