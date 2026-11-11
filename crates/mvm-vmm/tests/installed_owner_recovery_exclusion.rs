@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 
 use mvm_vmm::host::installed_owner::{
-    HolderLease, InstallationKey, InstallationOwner, OwnerError, Phase, Recovery,
+    HolderLease, InstallationKey, InstallationOwner, OwnerError, OwnerSnapshot, Phase, Recovery,
 };
 
 fn key() -> InstallationKey {
@@ -114,5 +114,78 @@ fn retained_exclusion_revalidates_original_namespace_without_releasing_its_locks
         "validation refusal cannot release original EX"
     );
     drop(guard);
+    assert!(shared_probe(&probe));
+}
+
+#[test]
+fn original_predecessor_distinguishes_bootstrap_from_retired_and_already_clean_epochs() {
+    let base = tempfile::tempdir().unwrap();
+    fs::set_permissions(base.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let root = base.path().canonicalize().unwrap().join("installation");
+    let mut owner = InstallationOwner::initialize(&root, key()).unwrap();
+    let probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("holders.lock"))
+        .unwrap();
+    {
+        let guard = owner.reconcile_with_exclusion().unwrap();
+        let original = fs::read(root.join("state.bin")).unwrap();
+        assert_eq!(
+            guard.original_predecessor().unwrap(),
+            OwnerSnapshot {
+                phase: Phase::Clean,
+                epoch: 0
+            }
+        );
+        guard.revalidate_for(&root, key()).unwrap();
+        assert!(
+            guard
+                .revalidate_for(&base.path().join("wrong-root"), key())
+                .is_err()
+        );
+        let mut wrong = key();
+        wrong.profile[0] ^= 1;
+        assert!(guard.revalidate_for(&root, wrong).is_err());
+        guard.revalidate_for(&root, key()).unwrap();
+        assert_eq!(fs::read(root.join("state.bin")).unwrap(), original);
+        assert!(!base.path().join("wrong-root").exists());
+        assert!(
+            !shared_probe(&probe),
+            "wrong-scope refusal cannot release original exclusion"
+        );
+    }
+    let epoch = owner.begin().unwrap();
+    {
+        let guard = owner.reconcile_with_exclusion().unwrap();
+        assert_eq!(
+            guard.recovery(),
+            Recovery::Retired {
+                epoch: epoch.generation()
+            }
+        );
+        assert_eq!(
+            guard.original_predecessor().unwrap(),
+            OwnerSnapshot {
+                phase: Phase::Active,
+                epoch: epoch.generation()
+            }
+        );
+        guard.revalidate_for(&root, key()).unwrap();
+        assert!(!shared_probe(&probe));
+    }
+    {
+        let guard = owner.reconcile_with_exclusion().unwrap();
+        assert_eq!(guard.recovery(), Recovery::AlreadyClean);
+        assert_eq!(
+            guard.original_predecessor().unwrap(),
+            OwnerSnapshot {
+                phase: Phase::Clean,
+                epoch: epoch.generation()
+            }
+        );
+        guard.revalidate_for(&root, key()).unwrap();
+        assert!(!shared_probe(&probe));
+    }
     assert!(shared_probe(&probe));
 }

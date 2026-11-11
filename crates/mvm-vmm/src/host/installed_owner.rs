@@ -595,12 +595,29 @@ pub struct RecoveryExclusion<'owner> {
     owner: &'owner mut InstallationOwner,
     _holders: File,
     recovery: Recovery,
+    original_predecessor: OwnerSnapshot,
 }
 
 impl RecoveryExclusion<'_> {
     /// Informational recovery outcome; the value alone retains no exclusion.
     pub fn recovery(&self) -> Recovery {
         self.recovery
+    }
+
+    /// Original facts captured under both exclusions before retirement. The
+    /// copied snapshot alone retains no exclusion or bootstrap authority.
+    pub fn original_predecessor(&self) -> Result<OwnerSnapshot> {
+        self.revalidate()?;
+        Ok(self.original_predecessor)
+    }
+
+    /// Revalidate this same retained exclusion for the canonical caller's
+    /// exact installation binding, without opening or modifying another root.
+    pub fn revalidate_for(&self, root: &Path, key: InstallationKey) -> Result<()> {
+        if self.owner.storage.root != root || self.owner.storage.key != key {
+            return Err(OwnerError::InvalidStorage);
+        }
+        self.revalidate()
     }
 
     /// Recheck the original namespace and Clean record while both original
@@ -800,7 +817,11 @@ impl InstallationOwner {
         let holders = self.holders_for_transition()?;
         // Identity and exact record checks occur again after the independent
         // holders EX acquisition, before any retirement or guard publication.
-        self.current()?;
+        record = self.current()?;
+        let original_predecessor = OwnerSnapshot {
+            phase: record.phase,
+            epoch: record.generation,
+        };
         let recovery = if record.phase == Phase::Clean {
             Recovery::AlreadyClean
         } else {
@@ -815,6 +836,7 @@ impl InstallationOwner {
             owner: self,
             _holders: holders,
             recovery,
+            original_predecessor,
         })
     }
 }
