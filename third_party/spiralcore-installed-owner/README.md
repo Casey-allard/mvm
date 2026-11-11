@@ -64,3 +64,20 @@ an initialization intent until the Clean resource and directory barriers are
 complete. Existing or partial homes require verified opening or explicit
 reconciliation. The receipt grants neither boot authority nor service readiness.
 Canonical CLI/SDK placement and installed-service qualification remain required.
+
+## Retained startup recovery exclusion
+
+`InstallationOwner::reconcile_with_exclusion()` returns an opaque borrowed
+`RecoveryExclusion`, retaining the original owner and a fresh independent
+holders-EX lock even when the record was already Clean. Its mutable borrow
+prevents a new owner epoch until the guard is dropped. `revalidate()` checks
+the original namespace, current Clean record and retained holders-file identity.
+The existing `reconcile()` result remains informational and is not a retained
+recovery guard.
+
+This guard excludes participating resource holders only. Startup reconciliation
+still needs checked original inventory, fenced canonical lifecycle state and
+bounded descriptor-relative filesystem work. An empty inventory, absent PID or
+this lock alone does not prove legacy-resource absence, original Child
+collection or service readiness. The host-agent startup integration remains
+separate from the component's focused lock and storage tests.

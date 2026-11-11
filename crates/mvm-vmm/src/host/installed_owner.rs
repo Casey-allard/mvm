@@ -586,6 +586,37 @@ pub struct InstallationOwner {
     // borrowed/inherited descriptor or publish Clean in Drop.
     _owner: File,
 }
+
+/// Retains the original owner's exclusion and an independently opened holders
+/// EX lock, including for an already-Clean store. This proves only exclusion
+/// of participating local resource holders, not legacy-resource absence,
+/// original Child collection, boot authority or service readiness.
+pub struct RecoveryExclusion<'owner> {
+    owner: &'owner mut InstallationOwner,
+    _holders: File,
+    recovery: Recovery,
+}
+
+impl RecoveryExclusion<'_> {
+    /// Informational recovery outcome; the value alone retains no exclusion.
+    pub fn recovery(&self) -> Recovery {
+        self.recovery
+    }
+
+    /// Recheck the original namespace and Clean record while both original
+    /// locks remain held. A refusal does not release either exclusion.
+    pub fn revalidate(&self) -> Result<()> {
+        let record = self.owner.current()?;
+        if object_id(&self._holders)? != self.owner.storage.ids[2] {
+            return Err(OwnerError::Fenced);
+        }
+        if record.phase != Phase::Clean {
+            return Err(OwnerError::RecoveryRequired);
+        }
+        Ok(())
+    }
+}
+
 impl InstallationOwner {
     /// Fresh local provisioning facts for the original active epoch. This is
     /// neither a resource descriptor nor permission to activate a worker.
@@ -753,6 +784,37 @@ impl InstallationOwner {
         self.commit(record)?;
         Ok(Recovery::Retired {
             epoch: record.generation,
+        })
+    }
+
+    /// Reconcile participating resources and retain actual exclusion through
+    /// the caller's recovery work. Unlike a copied `Recovery`, the returned
+    /// guard keeps holders EX even for AlreadyClean, and its mutable borrow
+    /// prevents beginning a new epoch until it is dropped. Callers must still
+    /// reconcile legacy resources and other namespaces independently.
+    pub fn reconcile_with_exclusion(&mut self) -> Result<RecoveryExclusion<'_>> {
+        let mut record = self.current()?;
+        if record.phase == Phase::Active {
+            self.supervisor.take();
+        }
+        let holders = self.holders_for_transition()?;
+        // Identity and exact record checks occur again after the independent
+        // holders EX acquisition, before any retirement or guard publication.
+        self.current()?;
+        let recovery = if record.phase == Phase::Clean {
+            Recovery::AlreadyClean
+        } else {
+            record.phase = Phase::Clean;
+            self.commit(record)?;
+            Recovery::Retired {
+                epoch: record.generation,
+            }
+        };
+        self.current()?;
+        Ok(RecoveryExclusion {
+            owner: self,
+            _holders: holders,
+            recovery,
         })
     }
 }
