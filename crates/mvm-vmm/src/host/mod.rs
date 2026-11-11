@@ -22,6 +22,8 @@ pub mod flowmux_identity;
 pub mod gpu_endpoint_spawn;
 pub mod helper_contract;
 pub mod helper_exit;
+#[cfg(unix)]
+pub mod host_agent_installation;
 pub mod host_agent_spawn;
 pub mod hvf_control_transport;
 pub mod hvf_stop;

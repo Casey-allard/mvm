@@ -53,3 +53,14 @@ channel. Actual helpers must retain the lease themselves; a parent actor's
 lease alone cannot protect recovery after that actor's process dies. The CLI
 and signer startup boundaries and the installed daemon still require their
 own exact-source integration acceptance.
+
+## Fresh host-agent provisioning
+
+The sibling `host_agent_installation` module reuses the original directory and
+platform ACL guards and the original Clean-record initializer. It owns the
+single host-agent namespace/key derivation. Its explicit fresh-home operation
+requires a new directory, retains the original directory descriptors, and keeps
+an initialization intent until the Clean resource and directory barriers are
+complete. Existing or partial homes require verified opening or explicit
+reconciliation. The receipt grants neither boot authority nor service readiness.
+Canonical CLI/SDK placement and installed-service qualification remain required.

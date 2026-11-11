@@ -125,7 +125,7 @@ fn storage_open_error(error: io::Error) -> OwnerError {
         _ => OwnerError::Io(error),
     }
 }
-fn open_root(path: &Path) -> Result<File> {
+pub(super) fn open_root(path: &Path) -> Result<File> {
     if !path.is_absolute()
         || path
             .components()
@@ -168,12 +168,12 @@ fn check_private(file: &File, directory: bool) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn check_acl(_file: &File) -> Result<()> {
+pub(super) fn check_acl(_file: &File) -> Result<()> {
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn check_acl(file: &File) -> Result<()> {
+pub(super) fn check_acl(file: &File) -> Result<()> {
     // Apple sys/acl.h: ACL_TYPE_EXTENDED=0x100, ACL_FIRST_ENTRY=0.
     unsafe extern "C" {
         fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
