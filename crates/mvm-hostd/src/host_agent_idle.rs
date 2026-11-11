@@ -102,7 +102,7 @@ pub async fn run_idle_watcher(
             }
             daemon.registration_count()
         };
-        let count = registrations + watched_sessions.load(Ordering::Relaxed);
+        let count = registrations.saturating_add(watched_sessions.load(Ordering::Relaxed));
         if count > 0 {
             zero_since = None;
         } else if zero_since.is_none() {

@@ -26,6 +26,7 @@ pub mod config;
 pub mod controller_proxy;
 pub mod daemon;
 pub mod handlers;
+pub mod mailbox_workers;
 pub mod registry;
 pub mod server;
 pub mod service_proxy;

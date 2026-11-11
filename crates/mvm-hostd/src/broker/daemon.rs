@@ -148,6 +148,7 @@ pub struct HostAgentDaemon {
     max_frame_bytes: usize,
     vms: HashMap<String, VmHandle>,
     registrations: HashMap<String, RegisterVm>,
+    mailbox_workers: Option<Arc<super::mailbox_workers::MailboxWorkers>>,
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +309,7 @@ impl HostAgentDaemon {
             max_frame_bytes,
             vms: HashMap::new(),
             registrations: HashMap::new(),
+            mailbox_workers: None,
         }
     }
 
@@ -317,6 +319,20 @@ impl HostAgentDaemon {
     pub fn with_signer_helper(mut self, signer_helper_uds_path: impl Into<PathBuf>) -> Self {
         self.signer_helper_uds_path = Some(signer_helper_uds_path.into());
         self
+    }
+
+    /// Explicit original-owner injection only. Ordinary daemon startup leaves
+    /// worker control disabled; this does not install a production helper.
+    pub fn with_mailbox_workers(
+        mut self,
+        workers: Arc<super::mailbox_workers::MailboxWorkers>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            workers.tenant() == self.tenant_id,
+            "foreign mailbox worker owner"
+        );
+        self.mailbox_workers = Some(workers);
+        Ok(self)
     }
 
     /// Persist the live registration set to `path` after every successful
@@ -334,6 +350,11 @@ impl HostAgentDaemon {
     /// Number of live VM registrations.
     pub fn registration_count(&self) -> usize {
         self.vms.len()
+            + self.mailbox_workers.as_ref().map_or(0, |workers| {
+                workers
+                    .registration_count()
+                    .unwrap_or(usize::MAX.saturating_sub(self.vms.len()))
+            })
     }
 
     /// Drop registrations whose VM state no longer has a live supervisor.
@@ -351,6 +372,13 @@ impl HostAgentDaemon {
             .collect();
 
         for vm_id in &dead {
+            if self
+                .mailbox_workers
+                .as_ref()
+                .is_some_and(|workers| workers.contains(vm_id).unwrap_or(true))
+            {
+                bail!("mailbox worker owner retains registration; pruning refused");
+            }
             self.vms.remove(vm_id);
             self.registrations.remove(vm_id);
             if let Err(e) = self.deregister_helper_vm(vm_id) {
@@ -405,6 +433,12 @@ impl HostAgentDaemon {
             }
             ControlRequest::Register(r) => self.register(r),
             ControlRequest::Deregister(d) => {
+                if let Some(workers) = &self.mailbox_workers {
+                    anyhow::ensure!(
+                        !workers.contains(&d.vm_id)?,
+                        "mailbox worker owner retains registration; legacy deregistration refused"
+                    );
+                }
                 // Drop = abort + unbind; idempotent on an unknown id.
                 self.vms.remove(&d.vm_id);
                 self.registrations.remove(&d.vm_id);
@@ -418,6 +452,12 @@ impl HostAgentDaemon {
     }
 
     fn register(&mut self, r: &RegisterVm) -> Result<()> {
+        if let Some(workers) = &self.mailbox_workers {
+            anyhow::ensure!(
+                !workers.contains(&r.vm_id)?,
+                "mailbox worker owner retains registration; replacement refused"
+            );
+        }
         // The daemon is per-tenant: refuse a registration for another tenant.
         if r.tenant_id != self.tenant_id {
             bail!(
@@ -667,6 +707,100 @@ impl HostAgentDaemon {
                 .accept()
                 .await
                 .context("host-agent control accept failed")?;
+            let workers = { daemon.lock().await.mailbox_workers.clone() };
+            if let Some(workers) = workers {
+                // Reservation bounds pending connections, frames and blocking
+                // jobs. Never queue an unbounded task before admission.
+                let Ok(permit) = workers.reserve_control() else {
+                    continue;
+                };
+                let daemon = daemon.clone();
+                tokio::spawn(async move {
+                    let frame = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        read_frame::<SignedControl>(&mut stream, CONTROL_MAX_FRAME_BYTES),
+                    )
+                    .await;
+                    let Ok(Ok(signed)) = frame else {
+                        return;
+                    };
+                    let key = { daemon.lock().await.verifying_key };
+                    if matches!(signed.request, ControlRequest::MailboxWorkerV1(_)) {
+                        let verified = workers.now_unix_ms().ok().and_then(|now| {
+                            mvm_core::protocol::mailbox_worker_control::verify_request(
+                                &signed, &key, now,
+                            )
+                            .ok()
+                            .cloned()
+                        });
+                        let Ok(mut stream) = stream.into_std() else {
+                            return;
+                        };
+                        let _ = tokio::task::spawn_blocking(move || {
+                            // A canceled async waiter cannot release workspace
+                            // credit while this blocking operation still runs.
+                            let _permit = permit;
+                            let Some(request) = verified else {
+                                let _ = super::mailbox_workers::write_error(
+                                    &mut stream,
+                                    "mailbox worker authorization refused",
+                                );
+                                return;
+                            };
+                            let deadline = workers
+                                .now_unix_ms()
+                                .ok()
+                                .and_then(|now| request.deadline_unix_ms.checked_sub(now))
+                                .map(|ms| {
+                                    std::time::Instant::now() + std::time::Duration::from_millis(ms)
+                                });
+                            let Some(deadline) = deadline else {
+                                return;
+                            };
+                            match workers.handle(&request) {
+                                Ok((result, fd)) => {
+                                    if mvm_vmm::host::mailbox_worker_transport::send_response(
+                                        &mut stream,
+                                        &result,
+                                        fd,
+                                        deadline,
+                                    )
+                                    .is_err()
+                                    {
+                                        let _ = workers.handoff_uncertain(&request);
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = super::mailbox_workers::write_error(
+                                        &mut stream,
+                                        &error.to_string(),
+                                    );
+                                }
+                            }
+                        })
+                        .await;
+                    } else {
+                        let _permit = permit;
+                        let response = match broker_control::verify(&signed, &key) {
+                            Ok(request) => match daemon.lock().await.apply(request) {
+                                Ok(()) => ControlResponse::Ok,
+                                Err(error) => ControlResponse::Err {
+                                    message: error.to_string(),
+                                },
+                            },
+                            Err(_) => ControlResponse::Err {
+                                message: "control signature rejected".into(),
+                            },
+                        };
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            write_frame(&mut stream, &response),
+                        )
+                        .await;
+                    }
+                });
+                continue;
+            }
             let verifying_key = {
                 let daemon = daemon.lock().await;
                 daemon.verifying_key
