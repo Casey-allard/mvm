@@ -33,6 +33,10 @@ use tokio::sync::{Mutex, oneshot};
 use mvm_hostd::audit_signer::config::SignerHelperConfig;
 use mvm_hostd::broker::daemon::{HostAgentConfig, HostAgentDaemon};
 
+#[cfg(all(test, unix))]
+#[path = "mvm-host-agent/signer_custody_tests.rs"]
+mod signer_custody_tests;
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -154,7 +158,369 @@ async fn spawn_worker(raw_cfg: &[u8]) -> Result<Child> {
     Ok(child)
 }
 
-async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<Child> {
+// One fixed stack and two one-shot results per tenant's existing signer role.
+// The actor starts before spawning, so a failed/canceled async requester never
+// becomes the owner of a spawned Child or a cancelable task carrying one.
+const SIGNER_ACTOR_STACK_BYTES: usize = 256 * 1024;
+const SIGNER_CONFIG_MAX_BYTES: usize = 64 * 1024;
+
+enum SignerReadiness {
+    Ready,
+    NotStarted(String),
+    Failed(String),
+}
+
+#[derive(Clone, Copy)]
+enum SignerOutcome {
+    NotStarted,
+    Collected(std::process::ExitStatus),
+}
+
+struct SignerChild {
+    lifeline: Option<std::os::unix::net::UnixStream>,
+    completion: oneshot::Receiver<SignerOutcome>,
+    outcome: Option<SignerOutcome>,
+    completion_lost: bool,
+    readiness_error: Option<String>,
+}
+impl SignerChild {
+    fn request_stop(&mut self) {
+        if let Some(lifeline) = self.lifeline.take() {
+            let _ = lifeline.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if self.completion_lost {
+            return Err(std::io::Error::other(
+                "signer actor lost completion; original collection is unproven",
+            ));
+        }
+        if self.outcome.is_none() {
+            match (&mut self.completion).await {
+                Ok(outcome) => self.outcome = Some(outcome),
+                Err(_) => {
+                    self.completion_lost = true;
+                    return Err(std::io::Error::other(
+                        "signer actor lost completion; original collection is unproven",
+                    ));
+                }
+            }
+        }
+        match self.outcome {
+            Some(SignerOutcome::Collected(status)) => Ok(status),
+            Some(SignerOutcome::NotStarted) => {
+                Err(std::io::Error::other("signer was never spawned"))
+            }
+            None => unreachable!("terminal outcome was just recorded"),
+        }
+    }
+    #[cfg(test)]
+    async fn kill(&mut self) -> std::io::Result<()> {
+        self.request_stop();
+        self.wait().await.map(|_| ())
+    }
+}
+impl Drop for SignerChild {
+    fn drop(&mut self) {
+        // Only the bounded lifeline closes here. The noncancelable actor still
+        // owns and collects the original Child, even if every waiter disappears.
+        self.request_stop();
+    }
+}
+
+struct OriginalSignerChild {
+    child: std::process::Child,
+    completion: Option<oneshot::Sender<SignerOutcome>>,
+    status: Option<std::process::ExitStatus>,
+    custody_uncertain: bool,
+    exit_observed: bool,
+}
+impl OriginalSignerChild {
+    fn collect(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.custody_uncertain {
+            return Err(std::io::Error::other("signer child custody is uncertain"));
+        }
+        if self.status.is_some() {
+            return Ok(self.status);
+        }
+        if let Err(error) = mvm_vmm::host::process_exit::require_owned_child_custody() {
+            self.custody_uncertain = true;
+            return Err(error);
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.finish(status);
+                Ok(Some(status))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                self.custody_uncertain = true;
+                Err(error)
+            }
+        }
+    }
+    fn collect_after_event(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.exit_observed = true;
+        if self.custody_uncertain {
+            return Err(std::io::Error::other("signer child custody is uncertain"));
+        }
+        if let Err(error) = mvm_vmm::host::process_exit::require_owned_child_custody() {
+            self.custody_uncertain = true;
+            return Err(error);
+        }
+        // The event can precede collectability on Darwin. Waiting here blocks
+        // only this original owner's thread, never the async runtime or a lock.
+        match self.child.wait() {
+            Ok(status) => {
+                self.finish(status);
+                Ok(status)
+            }
+            Err(error) => {
+                self.custody_uncertain = true;
+                Err(error)
+            }
+        }
+    }
+    fn finish(&mut self, status: std::process::ExitStatus) {
+        self.status = Some(status);
+        #[cfg(test)]
+        signer_custody_tests::record_collection(status);
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(SignerOutcome::Collected(status));
+        }
+    }
+}
+impl Drop for OriginalSignerChild {
+    fn drop(&mut self) {
+        if self.status.is_some() {
+            return;
+        }
+        // This guard exists only on the dedicated actor thread. After a
+        // fallible setup, cancellation, observation error or unwind, do not let
+        // std::Child::drop silently discard custody. Never restore an uncertain
+        // numeric identity by retrying a wait or signaling a reused PID.
+        if !self.custody_uncertain
+            && mvm_vmm::host::process_exit::require_owned_child_custody().is_ok()
+        {
+            if self.collect().ok().flatten().is_some() {
+                return;
+            }
+            if !self.custody_uncertain {
+                if !self.exit_observed {
+                    let _ = self.child.kill();
+                }
+                match self.child.wait() {
+                    Ok(status) => {
+                        self.finish(status);
+                        return;
+                    }
+                    Err(_) => self.custody_uncertain = true,
+                }
+            }
+        }
+        // Quarantine this single original owner, including its completion
+        // sender. No completion/credit/replacement can be manufactured from a
+        // failed wait. There is no polling or additional thread allocation.
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+fn signer_stop_requested(wake: &mut std::os::unix::net::UnixStream) -> std::io::Result<bool> {
+    let mut byte = [0];
+    match wake.read(&mut byte) {
+        Ok(0) => Ok(true),
+        Ok(_) => Err(std::io::Error::other("unexpected signer lifeline bytes")),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_signer_config(
+    stdin: &mut std::process::ChildStdin,
+    wake: &mut std::os::unix::net::UnixStream,
+    bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use std::io::Write;
+    let flags = rustix::fs::fcntl_getfl(&*stdin)?;
+    rustix::fs::fcntl_setfl(&*stdin, flags | rustix::fs::OFlags::NONBLOCK)?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if signer_stop_requested(wake)? || Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "signer startup canceled or expired",
+            ));
+        }
+        match stdin.write(&bytes[offset..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let timeout =
+                    Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
+                        .map_err(std::io::Error::other)?;
+                let mut fds = [
+                    PollFd::new(&*stdin, PollFlags::OUT),
+                    PollFd::new(&*wake, PollFlags::IN),
+                ];
+                match poll(&mut fds, Some(&timeout)) {
+                    Ok(_) => (),
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn probe_signer_socket(
+    path: &Path,
+    wake: &std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    // Only this actor endpoint is duplicated, never the facade endpoint whose
+    // final close is the cancellation signal. No Child moves into this future.
+    let cancellation = wake.try_clone()?;
+    tokio::runtime::Handle::current().block_on(async {
+        use tokio::io::AsyncReadExt;
+        let mut cancellation = tokio::net::UnixStream::from_std(cancellation)?;
+        let socket = tokio::net::UnixSocket::new_stream()?;
+        let mut byte = [0];
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "signer readiness deadline"))
+            }
+            _ = cancellation.read(&mut byte) => {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "signer readiness canceled"))
+            }
+            connected = socket.connect(path) => {
+                let connected = connected?;
+                // SO_ERROR==0 alone can describe an unconnected Unix socket
+                // after backlog EAGAIN. Require actual connection completion.
+                connected.peer_addr()?;
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "signer readiness deadline"));
+                }
+                Ok(())
+            }
+        }
+    })
+}
+
+fn run_signer_actor(
+    bin: PathBuf,
+    uds_path: PathBuf,
+    bytes: Vec<u8>,
+    mut wake: std::os::unix::net::UnixStream,
+    startup_deadline: Instant,
+    ready: oneshot::Sender<SignerReadiness>,
+    completion: oneshot::Sender<SignerOutcome>,
+) {
+    use mvm_vmm::host::process_exit::{ProcessExitObserver, wait_process_exit_events};
+    use std::os::fd::AsFd;
+    let spawned = (|| -> std::io::Result<std::process::Child> {
+        mvm_vmm::host::process_exit::require_owned_child_custody()?;
+        if signer_stop_requested(&mut wake)? || Instant::now() >= startup_deadline {
+            return Err(std::io::Error::other(
+                "signer startup canceled before spawn",
+            ));
+        }
+        mvm_core::env_hygiene::helper_command(&bin)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    })();
+    let child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = completion.send(SignerOutcome::NotStarted);
+            let _ = ready.send(SignerReadiness::NotStarted(error.to_string()));
+            return;
+        }
+    };
+    let mut owner = OriginalSignerChild {
+        child,
+        completion: Some(completion),
+        status: None,
+        custody_uncertain: false,
+        exit_observed: false,
+    };
+    let mut ready = Some(ready);
+    let serving = (|| -> Result<()> {
+        let observer = ProcessExitObserver::arm(owner.child.id().try_into()?)?;
+        let mut stdin = owner
+            .child
+            .stdin
+            .take()
+            .context("mvm-signer-helper stdin was not piped")?;
+        write_signer_config(&mut stdin, &mut wake, &bytes, startup_deadline)?;
+        drop(stdin);
+        drop(bytes);
+        // Keep the existing 25ms bounded UDS-connect readiness probe. Child
+        // exit and requester cancellation are event-driven, not PID probes.
+        loop {
+            if let Some(status) = owner.collect()? {
+                anyhow::bail!("mvm-signer-helper exited before readiness: {status}");
+            }
+            if signer_stop_requested(&mut wake)? || Instant::now() >= startup_deadline {
+                anyhow::bail!(
+                    "mvm-signer-helper startup canceled or exceeded its original readiness deadline"
+                );
+            }
+            #[cfg(test)]
+            signer_custody_tests::record_connect_attempt();
+            if probe_signer_socket(&uds_path, &wake, startup_deadline).is_ok() {
+                if signer_stop_requested(&mut wake)? || Instant::now() >= startup_deadline {
+                    anyhow::bail!("signer readiness canceled or expired before publication");
+                }
+                break;
+            }
+            let probe = startup_deadline.min(Instant::now() + Duration::from_millis(25));
+            let events = wait_process_exit_events(&[&observer], Some(wake.as_fd()), Some(probe))?;
+            if events.exited.contains(&0) {
+                let status = owner.collect_after_event()?;
+                anyhow::bail!("mvm-signer-helper exited before readiness: {status}");
+            }
+        }
+        ready
+            .take()
+            .expect("one startup result")
+            .send(SignerReadiness::Ready)
+            .map_err(|_| anyhow::anyhow!("signer startup requester disappeared"))?;
+        loop {
+            if owner.collect()?.is_some() {
+                return Ok(());
+            }
+            let events = wait_process_exit_events(&[&observer], Some(wake.as_fd()), None)?;
+            if events.exited.contains(&0) {
+                owner.collect_after_event()?;
+                return Ok(());
+            }
+            if events.wake_ready && signer_stop_requested(&mut wake)? {
+                return Ok(());
+            }
+        }
+    })();
+    if let Err(error) = serving
+        && let Some(ready) = ready.take()
+    {
+        let _ = ready.send(SignerReadiness::Failed(format!("{error:#}")));
+    }
+    // The actor's guard stops and collects before it can emit terminal status.
+    // An unconfirmed wait retains the guard here instead of returning/retrying.
+}
+
+async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<SignerChild> {
+    let startup_deadline = Instant::now() + SIGNER_HELPER_READY_TIMEOUT;
     let bin = signer_helper_bin_path()?;
     let helper_cfg = SignerHelperConfig {
         tenant_id: cfg.tenant_id.clone(),
@@ -162,23 +528,58 @@ async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<Child> {
         software_chain_key_path: Some(cfg.software_chain_key_path.clone()),
         max_frame_bytes: cfg.max_frame_bytes,
     };
-    let mut child = Command::from(mvm_core::env_hygiene::helper_command(&bin))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("spawn mvm-signer-helper {}", bin.display()))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("mvm-signer-helper stdin was not piped")?;
-    stdin
-        .write_all(&serde_json::to_vec(&helper_cfg)?)
-        .await
-        .context("pipe SignerHelperConfig to mvm-signer-helper")?;
-    drop(stdin);
-    wait_for_helper_uds(&mut child, &cfg.signer_helper_uds_path).await?;
+    let bytes = serde_json::to_vec(&helper_cfg)?;
+    anyhow::ensure!(
+        bytes.len() <= SIGNER_CONFIG_MAX_BYTES,
+        "signer configuration exceeds bounded actor workspace"
+    );
+    let (lifeline, wake) = std::os::unix::net::UnixStream::pair()?;
+    wake.set_nonblocking(true)?;
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let uds = cfg.signer_helper_uds_path.clone();
+    // Capture only the existing I/O reactor for nonblocking UDS probing. The
+    // actor owns its Child independently of any cancellable async operation.
+    let runtime = tokio::runtime::Handle::current();
+    // No Child exists until this successfully started thread runs.
+    std::thread::Builder::new()
+        .name("mvm-signer-owner".into())
+        .stack_size(SIGNER_ACTOR_STACK_BYTES)
+        .spawn(move || {
+            let _runtime = runtime.enter();
+            run_signer_actor(
+                bin,
+                uds,
+                bytes,
+                wake,
+                startup_deadline,
+                ready_tx,
+                completion_tx,
+            )
+        })?;
+    let mut child = SignerChild {
+        lifeline: Some(lifeline),
+        completion: completion_rx,
+        outcome: None,
+        completion_lost: false,
+        readiness_error: None,
+    };
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(startup_deadline), ready_rx).await
+    {
+        Ok(Ok(SignerReadiness::Ready)) => (),
+        Ok(Ok(SignerReadiness::NotStarted(error))) => return Err(anyhow::anyhow!(error)),
+        result => {
+            child.readiness_error = Some(match result {
+                Ok(Ok(SignerReadiness::Failed(error))) => error,
+                _ => "signer readiness unresolved at original deadline".into(),
+            });
+            child.request_stop();
+        }
+    }
+    if Instant::now() >= startup_deadline && child.readiness_error.is_none() {
+        child.readiness_error = Some("signer readiness observed after original deadline".into());
+        child.request_stop();
+    }
     Ok(child)
 }
 
@@ -192,27 +593,6 @@ fn signer_helper_bin_path() -> Result<PathBuf> {
     Ok(current.with_file_name("mvm-signer-helper"))
 }
 
-async fn wait_for_helper_uds(child: &mut Child, uds_path: &Path) -> Result<()> {
-    let start = Instant::now();
-    while start.elapsed() < SIGNER_HELPER_READY_TIMEOUT {
-        if let Some(status) = child.try_wait().context("poll mvm-signer-helper status")? {
-            anyhow::bail!("mvm-signer-helper exited before readiness: {status}");
-        }
-        // A crashed helper leaves its socket path behind; only a successful
-        // connection proves the replacement is ready for registration replay.
-        if tokio::net::UnixStream::connect(uds_path).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let _ = child.start_kill();
-    anyhow::bail!(
-        "mvm-signer-helper did not bind {} within {:?}",
-        uds_path.display(),
-        SIGNER_HELPER_READY_TIMEOUT
-    )
-}
-
 async fn supervise_signer_helper(
     cfg: HostAgentConfig,
     daemon: Arc<Mutex<HostAgentDaemon>>,
@@ -222,6 +602,20 @@ async fn supervise_signer_helper(
     loop {
         match spawn_signer_helper(&cfg).await {
             Ok(mut child) => {
+                if let Some(reason) = child.readiness_error.take() {
+                    tracing::warn!(tenant_id = %cfg.tenant_id, %reason, "signer startup unresolved; retaining original owner before retry");
+                    if let Err(error) = child.wait().await
+                        && !matches!(child.outcome, Some(SignerOutcome::NotStarted))
+                    {
+                        tracing::error!(tenant_id = %cfg.tenant_id, %error, "signer collection unproven; replacement fenced");
+                        let _retained_owner = child;
+                        std::future::pending::<()>().await;
+                        unreachable!("unresolved signer owner cannot restart");
+                    }
+                    // Only the actor's actual collected status permits retry.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
                 let rebound = {
                     let daemon = daemon.lock().await;
                     daemon.rebind_signer_helper_registrations()
@@ -243,10 +637,22 @@ async fn supervise_signer_helper(
                             error = %e,
                             "mvm-signer-helper registration replay failed"
                         );
+                        // Rebinding failed after a real spawn. Fence and
+                        // collect that original helper before an ordinary
+                        // startup error or a retry can replace it.
+                        child.request_stop();
+                        if let Err(error) = child.wait().await {
+                            tracing::error!(tenant_id = %cfg.tenant_id, %error, "signer cleanup unproven; replacement fenced");
+                            let _retained_owner = child;
+                            std::future::pending::<()>().await;
+                            unreachable!("unresolved signer owner cannot restart");
+                        }
                         if let Some(tx) = first_ready.take() {
                             let _ = tx.send(Err(e));
                             return;
                         }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
                     }
                 }
 
@@ -256,11 +662,11 @@ async fn supervise_signer_helper(
                         status = %status,
                         "mvm-signer-helper exited; restarting"
                     ),
-                    Err(e) => tracing::warn!(
-                        tenant_id = %cfg.tenant_id,
-                        error = %e,
-                        "mvm-signer-helper wait failed; restarting"
-                    ),
+                    Err(e) => {
+                        tracing::error!(tenant_id = %cfg.tenant_id, error = %e, "mvm-signer-helper collection unproven; replacement fenced");
+                        let _retained_owner = child;
+                        std::future::pending::<()>().await;
+                    }
                 }
             }
             Err(e) => {
