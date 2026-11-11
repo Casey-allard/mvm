@@ -5,20 +5,25 @@
     {
       "source_path": "crates/spiralcore-mvm-live/src/installed_owner.rs",
       "destination_path": "crates/mvm-vmm/src/host/installed_owner.rs",
-      "sha256": "94006668298fbb172ae52e23105db51b57a44aa881ae6a84c556e0f85991100c",
-      "portability_edits": []
+      "portability_edits": [
+        "Add private command-lease submodule and public typed spawn/startup re-exports; preserve the original owner/holder implementation."
+      ],
+      "source_sha256": "94006668298fbb172ae52e23105db51b57a44aa881ae6a84c556e0f85991100c",
+      "destination_sha256": "55836a32a85ff418ee8919eeaa56e3476af4223b33394a4e5dca32456e7b9768"
     },
     {
       "source_path": "crates/spiralcore-mvm-live/src/installed_owner/tests.rs",
       "destination_path": "crates/mvm-vmm/src/host/installed_owner/tests.rs",
-      "sha256": "4d9b5151bdf013e2c27e553dd74d69599fa058b3d141017a64a2e722382f66bf",
-      "portability_edits": []
+      "portability_edits": [],
+      "source_sha256": "4d9b5151bdf013e2c27e553dd74d69599fa058b3d141017a64a2e722382f66bf",
+      "destination_sha256": "4d9b5151bdf013e2c27e553dd74d69599fa058b3d141017a64a2e722382f66bf"
     },
     {
       "source_path": "crates/spiralcore-mvm-live/src/installed_owner/binding_tests.rs",
       "destination_path": "crates/mvm-vmm/src/host/installed_owner/binding_tests.rs",
-      "sha256": "e992c83c683dfc8b597f0fcbf0c6dde7a35195de517149977377b2073f4087fa",
-      "portability_edits": []
+      "portability_edits": [],
+      "source_sha256": "e992c83c683dfc8b597f0fcbf0c6dde7a35195de517149977377b2073f4087fa",
+      "destination_sha256": "e992c83c683dfc8b597f0fcbf0c6dde7a35195de517149977377b2073f4087fa"
     }
   ],
   "integration_test": {
@@ -28,5 +33,12 @@
       "Change library import from installed_owner to mvm_vmm::host::installed_owner."
     ]
   },
-  "dependencies": "Existing libc and workspace sha2 0.11.0; original component used sha2 0.10. No format or checksum-domain change."
+  "dependencies": "Existing libc and workspace sha2 0.11.0; original component used sha2 0.10. No format or checksum-domain change.",
+  "local_exec_extension": {
+    "files": [
+      "crates/mvm-vmm/src/host/installed_owner/command_lease.rs",
+      "crates/mvm-vmm/tests/installed_owner_handoff.rs"
+    ],
+    "description": "Typed local exec resource handoff; original fixed state representation and checksum domain unchanged."
+  }
 }

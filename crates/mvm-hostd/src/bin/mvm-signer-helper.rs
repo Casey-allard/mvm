@@ -27,6 +27,10 @@ fn main() -> Result<()> {
     // First statement in the process: a panic before this line would
     // print its payload unredacted.
     mvm_hostd::panic_hook::install("signer-helper");
+    // SAFETY: no worker, environment reader or descendant has been started;
+    // the launcher supplied unowned descriptors to this fresh process.
+    let _resource_lease =
+        unsafe { mvm_vmm::host::installed_owner::receive_resource_lease_at_startup() }?;
     // A signer-helper whose host-agent parent is gone holds key material no one
     // can reach — exit rather than leak as an orphan.
     mvm_hostd::parent_death::exit_when_orphaned();

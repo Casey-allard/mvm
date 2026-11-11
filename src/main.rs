@@ -1,4 +1,9 @@
 fn main() -> anyhow::Result<()> {
+    // SAFETY: process entry precedes CLI workers, environment readers and
+    // descendant spawns. Any supplied descriptors are inherited and unowned.
+    #[cfg(unix)]
+    let _resource_lease =
+        unsafe { mvm_vmm::host::installed_owner::receive_resource_lease_at_startup() }?;
     // On macOS, Virtualization.framework requires the main thread to pump
     // NSRunLoop for VM lifecycle callbacks. Run the CLI on a background
     // thread and keep the main thread available for the RunLoop.
