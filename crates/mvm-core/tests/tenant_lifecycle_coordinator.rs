@@ -33,6 +33,84 @@ fn activate(coordinator: &LifecycleCoordinator, generation: &LifecycleGeneration
 }
 
 #[test]
+fn preparing_turn_retains_original_file_lock_and_durably_advances_revision_before_action() {
+    use mvm_core::util::atomic_io::FileLock;
+    let home = tempfile::tempdir().unwrap();
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let coordinator = bootstrap(home.path(), &generation);
+    let gate = TenantLifecycleGate::new(home.path(), "tenant-a").unwrap();
+    let before = coordinator.snapshot(deadline()).unwrap();
+    let directory = mvm_core::config::host_agent_dir_at(home.path(), "tenant-a");
+    let result = gate
+        .with_preparing(&generation, deadline(), || {
+            // Test-only filesystem probes prove lock custody and ordering; real
+            // callbacks perform only short nonblocking memory operations.
+            assert!(FileLock::try_acquire(&directory.join("lifecycle.json"))?.is_none());
+            let state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("lifecycle.json"))?)?;
+            assert_eq!(state["revision"].as_u64(), Some(before.revision() + 1));
+            Ok(17)
+        })
+        .unwrap();
+    assert_eq!(result, 17);
+    let after = coordinator.snapshot(deadline()).unwrap();
+    assert_eq!(after.generation(), &generation);
+    assert_eq!(after.phase(), LifecyclePhase::Preparing);
+    assert!(after.pending().is_empty());
+    assert_eq!(after.revision(), before.revision() + 1);
+    assert!(
+        gate.with_preparing(&generation, deadline(), || -> anyhow::Result<()> {
+            anyhow::bail!("controlled memory action refusal")
+        })
+        .is_err()
+    );
+    assert_eq!(
+        coordinator.snapshot(deadline()).unwrap().revision(),
+        after.revision() + 1,
+        "an action refusal cannot restore an earlier inventory revision"
+    );
+}
+
+#[test]
+fn preparing_turn_refuses_stale_expired_active_and_draining_without_invoking_action() {
+    let home = tempfile::tempdir().unwrap();
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let stale = LifecycleGeneration::new([8; 32], 2).unwrap();
+    let coordinator = bootstrap(home.path(), &generation);
+    let gate = TenantLifecycleGate::new(home.path(), "tenant-a").unwrap();
+    let original = coordinator.snapshot(deadline()).unwrap().revision();
+    for (expected, expires) in [(&stale, deadline()), (&generation, Instant::now())] {
+        assert!(
+            gate.with_preparing(expected, expires, || -> anyhow::Result<()> {
+                panic!("stale or expired Preparing turn invoked action")
+            })
+            .is_err()
+        );
+    }
+    assert_eq!(
+        coordinator.snapshot(deadline()).unwrap().revision(),
+        original
+    );
+    activate(&coordinator, &generation);
+    assert!(
+        gate.with_preparing(&generation, deadline(), || -> anyhow::Result<()> {
+            panic!("Active is not Preparing")
+        })
+        .is_err()
+    );
+    let active = coordinator.snapshot(deadline()).unwrap();
+    coordinator
+        .begin_drain(&generation, active.revision(), deadline(), |_| Ok(()))
+        .unwrap();
+    assert!(
+        gate.with_preparing(&generation, deadline(), || -> anyhow::Result<()> {
+            panic!("Draining is not Preparing")
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn activation_callbacks_keep_original_file_turn_and_publish_only_durable_active() {
     use mvm_core::util::atomic_io::FileLock;
     use std::cell::Cell;

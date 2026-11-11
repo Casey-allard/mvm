@@ -590,6 +590,34 @@ impl TenantLifecycleGate {
         })
     }
 
+    /// Coordinate short local preparation under the original Preparing epoch.
+    /// This is not an activation or readiness grant. The callback must not
+    /// wait, spawn, perform I/O, acquire a blocking mutex or own original
+    /// service/resource custody. Its revision is durable before it runs, even
+    /// when the memory action subsequently refuses.
+    pub fn with_preparing<T>(
+        &self,
+        expected: &LifecycleGeneration,
+        deadline: Instant,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _lock = self.lock(deadline)?;
+        let record = self.read_record()?;
+        ensure!(
+            &record.generation == expected
+                && record.phase == LifecyclePhase::Preparing
+                && !record.unresolved
+                && record.pending.is_empty(),
+            "original lifecycle generation is not Preparing"
+        );
+        self.write_record(&record)?;
+        ensure!(
+            Instant::now() < deadline,
+            "lifecycle preparation deadline expired"
+        );
+        action()
+    }
+
     /// Commit a bounded in-memory admission under the original active generation.
     /// The mutation revision is durably advanced before the callback; a refused
     /// callback conservatively invalidates earlier inventory scans too.
