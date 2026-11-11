@@ -89,6 +89,144 @@ pub struct ProcessExitObserver {
     kind: ObserverKind,
 }
 
+/// Kernel readiness only: owners still collect each original Child themselves.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProcessExitEvents {
+    pub exited: Vec<usize>,
+    pub wake_ready: bool,
+    pub timed_out: bool,
+}
+
+/// Multiplex retained process observers and an optional ownership-handoff wake
+/// descriptor. None deadline means an indefinite kernel wait, not timer polling.
+/// The caller is the sole waiter for these observers and retains every handle.
+#[cfg(unix)]
+pub fn wait_process_exit_events(
+    observers: &[&ProcessExitObserver],
+    wake: Option<std::os::fd::BorrowedFd<'_>>,
+    deadline: Option<Instant>,
+) -> Result<ProcessExitEvents, ProcessExitError> {
+    use std::os::fd::AsRawFd;
+    if observers.len() > 1024 || (observers.is_empty() && wake.is_none()) {
+        return Err(ProcessExitError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid exit event set",
+        )));
+    }
+    let mut fds = Vec::with_capacity(observers.len() + 1);
+    let mut indices = Vec::with_capacity(observers.len());
+    let wake_index = wake.map(|fd| {
+        fds.push(libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        0
+    });
+    let mut exited = Vec::with_capacity(observers.len());
+    for (index, observer) in observers.iter().enumerate() {
+        let fd = match &observer.kind {
+            ObserverKind::AlreadyExited => {
+                exited.push(index);
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            ObserverKind::PidFd { fd } => *fd,
+            #[cfg(target_os = "macos")]
+            ObserverKind::Kqueue { fd } => *fd,
+        };
+        indices.push((fds.len(), index));
+        fds.push(libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    if !exited.is_empty() {
+        return Ok(ProcessExitEvents {
+            exited,
+            wake_ready: false,
+            timed_out: false,
+        });
+    }
+    loop {
+        let timeout = match deadline {
+            None => -1,
+            Some(deadline) => {
+                let Some(remaining) = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                else {
+                    return Ok(ProcessExitEvents {
+                        exited,
+                        wake_ready: false,
+                        timed_out: true,
+                    });
+                };
+                remaining
+                    .as_millis()
+                    .saturating_add(1)
+                    .min(i32::MAX as u128) as i32
+            }
+        };
+        // SAFETY: bounded initialized array, handles remain borrowed/live.
+        let result = unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                fds.len()
+                    .try_into()
+                    .map_err(|_| ProcessExitError::Unsupported)?,
+                timeout,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ProcessExitError::Io(error));
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(ProcessExitEvents {
+                exited,
+                wake_ready: false,
+                timed_out: true,
+            });
+        }
+        if result == 0 {
+            continue;
+        }
+        let wake_ready = wake_index.is_some_and(|index| fds[index].revents != 0);
+        for &(fd_index, index) in &indices {
+            let flags = fds[fd_index].revents;
+            if flags & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(ProcessExitError::Io(io::Error::other(
+                    "invalid retained exit descriptor",
+                )));
+            }
+            if flags & (libc::POLLIN | libc::POLLHUP) != 0 {
+                #[cfg(target_os = "linux")]
+                exited.push(index);
+                #[cfg(target_os = "macos")]
+                if observers[index].wait_event(
+                    deadline.unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(1)),
+                )? == ProcessExitWait::Exited
+                {
+                    exited.push(index);
+                }
+            }
+        }
+        if wake_ready || !exited.is_empty() {
+            return Ok(ProcessExitEvents {
+                exited,
+                wake_ready,
+                timed_out: false,
+            });
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ObserverKind {
     AlreadyExited,
@@ -400,6 +538,17 @@ fn process_is_dead(pid: libc::pid_t) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn multiplex_already_exited_private_state_is_immediate() {
+        let observer = super::ProcessExitObserver {
+            pid: 2,
+            kind: super::ObserverKind::AlreadyExited,
+        };
+        let events = super::wait_process_exit_events(&[&observer], None, None).unwrap();
+        assert_eq!(events.exited, vec![0]);
+        assert!(!events.timed_out);
+    }
     use super::*;
     use std::process::Command;
     use std::time::Duration;
