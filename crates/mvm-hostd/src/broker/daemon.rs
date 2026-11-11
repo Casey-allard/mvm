@@ -42,7 +42,8 @@ use tracing::warn;
 use crate::audit_signer::helper_client::SignerHelperClient;
 
 use super::control_prepare::{
-    InflightMutation, JournalSnapshots, MutationCell, MutationIoStage, MutationIoStatus, VmMapPhase,
+    InflightMutation, JournalSnapshots, MutationCell, MutationIoStage, MutationIoStatus,
+    MutationLoanBusy, VmMapPhase,
 };
 use super::server::{read_frame, write_frame};
 
@@ -380,6 +381,64 @@ impl Drop for HostAgentDaemon {
     }
 }
 
+fn active_worker_turn<T>(
+    lifecycle: Option<&DaemonLifecycleAdmission>,
+    deadline: std::time::Instant,
+    reserve: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match lifecycle {
+        Some(original) => original
+            .gate
+            .with_active(&original.generation, deadline, reserve),
+        None => reserve(),
+    }
+}
+
+/// Called after canonical verification. No durable or in-memory gate is held
+/// through a child operation, descriptor publication, or response write.
+fn dispatch_worker_control(
+    workers: &super::mailbox_workers::MailboxWorkers,
+    lifecycle: Option<&DaemonLifecycleAdmission>,
+    request: &mvm_core::protocol::mailbox_worker_control::MailboxWorkerRequest,
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    use mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation;
+    let _admission = match request.operation {
+        MailboxWorkerOperation::Acquire | MailboxWorkerOperation::DelegateConfig { .. } => {
+            Some(active_worker_turn(lifecycle, deadline, || {
+                Ok(workers.try_activation()?)
+            })?)
+        }
+        MailboxWorkerOperation::Query { .. } | MailboxWorkerOperation::Stop { .. } => None,
+    };
+    let (result, fd) = workers.handle(request)?;
+    let _publication = if fd.is_some() {
+        let authorized = (|| -> Result<_> {
+            let permit = workers.begin_config_publication(request)?;
+            active_worker_turn(lifecycle, deadline, || Ok(()))?;
+            Ok(permit)
+        })();
+        match authorized {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                drop(fd);
+                workers.handoff_uncertain(request)?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if mvm_vmm::host::mailbox_worker_transport::send_response(stream, &result, fd, deadline)
+        .is_err()
+    {
+        // The first SCM marker may have been sent. Never append another response.
+        let _ = workers.handoff_uncertain(request);
+    }
+    Ok(())
+}
+
 /// The resident per-tenant host-agent daemon.
 pub struct HostAgentDaemon {
     tenant_id: String,
@@ -400,6 +459,7 @@ pub struct HostAgentDaemon {
     #[cfg(test)]
     row_gap: Option<Arc<row_identity_tests::RowGap>>,
     mailbox_workers: Option<Arc<super::mailbox_workers::MailboxWorkers>>,
+    mailbox_retired: bool,
 }
 
 /// Presence is an observation, never freshness or authorization evidence.
@@ -1528,6 +1588,7 @@ impl HostAgentDaemon {
             #[cfg(test)]
             row_gap: None,
             mailbox_workers: None,
+            mailbox_retired: false,
         }
     }
 
@@ -1615,29 +1676,60 @@ impl HostAgentDaemon {
             &tenant,
             original_io_deadline(),
         )?;
-        let state = coordinator.snapshot(original_io_deadline())?;
-        anyhow::ensure!(
-            state.generation() == expected_generation
-                && state.phase() == mvm_core::tenant_lifecycle::LifecyclePhase::Draining,
-            "shutdown has no original durable Draining fence"
-        );
-        let retained = {
-            let original = daemon.lock().await;
+        // Subscribe BEFORE any observation that can report this field Busy.
+        // No daemon/cell/FileGate guard survives an event wait. The inline
+        // turn alone keeps the original accepted reply ahead of shutdown.
+        let mut releases = cell.subscribe_mutation_release();
+        loop {
+            let state = coordinator.snapshot(original_io_deadline())?;
             anyhow::ensure!(
-                Arc::ptr_eq(&original.custody, &cell)
-                    && original.lifecycle_admission.as_ref().map(|a| &a.generation)
-                        == Some(expected_generation),
-                "shutdown reconciliation generation changed"
+                state.generation() == expected_generation
+                    && state.phase() == mvm_core::tenant_lifecycle::LifecyclePhase::Draining,
+                "shutdown has no original durable Draining fence"
             );
-            original
-                .custody
-                .has_inflight_mutation()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::WouldBlock, error))?
-        };
-        if !retained {
-            return Ok(());
+            let observed = {
+                let original = daemon.lock().await;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&original.custody, &cell)
+                        && original.lifecycle_admission.as_ref().map(|a| &a.generation)
+                            == Some(expected_generation),
+                    "shutdown reconciliation generation changed"
+                );
+                original.custody.has_inflight_mutation()
+            };
+            match observed {
+                Ok(false) => return Ok(()),
+                Ok(true) => {
+                    let result = reconcile_original_mutation(
+                        &mut DaemonAccess::Shared(daemon.clone()),
+                        None,
+                    )
+                    .await;
+                    if result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.downcast_ref::<MutationLoanBusy>().is_some())
+                    {
+                        // Only this ORIGINAL inflight field's contention is
+                        // retryable here. Other I/O/map/identity errors retain
+                        // their own uncertainty and are never timer-polled.
+                        releases
+                            .changed()
+                            .await
+                            .context("original mutation release observer closed")?;
+                        continue;
+                    }
+                    return result;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    releases
+                        .changed()
+                        .await
+                        .context("original mutation release observer closed")?;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        reconcile_original_mutation(&mut DaemonAccess::Shared(daemon), None).await
     }
 
     /// Capture original canonical context only. A descriptor is not a grant;
@@ -1939,6 +2031,26 @@ impl HostAgentDaemon {
         Ok(())
     }
 
+    pub fn mailbox_worker_owner(&self) -> Option<Arc<super::mailbox_workers::MailboxWorkers>> {
+        self.mailbox_workers.clone()
+    }
+
+    pub fn record_mailbox_retirement(
+        &mut self,
+        owner: &Arc<super::mailbox_workers::MailboxWorkers>,
+        receipt: &super::mailbox_workers::MailboxWorkersRetirement,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.mailbox_workers
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, owner)),
+            "mailbox retirement belongs to a different original provider"
+        );
+        owner.validate_retirement(receipt)?;
+        self.mailbox_retired = true;
+        Ok(())
+    }
+
     /// Wire the daemon to a supervised resident signer helper. Registered VMs
     /// route `host.audit.v1` appends through this helper instead of a per-VM
     /// audit-signer process.
@@ -1957,6 +2069,10 @@ impl HostAgentDaemon {
             workers.tenant() == self.tenant_id,
             "foreign mailbox worker owner"
         );
+        anyhow::ensure!(
+            self.mailbox_workers.is_none(),
+            "mailbox worker owner already installed"
+        );
         self.mailbox_workers = Some(workers);
         Ok(self)
     }
@@ -1974,7 +2090,7 @@ impl HostAgentDaemon {
     }
 
     /// Checked original-owner observation, never a Child collection receipt.
-    pub fn checked_registration_count(&self) -> Result<usize> {
+    fn checked_service_registration_count(&self) -> Result<usize> {
         anyhow::ensure!(
             !self.custody.has_inflight_mutation()?,
             "original registration mutation unresolved"
@@ -1985,14 +2101,27 @@ impl HostAgentDaemon {
             map.phase != VmMapPhase::Retiring,
             "original service map is retiring"
         );
+        Ok(map.vms.len())
+    }
+
+    pub fn can_accept_idle_fence(&self) -> Result<bool> {
+        if let Some(workers) = &self.mailbox_workers
+            && !workers.try_idle()?
+        {
+            return Ok(false);
+        }
+        Ok(self.checked_service_registration_count()? == 0 && !self.has_accepted_work()?)
+    }
+
+    pub fn checked_registration_count(&self) -> Result<usize> {
+        let services = self.checked_service_registration_count()?;
         let workers = self
             .mailbox_workers
             .as_ref()
             .map(|workers| workers.registration_count())
             .transpose()?
             .unwrap_or(0);
-        map.vms
-            .len()
+        services
             .checked_add(workers)
             .context("original daemon registration count overflow")
     }
@@ -2507,14 +2636,16 @@ impl HostAgentDaemon {
             let daemon = daemon.lock().await;
             Some(daemon.work.changed.subscribe())
         };
-        loop {
+        let mut control_tasks = tokio::task::JoinSet::<Result<()>>::new();
+        let mut failed_join = false;
+        let listener_result = loop {
             let stop_requested = *stopped.borrow() || stopped.has_changed().is_err();
             if stop_requested {
                 let daemon = daemon.lock().await;
-                let known_settled = daemon.mailbox_workers.is_none()
+                let known_settled = (daemon.mailbox_workers.is_none() || daemon.mailbox_retired)
                     && matches!(daemon.has_accepted_work(), Ok(false));
                 if known_settled {
-                    return Ok(());
+                    break Ok(());
                 }
             }
             let accepted = tokio::select! {
@@ -2532,9 +2663,19 @@ impl HostAgentDaemon {
                         let _ = stopped.changed().await;
                     }
                 } => continue,
+                Some(completed) = control_tasks.join_next(), if !control_tasks.is_empty() => {
+                    if !matches!(completed, Ok(Ok(()))) {
+                        failed_join = true;
+                        break Err(anyhow::anyhow!("original mailbox control task failed"));
+                    }
+                    continue;
+                }
                 accepted = listener.accept() => accepted,
             };
-            let (mut stream, _addr) = accepted.context("host-agent control accept failed")?;
+            let (mut stream, _addr) = match accepted.context("host-agent control accept failed") {
+                Ok(connection) => connection,
+                Err(error) => break Err(error),
+            };
             let workers = { daemon.lock().await.mailbox_workers.clone() };
             if let Some(workers) = workers {
                 // Reservation bounds pending connections, frames and blocking
@@ -2544,16 +2685,19 @@ impl HostAgentDaemon {
                 };
                 let daemon = daemon.clone();
                 let control_stop = stopped.clone();
-                tokio::spawn(async move {
+                control_tasks.spawn(async move {
                     let frame = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         read_frame::<SignedControl>(&mut stream, CONTROL_MAX_FRAME_BYTES),
                     )
                     .await;
                     let Ok(Ok(signed)) = frame else {
-                        return;
+                        return Ok(());
                     };
-                    let key = { daemon.lock().await.verifying_key };
+                    let (key, lifecycle) = {
+                        let original = daemon.lock().await;
+                        (original.verifying_key, original.lifecycle_admission.clone())
+                    };
                     let closing = *control_stop.borrow() || control_stop.has_changed().is_err();
                     if matches!(signed.request, ControlRequest::MailboxWorkerV1(_)) {
                         let verified = workers.now_unix_ms().ok().and_then(|now| {
@@ -2567,9 +2711,9 @@ impl HostAgentDaemon {
                             .cloned()
                         });
                         let Ok(mut stream) = stream.into_std() else {
-                            return;
+                            return Ok(());
                         };
-                        let _ = tokio::task::spawn_blocking(move || {
+                        tokio::task::spawn_blocking(move || {
                             // A canceled async waiter cannot release workspace
                             // credit while this blocking operation still runs.
                             let _permit = permit;
@@ -2590,30 +2734,16 @@ impl HostAgentDaemon {
                             let Some(deadline) = deadline else {
                                 return;
                             };
-                            match workers.handle(&request) {
-                                Ok((result, fd)) => {
-                                    if mvm_vmm::host::mailbox_worker_transport::send_response(
-                                        &mut stream,
-                                        &result,
-                                        fd,
-                                        deadline,
-                                    )
-                                    .is_err()
-                                    {
-                                        let _ = workers.handoff_uncertain(&request);
-                                    }
-                                }
-                                Err(error) => {
-                                    let _ = super::mailbox_workers::write_error(
-                                        &mut stream,
-                                        &error.to_string(),
-                                    );
-                                }
+                            if let Err(error) = dispatch_worker_control(
+                                &workers, lifecycle.as_ref(), &request, &mut stream, deadline,
+                            ) {
+                                let _ = super::mailbox_workers::write_error(&mut stream, &error.to_string());
                             }
                         })
-                        .await;
+                        .await.context("original blocking mailbox control task failed")?;
                     } else {
                         let _permit = permit;
+                        let mut inline = None;
                         let response = match broker_control::verify(&signed, &key) {
                             Ok(request)
                                 if closing && !matches!(request, ControlRequest::Deregister(_)) =>
@@ -2623,6 +2753,8 @@ impl HostAgentDaemon {
                                 }
                             }
                             Ok(_request) => {
+                                let turn = { daemon.lock().await.inline_control_turn() };
+                                inline = Some(turn.lock_owned().await);
                                 match Self::apply_signed_shared(daemon.clone(), signed).await {
                                     Ok(()) => ControlResponse::Ok,
                                     Err(error) => ControlResponse::Err {
@@ -2639,7 +2771,9 @@ impl HostAgentDaemon {
                             write_frame(&mut stream, &response),
                         )
                         .await;
+                        drop(inline);
                     }
+                    Ok(())
                 });
                 continue;
             }
@@ -2714,7 +2848,24 @@ impl HostAgentDaemon {
                 warn!("host-agent control reply failed or expired");
             }
             drop(inline_turn);
+        };
+        // Even on a listening error, finish the workers admitted by this loop.
+        // Joining the outer task includes its owned blocking turn and reply.
+        while let Some(completed) = control_tasks.join_next().await {
+            if !matches!(completed, Ok(Ok(()))) {
+                failed_join = true;
+            }
         }
+        if failed_join {
+            let daemon = daemon.lock().await;
+            daemon
+                .work
+                .unresolved
+                .store(true, std::sync::atomic::Ordering::Release);
+            daemon.work.changed.send_replace(());
+            bail!("original mailbox control task collection unresolved");
+        }
+        listener_result
     }
 }
 
@@ -3154,7 +3305,7 @@ async fn execute_mutation(
     };
     if cleanup
         && access
-            .memory(|daemon| daemon.custody.has_inflight_mutation())
+            .memory(|daemon| Ok(daemon.custody.has_inflight_mutation()?))
             .await?
     {
         let signed = signed

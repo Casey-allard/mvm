@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,11 +32,71 @@ use super::service_proxy::ControllerServiceProxy;
 #[path = "control_prepare/publication_tests.rs"]
 mod publication_tests;
 
+#[cfg(test)]
+#[path = "control_prepare/release_tests.rs"]
+mod release_tests;
+
 /// Internal memory custody only. A live loan leaves the original object inside
 /// this same field, so canceling its future releases only the borrowed guard.
 struct CustodyField<T> {
     value: Mutex<Option<T>>,
+    released: watch::Sender<()>,
 }
+
+/// A release only requests a fresh observation of the same original field.
+/// It is neither vacancy nor a service/child collection receipt.
+pub(crate) struct CustodyReleaseObserver {
+    released: watch::Receiver<()>,
+}
+
+impl CustodyReleaseObserver {
+    pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.released.changed().await
+    }
+}
+
+/// All field access, including a vacant observation, uses this guard so the
+/// original mutex is unlocked before any release observer can wake.
+struct CustodyGuard<'a, T> {
+    value: Option<MutexGuard<'a, Option<T>>>,
+    released: &'a watch::Sender<()>,
+}
+
+impl<T> Deref for CustodyGuard<'_, T> {
+    type Target = Option<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.value.as_deref().expect("original guard remains held")
+    }
+}
+
+impl<T> DerefMut for CustodyGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value
+            .as_deref_mut()
+            .expect("original guard remains held")
+    }
+}
+
+impl<T> Drop for CustodyGuard<'_, T> {
+    fn drop(&mut self) {
+        drop(self.value.take());
+        self.released.send_replace(());
+    }
+}
+
+/// Only actual contention on the original inflight field gets this marker.
+/// Other custody, map, generation and I/O failures must not await its event.
+#[derive(Debug)]
+pub(crate) struct MutationLoanBusy;
+
+impl fmt::Display for MutationLoanBusy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("original mutation field is currently loaned")
+    }
+}
+
+impl std::error::Error for MutationLoanBusy {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CustodyError {
@@ -58,17 +119,32 @@ impl<T> CustodyField<T> {
     fn new() -> Self {
         Self {
             value: Mutex::new(None),
+            released: watch::channel(()).0,
         }
     }
 
     fn retaining(original: T) -> Self {
         Self {
             value: Mutex::new(Some(original)),
+            released: watch::channel(()).0,
         }
     }
 
+    fn subscribe_release(&self) -> CustodyReleaseObserver {
+        CustodyReleaseObserver {
+            released: self.released.subscribe(),
+        }
+    }
+
+    fn try_guard(&self) -> Result<CustodyGuard<'_, T>, CustodyError> {
+        Ok(CustodyGuard {
+            value: Some(self.value.try_lock().map_err(|_| CustodyError::Busy)?),
+            released: &self.released,
+        })
+    }
+
     fn loan(&self) -> Result<CustodyLoan<'_, T>, CustodyError> {
-        let value = self.value.try_lock().map_err(|_| CustodyError::Busy)?;
+        let value = self.try_guard()?;
         if value.is_none() {
             return Err(CustodyError::Empty);
         }
@@ -79,7 +155,7 @@ impl<T> CustodyField<T> {
     }
 
     fn is_vacant(&self) -> Result<bool, CustodyError> {
-        let value = self.value.try_lock().map_err(|_| CustodyError::Busy)?;
+        let value = self.try_guard()?;
         Ok(value.is_none())
     }
 }
@@ -375,10 +451,10 @@ impl MutationCell {
         // An absent live-map key does not prove absence while an original
         // mutation may retain its prepared or retiring service. Query both
         // fields in one short nonblocking observation; never await here.
-        let inflight =
-            self.inflight_mutation.value.try_lock().map_err(|_| {
-                anyhow::anyhow!("original mutation is loaned; VM status is unresolved")
-            })?;
+        let inflight = self
+            .inflight_mutation
+            .try_guard()
+            .map_err(|_| anyhow::anyhow!("original mutation is loaned; VM status is unresolved"))?;
         let mut map = self.map_loan()?;
         let original = map.value_mut();
         if original.vms.contains_key(vm_id) {
@@ -391,8 +467,15 @@ impl MutationCell {
         Ok(false)
     }
 
-    pub(crate) fn has_inflight_mutation(&self) -> Result<bool> {
-        Ok(!self.inflight_mutation.is_vacant()?)
+    pub(crate) fn subscribe_mutation_release(&self) -> CustodyReleaseObserver {
+        self.inflight_mutation.subscribe_release()
+    }
+
+    pub(crate) fn has_inflight_mutation(&self) -> std::io::Result<bool> {
+        self.inflight_mutation
+            .is_vacant()
+            .map(|vacant| !vacant)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock, MutationLoanBusy))
     }
 
     /// Reserve this original field before the canonical short bookkeeping
@@ -403,11 +486,7 @@ impl MutationCell {
         permit: &mut Option<OwnedSemaphorePermit>,
         reserve_accepted: impl FnOnce() -> Result<AcceptedDaemonWork>,
     ) -> Result<MutationLoan<'_>> {
-        let mut value = self
-            .inflight_mutation
-            .value
-            .try_lock()
-            .map_err(|_| CustodyError::Busy)?;
+        let mut value = self.inflight_mutation.try_guard()?;
         ensure!(value.is_none(), CustodyError::Busy);
         ensure!(permit.is_some(), "original mutation permit missing");
         let accepted = reserve_accepted()?;
@@ -427,9 +506,11 @@ impl MutationCell {
     }
 
     pub(crate) fn mutation_loan(&self) -> Result<MutationLoan<'_>> {
-        self.inflight_mutation
-            .loan()
-            .context("original mutation unavailable; status is unresolved")
+        self.inflight_mutation.loan().map_err(|error| match error {
+            CustodyError::Busy => anyhow::Error::new(MutationLoanBusy),
+            CustodyError::Empty => anyhow::Error::new(error)
+                .context("original mutation unavailable; status is unresolved"),
+        })
     }
 
     /// Called outside daemon/FileGate locks only after all mutation resources
@@ -503,8 +584,7 @@ impl MutationCell {
         // actual joins so another reservation cannot enter that gap.
         let inflight = self
             .inflight_mutation
-            .value
-            .try_lock()
+            .try_guard()
             .map_err(|_| anyhow::anyhow!("original mutation is loaned; drain is unresolved"))?;
         ensure!(
             inflight.is_none(),
@@ -1002,7 +1082,7 @@ impl StartLatch {
 /// the original; service-specific callers must establish their actual outcome.
 pub(crate) struct CustodyLoan<'a, T> {
     origin: &'a CustodyField<T>,
-    value: MutexGuard<'a, Option<T>>,
+    value: CustodyGuard<'a, T>,
 }
 
 impl<T> CustodyLoan<'_, T> {

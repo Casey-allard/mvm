@@ -344,3 +344,55 @@ async fn stale_normal_publication_cannot_mutate_a_replacement_row_in_the_same_ce
         "stale original request cannot publish a listener using the replacement row"
     );
 }
+
+#[tokio::test]
+async fn shutdown_reconciliation_waits_for_the_original_busy_loan_release() {
+    let mut fixture = Fixture::new(GapPoint::MutationAfterReservation).await;
+    let original_row = fixture.reserve_current_row(true).await;
+    let state = fixture.coordinator.snapshot(deadline()).unwrap();
+    fixture
+        .coordinator
+        .begin_drain(
+            &fixture.generation,
+            state.revision(),
+            deadline(),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let original = fixture.cell.mutation_loan().unwrap();
+    let shared = fixture.shared.clone();
+    let generation = fixture.generation.clone();
+    let mut caller =
+        tokio::spawn(
+            async move { HostAgentDaemon::reconcile_for_shutdown(shared, &generation).await },
+        );
+    let early = tokio::time::timeout(Duration::from_millis(20), &mut caller).await;
+    let returned_while_original_held = early.is_ok();
+    // Release THIS original guard; the successor must observe that event, not
+    // a timer, guessed PID state or a manufactured successful drain receipt.
+    drop(original);
+    let result = match early {
+        Ok(result) => result.unwrap(),
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), caller)
+            .await
+            .unwrap()
+            .unwrap(),
+    };
+    let original_still_retained = fixture.row_is_retained(original_row).await;
+    let credit = fixture.lane.available_permits();
+    fixture.cleanup().await;
+    eprintln!(
+        "SHUTDOWN_BUSY_RELEASE returned_while_held={returned_while_original_held} original_still_retained={original_still_retained} permits_before_fixture_cleanup={credit} actual_error={:?}",
+        result.as_ref().err().map(ToString::to_string)
+    );
+    assert!(
+        result.is_ok(),
+        "actual shutdown helper must finish the SAME original after its loan releases"
+    );
+    assert!(
+        !returned_while_original_held,
+        "Busy is pending original custody, not a terminal drain result"
+    );
+    assert!(!original_still_retained);
+    assert_eq!(credit, 1);
+}

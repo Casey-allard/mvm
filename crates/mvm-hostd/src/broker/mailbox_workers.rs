@@ -18,7 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ExitStatus};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -673,6 +673,8 @@ struct Slot {
     terminal_at: Option<Instant>,
     cell: Option<CleanupCell>,
     spawn_attempted: bool,
+    reservation_released: bool,
+    reservation_retired: bool,
 }
 struct WorkerLoan {
     slot: Arc<Mutex<Slot>>,
@@ -695,6 +697,98 @@ impl Drop for WorkerLoan {
         }
     }
 }
+struct ProviderState {
+    deadline: Option<Instant>,
+    active: usize,
+    publications: usize,
+    running: bool,
+    failed: bool,
+    retired: Option<Arc<RetirementProof>>,
+}
+struct ProviderFence {
+    state: Mutex<ProviderState>,
+    changed: Condvar,
+}
+struct RetirementProof {
+    deadline: Instant,
+    exits: Vec<(MailboxWorkerOwner, MailboxWorkerExit)>,
+    never_spawned: usize,
+}
+/// Actual local original-provider collection, not mailbox delivery authority.
+/// Only this provider can mint a receipt; neither identity nor exits deserialize.
+pub struct MailboxWorkersRetirement {
+    proof: Arc<RetirementProof>,
+}
+impl MailboxWorkersRetirement {
+    pub fn deadline(&self) -> Instant {
+        self.proof.deadline
+    }
+    pub fn never_spawned_released(&self) -> usize {
+        self.proof.never_spawned
+    }
+    pub fn original_exit(&self, owner: &MailboxWorkerOwner) -> Option<&MailboxWorkerExit> {
+        self.proof
+            .exits
+            .iter()
+            .find(|(original, _)| original == owner)
+            .map(|(_, exit)| exit)
+    }
+}
+/// Nonblocking reservation of a pre-fence activation; holds no mutex across I/O.
+pub struct MailboxActivationPermit {
+    fence: Arc<ProviderFence>,
+    counted: bool,
+}
+impl Drop for MailboxActivationPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .fence
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.counted {
+            if state.active == 0 {
+                state.failed = true;
+            } else {
+                state.active -= 1;
+            }
+        }
+        self.fence.changed.notify_all();
+    }
+}
+/// Outstanding original bounded SCM send; admitted sends may finish after fence.
+/// Quiescence requires its drop and no new publication is admitted after fence.
+pub struct MailboxConfigPublication {
+    fence: Arc<ProviderFence>,
+}
+impl Drop for MailboxConfigPublication {
+    fn drop(&mut self) {
+        let mut state = self
+            .fence
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.publications == 0 {
+            state.failed = true;
+        } else {
+            state.publications -= 1;
+        }
+        self.fence.changed.notify_all();
+    }
+}
+struct RetirementJob(Arc<ProviderFence>);
+impl Drop for RetirementJob {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.running = false;
+        self.0.changed.notify_all();
+    }
+}
+
 /// Long-lived tenant owner injected into the actual daemon. All state is bounded
 /// by the shared ledger. Default daemon construction never enables this path.
 pub struct MailboxWorkers {
@@ -704,6 +798,7 @@ pub struct MailboxWorkers {
     boot: [u8; 32],
     slots: Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
     generation: Mutex<u64>,
+    fence: Arc<ProviderFence>,
 }
 impl MailboxWorkers {
     pub fn new(
@@ -721,7 +816,313 @@ impl MailboxWorkers {
             boot: rand::random(),
             slots: Mutex::new(HashMap::new()),
             generation: Mutex::new(0),
+            fence: Arc::new(ProviderFence {
+                state: Mutex::new(ProviderState {
+                    deadline: None,
+                    active: 0,
+                    publications: 0,
+                    running: false,
+                    failed: false,
+                    retired: None,
+                }),
+                changed: Condvar::new(),
+            }),
         })
+    }
+    /// Short memory-only admission to be retained through original handle/reply.
+    pub fn try_activation(&self) -> io::Result<MailboxActivationPermit> {
+        let mut state = self
+            .fence
+            .state
+            .try_lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        if state.deadline.is_some() || state.failed {
+            return Err(refused("mailbox provider admission stopped"));
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| refused("activation count exhausted"))?;
+        Ok(MailboxActivationPermit {
+            fence: self.fence.clone(),
+            counted: true,
+        })
+    }
+    /// Conservative snapshot only, not a retirement receipt or absence proof.
+    pub fn try_idle(&self) -> io::Result<bool> {
+        let state = self
+            .fence
+            .state
+            .try_lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let slots = self
+            .slots
+            .try_lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        Ok(!state.failed
+            && state.deadline.is_none()
+            && state.active == 0
+            && state.publications == 0
+            && slots.is_empty())
+    }
+    fn operation_permit(
+        &self,
+        request: &MailboxWorkerRequest,
+    ) -> io::Result<MailboxActivationPermit> {
+        let mut state = lock(&self.fence.state)?;
+        if state.failed {
+            return Err(refused("provider fence uncertain"));
+        }
+        let activation = matches!(
+            request.operation,
+            MailboxWorkerOperation::Acquire | MailboxWorkerOperation::DelegateConfig { .. }
+        );
+        if activation && state.deadline.is_some() {
+            return Err(refused("mailbox provider admission stopped"));
+        }
+        let counted = state.deadline.is_none();
+        if counted {
+            state.active = state
+                .active
+                .checked_add(1)
+                .ok_or_else(|| refused("operation count exhausted"))?;
+        }
+        Ok(MailboxActivationPermit {
+            fence: self.fence.clone(),
+            counted,
+        })
+    }
+    pub fn begin_retirement(&self, deadline: Instant) -> io::Result<()> {
+        let mut state = lock(&self.fence.state)?;
+        if state.failed {
+            return Err(refused("provider fence uncertain"));
+        }
+        if state.deadline.is_none() {
+            state.deadline = Some(deadline);
+        }
+        self.fence.changed.notify_all();
+        Ok(())
+    }
+    /// Reserve BEFORE SCM send; caller holds this through its bounded send.
+    /// Exact owner/expiry checks are facts, never independent grant authority.
+    pub fn begin_config_publication(
+        &self,
+        request: &MailboxWorkerRequest,
+    ) -> io::Result<MailboxConfigPublication> {
+        let mut state = self
+            .fence
+            .state
+            .try_lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        if state.failed || state.deadline.is_some() {
+            return Err(refused("provider publication stopped"));
+        }
+        let MailboxWorkerOperation::DelegateConfig { owner } = &request.operation else {
+            return Err(refused("publication requires original DelegateConfig"));
+        };
+        let slots = self
+            .slots
+            .try_lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let slot = slots
+            .get(&request.vm_id)
+            .ok_or_else(|| refused("original publication slot absent"))?;
+        let slot = slot
+            .try_lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let now = self.now_unix_ms()?;
+        if request.tenant != self.tenant
+            || &slot.owner != owner
+            || slot.owner.context_commitment
+                != context_commitment(request).map_err(|_| refused("publication context"))?
+            || !slot.delegated
+            || slot.stop_requested
+            || slot.busy
+            || !matches!(slot.state, MailboxWorkerState::Starting)
+            || now >= request.admission_expires_at_unix_ms
+            || now >= request.deadline_unix_ms
+        {
+            return Err(refused(
+                "original publication context unavailable or expired",
+            ));
+        }
+        state.publications = state
+            .publications
+            .checked_add(1)
+            .ok_or_else(|| refused("publication count exhausted"))?;
+        Ok(MailboxConfigPublication {
+            fence: self.fence.clone(),
+        })
+    }
+    pub fn validate_retirement(&self, receipt: &MailboxWorkersRetirement) -> io::Result<()> {
+        let state = lock(&self.fence.state)?;
+        if state.failed
+            || !state
+                .retired
+                .as_ref()
+                .is_some_and(|proof| Arc::ptr_eq(proof, &receipt.proof))
+        {
+            return Err(refused("retirement is not from this original provider"));
+        }
+        Ok(())
+    }
+    /// Run in a retained blocking job. Expired grace never renews: original
+    /// outstanding turns/exit events may finish beyond it with custody retained.
+    pub fn retire_originals(&self) -> io::Result<MailboxWorkersRetirement> {
+        let mut state = lock(&self.fence.state)?;
+        let deadline = state
+            .deadline
+            .ok_or_else(|| refused("provider must fence before retirement"))?;
+        if state.failed {
+            return Err(refused("provider fence uncertain"));
+        }
+        if let Some(proof) = &state.retired {
+            return Ok(MailboxWorkersRetirement {
+                proof: proof.clone(),
+            });
+        }
+        if state.running {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        state.running = true;
+        drop(state);
+        let _job = RetirementJob(self.fence.clone());
+        let mut state = lock(&self.fence.state)?;
+        while state.active != 0 || state.publications != 0 {
+            state = self
+                .fence
+                .changed
+                .wait(state)
+                .map_err(|_| refused("provider wait poisoned"))?;
+            if state.failed {
+                return Err(refused("provider fence uncertain"));
+            }
+        }
+        drop(state);
+        let slots: Vec<_> = lock(&self.slots)?.values().cloned().collect();
+        // Fence every original lifetime channel BEFORE waiting for any child.
+        // A busy post-fence Stop already requests that same shutdown itself.
+        for slot in &slots {
+            let mut guard = lock(slot)?;
+            guard.stop_requested = true;
+            if let Some(worker) = guard.worker.as_mut() {
+                drop(worker.child.stdin.take());
+                let _ = worker.control.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        let mut exits = Vec::new();
+        exits
+            .try_reserve_exact(slots.len())
+            .map_err(|_| refused("retirement receipt allocation"))?;
+        let mut never_spawned = 0;
+        for slot in slots {
+            // A pre-existing Stop/Query may already hold the actual loan. Its
+            // operation guard notifies this SAME event; fresh cleanup traffic
+            // is not added to the pre-fence outstanding count.
+            let mut guard = loop {
+                let state = lock(&self.fence.state)?;
+                let guard = lock(&slot)?;
+                if !guard.busy {
+                    drop(state);
+                    break guard;
+                }
+                drop(guard);
+                drop(
+                    self.fence
+                        .changed
+                        .wait(state)
+                        .map_err(|_| refused("slot loan wait poisoned"))?,
+                );
+            };
+            guard.stop_requested = true;
+            let owner = guard.owner.clone();
+            if !guard.spawn_attempted && guard.worker.is_none() {
+                if !guard.reservation_released {
+                    self.budget.collected(&self.tenant)?;
+                    guard.reservation_released = true;
+                }
+                if let Some(cell) = guard.cell.take() {
+                    self.budget.return_cell(cell);
+                }
+                // Retirement is a local released reservation, NOT Collected.
+                guard.state = MailboxWorkerState::Unresolved;
+                if !guard.reservation_retired {
+                    self.budget.retire(&self.tenant, &guard.request.vm_id)?;
+                    guard.reservation_retired = true;
+                }
+                never_spawned += 1;
+                continue;
+            }
+            guard.busy = true;
+            let original_worker = guard.worker.take();
+            drop(guard);
+            let mut loan = WorkerLoan {
+                slot: slot.clone(),
+                worker: original_worker,
+                committed: false,
+            };
+            let worker = loan
+                .worker
+                .as_mut()
+                .ok_or_else(|| refused("spawned original worker missing"))?;
+            drop(worker.child.stdin.take());
+            let _ = worker.control.shutdown(std::net::Shutdown::Both);
+            let status = if let Some(status) = collect_child(worker)? {
+                status
+            } else {
+                if !worker.exit_observed {
+                    let observer = worker
+                        .observer
+                        .as_ref()
+                        .ok_or_else(|| refused("original worker observer missing"))?;
+                    let event = wait_process_exit_events(&[observer], None, None)
+                        .map_err(|_| refused("original exit wait failed"))?;
+                    if event.exited.is_empty() {
+                        return Err(refused("original exit not observed"));
+                    }
+                    worker.exit_observed = true;
+                }
+                require_owned_child_custody().inspect_err(|_| worker.custody_uncertain = true)?;
+                let status = worker
+                    .child
+                    .wait()
+                    .inspect_err(|_| worker.custody_uncertain = true)?;
+                worker.status = Some(status);
+                status
+            };
+            let terminal = collected(status);
+            let MailboxWorkerState::Collected { exit } = &terminal else {
+                unreachable!()
+            };
+            exits.push((owner, exit.clone()));
+            let mut guard = lock(&slot)?;
+            if !matches!(guard.state, MailboxWorkerState::Collected { .. }) {
+                self.budget.collected(&self.tenant)?;
+            }
+            if let Some(cell) = guard.cell.take() {
+                self.budget.return_cell(cell);
+            }
+            guard.worker = loan.worker.take();
+            guard.state = terminal;
+            guard.busy = false;
+            guard.terminal_at = Some(Instant::now());
+            loan.committed = true;
+            if !guard.reservation_retired {
+                self.budget.retire(&self.tenant, &guard.request.vm_id)?;
+                guard.reservation_retired = true;
+            }
+        }
+        let proof = Arc::new(RetirementProof {
+            deadline,
+            exits,
+            never_spawned,
+        });
+        let mut state = lock(&self.fence.state)?;
+        if state.failed || state.active != 0 || state.publications != 0 {
+            return Err(refused("provider did not quiesce"));
+        }
+        state.retired = Some(proof.clone());
+        Ok(MailboxWorkersRetirement { proof })
     }
     pub fn tenant(&self) -> &str {
         &self.tenant
@@ -756,6 +1157,13 @@ impl MailboxWorkers {
         Ok(slots.contains_key(vm))
     }
     fn expire_terminals(&self) -> io::Result<()> {
+        let fence = lock(&self.fence.state)?;
+        if fence.deadline.is_some() {
+            return Ok(());
+        }
+        // Keep SAME short fence-to-slots turn: retirement cannot capture an
+        // entry whose expiry has passed its check but has not removed it yet.
+        let _fence = fence;
         let mut slots = lock(&self.slots)?;
         let expired: Vec<String> = slots
             .iter()
@@ -808,6 +1216,7 @@ impl MailboxWorkers {
         &self,
         request: &MailboxWorkerRequest,
     ) -> io::Result<(MailboxWorkerResult, Option<OwnedFd>)> {
+        let _operation = self.operation_permit(request)?;
         if request.tenant != self.tenant {
             return Err(refused("foreign worker tenant"));
         }
@@ -821,6 +1230,17 @@ impl MailboxWorkers {
         let deadline = Instant::now() + std::time::Duration::from_millis(remaining);
         let context = context_commitment(request).map_err(|_| refused("worker context"))?;
         let slot = {
+            // SAME fence turn linearizes new reservation against retirement.
+            let admission = if matches!(request.operation, MailboxWorkerOperation::Acquire) {
+                let guard = lock(&self.fence.state)?;
+                if guard.deadline.is_some() || guard.failed {
+                    return Err(refused("provider acquisition stopped"));
+                }
+                Some(guard)
+            } else {
+                None
+            };
+            let _admission = admission;
             let mut slots = lock(&self.slots)?;
             if matches!(request.operation, MailboxWorkerOperation::Acquire) {
                 if let Some(slot) = slots.get(&request.vm_id) {
@@ -869,6 +1289,8 @@ impl MailboxWorkers {
                     terminal_at: None,
                     cell: Some(cell),
                     spawn_attempted: false,
+                    reservation_released: false,
+                    reservation_retired: false,
                 }));
                 slots.insert(request.vm_id.clone(), slot);
                 return Ok((
@@ -887,6 +1309,18 @@ impl MailboxWorkers {
                 .ok_or_else(|| refused("unknown worker acquisition"))?
         };
         let (original_worker, state, mut delegated, owner) = {
+            let _admission = if matches!(
+                request.operation,
+                MailboxWorkerOperation::DelegateConfig { .. }
+            ) {
+                let guard = lock(&self.fence.state)?;
+                if guard.deadline.is_some() || guard.failed {
+                    return Err(refused("provider delegation stopped"));
+                }
+                Some(guard)
+            } else {
+                None
+            };
             let mut slot = lock(&slot)?;
             let supplied = match &request.operation {
                 MailboxWorkerOperation::DelegateConfig { owner }
@@ -899,6 +1333,24 @@ impl MailboxWorkers {
                 || slot.owner.daemon_boot_nonce != self.boot
             {
                 return Err(refused("stale or mismatched worker owner"));
+            }
+            if matches!(request.operation, MailboxWorkerOperation::Query { .. })
+                && slot.stop_requested
+            {
+                let state = if matches!(slot.state, MailboxWorkerState::Collected { .. }) {
+                    slot.state.clone()
+                } else {
+                    MailboxWorkerState::Unresolved
+                };
+                return Ok((
+                    MailboxWorkerResult {
+                        request_nonce: request.request_nonce,
+                        owner: slot.owner.clone(),
+                        state,
+                        delegates_config: false,
+                    },
+                    None,
+                ));
             }
             if slot.busy {
                 return Err(refused("worker operation in progress"));
@@ -974,7 +1426,8 @@ impl MailboxWorkers {
                 // Factory/OS spawn ran outside the gate. Retain the original
                 // Child first, then refresh authority immediately before any
                 // pipe writer can escape to the launcher.
-                if self.now_unix_ms()? >= request.admission_expires_at_unix_ms
+                if lock(&self.fence.state)?.deadline.is_some()
+                    || self.now_unix_ms()? >= request.admission_expires_at_unix_ms
                     || Instant::now() >= deadline
                 {
                     drop(child.child.stdin.take());
@@ -1096,17 +1549,25 @@ impl Drop for MailboxWorkers {
             let collected = matches!(guard.state, MailboxWorkerState::Collected { .. });
             let never_spawned = guard.worker.is_none() && !guard.spawn_attempted && !guard.busy;
             if collected || never_spawned {
+                let already_retired = guard.reservation_retired;
                 let cell = guard.cell.take();
                 let tenant = guard.request.tenant.clone();
                 let vm = guard.request.vm_id.clone();
+                let released = guard.reservation_released;
                 drop(guard);
-                let credit = if never_spawned {
+                let credit = if never_spawned && !released {
                     self.budget.collected(&tenant)
                 } else {
                     Ok(())
                 };
                 if credit
-                    .and_then(|()| self.budget.retire(&tenant, &vm))
+                    .and_then(|()| {
+                        if already_retired {
+                            Ok(())
+                        } else {
+                            self.budget.retire(&tenant, &vm)
+                        }
+                    })
                     .is_err()
                 {
                     self.budget.cleanup.failed.store(true, Ordering::Release);
@@ -1177,6 +1638,69 @@ mod tests {
             bytes_per_worker: 65_536,
         }
     }
+    #[test]
+    fn provider_fence_waits_original_activation_beyond_grace_without_renewing_it() {
+        let budget = MailboxWorkerBudget::new(limits()).unwrap();
+        let provider =
+            Arc::new(MailboxWorkers::new("tenant", budget, Arc::new(NeverSpawn)).unwrap());
+        assert!(provider.try_idle().unwrap());
+        let activation = provider.try_activation().unwrap();
+        assert!(!provider.try_idle().unwrap());
+        let first = Instant::now(); // Already-expired grace is not a new wait grant.
+        provider.begin_retirement(first).unwrap();
+        assert!(provider.try_activation().is_err());
+        assert!(!provider.try_idle().unwrap());
+        // A same-thread try proves the short gate is not held across the turn.
+        assert!(provider.fence.state.try_lock().is_ok());
+        drop(activation);
+        let receipt = provider.retire_originals().unwrap();
+        assert_eq!(receipt.deadline(), first);
+        provider.validate_retirement(&receipt).unwrap();
+        assert_eq!(receipt.never_spawned_released(), 0);
+    }
+
+    #[test]
+    fn original_provider_retirement_releases_only_never_spawned_and_binds_its_receipt() {
+        let budget = MailboxWorkerBudget::new(limits()).unwrap();
+        let baseline = budget.usage().unwrap();
+        let provider = MailboxWorkers::new("tenant", budget.clone(), Arc::new(NeverSpawn)).unwrap();
+        let original_request = request(&budget, "tenant");
+        let acquired = provider.handle(&original_request).unwrap().0;
+        assert_eq!(budget.usage().unwrap().workers, 1);
+        let first = Instant::now() + std::time::Duration::from_secs(1);
+        provider.begin_retirement(first).unwrap();
+        provider
+            .begin_retirement(first + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            provider.handle(&original_request).is_err(),
+            "Acquire cannot restart a frozen provider"
+        );
+        let receipt = provider.retire_originals().unwrap();
+        provider.validate_retirement(&receipt).unwrap();
+        assert_eq!(receipt.deadline(), first);
+        assert_eq!(receipt.never_spawned_released(), 1);
+        assert!(
+            receipt.original_exit(&acquired.owner).is_none(),
+            "never-spawned is not Child collection"
+        );
+        assert_eq!(budget.usage().unwrap().workers, 0);
+        assert_eq!(
+            budget.usage().unwrap().bytes,
+            baseline.bytes,
+            "all original per-VM metadata registrations released"
+        );
+        let other =
+            MailboxWorkers::new("other-tenant", budget.clone(), Arc::new(NeverSpawn)).unwrap();
+        other.handle(&request(&budget, "other-tenant")).unwrap();
+        drop(other);
+        let foreign = MailboxWorkers::new("tenant", budget, Arc::new(NeverSpawn)).unwrap();
+        assert!(
+            foreign.validate_retirement(&receipt).is_err(),
+            "same tenant is not same original provider"
+        );
+    }
+
     #[test]
     fn nonblocking_collision_read_refuses_contention_poison_and_retains_terminal_slots() {
         let budget = MailboxWorkerBudget::new(limits()).unwrap();

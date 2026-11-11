@@ -34,6 +34,7 @@ use mvm_hostd::audit_signer::config::SignerHelperConfig;
 use mvm_hostd::broker::daemon::{
     HostAgentConfig, HostAgentDaemon, OriginalDrainController, OriginalDrainRequest,
 };
+use mvm_hostd::broker::mailbox_workers::{MailboxWorkers, MailboxWorkersRetirement};
 use mvm_hostd::host_agent_idle::IdleProposal;
 use mvm_hostd::watcher_jobs::{WatcherDrainReceipt, WatcherJobOwner};
 use mvm_vmm::host::installed_owner::{
@@ -1247,12 +1248,42 @@ struct WorkerCoordinator {
     accepted: mvm_hostd::broker::daemon::AcceptedWorkDrain,
     custody: mvm_hostd::broker::daemon::DaemonCustodyOwner,
     services_receipt: Option<mvm_hostd::broker::daemon::DaemonServicesDrainReceipt>,
+    mailbox_retirement: Option<MailboxRetirement>,
     resource_finished: bool,
     startup_journal_count: usize,
     drain_controller: OriginalDrainController,
 }
 
+// The handle stays in the coordinator when its outer grace future expires.
+enum MailboxRetirement {
+    Collecting(tokio::task::JoinHandle<std::io::Result<MailboxWorkersRetirement>>),
+    Collected(MailboxWorkersRetirement),
+    Unresolved,
+}
+
 impl WorkerCoordinator {
+    async fn collect_mailbox_owner(&mut self, owner: Arc<MailboxWorkers>) -> Result<()> {
+        let retirement = self.mailbox_retirement.get_or_insert_with(|| {
+            let original = owner.clone();
+            MailboxRetirement::Collecting(tokio::task::spawn_blocking(move || {
+                original.retire_originals()
+            }))
+        });
+        if let MailboxRetirement::Collecting(task) = retirement {
+            let outcome = task.await;
+            *retirement = MailboxRetirement::Unresolved;
+            let receipt = outcome.context("original mailbox collector task failed")??;
+            *retirement = MailboxRetirement::Collected(receipt);
+        }
+        let MailboxRetirement::Collected(receipt) = retirement else {
+            anyhow::bail!("original mailbox collection unresolved");
+        };
+        self.daemon
+            .lock()
+            .await
+            .record_mailbox_retirement(&owner, receipt)
+    }
+
     fn open(cfg: HostAgentConfig) -> Result<Self> {
         use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecycleGeneration};
         let verifying_key = cfg.load_verifying_key()?;
@@ -1298,6 +1329,7 @@ impl WorkerCoordinator {
             accepted,
             custody,
             services_receipt: None,
+            mailbox_retirement: None,
             resource_finished: false,
             startup_journal_count,
             drain_controller,
@@ -1427,13 +1459,12 @@ impl WorkerCoordinator {
                     .daemon
                     .try_lock()
                     .map_err(|_| anyhow::anyhow!("original daemon drain check contended"))?;
-                daemon.require_no_injected_mailbox_owner()?;
                 anyhow::ensure!(
                     state.pending().is_empty() && inventory.owned_running() == 0,
                     "original canonical session work remains live"
                 );
                 anyhow::ensure!(
-                    daemon.checked_registration_count()? == 0 && !daemon.has_accepted_work()?,
+                    daemon.can_accept_idle_fence()?,
                     "original daemon work remains live"
                 );
                 if let Some(watchers) = &self.watchers {
@@ -1504,12 +1535,29 @@ impl WorkerCoordinator {
     }
 
     async fn collect_originals(&mut self) -> Result<()> {
-        // Usage counters cannot stand in for the injected owner's actual
-        // receipt. This production path currently has no injected child owner.
-        {
+        let mailbox = {
             let mut daemon = self.daemon.lock().await;
             daemon.close_local_admission()?;
-            daemon.require_no_injected_mailbox_owner()?;
+            daemon.mailbox_worker_owner()
+        };
+        if let Some(owner) = &mailbox {
+            let phase = self
+                .lifecycle
+                .snapshot(Instant::now() + LIFECYCLE_IO_BUDGET)?;
+            anyhow::ensure!(
+                phase.generation() == &self.generation
+                    && phase.phase() == mvm_core::tenant_lifecycle::LifecyclePhase::Draining,
+                "mailbox retirement requires the original generation's durable drain fence"
+            );
+            let request = self
+                .drain_controller
+                .request(Instant::now() + COOPERATIVE_DRAIN_GRACE)?;
+            owner.begin_retirement(request.deadline())?;
+        } else {
+            anyhow::ensure!(
+                self.mailbox_retirement.is_none(),
+                "original mailbox provider disappeared"
+            );
         }
         if let Some(watchers) = self.watchers.as_mut() {
             watchers.drain().await?;
@@ -1517,6 +1565,9 @@ impl WorkerCoordinator {
         if self.services_receipt.is_none() {
             HostAgentDaemon::reconcile_for_shutdown(self.daemon.clone(), &self.generation).await?;
             self.services_receipt = Some(self.custody.drain_services().await?);
+        }
+        if let Some(owner) = mailbox {
+            self.collect_mailbox_owner(owner).await?;
         }
         let pending = self
             .lifecycle
@@ -1804,3 +1855,7 @@ fn main() -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "mvm-host-agent/worker_deadline_tests.rs"]
 mod worker_deadline_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "mvm-host-agent/worker_injected_owner_tests.rs"]
+mod worker_injected_owner_tests;
