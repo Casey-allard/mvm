@@ -24,3 +24,5 @@ pub use mvm_contract::protocol::{
 
 // Flatten protocol.rs contents up to `mvm_core::protocol::*`.
 pub use self::protocol::*;
+
+pub mod mailbox_worker_control;

@@ -397,6 +397,9 @@ impl HostAgentDaemon {
     /// signature verifies.
     pub fn apply(&mut self, req: &ControlRequest) -> Result<()> {
         match req {
+            ControlRequest::MailboxWorkerV1(_) => {
+                anyhow::bail!("mailbox worker ownership is not implemented");
+            }
             ControlRequest::HvfInstanceV1(_) => {
                 bail!("HVF instance control requires the instance supervisor")
             }

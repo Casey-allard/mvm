@@ -630,6 +630,9 @@ fn send_control(
             write_framed(&mut stream, &signed)?;
             match read_framed::<ControlResponse>(&mut stream)? {
                 ControlResponse::Ok => Ok(()),
+                ControlResponse::MailboxWorkerV1(_) => {
+                    bail!("unexpected mailbox worker response for legacy control")
+                }
                 ControlResponse::Err { message } => {
                     bail!("host-agent refused control request: {message}")
                 }

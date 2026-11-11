@@ -202,6 +202,7 @@ pub enum ControlRequest {
     Deregister(DeregisterVm),
     /// Domain-separated lifetime control for one native supervisor.
     HvfInstanceV1(super::hvf_control::HvfInstanceControl),
+    MailboxWorkerV1(Box<super::mailbox_worker::MailboxWorkerRequest>),
 }
 
 /// A host-signed control message: the [`ControlRequest`] plus an Ed25519
@@ -225,6 +226,8 @@ pub struct SignedControl {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlResponse {
+    /// Inactive versioned mailbox worker-owner result.
+    MailboxWorkerV1(Box<super::mailbox_worker::MailboxWorkerResult>),
     /// The request was applied.
     Ok,
     /// The request was rejected (bad signature, wrong tenant, unsafe id, bind

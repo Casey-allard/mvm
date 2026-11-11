@@ -46,3 +46,6 @@ pub mod uds_peer;
 pub mod ui;
 pub mod vm_helpers;
 pub mod workload_wait;
+
+#[cfg(unix)]
+pub mod mailbox_worker_transport;

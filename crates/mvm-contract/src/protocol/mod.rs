@@ -35,3 +35,5 @@ pub mod signing;
 pub mod upstream_tools;
 pub mod vcpu_quota;
 pub mod vm_backend;
+
+pub mod mailbox_worker;
