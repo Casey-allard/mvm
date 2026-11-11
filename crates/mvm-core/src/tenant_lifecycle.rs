@@ -624,6 +624,32 @@ impl TenantLifecycleGate {
         action()
     }
 
+    /// Coordinate short cleanup memory operations under the original Draining
+    /// generation. Pending rows and unresolved state remain intact; this grants
+    /// no activation, cleanup authority or original-child collection receipt.
+    /// The callback must not wait, spawn, perform I/O, acquire a blocking mutex
+    /// or own original service/resource custody. The checked mutation revision
+    /// is durable before it runs, even when the callback subsequently refuses.
+    pub fn with_draining<T>(
+        &self,
+        expected: &LifecycleGeneration,
+        deadline: Instant,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _lock = self.lock(deadline)?;
+        let record = self.read_record()?;
+        ensure!(
+            &record.generation == expected && record.phase == LifecyclePhase::Draining,
+            "original lifecycle generation is not Draining"
+        );
+        self.write_record(&record)?;
+        ensure!(
+            Instant::now() < deadline,
+            "lifecycle cleanup deadline expired"
+        );
+        action()
+    }
+
     /// Commit a bounded in-memory admission under the original active generation.
     /// The mutation revision is durably advanced before the callback; a refused
     /// callback conservatively invalidates earlier inventory scans too.

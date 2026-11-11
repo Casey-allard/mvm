@@ -121,6 +121,133 @@ fn preparing_turn_refuses_stale_expired_active_and_draining_without_invoking_act
 }
 
 #[test]
+fn draining_turn_keeps_original_pending_and_uncertainty_under_the_same_file_lock() {
+    use mvm_core::util::atomic_io::FileLock;
+    let home = tempfile::tempdir().unwrap();
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let coordinator = bootstrap(home.path(), &generation);
+    activate(&coordinator, &generation);
+    let gate = TenantLifecycleGate::new(home.path(), "tenant-a").unwrap();
+    let reservation = gate.reserve_launch("vm-a", "plan-a", deadline()).unwrap();
+    let active = coordinator.snapshot(deadline()).unwrap();
+    coordinator
+        .begin_drain(&generation, active.revision(), deadline(), |_| Ok(()))
+        .unwrap();
+    coordinator
+        .mark_unresolved(&generation, deadline())
+        .unwrap();
+    let before = coordinator.snapshot(deadline()).unwrap();
+    let directory = mvm_core::config::host_agent_dir_at(home.path(), "tenant-a");
+    let result = gate
+        .with_draining(&generation, deadline(), || {
+            // Test-only filesystem probes. Real actions perform only short memory
+            // operations and retain original service custody outside this callback.
+            assert!(FileLock::try_acquire(&directory.join("lifecycle.lock"))?.is_none());
+            let state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("lifecycle.json"))?)?;
+            assert_eq!(state["revision"].as_u64(), Some(before.revision() + 1));
+            assert_eq!(state["unresolved"], true);
+            Ok(17)
+        })
+        .unwrap();
+    assert_eq!(result, 17);
+    let after = coordinator.snapshot(deadline()).unwrap();
+    assert_eq!(after.phase(), LifecyclePhase::Draining);
+    assert_eq!(after.generation(), before.generation());
+    assert_eq!(
+        serde_json::to_vec(after.pending()).unwrap(),
+        serde_json::to_vec(before.pending()).unwrap()
+    );
+    assert!(after.unresolved());
+    assert_eq!(after.revision(), before.revision() + 1);
+    assert!(
+        gate.with_draining(&generation, deadline(), || -> anyhow::Result<()> {
+            anyhow::bail!("controlled cleanup memory refusal")
+        })
+        .is_err()
+    );
+    assert_eq!(
+        coordinator.snapshot(deadline()).unwrap().revision(),
+        after.revision() + 1
+    );
+    drop(reservation);
+}
+
+#[test]
+fn draining_turn_refuses_other_phases_stale_expired_and_contended_without_action() {
+    use mvm_core::util::atomic_io::FileLock;
+    let home = tempfile::tempdir().unwrap();
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let stale = LifecycleGeneration::new([8; 32], 2).unwrap();
+    let coordinator = bootstrap(home.path(), &generation);
+    let gate = TenantLifecycleGate::new(home.path(), "tenant-a").unwrap();
+    let refuse = |expected: &LifecycleGeneration, expires| {
+        assert!(
+            gate.with_draining(expected, expires, || -> anyhow::Result<()> {
+                panic!("refused Draining turn invoked cleanup")
+            })
+            .is_err()
+        );
+    };
+    refuse(&generation, deadline()); // Preparing
+    activate(&coordinator, &generation);
+    refuse(&generation, deadline()); // Active
+    let active = coordinator.snapshot(deadline()).unwrap();
+    coordinator
+        .begin_drain(&generation, active.revision(), deadline(), |_| Ok(()))
+        .unwrap();
+    let before = coordinator.snapshot(deadline()).unwrap();
+    refuse(&stale, deadline());
+    refuse(&generation, Instant::now());
+    let directory = mvm_core::config::host_agent_dir_at(home.path(), "tenant-a");
+    let lock = FileLock::try_acquire(&directory.join("lifecycle.lock"))
+        .unwrap()
+        .unwrap();
+    refuse(&generation, Instant::now() + Duration::from_millis(10));
+    drop(lock);
+    assert_eq!(
+        coordinator.snapshot(deadline()).unwrap().revision(),
+        before.revision()
+    );
+    coordinator
+        .finish_drain_after_collection(&generation, deadline(), |_| Ok(()))
+        .unwrap();
+    refuse(&generation, deadline()); // Drained
+}
+
+#[test]
+fn draining_turn_refuses_storage_and_revision_failure_before_cleanup() {
+    for overflow in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+        let coordinator = bootstrap(home.path(), &generation);
+        let gate = TenantLifecycleGate::new(home.path(), "tenant-a").unwrap();
+        let before = coordinator.snapshot(deadline()).unwrap();
+        coordinator
+            .begin_drain(&generation, before.revision(), deadline(), |_| Ok(()))
+            .unwrap();
+        let state_path =
+            mvm_core::config::host_agent_dir_at(home.path(), "tenant-a").join("lifecycle.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        if overflow {
+            state["revision"] = serde_json::json!(u64::MAX);
+            std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        } else {
+            std::fs::write(&state_path, b"malformed storage").unwrap();
+        }
+        let exact_before = std::fs::read(&state_path).unwrap();
+        assert!(
+            gate.with_draining(&generation, deadline(), || -> anyhow::Result<()> {
+                panic!("invalid storage or overflowing revision invoked cleanup")
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), exact_before);
+    }
+}
+
+#[test]
 fn activation_callbacks_keep_original_file_turn_and_publish_only_durable_active() {
     use mvm_core::util::atomic_io::FileLock;
     use std::cell::Cell;
