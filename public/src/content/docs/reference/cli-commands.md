@@ -15,6 +15,15 @@ tenant lifecycle and tenant policy authoring/review remain `mvmd`
 responsibilities. `mvmctl policy` covers only a workload's own authored
 policy, resolved on this host.
 
+On Unix, the ordinary command pipeline prepares an absent `MVM_HOME` with
+private permissions and the canonical `local` resource-owner record before
+configuration and command-audit writes. An audit tenant label does not select
+that namespace. Existing private homes are held without repairing missing
+owner metadata; native startup still requires canonical admission and explicit
+legacy reconciliation. Help/version parsing and existing early commands such
+as backend detection, caller identity and uninstall do not take this fresh-home
+preparation path. Preparation itself starts no service or guest.
+
 **Command grouping (Plan 178).** The surface is organized into a small set
 of top-level daily-driver verbs plus noun groups; operations on a single
 running VM are flattened into `machine`, contributor build-time verbs under `dev`, observability

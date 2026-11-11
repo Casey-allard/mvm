@@ -2889,3 +2889,47 @@ fn pool_refill_is_hidden_from_help() {
         assert!(refill.contains(flag), "{refill}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn normal_cli_writers_prepare_only_the_canonical_local_home() {
+    use mvm_vmm::host::host_agent_installation::descriptor;
+    use mvm_vmm::host::installed_owner::{InstallationOwner, Phase};
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::tempdir().expect("isolated CLI parent");
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = parent.path().canonicalize().unwrap().join("mvm-home");
+    let mut command = assert_cmd::Command::new(env!("CARGO_BIN_EXE_mvmctl"));
+    let output = command
+        .timeout(std::time::Duration::from_secs(30))
+        .env("MVM_HOME", &home)
+        .env("HOME", parent.path())
+        .env("MVM_TENANT", "audit-label-only")
+        .env("MVM_NO_UPDATE_CHECK", "1")
+        .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .args(["completions", "bash"])
+        .output()
+        .expect("run the normal CLI pipeline without a VM");
+    assert!(
+        output.status.success(),
+        "normal pipeline failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("mvmctl"));
+    let labels = descriptor(&home, mvm_core::plan::synthesis::DEFAULT_TENANT)
+        .expect("canonical private local home");
+    let owner = InstallationOwner::open(&labels.root, labels.key)
+        .expect("frontend provisioned the canonical owner before ordinary writers");
+    let state = owner.snapshot().unwrap();
+    assert_eq!(state.phase, Phase::Clean);
+    assert_eq!(
+        state.epoch, 0,
+        "filesystem preparation must not activate a service"
+    );
+    assert!(
+        !mvm_core::config::host_agent_dir_at(&home, "audit-label-only").exists(),
+        "an audit-chain label is not a provisioning namespace"
+    );
+}

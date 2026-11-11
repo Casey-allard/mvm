@@ -56,6 +56,8 @@ pub(crate) use vm::exec::RunProfile;
 #[cfg(test)]
 mod tests;
 
+#[cfg(unix)]
+use anyhow::Context;
 use anyhow::Result;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -404,6 +406,21 @@ fn run_command() -> Result<()> {
         }
     };
     apply_startup_env(&cli);
+    // Ordinary command hooks write config and audit state before dispatch.
+    // Prepare their canonical local namespace first; an audit label is not
+    // service authority. Existing early commands retain their no-create path.
+    #[cfg(unix)]
+    let _home_preparation = if cli.command.is_early_command() {
+        None
+    } else {
+        Some(
+            mvm_vmm::host::host_agent_installation::prepare_home(
+                &mvm_core::config::mvm_home_strict()?,
+                mvm_core::plan::synthesis::DEFAULT_TENANT,
+            )
+            .context("prepare canonical local home before CLI state writers")?,
+        )
+    };
     refuse_local_image_source_in_release_build(
         mvm_build::artifact_acquisition::compiled_channel(),
         &cli.command,
