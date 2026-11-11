@@ -33,6 +33,120 @@ fn activate(coordinator: &LifecycleCoordinator, generation: &LifecycleGeneration
 }
 
 #[test]
+fn activation_callbacks_keep_original_file_turn_and_publish_only_durable_active() {
+    use mvm_core::util::atomic_io::FileLock;
+    use std::cell::Cell;
+    let home = tempfile::tempdir().unwrap();
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let coordinator = bootstrap(home.path(), &generation);
+    let lock_path =
+        mvm_core::config::host_agent_dir_at(home.path(), "tenant-a").join("lifecycle.lock");
+    let prechecked = Cell::new(false);
+    let published = Cell::new(false);
+    coordinator
+        .activate_after_reconciliation_with(
+            &generation,
+            deadline(),
+            |snapshot| {
+                assert_eq!(snapshot.phase(), LifecyclePhase::Preparing);
+                // Test-only kernel probe: both callbacks must observe the SAME retained
+                // file turn. Production callbacks perform only nonblocking memory checks.
+                assert!(FileLock::try_acquire(&lock_path)?.is_none());
+                prechecked.set(true);
+                Ok(())
+            },
+            |snapshot| {
+                assert!(prechecked.get());
+                assert_eq!(snapshot.phase(), LifecyclePhase::Active);
+                assert!(FileLock::try_acquire(&lock_path)?.is_none());
+                published.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(published.get());
+    assert_eq!(
+        coordinator.snapshot(deadline()).unwrap().phase(),
+        LifecyclePhase::Active
+    );
+}
+
+#[test]
+fn activation_precheck_refusal_preserves_preparing_bytes_and_never_publishes() {
+    let home = tempfile::tempdir().unwrap();
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let coordinator = bootstrap(home.path(), &generation);
+    let state = mvm_core::config::host_agent_dir_at(home.path(), "tenant-a").join("lifecycle.json");
+    let original = std::fs::read(&state).unwrap();
+    let result = coordinator.activate_after_reconciliation_with(
+        &generation,
+        deadline(),
+        |_| anyhow::bail!("original owner check refused"),
+        |_| panic!("publication after refused precheck"),
+    );
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&state).unwrap(), original);
+}
+
+#[test]
+fn activation_callbacks_refuse_stale_generation_and_expired_admission_before_any_callback() {
+    let home = tempfile::tempdir().unwrap();
+    let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+    let coordinator = bootstrap(home.path(), &generation);
+    let stale = LifecycleGeneration::new([8; 32], 2).unwrap();
+    let path = mvm_core::config::host_agent_dir_at(home.path(), "tenant-a").join("lifecycle.json");
+    let original = std::fs::read(&path).unwrap();
+    for (expected, expires) in [(&stale, deadline()), (&generation, Instant::now())] {
+        assert!(
+            coordinator
+                .activate_after_reconciliation_with(
+                    expected,
+                    expires,
+                    |_| panic!("precheck ran for stale or expired activation"),
+                    |_| panic!("publication ran for stale or expired activation")
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[test]
+fn failed_or_panicking_partial_publication_fences_same_generation_without_claiming_rollback() {
+    use std::cell::Cell;
+    for panic in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+        let coordinator = bootstrap(home.path(), &generation);
+        let released = Cell::new(false);
+        let result = coordinator.activate_after_reconciliation_with(
+            &generation,
+            deadline(),
+            |_| Ok(()),
+            |_| {
+                released.set(true); // One fixture latch has already been released.
+                if panic {
+                    panic!("controlled partial publication panic");
+                }
+                anyhow::bail!("controlled partial publication refusal")
+            },
+        );
+        assert!(released.get());
+        assert!(result.is_err());
+        let observed = coordinator.snapshot(deadline()).unwrap();
+        assert_eq!(observed.generation(), &generation);
+        assert_eq!(observed.phase(), LifecyclePhase::Draining);
+        assert!(observed.unresolved());
+        assert!(
+            TenantLifecycleGate::new(home.path(), "tenant-a")
+                .unwrap()
+                .reserve_launch("vm-after-partial", "plan-a", deadline())
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn open_existing_refuses_absence_and_missing_state_without_initializing_anything() {
     let parent = tempfile::tempdir().expect("parent");
     let missing = parent.path().join("absent-home");

@@ -383,6 +383,39 @@ impl LifecycleCoordinator {
         generation: &LifecycleGeneration,
         deadline: Instant,
     ) -> Result<()> {
+        self.activate_after_reconciliation_with(generation, deadline, |_| Ok(()), |_| Ok(()))
+    }
+
+    /// Coordinate a host's staged readiness checks and local publication under
+    /// one original file turn. Callbacks return no guards and must perform only
+    /// short nonblocking memory checks/publication, without I/O or waiting.
+    /// They must not own original service/resource custody. The host retains
+    /// those owners and its closed external admission fence until success.
+    ///
+    /// Publication is not atomic: error or panic may follow a partial release.
+    /// After an attempted Active write, failure attempts same-generation
+    /// Draining/unresolved persistence; a failure of that fence remains explicit.
+    /// This storage operation supplies no service/Child readiness receipt.
+    pub fn activate_after_reconciliation_with(
+        &self,
+        generation: &LifecycleGeneration,
+        deadline: Instant,
+        precheck: impl FnOnce(&LifecycleSnapshot) -> Result<()>,
+        publish: impl FnOnce(&LifecycleSnapshot) -> Result<()>,
+    ) -> Result<()> {
+        self.activate_with_writer(generation, deadline, precheck, publish, |gate, record| {
+            gate.write_record(record)
+        })
+    }
+
+    fn activate_with_writer(
+        &self,
+        generation: &LifecycleGeneration,
+        deadline: Instant,
+        precheck: impl FnOnce(&LifecycleSnapshot) -> Result<()>,
+        publish: impl FnOnce(&LifecycleSnapshot) -> Result<()>,
+        mut write: impl FnMut(&TenantLifecycleGate, &Record) -> Result<()>,
+    ) -> Result<()> {
         LifecycleGeneration::new(generation.boot, generation.sequence)?;
         let _lock = self.gate.lock(deadline)?;
         let mut record = self.gate.read_record()?;
@@ -393,8 +426,67 @@ impl LifecycleCoordinator {
                 && &record.generation == generation,
             "lifecycle reconciliation is incomplete"
         );
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            precheck(&LifecycleSnapshot {
+                record: record.clone(),
+            })
+        }))
+        .map_err(|_| anyhow::anyhow!("lifecycle activation precheck panicked"))??;
+        ensure!(
+            Instant::now() < deadline,
+            "lifecycle activation deadline expired"
+        );
         record.phase = LifecyclePhase::Active;
-        self.gate.write_record(&record)
+        let mut expected = record.clone();
+        expected.revision = expected
+            .revision
+            .checked_add(1)
+            .context("lifecycle mutation counter exhausted")?;
+        let activated = (|| -> Result<()> {
+            write(&self.gate, &record)?;
+            ensure!(
+                Instant::now() < deadline,
+                "lifecycle activation deadline expired"
+            );
+            self.gate.validate_directory()?;
+            let confirmed = self.gate.read_record()?;
+            ensure!(
+                serde_json::to_vec(&confirmed)? == serde_json::to_vec(&expected)?,
+                "original Active lifecycle record changed before publication"
+            );
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publish(&LifecycleSnapshot { record: confirmed })
+            }))
+            .map_err(|_| anyhow::anyhow!("lifecycle activation publication panicked"))??;
+            ensure!(
+                Instant::now() < deadline,
+                "lifecycle activation deadline expired"
+            );
+            Ok(())
+        })();
+        if let Err(original) = activated {
+            // This is conservative failure fencing under the SAME retained
+            // file turn, not a renewed activation or cleanup-grace grant. Even
+            // if the original deadline expired, attempt to close durable Active.
+            let fenced = (|| -> Result<()> {
+                self.gate.validate_directory()?;
+                let mut current = self.gate.read_record()?;
+                ensure!(
+                    &current.generation == generation,
+                    "original activation generation changed during failure fencing"
+                );
+                current.phase = LifecyclePhase::Draining;
+                current.unresolved = true;
+                write(&self.gate, &current)
+            })();
+            return match fenced {
+                Ok(()) => Err(original),
+                Err(fence) => {
+                    Err(original.context(format!("lifecycle failure fence unresolved: {fence:#}")))
+                }
+            };
+        }
+        Ok(())
     }
 }
 
@@ -691,6 +783,163 @@ impl TenantLifecycleGate {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_deadline_expiring_after_active_commit_never_releases_publication() {
+        let home = tempfile::tempdir().unwrap();
+        crate::private_fs::create_owned_private_dir(home.path()).unwrap();
+        let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+        let metadata_deadline = Instant::now() + Duration::from_secs(1);
+        let coordinator = LifecycleCoordinator::prepare_after_exclusion(
+            home.path(),
+            "tenant-a",
+            generation.clone(),
+            256,
+            metadata_deadline,
+        )
+        .unwrap();
+        let expires = Instant::now() + Duration::from_millis(50);
+        let published = std::cell::Cell::new(false);
+        let mut writes = 0;
+        let outcome = coordinator.activate_with_writer(
+            &generation,
+            expires,
+            |_| Ok(()),
+            |_| {
+                published.set(true);
+                Ok(())
+            },
+            |gate, record| {
+                writes += 1;
+                gate.write_record(record)?;
+                if writes == 1 {
+                    // A controlled writer completion, not a renewed activation
+                    // budget: force the exact postcommit deadline boundary.
+                    while Instant::now() < expires {
+                        std::thread::yield_now();
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.is_err());
+        assert!(!published.get());
+        assert_eq!(writes, 2, "expiry after Active commit must attempt fencing");
+        let state = coordinator.snapshot(metadata_deadline).unwrap();
+        assert_eq!(state.generation(), &generation);
+        assert_eq!(state.phase(), LifecyclePhase::Draining);
+        assert!(state.unresolved());
+    }
+
+    #[test]
+    fn activation_state_barrier_failures_never_publish_and_attempt_conservative_fencing() {
+        for postcommit in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            crate::private_fs::create_owned_private_dir(home.path()).unwrap();
+            let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+            let deadline = || Instant::now() + Duration::from_secs(1);
+            let coordinator = LifecycleCoordinator::prepare_after_exclusion(
+                home.path(),
+                "tenant-a",
+                generation.clone(),
+                256,
+                deadline(),
+            )
+            .unwrap();
+            let published = std::cell::Cell::new(false);
+            let mut writes = 0;
+            let outcome = coordinator.activate_with_writer(
+                &generation,
+                deadline(),
+                |_| Ok(()),
+                |_| {
+                    published.set(true);
+                    Ok(())
+                },
+                |gate, record| {
+                    writes += 1;
+                    if writes == 1 {
+                        if postcommit {
+                            gate.write_record_staged(record, write_private, |_| {
+                                anyhow::bail!("controlled postcommit cleanup sync failure")
+                            })
+                        } else {
+                            gate.write_record_with(record, |_, _| {
+                                Err(std::io::Error::other(
+                                    "controlled Active state publication failure",
+                                ))
+                            })
+                        }
+                    } else {
+                        gate.write_record(record)
+                    }
+                },
+            );
+            assert!(outcome.is_err());
+            assert!(!published.get());
+            if postcommit {
+                let state = coordinator.snapshot(deadline()).unwrap();
+                assert_eq!(state.generation(), &generation);
+                assert_eq!(state.phase(), LifecyclePhase::Draining);
+                assert!(state.unresolved());
+                assert_eq!(writes, 2, "durable Active must be conservatively fenced");
+            } else {
+                assert!(
+                    coordinator
+                        .gate
+                        .directory
+                        .join(".lifecycle.intent")
+                        .is_file()
+                );
+                assert!(TenantLifecycleGate::new(home.path(), "tenant-a").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_publication_and_failed_fencing_keep_original_error_and_durable_uncertainty() {
+        let home = tempfile::tempdir().unwrap();
+        crate::private_fs::create_owned_private_dir(home.path()).unwrap();
+        let generation = LifecycleGeneration::new([7; 32], 1).unwrap();
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        let coordinator = LifecycleCoordinator::prepare_after_exclusion(
+            home.path(),
+            "tenant-a",
+            generation.clone(),
+            256,
+            deadline(),
+        )
+        .unwrap();
+        let mut writes = 0;
+        let outcome = coordinator.activate_with_writer(
+            &generation,
+            deadline(),
+            |_| Ok(()),
+            |_| anyhow::bail!("original partial publication refusal"),
+            |gate, record| {
+                writes += 1;
+                if writes == 1 {
+                    gate.write_record(record)
+                } else {
+                    gate.write_record_with(record, |_, _| {
+                        Err(std::io::Error::other("controlled failure-fence refusal"))
+                    })
+                }
+            },
+        );
+        let error = format!("{:#}", outcome.unwrap_err());
+        assert!(error.contains("original partial publication refusal"));
+        assert!(error.contains("controlled failure-fence refusal"));
+        assert_eq!(writes, 2);
+        assert!(
+            coordinator
+                .gate
+                .directory
+                .join(".lifecycle.intent")
+                .is_file()
+        );
+        assert!(TenantLifecycleGate::new(home.path(), "tenant-a").is_err());
+    }
 
     #[test]
     fn an_aba_path_restore_cannot_hide_the_actual_opened_lock_inode() {
