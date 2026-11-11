@@ -26,6 +26,66 @@ pub struct ProvisionedHome {
     directories: Vec<(PathBuf, File)>,
 }
 
+/// Filesystem preparation only. Existing storage still needs canonical
+/// service/lifecycle admission before any child-bearing native operation.
+pub enum HomePreparation {
+    Fresh(ProvisionedHome),
+    ExistingUnverified(ExistingHome),
+}
+
+/// Holds the original private home without initializing or trusting its store.
+pub struct ExistingHome {
+    home: PathBuf,
+    original: File,
+}
+
+impl HomePreparation {
+    pub fn home(&self) -> &Path {
+        match self {
+            Self::Fresh(home) => home.home(),
+            Self::ExistingUnverified(home) => &home.home,
+        }
+    }
+
+    /// Check original directory custody, not service readiness or authority.
+    pub fn verify(&self) -> io::Result<()> {
+        match self {
+            Self::Fresh(home) => home.verify(),
+            Self::ExistingUnverified(home) => {
+                let current = open_root(&home.home).map_err(io::Error::other)?;
+                if identity(&current)? != identity(&home.original)? {
+                    return Err(invalid("existing home identity changed"));
+                }
+                require_no_intent(&current)
+            }
+        }
+    }
+}
+
+/// Prepare the selected home before configuration/key/cache writers. Only an
+/// exclusive new-directory creation returns Fresh. An existing private home
+/// stays unverified; this function never acquires the live service's owner EX,
+/// repairs metadata, starts children, or grants legacy activation.
+pub fn prepare_home(home: &Path, tenant: &str) -> io::Result<HomePreparation> {
+    validate(home, tenant)?;
+    match std::fs::symlink_metadata(home) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_new_home_and_provision(home, tenant).map(HomePreparation::Fresh)
+        }
+        Err(error) => Err(error),
+        Ok(_) => {
+            let original = open_root(home).map_err(io::Error::other)?;
+            require_no_intent(&original)?;
+            let prepared = HomePreparation::ExistingUnverified(ExistingHome {
+                home: home.to_path_buf(),
+                original,
+            });
+            prepared.verify()?;
+            Ok(prepared)
+        }
+    }
+}
+
 impl ProvisionedHome {
     pub fn home(&self) -> &Path {
         &self.home

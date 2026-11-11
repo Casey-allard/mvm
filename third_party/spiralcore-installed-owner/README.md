@@ -65,6 +65,14 @@ complete. Existing or partial homes require verified opening or explicit
 reconciliation. The receipt grants neither boot authority nor service readiness.
 Canonical CLI/SDK placement and installed-service qualification remain required.
 
+`prepare_home` distinguishes a new `Fresh` directory receipt from an
+`ExistingUnverified` held private-home identity. The existing case performs no
+initialization, repair or owner-EX acquisition, so it does not contend with a
+live host agent. Neither variant is a service-admission proof. Before any
+child-bearing native preparation or launch, the caller must use the canonical
+live-agent/lifecycle admission path; missing or legacy resource state cannot be
+promoted by this filesystem check. Pure constructors remain unchanged.
+
 ## Retained startup recovery exclusion
 
 `InstallationOwner::reconcile_with_exclusion()` returns an opaque borrowed

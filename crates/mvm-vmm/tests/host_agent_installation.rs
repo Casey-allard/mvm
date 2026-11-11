@@ -4,7 +4,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 
-use mvm_vmm::host::host_agent_installation::{create_new_home_and_provision, descriptor};
+use mvm_vmm::host::host_agent_installation::{
+    HomePreparation, create_new_home_and_provision, descriptor, prepare_home,
+};
 use mvm_vmm::host::installed_owner::{HolderLease, InstallationOwner, Phase};
 
 #[test]
@@ -108,4 +110,62 @@ fn existing_empty_partial_and_symlink_homes_are_not_adopted_or_repaired() {
     let nested = link.join("child-home");
     assert!(create_new_home_and_provision(&nested, "local").is_err());
     assert!(!target.join("child-home").exists());
+}
+
+#[test]
+fn home_preparation_distinguishes_fresh_from_live_owned_existing_storage() {
+    let parent = tempfile::tempdir().unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let home = parent.path().canonicalize().unwrap().join("fresh-home");
+    let prepared = prepare_home(&home, "local").unwrap();
+    assert!(matches!(&prepared, HomePreparation::Fresh(_)));
+    prepared.verify().unwrap();
+    assert_eq!(prepared.home(), home);
+    let labels = descriptor(&home, "local").unwrap();
+    let mut owner = InstallationOwner::open(&labels.root, labels.key).unwrap();
+    let epoch = owner.begin().unwrap();
+    let record = labels.root.join("state.bin");
+    let original = fs::read(&record).unwrap();
+
+    let existing = prepare_home(&home, "local").unwrap();
+    assert!(matches!(&existing, HomePreparation::ExistingUnverified(_)));
+    existing.verify().unwrap();
+    assert_eq!(fs::read(record).unwrap(), original);
+    assert_eq!(owner.snapshot().unwrap().phase, Phase::Active);
+    owner.finish(epoch).unwrap();
+}
+
+#[test]
+fn existing_home_preparation_preserves_unverified_state_and_refuses_intent_or_replacement() {
+    let parent = tempfile::tempdir().unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let parent = parent.path().canonicalize().unwrap();
+    let home = parent.join("existing-home");
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(home.join("retained"), b"existing unverified storage").unwrap();
+    let prepared = prepare_home(&home, "local").unwrap();
+    assert!(matches!(&prepared, HomePreparation::ExistingUnverified(_)));
+    prepared.verify().unwrap();
+    assert!(!home.join("host-agent").exists());
+    assert_eq!(
+        fs::read(home.join("retained")).unwrap(),
+        b"existing unverified storage"
+    );
+
+    let intent = home.join(".host-agent-provisioning.intent");
+    fs::write(&intent, b"retained incomplete initialization").unwrap();
+    assert!(prepare_home(&home, "local").is_err());
+    assert!(prepared.verify().is_err());
+    fs::remove_file(intent).unwrap();
+    let preserved = parent.join("preserved-home");
+    fs::rename(&home, &preserved).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(prepared.verify().is_err());
+    assert_eq!(
+        fs::read(preserved.join("retained")).unwrap(),
+        b"existing unverified storage"
+    );
+    assert!(!home.join("host-agent").exists());
 }
