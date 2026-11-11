@@ -370,7 +370,10 @@ impl MailboxService {
     /// Returns an error when the guest sent no frame at all, which is what a
     /// guest whose workload has not written its outbox yet looks like; the
     /// launch path dials again rather than miss a message written after the
-    /// first dial. A frame the queue refuses is still a served connection.
+    /// first dial. A frame the queue refuses is still a served connection,
+    /// except when the queue is full: the guest keeps that frame to resend, so
+    /// the launch path treats it as no progress and backs off rather than
+    /// redialing at the post-frame pace.
     pub fn serve_guest(
         &self,
         route: &mvm_core::vm_backend::HostDialRoute,
@@ -380,11 +383,15 @@ impl MailboxService {
             route,
             mvm_contract::protocol::mailbox::MAILBOX_PORT,
         )?;
-        serve(&self.shared, stream, |body| {
+        match serve(&self.shared, stream, |body| {
             sealer.seal(OutboxMessage::decode(body)?)
-        })
-        .then_some(())
-        .ok_or_else(|| std::io::Error::other("the guest sent no mailbox frame"))
+        }) {
+            Served::Frame => Ok(()),
+            Served::QueueFull => Err(std::io::Error::other(
+                "the mailbox queue is full; the guest keeps its frame",
+            )),
+            Served::NoFrame => Err(std::io::Error::other("the guest sent no mailbox frame")),
+        }
     }
 
     /// Take the oldest accepted plaintext, if any.
@@ -429,18 +436,31 @@ pub fn send_on(
     send_frame(&mut stream, capability, envelope)
 }
 
+/// How a guest connection ended.
+enum Served {
+    /// A frame arrived and was answered, delivered or refused for good.
+    Frame,
+    /// A frame arrived and the queue had no room for it.
+    QueueFull,
+    NoFrame,
+}
+
 /// Read one frame, turn it into a capability and envelope with `prepare`, and
-/// answer with the admission verdict. Returns whether a frame arrived.
+/// answer with the admission verdict.
 fn serve(
     shared: &Shared,
     mut stream: UnixStream,
     prepare: impl FnOnce(&[u8]) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal>,
-) -> bool {
+) -> Served {
     arm(&stream);
     let frame = read_frame(shared, &mut stream);
     let received = frame.is_ok();
-    answer(shared, &mut stream, frame, prepare);
-    received
+    let verdict = answer(shared, &mut stream, frame, prepare);
+    match (received, verdict) {
+        (false, _) => Served::NoFrame,
+        (true, Err(Refusal::QueueFull(_))) => Served::QueueFull,
+        (true, _) => Served::Frame,
+    }
 }
 
 /// A host peer's connection: a read request, or a sealed send.
@@ -464,7 +484,9 @@ fn serve_peer(shared: &Shared, mut stream: UnixStream) {
                 .map_err(|_| Refusal::Malformed);
             reply_with(&mut stream, &reply);
         }
-        frame => answer(shared, &mut stream, frame, decode_frame),
+        frame => {
+            let _ = answer(shared, &mut stream, frame, decode_frame);
+        }
     }
 }
 
@@ -478,11 +500,12 @@ fn answer(
     stream: &mut UnixStream,
     frame: Result<Vec<u8>, Refusal>,
     prepare: impl FnOnce(&[u8]) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal>,
-) {
+) -> Result<(), Refusal> {
     let verdict = frame
         .and_then(|body| prepare(&body))
         .and_then(|(capability, envelope)| admit(shared, &capability, &envelope));
     reply_with(stream, &verdict);
+    verdict
 }
 
 fn reply_with<T: serde::Serialize>(stream: &mut UnixStream, reply: &Result<T, Refusal>) {
@@ -738,6 +761,55 @@ mod tests {
         // The seed and the encryption root, with a re-minted secret, do not.
         let reminted = mvm_core::crypto::aead::Key::from_bytes([8; 32]);
         assert!(open_under(dir.path(), &reminted, "without.sock", &sealed).is_err());
+    }
+
+    #[test]
+    fn restarted_mailbox_refuses_old_frame_and_accepts_new_frame() {
+        let keys = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        crate::audit::host_keypair::load_or_init_at(keys.path()).unwrap();
+        let grant = grant_at(keys.path(), 1);
+        let socket = keys.path().join("restart.sock");
+
+        let old_secret = crate::mailbox_launch::mint_epoch_secret(state.path()).unwrap();
+        let (policy, mut sealer) = derive_launch_keys(keys.path(), &grant, &old_secret)
+            .unwrap()
+            .trust();
+        let service = MailboxService::bind(&socket, LAUNCH_LIMITS, policy).unwrap();
+        let (capability, envelope) = sealer.seal(greeting()).unwrap();
+        send(&socket, &capability, &envelope).expect("first send accepted");
+        assert_eq!(
+            send(&socket, &capability, &envelope),
+            Err(Refusal::Mailbox(
+                mvm_core::mailbox::MailboxError::Replay.to_string()
+            ))
+        );
+        assert_eq!(
+            recv(&socket).unwrap().message,
+            Some(hex::encode(b"epoch one secret"))
+        );
+        drop(service);
+
+        let new_secret = crate::mailbox_launch::mint_epoch_secret(state.path()).unwrap();
+        assert_ne!(old_secret.expose_bytes(), new_secret.expose_bytes());
+        let (policy, mut sealer) = derive_launch_keys(keys.path(), &grant, &new_secret)
+            .unwrap()
+            .trust();
+        let _restarted = MailboxService::bind(&socket, LAUNCH_LIMITS, policy).unwrap();
+        assert_eq!(
+            send(&socket, &capability, &envelope),
+            Err(Refusal::Mailbox(
+                mvm_core::mailbox::MailboxError::DecryptionFailed.to_string()
+            ))
+        );
+        assert_eq!(recv(&socket).unwrap().message, None);
+
+        let (capability, envelope) = sealer.seal(greeting()).unwrap();
+        send(&socket, &capability, &envelope).expect("new launch frame accepted");
+        assert_eq!(
+            recv(&socket).unwrap().message,
+            Some(hex::encode(b"epoch one secret"))
+        );
     }
 
     #[test]

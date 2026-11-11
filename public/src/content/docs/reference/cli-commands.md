@@ -1241,6 +1241,12 @@ cleanup can still refuse. Other backends retain their existing expiry cleanup.
 Identity and lifetime are separate: `--name <N>` names a foreground transient
 run but does not make it persistent. `-d`/`--detach`, `--up-json`, or the
 explicit `machine create`/`start` lifecycle make a long-lived machine.
+With `-d` and a command after `--`, the command is started in the guest and
+`machine run` returns once the guest agent has accepted it; the command keeps
+running and `machine logs`, `machine exec` and `machine stop` work afterwards.
+Interrupting (Ctrl-C, SIGTERM) a foreground transient run stops and removes its
+VM before `mvmctl` exits with status 130 (143 for SIGTERM); a second interrupt
+during that cleanup exits at once.
 `--volume` host shares work on every run mode. The syntax is
 `HOST:/GUEST[:MODE]` (`MODE` defaults to `ro`; `rw` needs `--profile dev` or
 `permissive`). Persistent machine specs canonicalize host paths to absolute
@@ -1818,6 +1824,11 @@ At launch of an installed bundle:
 - the descriptor's resources become the defaults for whichever of `--cpus` and
   `--memory` the command line did not name; the host's memory ceiling and
   admission budget still apply and refuse rather than clamp;
+- a signed `policy.allow_hosts` and `policy.request_budget` are folded into the
+  launch's network policy. This also applies to a positional `.mvmpkg` or its
+  installed bundle digest on a persistent `machine run -d`: the request ceiling
+  is retained in the machine spec for later starts. A wider operator policy or
+  host list is refused rather than replacing the signed ceiling;
 - a required secret slot with no `--secret` binding refuses the launch; the
   value stays on the host and is substituted at the endpoint, as for any
   binding;
