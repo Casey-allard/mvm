@@ -128,7 +128,7 @@ mod tests {
         let err = service()
             .acquire_launch_lease(&jit_launch("vm-2"))
             .unwrap_err();
-        assert!(format!("{err:#}").contains("original lock file was replaced"));
+        assert!(format!("{err:#}").contains("failed to open lock file"));
         fs::remove_file(&name).unwrap();
         fs::create_dir(&name).unwrap();
         let err = service()

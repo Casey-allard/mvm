@@ -764,11 +764,11 @@ impl FileLock {
         self._file.metadata()
     }
 
-    fn open_lock_file(lock_path: &Path) -> Result<fs::File> {
+    fn open_lock_file(lock_path: &Path, options: &mut fs::OpenOptions) -> Result<fs::File> {
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent).ok();
         }
-        fs::OpenOptions::new()
+        options
             .create(true)
             .truncate(false)
             .write(true)
@@ -780,7 +780,7 @@ impl FileLock {
     /// Only kernel-reported contention is retried. All attempts use one open file.
     #[cfg(unix)]
     pub fn acquire_until(path: &Path, deadline: std::time::Instant) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         use std::time::{Duration, Instant};
 
         let lock_path = path.with_extension("lock");
@@ -788,7 +788,14 @@ impl FileLock {
             Instant::now() < deadline,
             "lock acquisition deadline expired"
         );
-        let file = Self::open_lock_file(&lock_path)?;
+        let file = Self::open_lock_file(
+            &lock_path,
+            fs::OpenOptions::new()
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK),
+        )?;
+        let held = file.metadata()?;
+        anyhow::ensure!(held.is_file(), "expected a regular lock file");
         let mut delay = Duration::from_millis(1);
         loop {
             anyhow::ensure!(
@@ -798,10 +805,9 @@ impl FileLock {
             match file.try_lock() {
                 Ok(()) => {
                     let guard = Self { _file: file };
-                    let held = guard.metadata()?;
                     let named = fs::symlink_metadata(&lock_path)?;
                     anyhow::ensure!(
-                        held.is_file() && held.dev() == named.dev() && held.ino() == named.ino(),
+                        held.dev() == named.dev() && held.ino() == named.ino(),
                         "original lock file was replaced"
                     );
                     anyhow::ensure!(
@@ -830,7 +836,7 @@ impl FileLock {
     /// flock. Blocks until the lock is available.
     pub fn acquire(path: &Path) -> Result<Self> {
         let lock_path = path.with_extension("lock");
-        let file = Self::open_lock_file(&lock_path)?;
+        let file = Self::open_lock_file(&lock_path, &mut fs::OpenOptions::new())?;
         file.lock()
             .with_context(|| format!("failed to acquire lock: {}", lock_path.display()))?;
         Ok(Self { _file: file })
@@ -841,7 +847,7 @@ impl FileLock {
     /// Returns `None` if another process holds the lock.
     pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let lock_path = path.with_extension("lock");
-        let file = Self::open_lock_file(&lock_path)?;
+        let file = Self::open_lock_file(&lock_path, &mut fs::OpenOptions::new())?;
         // std distinguishes contention from a real error in the type, so
         // "another process holds it" no longer rides on an errno comparison.
         match file.try_lock() {
