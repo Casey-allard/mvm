@@ -122,12 +122,55 @@ impl StopCustody {
             sdk_cleanup: None,
         })
     }
+    pub(super) fn live_for_reconnect(
+        &mut self,
+        state: &std::path::Path,
+    ) -> Result<super::super::lifetime::OriginalVmm> {
+        ensure!(
+            !self.vm_stopped
+                && !self.sdk_abort_confirmed
+                && !self.kernel_exit_observed
+                && self.sdk_cleanup.is_none(),
+            "original VM is retiring"
+        );
+        let check = |fd: &File, path: &std::path::Path| -> Result<()> {
+            require_directory(fd, path)?;
+            let m = fd.metadata()?;
+            ensure!(
+                m.mode() & 0o022 == 0 && m.uid() == rustix::process::geteuid().as_raw(),
+                "unsafe original runtime or socket directory"
+            );
+            Ok(())
+        };
+        check(&self.state, state)?;
+        if let Some((path, fd)) = &self.split_socket {
+            check(fd, path)?;
+        }
+        let (identity, observer) = self.vmm.as_ref().context("original VMM observer absent")?;
+        ensure!(identity.is_live_and_ours(), "original VM has exited");
+        if observer.wait_event(Instant::now())? == ProcessExitWait::Exited {
+            // On Darwin this observation consumes the original exit event.
+            // Preserve it for the later SDK stop/collection owner.
+            self.kernel_exit_observed = true;
+            anyhow::bail!("original VM has exited");
+        }
+        ensure!(identity.is_live_and_ours(), "original VM has exited");
+        Ok(super::super::lifetime::OriginalVmm::from_held(*identity)?)
+    }
     pub(super) fn spawn_helper(
         &self,
         config: &crate::mailbox_process::MailboxProcessConfig,
         owner_dir: &std::path::Path,
-    ) -> Result<(Child, OriginalMarker, Option<String>)> {
-        let mut command = super::super::serving_command()?;
+    ) -> Result<(
+        Child,
+        OriginalMarker,
+        Option<String>,
+        super::reconnect::RestartInput,
+    )> {
+        let command = super::super::serving_command()?;
+        let mut restart =
+            super::reconnect::RestartInput::capture(config, command.get_program(), owner_dir)?;
+        let mut command = restart.command()?;
         let original = self
             .vmm
             .as_ref()
@@ -142,12 +185,19 @@ impl StopCustody {
                 &super::super::OriginalJournalStartup {
                     config,
                     original_vmm_v1,
+                    required_reader_sha256: None,
                 },
                 &mut child,
             ),
             None => super::super::configure_serving(config, &mut child),
         };
-        Ok((child, marker, readiness.err().map(|e| e.to_string())))
+        let readiness = readiness.and_then(|()| restart.capture_socket());
+        Ok((
+            child,
+            marker,
+            readiness.err().map(|e| e.to_string()),
+            restart,
+        ))
     }
     pub(super) fn observe_helper(
         &self,
@@ -454,6 +504,38 @@ mod tests {
         assert!(vm.try_wait().unwrap().is_none());
         vm.kill().unwrap();
         vm.wait().unwrap();
+    }
+
+    #[test]
+    fn reconnect_requires_the_still_running_original_and_its_protected_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("original");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut vm = Command::new("sleep").arg("20").spawn().unwrap();
+        let id = EndpointPid::of_child(vm.id());
+        let observer = ProcessExitObserver::arm(id.pid).unwrap();
+        let mut owner =
+            StopCustody::capture_state(&state, BackendKind::Firecracker, Some((id, observer)))
+                .unwrap();
+        assert!(owner.live_for_reconnect(&state).is_ok());
+        owner.sdk_abort_confirmed = true;
+        assert!(owner.live_for_reconnect(&state).is_err());
+        owner.sdk_abort_confirmed = false;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(owner.live_for_reconnect(&state).is_err());
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let replaced = dir.path().join("moved");
+        std::fs::rename(&state, &replaced).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        assert!(owner.live_for_reconnect(&state).is_err());
+        std::fs::remove_dir(&state).unwrap();
+        std::fs::rename(&replaced, &state).unwrap();
+        vm.kill().unwrap();
+        vm.wait().unwrap();
+        assert!(owner.live_for_reconnect(&state).is_err());
+        assert!(owner.live_for_reconnect(&state).is_err());
     }
 
     #[test]

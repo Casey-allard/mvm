@@ -101,15 +101,16 @@ impl Drop for OwnedListener {
 /// transport error or missing reply leaves A's retained intent untouched.
 pub struct OriginalJournalSourceHost {
     pub(super) source: Child,
-    readiness: Option<String>,
+    pub(super) readiness: Option<String>,
+    pub(super) restart: super::reconnect::RestartInput,
     pub(super) stop: super::stop::StopCustody,
     pub(super) boot: mvm_core::mailbox::reader::MailboxReaderBootBinding,
     pub(super) _guard: std::sync::Arc<super::LaunchClaim>,
     pub(super) marker: super::OriginalMarker,
     listener: OwnedListener,
-    destination: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
+    pub(super) destination: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
     pub(super) plan: ExecutionPlan,
-    grants: std::sync::Arc<JournalCredentials>,
+    pub(super) grants: std::sync::Arc<JournalCredentials>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -121,6 +122,14 @@ pub struct CompletedRelayIo {
 }
 
 impl OriginalJournalSourceHost {
+    pub(super) fn require_original_relay(&self) -> Result<()> {
+        let named = std::fs::symlink_metadata(&self.listener.path)?;
+        ensure!(
+            (named.dev(), named.ino()) == self.listener.inode && named.nlink() == 1,
+            "original A relay socket changed"
+        );
+        Ok(())
+    }
     pub fn require_ready(&self) -> Result<()> {
         if let Some(e) = &self.readiness {
             anyhow::bail!("original A did not become ready: {e}");
@@ -314,10 +323,11 @@ impl PairedJournalAdmission {
                     };
                     config.keys.outbound_source = Some(delegated);
                     let listener = OwnedListener::bind(&config.vm_state_dir)?;
-                    let (source, marker, readiness) =
+                    let (source, marker, readiness, restart) =
                         stop.spawn_helper(config, &guard.owner_dir)?;
                     Ok(OriginalJournalSourceHost {
                         source,
+                        restart,
                         boot: boot.clone(),
                         readiness,
                         stop,

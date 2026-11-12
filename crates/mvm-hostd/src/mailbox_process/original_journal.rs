@@ -8,7 +8,9 @@ pub(crate) mod object_registration;
 pub mod object_workers;
 #[cfg(test)]
 mod paired_process_tests;
+mod reconnect;
 pub mod relay;
+pub use reconnect::JournalHelper;
 mod stop;
 pub use stop::{JournalOwner, JournalStopOutcome};
 mod runtime_state;
@@ -33,6 +35,7 @@ use std::time::Instant;
 pub struct OriginalJournalDestination {
     pub(super) incoming: Option<super::paired_incoming::EnrolledIncoming>,
     child: Child,
+    restart: reconnect::RestartInput,
     readiness: Option<String>,
     stop: stop::StopCustody,
     _original: std::sync::Arc<LaunchClaim>,
@@ -163,9 +166,10 @@ impl OriginalJournalDestination {
             None
         };
         let current = &policy.context;
-        let (child, marker, readiness) = stop.spawn_helper(config, &guard.owner_dir)?;
+        let (child, marker, readiness, restart) = stop.spawn_helper(config, &guard.owner_dir)?;
         Ok(Self {
             child,
+            restart,
             readiness,
             stop,
             incoming,
