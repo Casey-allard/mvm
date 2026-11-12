@@ -112,3 +112,69 @@ pub enum SenderRequestV1 {
     },
 }
 pub const MAX_ORDINAL_PAYLOAD: usize = 8192;
+
+/// Requests on the workload's local reader socket. The agent alone holds the signing key.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApplicationSenderRequestV1 {
+    Stage {
+        handle: SenderOrdinalV1,
+        #[serde(with = "super::reader_wire::payload_base64")]
+        payload: Vec<u8>,
+    },
+    Status {
+        handle: SenderOrdinalV1,
+    },
+    Settle {
+        handle: SenderOrdinalV1,
+        receipt_digest: [u8; 32],
+    },
+}
+
+impl std::fmt::Debug for ApplicationSenderRequestV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stage { handle, payload } => f
+                .debug_struct("Stage")
+                .field("handle", handle)
+                .field("payload_bytes", &payload.len())
+                .finish(),
+            Self::Status { handle } => f.debug_tuple("Status").field(handle).finish(),
+            Self::Settle { handle, .. } => f.debug_tuple("Settle").field(handle).finish(),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod application_tests {
+    use super::*;
+    use crate::mailbox::reader_wire::{
+        ApplicationReaderRequest, read_application_request, write_application_request,
+    };
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn application_sender_requests_roundtrip_and_cannot_supply_an_agent_statement() {
+        let handle = SenderOrdinalV1 {
+            direction: [5; 32],
+            ordinal: 1,
+        };
+        for operation in [
+            serde_json::json!({"operation":"stage", "handle":handle, "payload":"AAEA"}),
+            serde_json::json!({"operation":"status", "handle":handle}),
+            serde_json::json!({"operation":"settle", "handle":handle, "receipt_digest":vec![2;32]}),
+        ] {
+            let value = serde_json::json!({"operation":"sender_ordinal_v1", "request":operation});
+            let request: ApplicationReaderRequest = serde_json::from_value(value.clone()).unwrap();
+            let (mut client, mut agent) = UnixStream::pair().unwrap();
+            write_application_request(&mut client, &request).unwrap();
+            assert_eq!(
+                serde_json::to_value(read_application_request(&mut agent).unwrap()).unwrap(),
+                value
+            );
+        }
+        let signed = serde_json::json!({"operation":"sender_ordinal_v1","request":{
+            "operation":"settle","handle":handle,"receipt_digest":vec![2;32],"signature":vec![7;64]}});
+        assert!(serde_json::from_value::<ApplicationReaderRequest>(signed).is_err());
+    }
+}

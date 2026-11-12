@@ -152,6 +152,9 @@ pub enum ReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApplicationReaderRequest {
+    SenderOrdinalV1 {
+        request: Box<super::sender_ordinal::ApplicationSenderRequestV1>,
+    },
     /// Fresh, read-only sample for the exact retained, unacknowledged Call.
     AuthorizeObjectCallV1 {
         pair: [u8; 32],
@@ -185,6 +188,9 @@ pub enum ApplicationReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderResponse {
+    SenderPendingV1 {
+        handle: super::sender_ordinal::SenderOrdinalV1,
+    },
     SenderAcceptedV1 {
         handle: super::sender_ordinal::SenderOrdinalV1,
         receipt: Box<SignedDestinationReceipt>,

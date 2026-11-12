@@ -20,9 +20,19 @@ pub struct JournalAttempts(Option<(MessageId, [u8; 32], u8)>);
 /// Only the original generation is eligible. Old agents read their fixed
 /// outbox-local path and a replacement generation computes a different name.
 pub fn slot_name(boot: &MailboxReaderBootBinding) -> Result<String, Refusal> {
-    let digest = mvm_core::mailbox::outbound::journal_direction_commitment(boot)
-        .map_err(|_| Refusal::NotAuthorized)?;
-    Ok(journal_slot_name(&digest))
+    Ok(journal_slot_name(&legacy_direction_commitment(boot)?))
+}
+
+fn legacy_direction_commitment(boot: &MailboxReaderBootBinding) -> Result<[u8; 32], Refusal> {
+    let direction = boot
+        .outbound_journal_v1
+        .as_ref()
+        .ok_or(Refusal::NotAuthorized)?;
+    if direction.sender_settlement.is_some() {
+        return Err(Refusal::NotAuthorized);
+    }
+    mvm_core::mailbox::outbound::journal_direction_commitment(boot)
+        .map_err(|_| Refusal::NotAuthorized)
 }
 
 pub fn check_available(
@@ -36,11 +46,7 @@ pub fn check_available(
         .outbound_journal_v1
         .as_ref()
         .ok_or(Refusal::NotAuthorized)?;
-    if mvm_core::mailbox::outbound::journal_direction_commitment(boot)
-        .map_err(|_| Refusal::NotAuthorized)?
-        != commitment
-        || recipient != d.address.recipient
-    {
+    if legacy_direction_commitment(boot)? != commitment || recipient != d.address.recipient {
         return Err(Refusal::NotAuthorized);
     }
     if len == 0 || len > d.max_payload_bytes {
@@ -269,6 +275,43 @@ mod tests {
         };
         (boot, msg, receipt, b)
     }
+    #[test]
+    fn ordinal_sender_refuses_the_arbitrary_id_writer_on_its_own_valid_direction() {
+        use mvm_contract::protocol::mailbox::SenderSettlementProfile;
+        let (mut boot, msg, _, _) = fixture();
+        let commitment = |b: &MailboxReaderBootBinding| {
+            mvm_core::mailbox::outbound::journal_direction_commitment(b).unwrap()
+        };
+        assert_eq!(
+            check_available(&boot, commitment(&boot), msg.recipient, 1, 150),
+            Ok(())
+        );
+        boot.outbound_journal_v1.as_mut().unwrap().sender_settlement =
+            Some(SenderSettlementProfile::OrdinalV1);
+        assert_eq!(
+            check_available(&boot, commitment(&boot), msg.recipient, 1, 150),
+            Err(Refusal::NotAuthorized)
+        );
+        assert_eq!(slot_name(&boot), Err(Refusal::NotAuthorized));
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(journal_slot_name(&commitment(&boot)));
+        write_single_outbox(&staged, &msg).unwrap();
+        let original = std::fs::read(&staged).unwrap();
+        let mut stream = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            forward_for_original_boot(
+                &mut stream,
+                &staged,
+                &boot,
+                &mut JournalAttempts::default(),
+                || Ok(150)
+            ),
+            Err(Refusal::NotAuthorized)
+        );
+        assert!(stream.into_inner().is_empty());
+        assert_eq!(std::fs::read(staged).unwrap(), original);
+    }
+
     #[test]
     fn original_remote_intent_survives_lost_reply_and_wrong_domain_before_exact_b_receipt() {
         let (boot, msg, receipt, b) = fixture();
