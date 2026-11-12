@@ -6,7 +6,7 @@ use super::MailboxProcessConfig;
 use mvm_contract::protocol::{mailbox::MailboxGrant, mailbox_worker::MailboxWorkerOwner};
 use mvm_core::vm_backend::HostDialRoute;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io::{self, Cursor, Error, ErrorKind};
+use std::io::{self, Cursor, Error, ErrorKind, Read, Write};
 use std::os::{fd::AsRawFd, unix::net::UnixStream};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -54,8 +54,18 @@ impl PrepareOwnedV1 {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "status", deny_unknown_fields)]
 pub enum OwnedStatusV1 {
-    Ready { owner: MailboxWorkerOwner },
-    Failed { owner: MailboxWorkerOwner },
+    Ready {
+        owner: MailboxWorkerOwner,
+    },
+    /// The helper has exclusively bound the addressed ingress. Emit only
+    /// after selecting the dedicated authenticated parent-only handler.
+    ReadyCastDestinationV1 {
+        owner: MailboxWorkerOwner,
+        direction_commitment: [u8; 32],
+    },
+    Failed {
+        owner: MailboxWorkerOwner,
+    },
 }
 
 // The entry mode selects v1; direction fixes the expected document type.
@@ -84,7 +94,13 @@ pub fn read_ready(
     owner: &MailboxWorkerOwner,
     deadline: Instant,
 ) -> io::Result<()> {
-    validate_status(read_frame(stream, deadline)?, owner)
+    match validate_status(read_frame(stream, deadline)?, owner)? {
+        ReadyIngress::Legacy => Ok(()),
+        ReadyIngress::CastDestination(_) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "expected legacy readiness",
+        )),
+    }
 }
 /// Poll one framed status on the broker's nonblocking socket. Preserve a
 /// partial header/body across Query calls until a complete status is available.
@@ -92,7 +108,7 @@ pub(crate) fn poll_ready(
     stream: &mut UnixStream,
     pending: &mut Vec<u8>,
     owner: &MailboxWorkerOwner,
-) -> io::Result<bool> {
+) -> io::Result<Option<ReadyIngress>> {
     use std::io::Read;
     let mut chunk = [0u8; 512];
     loop {
@@ -108,23 +124,33 @@ pub(crate) fn poll_ready(
         if pending.len() == end {
             let status =
                 serde_json::from_slice(&pending[4..]).map_err(|_| ErrorKind::InvalidData)?;
-            validate_status(status, owner)?;
-            return Ok(true);
+            return validate_status(status, owner).map(Some);
         }
         let left = (end - pending.len()).min(chunk.len());
         match stream.read(&mut chunk[..left]) {
             Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
             Ok(n) => pending.extend_from_slice(&chunk[..n]),
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
-                return Ok(false);
+                return Ok(None);
             }
             Err(e) => return Err(e),
         }
     }
 }
-fn validate_status(status: OwnedStatusV1, owner: &MailboxWorkerOwner) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadyIngress {
+    Legacy,
+    CastDestination([u8; 32]),
+}
+fn validate_status(status: OwnedStatusV1, owner: &MailboxWorkerOwner) -> io::Result<ReadyIngress> {
     match status {
-        OwnedStatusV1::Ready { owner: received } if received == *owner => Ok(()),
+        OwnedStatusV1::Ready { owner: received } if received == *owner => Ok(ReadyIngress::Legacy),
+        OwnedStatusV1::ReadyCastDestinationV1 {
+            owner: received,
+            direction_commitment,
+        } if received == *owner && direction_commitment != [0; 32] => {
+            Ok(ReadyIngress::CastDestination(direction_commitment))
+        }
         OwnedStatusV1::Failed { owner: received } if received == *owner => {
             Err(Error::other("owned helper failed"))
         }
@@ -137,7 +163,8 @@ fn validate_status(status: OwnedStatusV1, owner: &MailboxWorkerOwner) -> io::Res
 
 fn read_frame<T: DeserializeOwned>(s: &UnixStream, deadline: Instant) -> io::Result<T> {
     let mut header = [0; 4];
-    receive(s, &mut header, deadline)?;
+    let mut stream = DeadlineStream::new(s, deadline);
+    stream.read_exact(&mut header)?;
     let n = u32::from_be_bytes(header) as usize;
     if n == 0 || n > FRAME_LIMIT {
         return Err(Error::new(
@@ -146,7 +173,7 @@ fn read_frame<T: DeserializeOwned>(s: &UnixStream, deadline: Instant) -> io::Res
         ));
     }
     let mut bytes = [0; FRAME_LIMIT];
-    receive(s, &mut bytes[..n], deadline)?;
+    stream.read_exact(&mut bytes[..n])?;
     serde_json::from_slice(&bytes[..n])
         .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid control frame"))
 }
@@ -162,46 +189,52 @@ fn write_frame<T: Serialize>(s: &UnixStream, value: &T, deadline: Instant) -> io
     })?;
     let n = body.position() as usize;
     bytes[..4].copy_from_slice(&(n as u32).to_be_bytes());
-    let mut remaining = &bytes[..4 + n];
-    while !remaining.is_empty() {
-        let written = attempt(s, libc::POLLOUT, deadline, || {
-            // SAFETY: the slice remains readable for the duration of send.
-            unsafe {
-                libc::send(
-                    s.as_raw_fd(),
-                    remaining.as_ptr().cast(),
-                    remaining.len(),
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                )
-            }
-        })?;
-        if written == 0 {
-            return Err(ErrorKind::WriteZero.into());
-        }
-        remaining = &remaining[written..];
-    }
-    Ok(())
+    DeadlineStream::new(s, deadline).write_all(&bytes[..4 + n])
 }
 
-fn receive(s: &UnixStream, mut remaining: &mut [u8], deadline: Instant) -> io::Result<()> {
-    while !remaining.is_empty() {
-        let read = attempt(s, libc::POLLIN, deadline, || {
-            // SAFETY: the mutable slice covers all bytes passed to recv.
+/// Use the existing bounded control I/O on a separate, already connected
+/// data socket without creating a watchdog thread or changing its FD flags.
+pub(crate) struct DeadlineStream<'a> {
+    socket: &'a UnixStream,
+    deadline: Instant,
+}
+impl<'a> DeadlineStream<'a> {
+    pub(crate) fn new(socket: &'a UnixStream, deadline: Instant) -> Self {
+        Self { socket, deadline }
+    }
+}
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        attempt(self.socket, libc::POLLIN, self.deadline, || {
+            // SAFETY: the borrowed socket and writable buffer stay live.
             unsafe {
                 libc::recv(
-                    s.as_raw_fd(),
-                    remaining.as_mut_ptr().cast(),
-                    remaining.len(),
+                    self.socket.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
                     libc::MSG_DONTWAIT,
                 )
             }
-        })?;
-        if read == 0 {
-            return Err(ErrorKind::UnexpectedEof.into());
-        }
-        remaining = &mut remaining[read..];
+        })
     }
-    Ok(())
+}
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        attempt(self.socket, libc::POLLOUT, self.deadline, || {
+            // SAFETY: the borrowed socket and readable buffer stay live.
+            unsafe {
+                libc::send(
+                    self.socket.as_raw_fd(),
+                    buf.as_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            }
+        })
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // Per-call nonblocking I/O also works on blocking descriptors. No socket
