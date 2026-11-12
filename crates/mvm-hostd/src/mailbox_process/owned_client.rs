@@ -27,7 +27,7 @@ pub struct InstalledMailboxPeer {
     observer: Mutex<Option<ProcessExitObserver>>,
     pid: u32,
     prepared_direction: Mutex<Option<[u8; 32]>>,
-    published_cast:Mutex<Option<(MailboxWorkerOwner,[u8;32])>>,
+    published_cast:Mutex<Option<(MailboxWorkerOwner,[u8;32],std::ops::Range<i64>)>>,
     issuer: [u8; 16],
     admitted_vm: Option<String>,
     native_start: native_start::NativeStartCustody,
@@ -122,7 +122,7 @@ impl InstalledMailboxPeer {
 impl mvm_core::vm_backend::InstalledBrokerPeer for InstalledMailboxPeer {
     fn original_cast_published(&self, name:&str, plan:&[u8;32], owner:&MailboxWorkerOwner) -> bool {
         self.admitted_vm.as_deref()==Some(name) && self.check_original_alive().is_ok()
-            && self.published_cast.try_lock().is_ok_and(|cell|cell.as_ref().is_some_and(|(o,p)|o==owner && p==plan))
+            && self.published_cast.try_lock().is_ok_and(|cell|cell.as_ref().is_some_and(|(o,p,w)|o==owner && p==plan && w.contains(&crate::mailbox_launch::now_unix_ms())))
     }
     fn authenticate(&self, stream: &UnixStream) -> Result<()> {
         InstalledMailboxPeer::authenticate(self, stream)
@@ -642,10 +642,11 @@ impl InstalledMailboxClient {
     /// derived bytes and epoch state out of the host-agent control connection.
     pub fn mark_cast_published(&self, role:&crate::mailbox_launch::cast_pair::development::PreparedRole)->Result<()> {
         self.check_prepared_development_role(role)?;
-        ensure!(role.immutable,"original boot requires fixed-generation Cast");
+        let window=role.immutable_window.clone().context("original boot requires fixed-generation Cast")?;
+        ensure!(window.contains(&crate::mailbox_launch::now_unix_ms()),"original Cast expired");
         let mut cell=self.development_peer()?.published_cast.try_lock().map_err(|_|anyhow::anyhow!("original publication busy"))?;
         ensure!(cell.is_none(),"original Cast already published");
-        *cell=Some((self.original()?,self.acquire.plan_commitment));
+        *cell=Some((self.original()?,self.acquire.plan_commitment,window));
         Ok(())
     }
     pub fn configure_and_wait(&self, backend: &AnyBackend, deadline: Instant) -> Result<()> {
@@ -677,7 +678,7 @@ impl InstalledMailboxClient {
         self.check_prepared_development_role(&prepared)?;
         let owner = self.original()?;
         use mvm_core::vm_backend::InstalledBrokerPeer;
-        let joined=prepared.immutable && self.development_peer()?.original_cast_published(&self.acquire.vm_id,&self.acquire.plan_commitment,&owner);
+        let joined=prepared.immutable_window.is_some() && self.development_peer()?.original_cast_published(&self.acquire.vm_id,&self.acquire.plan_commitment,&owner);
         ensure!(joined, "private immutable boot has not been published");
         self.configure_with(backend, deadline, joined, |config| prepared.install(config, &owner))?
             .context("original config pipe already delegated: cannot change its enrollment")

@@ -328,6 +328,7 @@ impl VmStartConfig {
         let Some(binding)=&self.installed_mailbox_owner else{return false};
         self.name==plan.workload.0 && plan.tenant.0=="local"
             && plan.mailbox.and_then(|g|g.local_service)==Some(MailboxLocalServiceGrant::original_cast_v1())
+            && crate::plan::verify_plan_id(plan).is_ok()
             && plan.plan_id.0==format!("sha256:{}",hex::encode(binding.plan_commitment))
             && binding.peer.original_cast_published(&self.name,&binding.plan_commitment,&binding.owner)
     }

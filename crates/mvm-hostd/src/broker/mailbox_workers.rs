@@ -2258,6 +2258,36 @@ mod tests {
         }
     }
     #[test]
+    fn compact_original_cast_profile_rejects_unjoined_names_grants_and_backends() {
+        use crate::mailbox_process::installed_profile::{InstalledMailboxProfile,MailboxPair,CAST_QUALIFIER};
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        let pair=MailboxPair::new(["alpha","beta"]).unwrap();
+        let old=InstalledMailboxProfile::Pair(pair.clone());
+        let profile=InstalledMailboxProfile::OriginalCast(pair);
+        let args=profile.arguments().into_iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(matches!(InstalledMailboxProfile::parse(&args).unwrap(),Some(InstalledMailboxProfile::OriginalCast(_))));
+        assert_eq!(args.last().unwrap(),CAST_QUALIFIER);
+        assert_eq!(profile.worker_limits().host_bytes,old.worker_limits().host_bytes);
+        assert!(profile.worker_limits().bytes_per_worker < old.worker_limits().bytes_per_worker);
+        let budget=MailboxWorkerBudget::new(profile.worker_limits()).unwrap();
+        let mut r=request(&budget,"local");
+        r.vm_id="alpha".into(); r.workload_id=r.vm_id.clone();
+        let usage=budget.usage().unwrap();
+        assert!(profile.check_grant(&r).is_err());
+        r.mailbox_grant.local_service=Some(MailboxLocalServiceGrant::original_cast_v1());
+        assert!(old.check_grant(&r).is_err());
+        assert!(InstalledMailboxProfile::Single.check_grant(&r).is_err());
+        assert!(profile.check_grant(&r).is_ok());
+        r.vm_id="third".into(); assert!(profile.check_grant(&r).is_err());
+        r.vm_id="beta".into(); r.backend=MailboxWorkerBackend::Hvf;
+        assert!(profile.check_grant(&r).is_err());
+        r.backend=MailboxWorkerBackend::Firecracker;
+        r.mailbox_grant.local_service=Some(MailboxLocalServiceGrant::reliable_v1());
+        assert!(profile.check_grant(&r).is_err());
+        assert_eq!(budget.usage().unwrap(),usage);
+    }
+
+    #[test]
     fn paired_installed_budget_preserves_two_particular_admissions_and_one_shared_workspace() {
         use crate::mailbox_process::installed_profile::{InstalledMailboxProfile, MailboxPair};
         use std::os::unix::fs::PermissionsExt;
