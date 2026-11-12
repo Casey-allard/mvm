@@ -195,27 +195,8 @@ pub(super) fn start_persistent(
     fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
     journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
-    let PreparedPersistentBoot {
-        backend,
-        start_config,
-        admission,
-        prepared_volumes,
-        built_runtime: _built_runtime,
-    } = prepare_persistent_boot(params, journal.as_deref())?;
-    let name_label = start_config.name.clone();
-    let name = name_label.as_str();
-    let backend_label = backend.name().to_string();
-    let backend_name = backend_label.as_str();
-    finish_legacy_persistent(
-        backend,
-        start_config,
-        admission,
-        prepared_volumes,
-        name,
-        backend_name,
-        journal,
-        fresh_state,
-    )
+    let boot = prepare_persistent_boot(params, journal.as_deref())?;
+    finish_legacy_persistent(boot, journal, fresh_state)
 }
 
 struct PreparedPersistentBoot {
@@ -496,15 +477,23 @@ fn complete_writable_images(
 }
 
 fn finish_legacy_persistent(
-    backend: mvm_runtime::backend::AnyBackend,
-    start_config: mvm_core::vm_backend::VmStartConfig,
-    mut admission: crate::admission::AdmissionContext,
-    mut prepared_volumes: crate::volume::LaunchPreparation,
-    name: &str,
-    backend_name: &str,
+    boot: PreparedPersistentBoot,
     mut journal: Option<&mut journal::InstalledJournal<'_>>,
     fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    // Keep the verified runtime pack held through startup and any rollback.
+    let _built_runtime = boot.built_runtime;
+    let PreparedPersistentBoot {
+        backend,
+        start_config,
+        mut admission,
+        mut prepared_volumes,
+        ..
+    } = boot;
+    let name_label = start_config.name.clone();
+    let name = name_label.as_str();
+    let backend_label = backend.name().to_string();
+    let backend_name = backend_label.as_str();
     let mailbox_posture = admission.admitted.mailbox_posture();
     // VMM selection + workload-support check + start move behind the facade; the
     // admission gate (above) and the launched/failed emits stay here.
