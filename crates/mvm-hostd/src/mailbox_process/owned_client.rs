@@ -376,21 +376,7 @@ impl InstalledMailboxClient {
             !std::ptr::eq(pa, pb),
             "development direction needs distinct issuer lanes"
         );
-        let mut a = pa
-            .prepared_direction
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("original source lane busy"))?;
-        let mut b = pb
-            .prepared_direction
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("original destination lane busy"))?;
-        ensure!(
-            a.is_none() && b.is_none(),
-            "original development direction already prepared"
-        );
-        *a = Some(context);
-        *b = Some(context);
-        Ok(())
+        bind_pair_once(&pa.prepared_direction, &pb.prepared_direction, context)
     }
     fn development_peer(&self) -> Result<&InstalledMailboxPeer> {
         ensure!(
@@ -706,6 +692,26 @@ impl InstalledMailboxClient {
     }
 }
 
+fn bind_pair_once(
+    left: &Mutex<Option<[u8; 32]>>,
+    right: &Mutex<Option<[u8; 32]>>,
+    context: [u8; 32],
+) -> Result<()> {
+    let mut a = left
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("original source lane busy"))?;
+    let mut b = right
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("original destination lane busy"))?;
+    ensure!(
+        a.is_none() && b.is_none(),
+        "original development direction already prepared"
+    );
+    *a = Some(context);
+    *b = Some(context);
+    Ok(())
+}
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
@@ -716,6 +722,20 @@ mod tests {
 
     const CHILD_SOCKET: &str = "MVM_TEST_INSTALLED_ORIGINAL_PEER_SOCKET";
 
+    #[test]
+    fn original_development_pair_binding_is_atomic_and_cannot_rotate() {
+        let a = Mutex::new(None);
+        let b = Mutex::new(None);
+        let busy = b.lock().unwrap();
+        assert!(bind_pair_once(&a, &b, [7; 32]).is_err());
+        assert!(a.lock().unwrap().is_none());
+        drop(busy);
+        bind_pair_once(&a, &b, [8; 32]).unwrap();
+        assert!(bind_pair_once(&a, &b, [8; 32]).is_err());
+        assert!(bind_pair_once(&b, &a, [9; 32]).is_err());
+        assert_eq!(*a.lock().unwrap(), Some([8; 32]));
+        assert_eq!(*b.lock().unwrap(), Some([8; 32]));
+    }
     #[test]
     fn original_peer_fixture() {
         let Some(path) = std::env::var_os(CHILD_SOCKET) else {

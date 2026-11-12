@@ -103,6 +103,7 @@ fn credentials(g: AddressedCastGrants<'_>) -> Result<[u8; 32]> {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PrivateLaunch {
+    direction: Option<[u8; 32]>,
     end: End,
     wrapping: [u8; 32],
     scope: SignedMailboxCapability,
@@ -137,6 +138,7 @@ impl LaunchCustody {
         let end = End::new(owner, role, scope_hash(scope)?)?;
         let wrapping = Key::random();
         let setup = PrivateLaunch {
+            direction: None,
             end: end.clone(),
             wrapping: *wrapping.expose_bytes(),
             scope: scope.clone(),
@@ -149,31 +151,8 @@ impl LaunchCustody {
                 original,
                 routing,
             },
-            PreparedRole {
-                setup,
-                grant,
-                direction: None,
-            },
+            PreparedRole { setup, grant },
         ))
-    }
-    #[cfg(test)]
-    pub(crate) fn attach(
-        config: &mut MailboxProcessConfig,
-        owner: &MailboxWorkerOwner,
-        role: EndpointRole,
-        scope: &SignedMailboxCapability,
-    ) -> Result<Self> {
-        let original = authorized_role_policy(config, role, scope)?;
-        let (issuer, prepared) = Self::create(
-            config.grant,
-            original,
-            config.keys.template.routing.clone(),
-            owner,
-            role,
-            scope,
-        )?;
-        prepared.install(config, owner)?;
-        Ok(issuer)
     }
     pub fn greeting(&self) -> LocalGreeting {
         self.end.greeting()
@@ -390,11 +369,18 @@ pub struct DirectionDelivery {
 /// Only the original SDK holds this nonclone secret. Its exclusive config
 /// descriptor is consumed once, later, without a second key mint or rebind.
 pub struct PreparedRole {
-    direction: Option<[u8; 32]>,
     setup: PrivateLaunch,
     grant: MailboxGrant,
 }
 impl PreparedRole {
+    fn bind(&mut self, d: &DevelopmentDirection) -> Result<()> {
+        ensure!(
+            self.setup.direction.is_none() && &self.setup.end == d.end(self.setup.end.role),
+            "cannot change original role direction"
+        );
+        self.setup.direction = Some(d.commitment());
+        Ok(())
+    }
     pub(crate) fn check_recipient(
         &self,
         owner: &MailboxWorkerOwner,
@@ -402,7 +388,7 @@ impl PreparedRole {
     ) -> Result<()> {
         self.setup.end.original(owner)?;
         ensure!(
-            self.direction.is_some() && self.direction == context,
+            self.setup.direction.is_some() && self.setup.direction == context,
             "wrong prepared original issuer or direction"
         );
         Ok(())
@@ -414,7 +400,9 @@ impl PreparedRole {
     ) -> Result<()> {
         self.setup.end.original(owner)?;
         ensure!(
-            self.grant == config.grant && config.keys.development_cast.is_none(),
+            self.setup.direction.is_some()
+                && self.grant == config.grant
+                && config.keys.development_cast.is_none(),
             "original granted config changed"
         );
         authorized_role_policy(config, self.setup.end.role, &self.setup.scope)?;
@@ -436,9 +424,27 @@ fn prepare_original(
     now: i64,
 ) -> Result<(LaunchCustody, PreparedRole)> {
     let grant = p.installed.worker.acquire_request().mailbox_grant;
-    let keys = mvm_core::config::mvm_keys_dir();
-    let trusted = super::derived_keys(&keys, &grant.mailbox, grant.epoch)?;
-    let template = super::template_for(&keys, &trusted, &grant, now)?;
+    let (issuer, setup) = prepare_at(
+        &mvm_core::config::mvm_keys_dir(),
+        grant,
+        owner,
+        role,
+        scope,
+        now,
+    )?;
+    check_policy(&issuer.original, p.current)?;
+    Ok((issuer, setup))
+}
+fn prepare_at(
+    keys: &std::path::Path,
+    grant: MailboxGrant,
+    owner: &MailboxWorkerOwner,
+    role: EndpointRole,
+    scope: &SignedMailboxCapability,
+    now: i64,
+) -> Result<(LaunchCustody, PreparedRole)> {
+    let trusted = super::derived_keys(keys, &grant.mailbox, grant.epoch)?;
+    let template = super::template_for(keys, &trusted, &grant, now)?;
     let original = checked_role_policy(
         grant,
         template.launch_context(),
@@ -447,7 +453,6 @@ fn prepare_original(
         role,
         scope,
     )?;
-    check_policy(&original, p.current)?;
     LaunchCustody::create(grant, original, template.routing, owner, role, scope)
 }
 
@@ -519,8 +524,8 @@ pub fn prepare(
         destination.installed.worker,
         delivery.direction.commitment(),
     )?;
-    source_setup.direction = Some(delivery.direction.commitment());
-    destination_setup.direction = source_setup.direction;
+    source_setup.bind(&delivery.direction)?;
+    destination_setup.bind(&delivery.direction)?;
     Ok(PreparedDevelopment {
         delivery,
         source: source_setup,
@@ -670,7 +675,7 @@ impl PrivateSlot {
         };
         p.end.original(owner)?;
         ensure!(
-            &p.end == d.end(role),
+            &p.end == d.end(role) && p.direction == Some(d.commitment()),
             "wrong original endpoint for this direction"
         );
         let wrapping = Key::from_slice(&p.wrapping)?;
