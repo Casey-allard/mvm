@@ -3,7 +3,42 @@
 mod canonical {
     include!("mailbox_crypto.rs");
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(unix, feature = "test-support"))]
+    struct Meter<S> {
+        io: S,
+        read: u64,
+        written: u64,
+    }
+    #[cfg(all(unix, feature = "test-support"))]
+    impl<S: std::io::Read> std::io::Read for Meter<S> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.io.read(bytes)?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+    #[cfg(all(unix, feature = "test-support"))]
+    impl<S: std::io::Write> std::io::Write for Meter<S> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let n = self.io.write(bytes)?;
+            self.written += n as u64;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.io.flush()
+        }
+    }
+    #[cfg(all(unix, feature = "test-support"))]
+    fn thread_cpu_ns() -> u64 {
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime initializes a writable timespec on success.
+        let result =
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) };
+        assert_eq!(result, 0);
+        let time = unsafe { time.assume_init() };
+        (time.tv_sec as u64) * 1_000_000_000 + time.tv_nsec as u64
+    }
+    #[cfg(all(unix, feature = "test-support"))]
     #[test]
     fn authorized_cast_delivers_exact_bytes_and_rejects_changed_authority() {
         use mvm_contract::protocol::mailbox::{
@@ -174,16 +209,32 @@ mod canonical {
                 .is_err()
         );
 
-        let (mut host, mut guest) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (host, guest) = std::os::unix::net::UnixStream::pair().unwrap();
         for io in [&host, &guest] {
             io.set_read_timeout(Some(std::time::Duration::from_secs(1)))
                 .unwrap();
             io.set_write_timeout(Some(std::time::Duration::from_secs(1)))
                 .unwrap();
         }
+        let mut host = Meter {
+            io: host,
+            read: 0,
+            written: 0,
+        };
+        let mut guest = Meter {
+            io: guest,
+            read: 0,
+            written: 0,
+        };
         std::thread::scope(|scope| {
-            let receiver =
-                scope.spawn(|| chan.receive_on(&mut guest, || live.now_unix_ms, &mut inbox));
+            let receiver = scope.spawn(|| {
+                let cpu = thread_cpu_ns();
+                chan.receive_on(&mut guest, || live.now_unix_ms, &mut inbox)
+                    .unwrap();
+                (thread_cpu_ns() - cpu, guest.read, guest.written)
+            });
+            let start = std::time::Instant::now();
+            let host_cpu = thread_cpu_ns();
             let ack = chan
                 .dispatch_on(&mut host, || {
                     Ok(mvm_core::mailbox::frame::cast::CastAdmission {
@@ -200,7 +251,20 @@ mod canonical {
                 proof.admission().journal_view().header().message_id
             );
             assert_eq!(ack.delivery_sequence, 1);
-            receiver.join().unwrap().unwrap();
+            let host_cpu = thread_cpu_ns() - host_cpu;
+            let wall = start.elapsed().as_nanos();
+            let (guest_cpu, guest_read, guest_written) = receiver.join().unwrap();
+            assert_eq!(host.written, guest_read);
+            assert_eq!(host.read, guest_written);
+            println!(
+                "cast_socketpair payload={} host_to_guest={} guest_to_host={} dispatch_ack_ns={} host_thread_cpu_ns={} guest_thread_cpu_ns={}",
+                input.len(),
+                host.written,
+                host.read,
+                wall,
+                host_cpu,
+                guest_cpu
+            );
         });
         let mut second = h;
         second.message_id = MessageId::from_bytes([42; 32]);
