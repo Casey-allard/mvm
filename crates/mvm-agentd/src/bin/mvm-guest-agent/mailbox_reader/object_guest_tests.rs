@@ -148,6 +148,9 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
 
     let seed = Box::leak(Box::new(Zeroizing::new(guest.to_bytes())));
     let reader = Arc::new(GuestReader {
+        role: None,
+        settlement: Default::default(),
+        outbox: Default::default(),
         boot: MailboxReaderBootBinding {
             durable_object_pair_sha256_v1: Some([71; 32]),
             outbound_journal_v1: None,

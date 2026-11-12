@@ -20,6 +20,31 @@ struct Intent {
     plan_nonce: mvm_contract::plan::Nonce,
     submission: ObjectSubmissionV1,
 }
+pub fn load(
+    dir: &Path,
+    boot: &MailboxReaderBootBinding,
+    pair: [u8; 32],
+) -> Result<ObjectSubmissionV1, Refusal> {
+    let _lock = lock_outbox_dir(dir)?;
+    let mut bytes = Vec::new();
+    open_outbox(&slot(dir))
+        .and_then(|f| f.take((MAX_STAGED + 1) as u64).read_to_end(&mut bytes))
+        .map_err(|_| Refusal::Unavailable)?;
+    if bytes.len() > MAX_STAGED {
+        return Err(Refusal::Oversized(MAX_STAGED));
+    }
+    let record: Intent = serde_json::from_slice(&bytes).map_err(|_| Refusal::Malformed)?;
+    if record.version != 1
+        || boot.durable_object_pair_sha256_v1 != Some(pair)
+        || record.pair != pair
+        || record.boot != boot.boot
+        || record.plan_nonce != boot.plan_nonce
+    {
+        return Err(Refusal::NotAuthorized);
+    }
+    Ok(record.submission)
+}
+
 fn slot(dir: &Path) -> PathBuf {
     dir.join("outbox-object-pair-v1")
 }
@@ -28,6 +53,18 @@ pub fn stage(
     boot: &MailboxReaderBootBinding,
     pair: [u8; 32],
     submission: &ObjectSubmissionV1,
+) -> Result<(), Refusal> {
+    stage_after(dir, boot, pair, submission, None)
+}
+
+/// Replace only the exact earlier intent whose destination settlement the
+/// calling agent independently verified on this original boot.
+pub fn stage_after(
+    dir: &Path,
+    boot: &MailboxReaderBootBinding,
+    pair: [u8; 32],
+    submission: &ObjectSubmissionV1,
+    settled: Option<&ObjectSubmissionV1>,
 ) -> Result<(), Refusal> {
     if boot.durable_object_pair_sha256_v1 != Some(pair)
         || submission.payload().is_empty()
@@ -56,7 +93,20 @@ pub fn stage(
         .and_then(|f| f.take((MAX_STAGED + 1) as u64).read_to_end(&mut existing))
     {
         Ok(_) if existing == bytes => sync_dir(dir).map_err(|_| Refusal::Unavailable),
-        Ok(_) => Err(Refusal::QueueFull(1)),
+        Ok(_) => {
+            let old: Intent = serde_json::from_slice(&existing).map_err(|_| Refusal::Malformed)?;
+            if old.version != 1
+                || old.boot != boot.boot
+                || old.plan_nonce != boot.plan_nonce
+                || old.pair != pair
+                || old.submission.message_id() == submission.message_id()
+                || Some(&old.submission) != settled
+            {
+                return Err(Refusal::QueueFull(1));
+            }
+            mvm_core::util::atomic_io::atomic_write_durable(&path, &bytes)
+                .map_err(|_| Refusal::Unavailable)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             atomic_write_new(&path, &bytes).map_err(|_| Refusal::Unavailable)?;
             sync_dir(dir).map_err(|_| Refusal::Unavailable)

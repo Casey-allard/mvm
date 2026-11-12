@@ -72,6 +72,10 @@ impl std::fmt::Debug for ObjectSubmissionV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderRequest {
+    GetObjectRoleV1 {
+        pair: [u8; 32],
+        boot: mvm_contract::protocol::mailbox::BootId,
+    },
     Receive,
     SubmitObjectV1 {
         pair: [u8; 32],
@@ -93,6 +97,10 @@ pub enum ReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApplicationReaderRequest {
+    ObjectSubmissionStatusV1 {
+        pair: [u8; 32],
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+    },
     StageObjectV1 {
         pair: [u8; 32],
         submission: Box<ObjectSubmissionV1>,
@@ -116,6 +124,13 @@ pub enum ApplicationReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderResponse {
+    ObjectRoleV1 {
+        signed: Box<super::object_pair::role::SignedObjectRoleV1>,
+    },
+    ObjectPendingV1 {
+        pair: [u8; 32],
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+    },
     /// Returned only on the original local reader socket; never a delivery receipt.
     OutboundJournalAvailableV1 {
         commitment: [u8; 32],
@@ -275,19 +290,31 @@ mod payload_base64 {
     }
 }
 
+/// During an original submission an incomplete verdict leaves acceptance unknown.
+/// A completely received invalid value is still a protocol refusal.
+pub fn read_submission_response(stream: &mut impl Read) -> Result<ReaderResponse, Refusal> {
+    read_frame_with_io(stream, MAX_RESPONSE_BYTES, Refusal::Unavailable)
+}
+
 fn read_frame<T: DeserializeOwned>(stream: &mut impl Read, limit: usize) -> Result<T, Refusal> {
+    read_frame_with_io(stream, limit, Refusal::Malformed)
+}
+
+fn read_frame_with_io<T: DeserializeOwned>(
+    stream: &mut impl Read,
+    limit: usize,
+    io_failure: Refusal,
+) -> Result<T, Refusal> {
     let mut len = [0u8; 4];
     stream
         .read_exact(&mut len)
-        .map_err(|_| Refusal::Malformed)?;
+        .map_err(|_| io_failure.clone())?;
     let len = u32::from_be_bytes(len) as usize;
     if !(READER_MAGIC.len()..=limit).contains(&len) {
         return Err(Refusal::Oversized(limit));
     }
     let mut body = vec![0; len];
-    stream
-        .read_exact(&mut body)
-        .map_err(|_| Refusal::Malformed)?;
+    stream.read_exact(&mut body).map_err(|_| io_failure)?;
     decode_body(&body)
 }
 

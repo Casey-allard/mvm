@@ -543,9 +543,9 @@ fn serve_reader(
                     .map_err(reader_refusal)?;
                 Ok(ReaderResponse::Acknowledged { ack: signed })
             }
-            ReaderRequest::SubmitObjectV1 { .. } | ReaderRequest::Possession { .. } => {
-                Err(Refusal::NotAuthorized)
-            }
+            ReaderRequest::GetObjectRoleV1 { .. }
+            | ReaderRequest::SubmitObjectV1 { .. }
+            | ReaderRequest::Possession { .. } => Err(Refusal::NotAuthorized),
         }
     });
     let response = result.unwrap_or_else(|reason| ReaderResponse::Refused { reason });
@@ -559,6 +559,8 @@ fn serve_reader(
         ReaderResponse::Challenge { .. } => mark("reader_challenge"),
         // A slot report belongs to the guest-local interface, not this host stream.
         ReaderResponse::OutboundJournalAvailableV1 { .. }
+        | ReaderResponse::ObjectRoleV1 { .. }
+        | ReaderResponse::ObjectPendingV1 { .. }
         | ReaderResponse::ObjectAcceptedV1 { .. }
         | ReaderResponse::ObjectStagedV1 { .. } => {}
     }
