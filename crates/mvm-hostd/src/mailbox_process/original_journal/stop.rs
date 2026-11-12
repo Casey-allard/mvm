@@ -4,7 +4,10 @@ use anyhow::{Context, Result, ensure};
 use mvm_contract::protocol::vm_backend::{BackendKind, VmId};
 use mvm_core::{mailbox::reader::MailboxReaderBootBinding, plan::ExecutionPlan};
 use mvm_runtime::AnyBackend;
-use mvm_vmm::host::network_endpoint_spawn::EndpointPid;
+use mvm_vmm::host::{
+    network_endpoint_spawn::EndpointPid,
+    process_exit::{ProcessExitObserver, ProcessExitWait},
+};
 use std::{
     fs::File,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -17,8 +20,10 @@ pub(super) struct StopCustody {
     kind: BackendKind,
     // Component-only helper fixtures need no VMM. A real typed stop always
     // requires the originally observed kernel identity before touching a VMM.
-    vmm: Option<EndpointPid>,
+    vmm: Option<(EndpointPid, ProcessExitObserver)>,
+    sdk_abort_confirmed: bool,
     vm_stopped: bool,
+    kernel_exit_observed: bool,
     assisted: bool,
 }
 
@@ -37,12 +42,18 @@ impl StopCustody {
             .ok()
             .flatten()
             .map(EndpointPid::of_child)
-            .filter(EndpointPid::is_live_and_ours);
+            .filter(EndpointPid::is_live_and_ours)
+            .and_then(|original| {
+                let observer = ProcessExitObserver::arm(original.pid).ok()?;
+                original.is_live_and_ours().then_some((original, observer))
+            });
         Ok(Self {
             state,
             kind: backend.kind(),
             vmm,
+            sdk_abort_confirmed: false,
             vm_stopped: false,
+            kernel_exit_observed: false,
             assisted: false,
         })
     }
@@ -90,13 +101,23 @@ impl JournalOwner<'_> {
         }
     }
 
+    /// Record the SDK's successful abort on this original. Collection still
+    /// independently requires the kernel observer armed at helper installation.
+    pub fn note_launch_aborted(&mut self, plan: &ExecutionPlan) -> Result<()> {
+        let (name, boot, _, state, _, _) = self.parts();
+        ensure!(name == plan.image.name, "abort belongs to another VM");
+        boot.check_plan(plan)?;
+        state.sdk_abort_confirmed = true;
+        Ok(())
+    }
+
     /// Stop only the original VM, collect its mailbox, then perform the caller's
     /// SDK accounting while the original name exclusion and launcher still hold.
     pub fn stop_and_collect(
         &mut self,
         name: &str,
         until: Instant,
-        finish: impl FnOnce(&ExecutionPlan) -> Result<()>,
+        finish: impl FnOnce(&ExecutionPlan, bool) -> Result<()>,
     ) -> Result<JournalStopOutcome> {
         let (original_name, boot, guard, state, marker, child) = self.parts();
         ensure!(original_name == name, "different original machine name");
@@ -134,11 +155,14 @@ impl JournalOwner<'_> {
             matches!(std::fs::symlink_metadata(dir.join(super::super::MAILBOX_PID_FILE)),Err(e) if e.kind()==std::io::ErrorKind::NotFound),
             "unexpected ordinary mailbox PID record for paired original"
         );
-        if !state.vm_stopped {
+        let (original, observer) = state
+            .vmm
+            .as_ref()
+            .context("no original kernel process identity")?;
+        if !state.vm_stopped && !state.sdk_abort_confirmed {
             let backend =
                 AnyBackend::for_started_vm(name).context("original VMM backend is unavailable")?;
             let vm = VmId(name.to_owned());
-            let original = state.vmm.context("no original kernel process identity")?;
             ensure!(
                 backend.kind() == state.kind
                     && original.is_live_and_ours()
@@ -149,6 +173,13 @@ impl JournalOwner<'_> {
             // admitted services. The paired mailbox has no numeric PID record.
             backend.stop(&vm)?;
             state.vm_stopped = true;
+        }
+        if !state.kernel_exit_observed {
+            ensure!(
+                observer.wait_event(until)? == ProcessExitWait::Exited,
+                "original VMM exit still unconfirmed"
+            );
+            state.kernel_exit_observed = true;
         }
         let natural = Instant::now() + Duration::from_millis(250);
         let status = loop {
@@ -165,7 +196,7 @@ impl JournalOwner<'_> {
         };
         same_state()?;
         super::super::shred_epoch_secret(&dir)?;
-        finish(&plan)?;
+        finish(&plan, state.sdk_abort_confirmed)?;
         Ok(JournalStopOutcome {
             helper_status: status,
             assisted: state.assisted,

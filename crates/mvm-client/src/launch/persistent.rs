@@ -502,7 +502,7 @@ fn finish_legacy_persistent(
     mut prepared_volumes: crate::volume::LaunchPreparation,
     name: &str,
     backend_name: &str,
-    journal: Option<&mut journal::InstalledJournal<'_>>,
+    mut journal: Option<&mut journal::InstalledJournal<'_>>,
     fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
     let mailbox_posture = admission.admitted.mailbox_posture();
@@ -545,10 +545,11 @@ fn finish_legacy_persistent(
     // The guest asserts a mailbox exactly when the plan grants one, so the
     // host side starts here or the launch is rolled back.
     let paired = journal.is_some();
-    if let Some(endpoint) = journal {
+    if let Some(endpoint) = journal.as_deref_mut() {
         if let Err(error) = endpoint.serve(&admission.admitted, &started) {
             match started.backend().abort_start(started.vm_id()) {
                 Ok(_) => {
+                    endpoint.note_launch_aborted(admission.admitted.plan())?;
                     crate::local::deregister_from_name_registry(name);
                     emit_failed(&admission, "mailbox-process", &error);
                 }
@@ -597,6 +598,9 @@ fn finish_legacy_persistent(
             prepared_volumes.commit();
             audit_detached_readiness_failure(&admission, name, &error);
         } else {
+            if let Some(endpoint) = journal.as_deref_mut() {
+                endpoint.note_launch_aborted(admission.admitted.plan())?;
+            }
             audit_detached_readiness_failure(&admission, name, &error);
             // The failure record and session seal live under the runtime
             // state directory, so cleanup must follow audit finalization.
@@ -611,12 +615,15 @@ fn finish_legacy_persistent(
         }
         return Err(anyhow::Error::new(error));
     }
-    if paired {
+    if let Some(endpoint) = journal {
         journal::account_started(
             &admission,
             &started,
             name,
-            || started.backend().abort_start(started.vm_id()).map(|_| ()),
+            || {
+                started.backend().abort_start(started.vm_id())?;
+                endpoint.note_launch_aborted(admission.admitted.plan())
+            },
             || prepared_volumes.commit(),
         )?;
     } else {

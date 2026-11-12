@@ -80,6 +80,21 @@ impl InstalledJournal<'_> {
         }
     }
 
+    pub(super) fn note_launch_aborted(
+        &mut self,
+        plan: &mvm_core::plan::ExecutionPlan,
+    ) -> Result<()> {
+        use mvm_hostd::mailbox_process::original_journal::JournalOwner;
+        let original = match self {
+            Self::Destination { owner, .. } => owner.as_mut().map(JournalOwner::Destination),
+            Self::Source { owner, .. } => owner.as_mut().map(JournalOwner::Source),
+        };
+        if let Some(mut held) = original {
+            held.note_launch_aborted(plan)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn serve(
         &mut self,
         admitted: &AdmittedPlan,
@@ -166,8 +181,10 @@ impl crate::LocalBackend {
     {
         let name = &id.0;
         original
-            .stop_and_collect(name, until, |plan| {
-                crate::launch::seal_stopped_session(plan, name);
+            .stop_and_collect(name, until, |plan, aborted| {
+                if !aborted {
+                    crate::launch::seal_stopped_session(plan, name);
+                }
                 self.release_stopped_leases(name)?;
                 crate::local::deregister_from_name_registry(name);
                 crate::local::remove_stopped_runtime_state(name)?;
