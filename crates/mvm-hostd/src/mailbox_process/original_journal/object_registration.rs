@@ -41,6 +41,7 @@ impl OriginalDirectory {
 
     fn require_current(&self) -> Result<()> {
         let current = fs::symlink_metadata(&self.path)?;
+        mvm_core::private_fs::require_current_owner(&current)?;
         ensure!(
             current.is_dir()
                 && current.mode() & 0o022 == 0
