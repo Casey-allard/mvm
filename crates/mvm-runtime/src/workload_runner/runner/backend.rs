@@ -13,6 +13,46 @@ fn has_vm_marker(state_dir: &std::path::Path) -> bool {
             .any(|name| state_dir.join(name).exists())
 }
 
+impl
+    WorkloadRunner<mvm_backends::driver::HvfDriver, RealNetworkEndpointSpawner, RealBrokerRegistrar>
+{
+    /// Only this concrete production spawner can project a reader into an
+    /// opaque native launch. A mock spawner cannot attach a substituted boot.
+    pub(crate) fn prepare_owned_hvf_original(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::host::boot_images::FrozenBootImageBytes,
+    ) -> Result<ColdHvfChannel> {
+        let plan = config
+            .plan_json
+            .as_deref()
+            .map(mvm_core::plan::plan_from_admitted_json)
+            .transpose()?;
+        let Some(plan) = plan.filter(|p| {
+            p.mailbox
+                .is_some_and(|g| g.durable_object_pair_sha256_v1.is_some())
+        }) else {
+            return self.prepare_cold_hvf_channel(config, images);
+        };
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let runner = WorkloadRunner {
+            driver: self.driver.clone(),
+            spawner: OriginalObjectSpawner(Arc::clone(&slot)),
+            broker: RealBrokerRegistrar,
+            console_streamer: Arc::clone(&self.console_streamer),
+        };
+        let mut owner = runner.prepare_cold_hvf_channel(config, images)?;
+        // prepare_cold_hvf_channel has completed writing the original identity
+        // drive, before any HVF child or control handshake exists.
+        let reader = slot
+            .get()
+            .context("selected HVF drive did not receive its original reader")?;
+        reader.check_plan(&plan)?;
+        owner.capture_original_reader(reader.clone())?;
+        Ok(owner)
+    }
+}
+
 impl<S: NetworkEndpointSpawner + 'static, B: BrokerRegistrar + 'static>
     WorkloadRunner<mvm_backends::driver::hvf::HvfDriver, S, B>
 {

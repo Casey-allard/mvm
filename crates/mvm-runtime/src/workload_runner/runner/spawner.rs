@@ -291,9 +291,7 @@ fn observe_original(capture: Option<&Capture>, boot: Option<&ReaderBoot>) -> Res
     }
     Ok(())
 }
-#[cfg(target_os = "linux")]
 pub(crate) struct OriginalObjectSpawner(pub std::sync::Arc<Capture>);
-#[cfg(target_os = "linux")]
 impl NetworkEndpointSpawner for OriginalObjectSpawner {
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>> {
         prepare_local_identity(req, Some(&self.0))
@@ -925,8 +923,25 @@ mod tests {
         assert!(image.windows(encoded.len()).any(|bytes| bytes == encoded));
         assert_eq!(ReaderBoot::load(&state).unwrap(), *expected);
         assert!(prepare_observation_identity_inner(&request, &anchor, Some(&slot)).is_err());
-        assert_eq!(std::fs::read(drive).unwrap(), image);
+        assert_eq!(std::fs::read(&drive).unwrap(), image);
         assert_eq!(ReaderBoot::load(&state).unwrap(), *expected);
+
+        let sibling_state = root.path().join("sibling");
+        let sibling_req = NetworkEndpointSpawnRequest {
+            state_dir: &sibling_state,
+            ..request
+        };
+        let sibling_slot = Capture::new();
+        let sibling_drive =
+            prepare_observation_identity_inner(&sibling_req, &anchor, Some(&sibling_slot))
+                .unwrap()
+                .unwrap();
+        let sibling = sibling_slot.get().unwrap();
+        sibling.check_plan(&plan).unwrap();
+        assert_ne!(sibling, expected);
+        assert_ne!(std::fs::read(sibling_drive).unwrap(), image);
+        assert_eq!(slot.get().unwrap(), expected);
+        assert_eq!(std::fs::read(drive).unwrap(), image);
     }
 
     #[test]

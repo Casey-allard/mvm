@@ -230,13 +230,25 @@ impl<'a> InstalledParticipant<'a> {
         original: &'a mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch,
         boot: &'a MailboxReaderBootBinding,
     ) -> Result<Self> {
-        let owner = Self {
+        let owner = Self::from_original_hvf(admitted, original)?;
+        check_hvf_reader(admitted.plan(), owner.boot, boot)?;
+        Ok(owner)
+    }
+
+    /// The admitted SDK need only supply the retained original runtime; the
+    /// immutable public ACK key and boot identity come from its own drive.
+    pub fn from_original_hvf(
+        admitted: &'a AdmittedPlan,
+        original: &'a mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch,
+    ) -> Result<Self> {
+        let boot = original.original_object_reader()?;
+        boot.check_plan(admitted.plan())?;
+        check_hvf_config(admitted, original)?;
+        Ok(Self {
             admitted,
             original: OriginalNative::Hvf(original),
             boot,
-        };
-        check_original_native(&owner)?;
-        Ok(owner)
+        })
     }
     #[cfg(target_os = "linux")]
     pub fn from_original_firecracker(admitted: &'a AdmittedPlan) -> Result<Self> {
@@ -253,10 +265,15 @@ impl<'a> InstalledParticipant<'a> {
 
 fn check_hvf_reader(
     plan: &mvm_core::plan::ExecutionPlan,
-    _minted: &MailboxReaderBootBinding,
+    minted: &MailboxReaderBootBinding,
     presented: &MailboxReaderBootBinding,
 ) -> Result<()> {
-    presented.check_plan(plan)
+    minted.check_plan(plan)?;
+    ensure!(
+        minted == presented,
+        "different original HVF mailbox boot or ACK key"
+    );
+    Ok(())
 }
 
 fn check_original_native(participant: &InstalledParticipant<'_>) -> Result<()> {
@@ -272,8 +289,19 @@ fn check_original_native(participant: &InstalledParticipant<'_>) -> Result<()> {
         }
         OriginalNative::Hvf(original) => original,
     };
-    original.validate_live()?;
-    let name = &participant.admitted.plan().image.name;
+    check_hvf_reader(
+        participant.admitted.plan(),
+        original.original_object_reader()?,
+        participant.boot,
+    )?;
+    check_hvf_config(participant.admitted, original)
+}
+
+fn check_hvf_config(
+    admitted: &AdmittedPlan,
+    original: &mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch,
+) -> Result<()> {
+    let name = &admitted.plan().image.name;
     mvm_core::naming::validate_vm_name(name)?;
     ensure!(
         &original.vm_id()?.0 == name,
@@ -287,9 +315,9 @@ fn check_original_native(participant: &InstalledParticipant<'_>) -> Result<()> {
             .context("original native plan missing")?,
     )?;
     ensure!(
-        envelope.0.payload == participant.admitted.signed().0.payload
-            && envelope.0.signature == participant.admitted.signed().0.signature
-            && envelope.0.signer_id == participant.admitted.signed().0.signer_id,
+        envelope.0.payload == admitted.signed().0.payload
+            && envelope.0.signature == admitted.signed().0.signature
+            && envelope.0.signer_id == admitted.signed().0.signer_id,
         "original native launch signed a different plan"
     );
     Ok(())

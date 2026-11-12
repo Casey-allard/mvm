@@ -60,6 +60,7 @@ pub(super) struct ColdHvfPreparation {
 struct Custody {
     preparation: ColdHvfPreparation,
     native: Option<ColdHvfOwner>,
+    original_reader: Option<mvm_core::mailbox::reader::MailboxReaderBootBinding>,
     failed_boot: Option<ColdHvfBootFailure>,
     native_exit: Option<mvm_vmm::host::hvf_stop::ConfirmedExit>,
     entrypoint_terminal: Option<mvm_agentd::vsock::EntrypointEvent>,
@@ -142,6 +143,7 @@ impl ColdHvfChannel {
             custody: Some(Custody {
                 preparation,
                 native: None,
+                original_reader: None,
                 failed_boot: None,
                 native_exit: None,
                 entrypoint_terminal: None,
@@ -177,6 +179,34 @@ impl ColdHvfChannel {
             .as_ref()
             .map(|custody| custody.preparation.launch.config())
             .context("runtime custody already released")
+    }
+
+    pub(super) fn capture_original_reader(
+        &mut self,
+        boot: mvm_core::mailbox::reader::MailboxReaderBootBinding,
+    ) -> Result<()> {
+        let custody = self.custody()?;
+        anyhow::ensure!(
+            custody.phase == Phase::Prepared
+                && custody.native.is_none()
+                && custody.original_reader.is_none(),
+            "original HVF reader capture already spent"
+        );
+        custody.original_reader = Some(boot);
+        Ok(())
+    }
+
+    /// Public reader written into this owner's exact cold identity drive.
+    /// Requires the original activated VMM child, control instance and
+    /// authenticated guest bridge to remain live.
+    pub fn original_object_reader(
+        &self,
+    ) -> Result<&mvm_core::mailbox::reader::MailboxReaderBootBinding> {
+        self.validate_live()?;
+        self.custody
+            .as_ref()
+            .and_then(|c| c.original_reader.as_ref())
+            .context("no selected original HVF reader")
     }
 
     pub fn validate_live(&self) -> Result<()> {
