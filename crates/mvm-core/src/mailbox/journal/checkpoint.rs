@@ -19,6 +19,27 @@ use super::{
 
 const CHECKPOINT_DOMAIN: &[u8] = b"mvm.mailbox.local-checkpoint.v1\0";
 
+enum CheckpointAttempt {
+    Committed(JournalTip),
+    NeedsSpace { retirees: usize },
+}
+
+// Reject a snapshot that cannot possibly fit before signing or allocating its
+// full canonical encoding. The final framed and encrypted size check remains.
+struct RemainingBytes(usize);
+impl std::io::Write for RemainingBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(std::io::ErrorKind::WriteZero)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointEntry {
@@ -207,11 +228,13 @@ impl MailboxJournal {
         if now_unix_ms < 0 || self.tier != AcceptanceTier::Local {
             return Err(JournalError::InvalidLimits);
         }
-        if self.records >= self.limits.max_records.saturating_sub(8).max(1)
-            || (self.records > 1 && self.bytes >= self.limits.max_bytes / 2)
+        if self.deferred_retirees.is_none()
+            && (self.records >= self.limits.max_records.saturating_sub(8).max(1)
+                || (self.records > 1 && self.bytes >= self.limits.max_bytes / 2))
         {
             return Ok(true);
         }
+        let mut retirees = 0;
         for entry in self.seen.values() {
             if (entry.acknowledged || entry.expired_at_unix_ms.is_some())
                 && now_unix_ms
@@ -219,7 +242,10 @@ impl MailboxJournal {
                         .retained_until(entry.envelope.routing.expires_at_unix_ms)
                         .map_err(|_| JournalError::Corrupt)?
             {
-                return Ok(true);
+                retirees += 1;
+                if retirees > self.deferred_retirees.unwrap_or(0) {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -232,8 +258,12 @@ impl MailboxJournal {
         signer: &SigningKey,
         anchor: &FileJournalAnchor,
     ) -> Result<(), JournalError> {
-        if self.local_compaction_due(now_unix_ms)? {
-            self.compact_local(now_unix_ms, signer, anchor)?;
+        self.local_ready(anchor, &signer.verifying_key())?;
+        if self.local_compaction_due(now_unix_ms)?
+            && let CheckpointAttempt::NeedsSpace { retirees } =
+                self.try_compact_local(now_unix_ms, signer, anchor)?
+        {
+            self.deferred_retirees = Some(retirees);
         }
         Ok(())
     }
@@ -249,6 +279,18 @@ impl MailboxJournal {
         signer: &SigningKey,
         anchor: &FileJournalAnchor,
     ) -> Result<JournalTip, JournalError> {
+        match self.try_compact_local(now_unix_ms, signer, anchor)? {
+            CheckpointAttempt::Committed(tip) => Ok(tip),
+            CheckpointAttempt::NeedsSpace { .. } => Err(JournalError::Full),
+        }
+    }
+
+    fn try_compact_local(
+        &mut self,
+        now_unix_ms: i64,
+        signer: &SigningKey,
+        anchor: &FileJournalAnchor,
+    ) -> Result<CheckpointAttempt, JournalError> {
         self.local_ready(anchor, &signer.verifying_key())?;
         let retention = self.retention.ok_or(JournalError::InvalidLimits)?;
         let history_key = self
@@ -296,6 +338,16 @@ impl MailboxJournal {
                 .map(|(challenge, identity)| (*challenge, *identity))
                 .collect(),
         };
+        let free = self.limits.max_bytes.saturating_sub(self.bytes);
+        let mut budget = RemainingBytes(free.min(MAX_RECORD_BYTES as u64) as usize);
+        if let Err(error) = serde_json::to_writer(&mut budget, &state) {
+            if error.io_error_kind() == Some(std::io::ErrorKind::WriteZero) {
+                return Ok(CheckpointAttempt::NeedsSpace {
+                    retirees: retired.len(),
+                });
+            }
+            return Err(JournalError::Corrupt);
+        }
         let signature = signer
             .sign(&canonical_bytes(CHECKPOINT_DOMAIN, &state)?)
             .to_bytes()
@@ -314,7 +366,9 @@ impl MailboxJournal {
         };
         let body = Zeroizing::new(serde_json::to_vec(&record).map_err(|_| JournalError::Corrupt)?);
         if body.len() + 64 + aead::NONCE_SIZE + aead::TAG_SIZE > MAX_RECORD_BYTES {
-            return Err(JournalError::Full);
+            return Ok(CheckpointAttempt::NeedsSpace {
+                retirees: retired.len(),
+            });
         }
         let ciphertext = aead::seal(
             &self.record_key(),
@@ -327,7 +381,9 @@ impl MailboxJournal {
             .checked_add(size)
             .is_none_or(|n| n > self.limits.max_bytes)
         {
-            return Err(JournalError::Full);
+            return Ok(CheckpointAttempt::NeedsSpace {
+                retirees: retired.len(),
+            });
         }
         let tag = self.mac(&ciphertext);
         let mut bytes = self.tip.head.to_vec();
@@ -365,6 +421,7 @@ impl MailboxJournal {
         self.bytes = size;
         self.records = 1;
         self.poisoned = false;
-        Ok(next)
+        self.deferred_retirees = None;
+        Ok(CheckpointAttempt::Committed(next))
     }
 }

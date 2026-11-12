@@ -61,6 +61,7 @@ impl MailboxJournal {
             tip: JournalTip::genesis(),
             bytes: 0,
             records: 0,
+            deferred_retirees: None,
             seen: BTreeMap::new(),
             order: Vec::new(),
             used_challenges: BTreeMap::new(),

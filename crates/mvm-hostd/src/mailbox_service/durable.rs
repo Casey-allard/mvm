@@ -141,17 +141,16 @@ impl DurableMailboxService {
             .state
             .lock()
             .expect("mailbox journal lock poisoned");
-        if state.journal.local_compaction_due(now_unix_ms)? {
-            state
-                .journal
-                .compact_local(now_unix_ms, &self.shared.signer, anchor)?;
+        state
+            .journal
+            .maintain_local_checkpoint(now_unix_ms, &self.shared.signer, anchor)?;
+        match settle_expired(&self.shared, &mut state.journal, now_unix_ms) {
+            Err(JournalError::Full) => return Err(JournalError::MaintenancePending),
+            result => result?,
         }
-        settle_expired(&self.shared, &mut state.journal, now_unix_ms)?;
-        if state.journal.local_compaction_due(now_unix_ms)? {
-            state
-                .journal
-                .compact_local(now_unix_ms, &self.shared.signer, anchor)?;
-        }
+        state
+            .journal
+            .maintain_local_checkpoint(now_unix_ms, &self.shared.signer, anchor)?;
         Ok(())
     }
 

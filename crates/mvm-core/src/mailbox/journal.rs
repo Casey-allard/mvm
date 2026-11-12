@@ -367,6 +367,8 @@ pub struct MailboxJournal {
     tip: JournalTip,
     bytes: u64,
     records: usize,
+    // Retry a space-limited snapshot once another signed identity can be retired.
+    deferred_retirees: Option<usize>,
     seen: BTreeMap<ReplayIdentity, Seen>,
     order: Vec<ReplayIdentity>,
     used_challenges: BTreeMap<[u8; 32], ReplayIdentity>,
@@ -2645,44 +2647,67 @@ mod anchor_tests {
         let root = dir.path().join("journal");
         let (envelope, capability, mut context, key, sender, signer) = message();
         let (reference, custody) = versioned_custody();
-        let anchor = FileJournalAnchor::open(
-            &dir.path().join("anchor/tip"),
-            address(),
-            [22; 32],
-        ).unwrap();
+        let anchor =
+            FileJournalAnchor::open(&dir.path().join("anchor/tip"), address(), [22; 32]).unwrap();
         let open = |quota| {
             MailboxJournal::open_local_with_custody(
-                &root, reference, signer.verifying_key(), quota, &custody, &anchor,
+                &root,
+                reference,
+                signer.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
                 local_retention(),
-            ).unwrap()
+            )
+            .unwrap()
         };
         let mut journal = open(limits());
-        let admission = || super::tests::admission(&envelope, &capability, &context, &key, &sender, &signer);
-        let receipt = journal.admit_local(admission(), &anchor).unwrap();
+        let original = || admission(&envelope, &capability, &context, &key, &sender, &signer);
+        let receipt = journal.admit_local(original(), &anchor).unwrap();
+        let (other, cap, ctx, dek, a, b) = message_at(3, 2, context.now_unix_ms);
+        journal
+            .admit_local(admission(&other, &cap, &ctx, &dek, &a, &b), &anchor)
+            .unwrap();
         let retained_tip = anchor.tip();
         // A checkpoint needs temporary space beside the complete retained prefix.
-        let quota = JournalLimits { max_records: 10, max_bytes: journal.bytes + 1 };
+        let quota = JournalLimits {
+            max_records: 100,
+            max_bytes: journal.bytes + 1,
+        };
         drop(journal);
         let mut journal = open(quota);
         assert!(journal.local_compaction_due(context.now_unix_ms).unwrap());
-        journal.maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor).unwrap();
+        journal
+            .maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor)
+            .unwrap();
         assert!(!journal.local_compaction_due(context.now_unix_ms).unwrap());
-        assert!(matches!(journal.compact_local(context.now_unix_ms, &signer, &anchor),Err(JournalError::Full)));
-        assert_eq!(journal.admit_local(admission(), &anchor).unwrap(), receipt);
+        assert!(matches!(
+            journal.compact_local(context.now_unix_ms, &signer, &anchor),
+            Err(JournalError::Full)
+        ));
+        assert_eq!(journal.admit_local(original(), &anchor).unwrap(), receipt);
         let (next, cap, ctx, dek, a, b) = message_at(2, 2, context.now_unix_ms);
-        assert!(matches!(journal.admit_local(super::tests::admission(&next,&cap,&ctx,&dek,&a,&b), &anchor), Err(JournalError::Full)));
+        assert!(matches!(
+            journal.admit_local(admission(&next, &cap, &ctx, &dek, &a, &b), &anchor),
+            Err(JournalError::Full)
+        ));
         assert_eq!(anchor.tip(), retained_tip);
         assert!(record_path(&root, 1).exists());
         drop(journal);
         let mut journal = open(quota);
-        journal.maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor).unwrap();
-        assert_eq!(journal.admit_local(admission(), &anchor).unwrap(), receipt);
+        journal
+            .maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor)
+            .unwrap();
+        assert_eq!(journal.admit_local(original(), &anchor).unwrap(), receipt);
         // A pre-publication capacity refusal must never mask anchor disagreement.
         let mut wrong = retained_tip;
         wrong.cursor += 1;
         anchor.advance(wrong).unwrap();
         context.now_unix_ms += 1;
-        assert!(matches!(journal.maintain_local_checkpoint(context.now_unix_ms, &signer,&anchor),Err(JournalError::Rollback)));
+        assert!(matches!(
+            journal.maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor),
+            Err(JournalError::Rollback)
+        ));
     }
 
     #[test]
