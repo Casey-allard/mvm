@@ -21,7 +21,7 @@
 
 pub(crate) mod destination_ingress;
 #[cfg(unix)]
-mod source_ingress;
+pub(crate) mod source_ingress;
 pub mod installed_profile;
 pub mod owned;
 pub mod owned_client;
