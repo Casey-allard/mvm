@@ -3,6 +3,7 @@
 //! retains the original Child until collection. A pidfile cannot recreate it.
 
 pub mod authorization;
+pub mod relay;
 
 use super::{MailboxLaunchPosture, MailboxProcessConfig, spawn_serving, spawn_with_original};
 use anyhow::{Context, Result, ensure};
@@ -30,6 +31,7 @@ pub struct OriginalJournalDestination {
     policy_epoch: u64,
     issuer: PrincipalId,
     keys_dir: PathBuf,
+    name: String,
     revocations_path: PathBuf,
     inbound: mvm_core::mailbox::OpenContext,
     sender_key: ed25519_dalek::VerifyingKey,
@@ -94,6 +96,7 @@ impl OriginalJournalDestination {
             policy_epoch: current.current_policy_epoch,
             issuer: current.expected_capability_issuer,
             keys_dir: config.keys_dir.clone(),
+            name: plan.image.name.clone(),
             revocations_path: super::reader::revocations_path(&config.vm_state_dir),
             inbound: current.clone(),
             sender_key: policy.sender_key,

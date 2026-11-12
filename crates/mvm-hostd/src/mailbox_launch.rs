@@ -207,6 +207,9 @@ pub(crate) fn journal_scope_before_launch(
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivedMailboxKeys {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outbound_source:
+        Option<crate::mailbox_process::original_journal::relay::SourceConfiguration>,
     sender: [u8; 32],
     authority: [u8; 32],
     encryption: [u8; 32],
@@ -352,6 +355,7 @@ pub fn derive_launch_keys(
     }
     let template = template_for(keys_dir, &derived, grant, now_unix_ms())?;
     Ok(DerivedMailboxKeys {
+        outbound_source: None,
         sender: derived.sender.to_bytes(),
         authority: derived.authority.to_bytes(),
         encryption: *encryption,

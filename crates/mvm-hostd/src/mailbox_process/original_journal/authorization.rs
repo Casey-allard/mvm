@@ -17,6 +17,8 @@ use mvm_core::plan::{ExecutionPlan, Nonce};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// All three must be separately supplied, already signed original grants.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JournalCredentials {
     pub source_scope: SignedMailboxCapability,
     pub destination_send: SignedMailboxCapability,
@@ -355,9 +357,9 @@ mod tests {
 /// Borrowed only during the pre-sign / pre-dispatch decision. The underlying
 /// original process cannot be replaced or reconstructed from a public ID.
 pub struct PairedJournalAdmission {
-    original: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
-    grants: std::sync::Arc<JournalCredentials>,
-    deadline: Instant,
+    pub(super) original: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
+    pub(super) grants: std::sync::Arc<JournalCredentials>,
+    pub(super) deadline: Instant,
 }
 
 impl std::fmt::Debug for PairedJournalAdmission {

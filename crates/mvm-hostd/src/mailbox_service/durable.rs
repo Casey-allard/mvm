@@ -41,9 +41,9 @@ const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 const GUEST_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_EXPIRY_RECORDS_PER_REQUEST: usize = 8;
 
-pub(super) struct GuestDeadline<'a> {
-    pub(super) stream: &'a mut UnixStream,
-    pub(super) until: Instant,
+pub(crate) struct GuestDeadline<'a> {
+    pub(crate) stream: &'a mut UnixStream,
+    pub(crate) until: Instant,
 }
 
 impl GuestDeadline<'_> {

@@ -25,10 +25,10 @@ use std::time::{Duration, Instant};
 /// B's original role transfers the directional payload key alone to A. The
 /// original mailbox authority signer and retained local payload key stay at B.
 pub(crate) struct PairedSourceMaterial {
-    commitment: [u8; 32],
-    key: Key,
-    encryption: EncryptionContext,
-    routing: MailboxRoutingFrame,
+    pub(crate) commitment: [u8; 32],
+    pub(crate) key: Key,
+    pub(crate) encryption: EncryptionContext,
+    pub(crate) routing: MailboxRoutingFrame,
 }
 impl PairedSourceMaterial {
     pub(crate) fn from_enrollment(
