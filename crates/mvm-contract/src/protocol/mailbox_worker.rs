@@ -1,4 +1,4 @@
-//! Inactive version-one host-signed mailbox child-owner control contract.
+//! Version-one host-signed mailbox child-owner controls for installed hosts.
 //! No key material, executable paths, or PID authority crosses this protocol.
 use super::mailbox::MailboxGrant;
 use alloc::string::String;
@@ -85,7 +85,7 @@ pub enum MailboxWorkerState {
         exit: MailboxWorkerExit,
     },
     Unresolved,
-    /// Returned exclusively to ReleaseUnstartedV1, never as a Child exit.
+    /// Proved by ReleaseUnstartedV1 and replayable via LookupExistingV1.
     ReleasedBeforeSpawn,
 }
 

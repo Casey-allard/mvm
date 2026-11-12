@@ -1,11 +1,10 @@
-//! Explicitly injected, bounded ownership of original mailbox worker children.
-//! No production constructor installs this in the daemon. The factory must be
-//! supplied by the original trusted host owner; it receives no root/key bytes.
+//! Bounded ownership of original mailbox worker children. An explicitly
+//! provisioned installation binds the canonical helper, resource epoch and
+//! local workload. Signed controls carry no private key material.
 //! Collected status is local process evidence, not a mailbox delivery receipt.
 //! Drop hands original custody to one charged host-budget actor; that handoff
-//! is asynchronous and never a successful Stop receipt. Real helper mode,
-//! supported SIGCHLD/custody disposition and production owner injection remain
-//! separate admission/qualification gates.
+//! is asynchronous. A collected child receipt requires original custody and
+//! a checked exit status.
 mod owned_factory;
 use mvm_core::protocol::mailbox_worker_control::*;
 use mvm_vmm::host::process_exit::{
@@ -658,7 +657,26 @@ pub trait MailboxWorkerFactory: Send + Sync {
         request: &MailboxWorkerRequest,
         owner: &MailboxWorkerOwner,
     ) -> io::Result<SpawnedMailboxWorker>;
+
+    /// Classify a failure only when the trusted factory can prove no helper
+    /// exists. A legacy error or unwind retains the original reservation.
+    fn spawn_classified(&self, request: &MailboxWorkerRequest, owner: &MailboxWorkerOwner)
+        -> Result<SpawnedMailboxWorker, MailboxSpawnFailure> {
+        self.spawn(request, owner).map_err(MailboxSpawnFailure::Uncertain)
+    }
 }
+pub enum MailboxSpawnFailure {
+    NoChild(io::Error),
+    Uncertain(io::Error),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpawnState {
+    NotAttempted,
+    RejectedBeforeSpawn,
+    RequiresCollection,
+}
+
 /// Original child plus exclusive private readiness/lifetime connection. The
 /// production helper mode remains separately gated; test fixtures may implement
 /// the same bounded owner-JSON readiness line without a real guest.
@@ -687,7 +705,7 @@ struct Slot {
     worker: Option<Worker>,
     terminal_at: Option<Instant>,
     cell: Option<CleanupCell>,
-    spawn_attempted: bool,
+    spawn_state: SpawnState,
     reservation_released: bool,
     // Last field: release the original metadata charge after the Child and FDs drop.
     terminal_metadata: Option<TerminalMetadata>,
@@ -1088,7 +1106,7 @@ impl MailboxWorkers {
             };
             guard.stop_requested = true;
             let owner = guard.owner.clone();
-            if !guard.spawn_attempted && guard.worker.is_none() {
+            if guard.spawn_state != SpawnState::RequiresCollection && guard.worker.is_none() {
                 if !guard.reservation_released {
                     self.budget.collected(&self.tenant)?;
                     guard.reservation_released = true;
@@ -1438,7 +1456,7 @@ impl MailboxWorkers {
                     worker: None,
                     terminal_at: None,
                     cell: Some(cell),
-                    spawn_attempted: false,
+                    spawn_state: SpawnState::NotAttempted,
                     reservation_released: false,
                     terminal_metadata: None,
                 }));
@@ -1512,7 +1530,7 @@ impl MailboxWorkers {
             ) {
                 // Under the original slot lock a competing Delegate is either
                 // still busy, already attempted, or will see stop_requested.
-                if slot.spawn_attempted || slot.worker.is_some() || slot.delegated {
+                if slot.spawn_state == SpawnState::RequiresCollection || slot.worker.is_some() || slot.delegated {
                     return Err(refused("original worker spawn was attempted"));
                 }
                 if !slot.reservation_released {
@@ -1534,7 +1552,7 @@ impl MailboxWorkers {
                     None,
                 ));
             }
-            if slot.stop_requested
+            if (slot.stop_requested || (!slot.delegated && slot.spawn_state != SpawnState::NotAttempted))
                 && matches!(
                     request.operation,
                     MailboxWorkerOperation::DelegateConfig { .. }
@@ -1576,8 +1594,17 @@ impl MailboxWorkers {
                     return Err(refused("worker authority expired before spawn"));
                 }
                 require_owned_child_custody()?;
-                lock(&slot)?.spawn_attempted = true;
-                let spawned = self.factory.spawn(request, &owner)?;
+                // Set before calling external factory code: panic, a rejected
+                // handoff without proof, or loss of custody must fail closed.
+                lock(&slot)?.spawn_state = SpawnState::RequiresCollection;
+                let spawned = match self.factory.spawn_classified(request, &owner) {
+                    Ok(child) => child,
+                    Err(MailboxSpawnFailure::NoChild(error)) => {
+                        lock(&slot)?.spawn_state = SpawnState::RejectedBeforeSpawn;
+                        return Err(error);
+                    }
+                    Err(MailboxSpawnFailure::Uncertain(error)) => return Err(error),
+                };
                 *worker = Some(Worker {
                     parent_lease: spawned.parent_lease,
                     child: spawned.child,
@@ -1738,7 +1765,7 @@ impl Drop for MailboxWorkers {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let collected = matches!(guard.state, MailboxWorkerState::Collected { .. });
-            let never_spawned = guard.worker.is_none() && !guard.spawn_attempted && !guard.busy;
+            let never_spawned = guard.worker.is_none() && guard.spawn_state != SpawnState::RequiresCollection && !guard.busy;
             if collected || never_spawned {
                 let metadata_owned = guard.terminal_metadata.is_some();
                 let cell = guard.cell.take();
@@ -2136,6 +2163,84 @@ mod tests {
             deadline_unix_ms: now + 4_000,
             backend: MailboxWorkerBackend::Firecracker,
             operation: MailboxWorkerOperation::Acquire,
+        }
+    }
+    #[test]
+    fn missing_vm_state_before_spawn_allows_signed_release_and_joined_retirement() {
+        use std::os::unix::fs::PermissionsExt;
+        use mvm_vmm::host::installed_owner::{InstallationBinding, InstallationKey};
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("mvm-mailbox");
+        std::fs::write(&image, b"unused: this fixture fails before exec").unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binding = Arc::new(InstallationBinding {
+            root: dir.path().join("unused"),
+            key: InstallationKey { installation: [1; 32], profile: [2; 32] }, generation: 1,
+        });
+        let factory = InstalledMailboxWorkerFactory::new(&image, binding, dir.path()).unwrap();
+        let budget = MailboxWorkerBudget::new(limits()).unwrap();
+        let workers = MailboxWorkers::new("local", budget.clone(), Arc::new(factory)).unwrap();
+        let mut r = request(&budget, "local");
+        r.workload_id = r.vm_id.clone();
+        let signed = |r: &MailboxWorkerRequest| {
+            let key = SigningKey::from_bytes(&[7; 32]);
+            let envelope = broker_control::sign(ControlRequest::MailboxWorkerV1(Box::new(r.clone())), &key.to_bytes()).unwrap();
+            verify_request(&envelope, &key.verifying_key(), budget.now_unix_ms().unwrap()).unwrap();
+            workers.handle(r)
+        };
+        r.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: 1 };
+        let original = signed(&r).unwrap().0.owner;
+        r.operation = MailboxWorkerOperation::DelegateConfig { owner: original.clone() };
+        assert_eq!(signed(&r).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(signed(&r).unwrap_err().to_string().contains("admission has already been stopped"));
+        r.operation = MailboxWorkerOperation::Stop { owner: original.clone() };
+        assert_eq!(signed(&r).unwrap().0.state, MailboxWorkerState::Unresolved);
+        r.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: original.clone() };
+        assert_eq!(signed(&r).expect("original factory never created a child").0.state, MailboxWorkerState::ReleasedBeforeSpawn);
+        assert_eq!(budget.usage().unwrap().workers, 0);
+        r.operation = MailboxWorkerOperation::DelegateConfig { owner: original.clone() };
+        assert!(signed(&r).is_err());
+        r.vm_id = "another-vm".into();
+        r.workload_id = r.vm_id.clone();
+        r.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: 1 };
+        let next = signed(&r).unwrap().0.owner;
+        assert_ne!(next, original);
+        assert_eq!(budget.usage().unwrap().workers, 1);
+        workers.begin_retirement(Instant::now()).unwrap();
+        let receipt = workers.retire_originals().unwrap();
+        assert_eq!(receipt.never_spawned_released(), 2);
+        assert!(receipt.original_exit(&original).is_none());
+        workers.finalize_retirement(&receipt).unwrap();
+        assert_eq!(budget.usage().unwrap().workers, 0);
+    }
+    #[test]
+    fn uncertain_or_panicked_spawn_cannot_redelegate_or_release() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::atomic::AtomicUsize;
+        struct FailedFactory { panic: bool, attempts: Arc<AtomicUsize> }
+        impl MailboxWorkerFactory for FailedFactory {
+            fn spawn(&self, _: &MailboxWorkerRequest, _: &MailboxWorkerOwner) -> io::Result<SpawnedMailboxWorker> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                if self.panic { panic!("factory lost its original handoff"); }
+                Err(io::Error::other("unclassified legacy spawn failure"))
+            }
+        }
+        for panic in [false, true] {
+            let budget = MailboxWorkerBudget::new(limits()).unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let workers = MailboxWorkers::new("tenant", budget.clone(), Arc::new(FailedFactory { panic, attempts: attempts.clone() })).unwrap();
+            let mut r = request(&budget, "tenant");
+            let owner = workers.handle(&r).unwrap().0.owner;
+            r.operation = MailboxWorkerOperation::DelegateConfig { owner: owner.clone() };
+            let first = catch_unwind(AssertUnwindSafe(|| workers.handle(&r)));
+            assert!(if panic { first.is_err() } else { first.unwrap().is_err() });
+            assert!(workers.handle(&r).is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            r.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner };
+            assert!(workers.handle(&r).is_err());
+            assert_eq!(budget.usage().unwrap().workers, 1);
+            workers.begin_retirement(Instant::now()).unwrap();
+            assert!(workers.retire_originals().is_err());
         }
     }
     struct NeverSpawn;

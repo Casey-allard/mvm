@@ -70,6 +70,12 @@ impl OwnedMailboxWorkerFactory {
     }
 }
 impl MailboxWorkerFactory for OwnedMailboxWorkerFactory {
+    fn spawn_classified(&self, request: &MailboxWorkerRequest, owner: &MailboxWorkerOwner)
+        -> Result<SpawnedMailboxWorker, MailboxSpawnFailure> {
+        // Every fallible operation, including Command::spawn, precedes
+        // provision of Child. From that point the handoff is infallible.
+        self.spawn(request, owner).map_err(MailboxSpawnFailure::NoChild)
+    }
     fn admit(&self, request: &MailboxWorkerRequest) -> io::Result<()> {
         if context_commitment(request).map_err(|_| refused("invalid mailbox context"))?
             != self.context
@@ -168,6 +174,12 @@ impl InstalledMailboxWorkerFactory {
     }
 }
 impl MailboxWorkerFactory for InstalledMailboxWorkerFactory {
+    fn spawn_classified(&self, request: &MailboxWorkerRequest, owner: &MailboxWorkerOwner)
+        -> Result<SpawnedMailboxWorker, MailboxSpawnFailure> {
+        // State/route validation precedes the same infallible Child handoff
+        // as the per-VM factory.
+        self.spawn(request, owner).map_err(MailboxSpawnFailure::NoChild)
+    }
     fn requires_signed_provision(&self) -> bool { true }
     fn admit(&self, request: &MailboxWorkerRequest) -> io::Result<()> {
         if matches!(request.operation, MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch }
