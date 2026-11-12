@@ -170,12 +170,12 @@ impl GuestSubmitEndpoint {
             self.pending
                 .as_ref()
                 .expect("original claim retained")
-                .forward_on(
+                .forward_on_current(
                     stream,
                     &self.origin.greeting(),
                     &window.generation,
+                    || window.live(now()),
                     |_, result| {
-                        window.live(now())?;
                         *prior = Some(result.clone());
                         Ok(())
                     },

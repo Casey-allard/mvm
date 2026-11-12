@@ -307,3 +307,45 @@ fn publication_survives_unlink_failure_and_rejects_changed_message_identity() {
         assert_eq!(result.is_ok(), step == 2);
     }
 }
+
+#[test]
+fn revoked_submit_after_greeting_keeps_claim_bytes_off_stream() {
+    use std::cell::Cell;
+    let limits = MailboxLocalServiceGrant::reliable_v1().limits;
+    let original = encode_local_frame(
+        &LocalFrame::Submit(Box::new(request())),
+        LocalRole::Submit,
+        LocalDirection::GuestToHost,
+        &limits,
+    )
+    .unwrap();
+    let pending = PreparedSubmit::from_claim(original, limits).unwrap();
+    let (mut host, mut guest) = UnixStream::pair().unwrap();
+    let hello = encode_local_greeting(&greeting()).unwrap();
+    host.write_all(&hello).unwrap();
+    let n = Cell::new(0);
+    let err = pending
+        .forward_on_current(
+            &mut guest,
+            &greeting(),
+            &[3; 32],
+            || {
+                n.set(n.get() + 1);
+                if n.get() == 1 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "original grant expired",
+                    ))
+                }
+            },
+            |_, _| panic!("must retain the original claim"),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    drop(guest);
+    let mut got = Vec::new();
+    host.read_to_end(&mut got).unwrap();
+    assert_eq!(got, hello, "only the greeting echo was authorized");
+}
