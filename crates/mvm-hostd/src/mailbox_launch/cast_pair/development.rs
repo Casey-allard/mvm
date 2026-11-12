@@ -2,7 +2,6 @@
 //! The launcher uses each worker's once-delegated private config descriptor.
 //! The relay sees only a public direction and fixed-size, separately wrapped keys.
 pub(crate) mod destination;
-pub mod control;
 use super::{InstalledCastParticipant, RoutedCast};
 use crate::mailbox_process::MailboxProcessConfig;
 use anyhow::{Result, ensure};

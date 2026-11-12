@@ -187,6 +187,22 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         .is_err()
     );
 
+    let public = original_b
+        .setup
+        .destination
+        .as_ref()
+        .unwrap()
+        .public_control();
+    let bytes = serde_json::to_vec(&public).unwrap();
+    let public: control::PublicCastControl = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(public.commitment().unwrap(), d.commitment());
+    public.binds(&aowner, &bowner).unwrap();
+    assert!(public.binds(&bowner, &aowner).is_err());
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(doc.as_object().unwrap().len(), 4);
+    for raw in ["capsule", "wrapping", "authorities"] {
+        assert!(doc.get(raw).is_none());
+    }
     original_a.bind(d).unwrap();
     original_b.bind(d).unwrap();
     assert!(original_a.bind(d).is_err());

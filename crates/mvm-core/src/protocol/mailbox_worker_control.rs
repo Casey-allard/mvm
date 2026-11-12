@@ -126,14 +126,26 @@ fn verify_binding<'a>(
     }
     match &r.operation {
         MailboxWorkerOperation::Acquire | MailboxWorkerOperation::LookupExistingV1 => (),
-        MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch } if *resource_epoch != 0 => (),
-        MailboxWorkerOperation::ForwardCastV1 { owner, destination_vm, destination_owner, resource_epoch, projection }
-            if owner_valid(owner) && owner.context_commitment == context_commitment(r)?
-                && owner_valid(destination_owner) && owner.lease != destination_owner.lease
-                && owner.daemon_boot_nonce == destination_owner.daemon_boot_nonce
-                && owner.context_commitment != destination_owner.context_commitment
-                && label(destination_vm) && destination_vm != &r.vm_id
-                && *resource_epoch != 0 && !projection.is_empty() && projection.len() <= MAX_WORKER_CONTROL_BYTES => {}
+        MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch } if *resource_epoch != 0 => {
+            ()
+        }
+        MailboxWorkerOperation::ForwardCastV1 {
+            owner,
+            destination_vm,
+            destination_owner,
+            resource_epoch,
+            projection,
+        } if owner_valid(owner)
+            && owner.context_commitment == context_commitment(r)?
+            && owner_valid(destination_owner)
+            && owner.lease != destination_owner.lease
+            && owner.daemon_boot_nonce == destination_owner.daemon_boot_nonce
+            && owner.context_commitment != destination_owner.context_commitment
+            && label(destination_vm)
+            && destination_vm != &r.vm_id
+            && *resource_epoch != 0
+            && !projection.is_empty()
+            && projection.len() <= MAX_WORKER_CONTROL_BYTES => {}
         MailboxWorkerOperation::DelegateConfig { owner }
         | MailboxWorkerOperation::Query { owner }
         | MailboxWorkerOperation::Stop { owner }
@@ -165,7 +177,9 @@ pub fn verify_result(
                 && !result.delegates_config => {}
         MailboxWorkerOperation::Acquire | MailboxWorkerOperation::ProvisionAdmittedV1 { .. } => return Err(WorkerControlError::Binding),
         MailboxWorkerOperation::ForwardCastV1 { owner, .. }
-            if owner == &result.owner && result.state == MailboxWorkerState::Serving && !result.delegates_config => {}
+            if owner == &result.owner
+                && result.state == MailboxWorkerState::Serving
+                && !result.delegates_config => {}
         MailboxWorkerOperation::DelegateConfig { owner }
         | MailboxWorkerOperation::Query { owner }
         | MailboxWorkerOperation::Stop { owner }

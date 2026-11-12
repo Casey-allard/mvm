@@ -172,8 +172,24 @@ pub fn map_serving_cast_pair(
     destination_greeting: LocalGreeting,
     grants: AddressedCastGrants<'_>,
 ) -> Result<ServingCastMapping> {
-    fn view(p:ServingCastParticipant<'_>)->MapParticipant<'_>{MapParticipant { plan:p.plan.plan(), signed:p.plan.signed(), current:p.current, owner:p.owner }}
-    map_original_pair(workers,view(source),view(destination),backend,trusted_plan_signers,destination_greeting,grants,&mvm_core::config::mvm_home_strict()?)
+    fn view(p: ServingCastParticipant<'_>) -> MapParticipant<'_> {
+        MapParticipant {
+            plan: p.plan.plan(),
+            signed: p.plan.signed(),
+            current: p.current,
+            owner: p.owner,
+        }
+    }
+    map_original_pair(
+        workers,
+        view(source),
+        view(destination),
+        backend,
+        trusted_plan_signers,
+        destination_greeting,
+        grants,
+        &mvm_core::config::mvm_home_strict()?,
+    )
 }
 struct MapParticipant<'a> {
     plan: &'a mvm_core::plan::ExecutionPlan,
@@ -182,10 +198,15 @@ struct MapParticipant<'a> {
     owner: &'a MailboxWorkerOwner,
 }
 fn map_original_pair(
-    workers:&MailboxWorkers, source:MapParticipant<'_>,destination:MapParticipant<'_>,backend:&AnyBackend,
-    trusted_plan_signers:&[(&str,&VerifyingKey)],destination_greeting:LocalGreeting,
-    grants:AddressedCastGrants<'_>,home:&std::path::Path
-)->Result<ServingCastMapping> {
+    workers: &MailboxWorkers,
+    source: MapParticipant<'_>,
+    destination: MapParticipant<'_>,
+    backend: &AnyBackend,
+    trusted_plan_signers: &[(&str, &VerifyingKey)],
+    destination_greeting: LocalGreeting,
+    grants: AddressedCastGrants<'_>,
+    home: &std::path::Path,
+) -> Result<ServingCastMapping> {
     use mvm_core::protocol::mailbox_worker_control::context_commitment;
     use mvm_runtime::catalog::BackendKind;
     let kind = match backend.kind() {
@@ -193,10 +214,7 @@ fn map_original_pair(
         BackendKind::Hvf => MailboxWorkerBackend::Hvf,
         _ => anyhow::bail!("unsupported installed Cast backend"),
     };
-    let (a, b) = (
-        &source.plan.workload.0,
-        &destination.plan.workload.0,
-    );
+    let (a, b) = (&source.plan.workload.0, &destination.plan.workload.0);
     let requests = workers.original_cast_pair((a, source.owner), (b, destination.owner))?;
     for (request, participant) in requests.iter().zip([&source, &destination]) {
         let plan = participant.plan;
@@ -206,8 +224,7 @@ fn map_original_pair(
                 && request.vm_id == plan.workload.0
                 && request.workload_id == plan.workload.0
                 && plan.mailbox == Some(request.mailbox_grant)
-                && plan.plan_id.0
-                    == format!("sha256:{}", hex::encode(request.plan_commitment))
+                && plan.plan_id.0 == format!("sha256:{}", hex::encode(request.plan_commitment))
                 && context_commitment(request)? == participant.owner.context_commitment,
             "original Cast worker differs from the signed plan"
         );
@@ -229,7 +246,7 @@ fn map_original_pair(
         now,
     )?;
     channel.restrict_frame_budget(CAST_BODY_LIMIT as u32)?;
-    let state = mvm_core::config::vm_state_dir_at(home,b);
+    let state = mvm_core::config::vm_state_dir_at(home, b);
     let route = backend
         .host_dial_route(&state, MAILBOX_PORT)
         .context("missing installed mailbox route")?;
@@ -237,7 +254,9 @@ fn map_original_pair(
         channel,
         destination_route: route,
         destination_socket: mvm_core::config::vm_mailbox_socket_at(&state),
-        source_socket: mvm_core::config::vm_mailbox_socket_at(&mvm_core::config::vm_state_dir_at(home,a)),
+        source_socket: mvm_core::config::vm_mailbox_socket_at(&mvm_core::config::vm_state_dir_at(
+            home, a,
+        )),
         source_vm: a.to_owned(),
         destination_vm: b.to_owned(),
         source_owner: source.owner.clone(),

@@ -78,7 +78,12 @@ pub(crate) struct PrivateDestination {
 }
 impl PrivateDestination {
     pub(super) fn public_control(&self) -> super::control::PublicCastControl {
-        super::control::PublicCastControl::new(self.fields.clone(), self.plans.clone(), self.scopes.clone(), self.policies.clone())
+        super::control::PublicCastControl::new(
+            self.fields.clone(),
+            self.plans.clone(),
+            self.scopes.clone(),
+            self.policies.clone(),
+        )
     }
     pub(super) fn for_source(&self, capsule: &Capsule) -> Self {
         let mut source = self.clone();

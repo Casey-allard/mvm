@@ -172,10 +172,24 @@ fn lost_peer_reply_keeps_cast_workspace_until_the_original_child_exits() {
     let (b, b_input) = make("b", 2);
     let base = budget.usage().unwrap();
     let participants = (("a", &a), ("b", &b));
-    assert!(registry.claim_original_cast_turn(participants.0,participants.1,[43;32],[1;32]).is_err());
-    registry.claim_original_cast_turn(participants.0,participants.1,[42;32],[1;32]).unwrap();
-    assert!(registry.claim_original_cast_turn(participants.0,participants.1,[42;32],[1;32]).is_err());
-    assert!(registry.claim_original_cast_turn(participants.0,participants.1,[42;32],[2;32]).is_err());
+    assert!(
+        registry
+            .claim_original_cast_turn(participants.0, participants.1, [43; 32], [1; 32])
+            .is_err()
+    );
+    registry
+        .claim_original_cast_turn(participants.0, participants.1, [42; 32], [1; 32])
+        .unwrap();
+    assert!(
+        registry
+            .claim_original_cast_turn(participants.0, participants.1, [42; 32], [1; 32])
+            .is_err()
+    );
+    assert!(
+        registry
+            .claim_original_cast_turn(participants.0, participants.1, [42; 32], [2; 32])
+            .is_err()
+    );
     let wrong_source = UnixStream::connect(dir.path().join("b")).unwrap();
     assert!(
         registry
