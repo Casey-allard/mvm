@@ -880,6 +880,7 @@ fn per_role_sender_retries_the_original_seal_after_an_uncertain_carrier_result()
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_call()
 -> anyhow::Result<()> {
