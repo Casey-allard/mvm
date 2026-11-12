@@ -1,0 +1,204 @@
+//! Original A-side dispatch for the opt-in local-durable direction.
+use super::{GuestSealer, Refusal};
+use crate::mailbox_launch::MailboxTemplate;
+use crate::mailbox_process::original_journal::authorization::{
+    JournalCredentials, check_credentials, destination_header, now_ms,
+};
+use anyhow::{Context, Result, ensure};
+use ed25519_dalek::VerifyingKey;
+use mvm_contract::protocol::mailbox::{
+    EncryptionContext, MailboxJournalDirectionV1, MailboxOperation, MailboxRoutingFrame,
+    PrincipalId, SignedDestinationReceipt,
+};
+use mvm_core::crypto::aead::Key;
+use mvm_core::mailbox::{
+    OpenContext,
+    frame::{OutboxMessage, send_local_receipted_frame},
+    outbound::{check_projection, journal_direction_commitment},
+    reader::MailboxReaderBootBinding,
+};
+use mvm_core::plan::ExecutionPlan;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// B's original role transfers the directional payload key alone to A. The
+/// original mailbox authority signer and retained local payload key stay at B.
+pub(crate) struct PairedSourceMaterial {
+    commitment: [u8; 32],
+    key: Key,
+    encryption: EncryptionContext,
+    routing: MailboxRoutingFrame,
+}
+impl PairedSourceMaterial {
+    pub(crate) fn from_enrollment(
+        commitment: [u8; 32],
+        key: Key,
+        encryption: EncryptionContext,
+        routing: MailboxRoutingFrame,
+    ) -> Self {
+        Self {
+            commitment,
+            key,
+            encryption,
+            routing,
+        }
+    }
+}
+
+/// A never needs B's Child handle or signing secret. A's original launcher
+/// supplies one authenticated original-destination connection for each turn.
+pub(crate) struct DirectedJournalSource {
+    source: MailboxTemplate,
+    source_context: OpenContext,
+    destination_context: OpenContext,
+    sealer: GuestSealer,
+    direction: MailboxJournalDirectionV1,
+    grants: JournalCredentials,
+    verifier: VerifyingKey,
+    source_revocations: PathBuf,
+    destination_revocations: PathBuf,
+}
+impl DirectedJournalSource {
+    /// Called only after the original A's production posture/reader boot and
+    /// still-original B's peer admission have been verified by the launcher.
+    pub(crate) fn from_original(
+        plan: &ExecutionPlan,
+        boot: &MailboxReaderBootBinding,
+        original: &GuestSealer,
+        local: &OpenContext,
+        destination: &OpenContext,
+        grants: JournalCredentials,
+        material: PairedSourceMaterial,
+        source_state: &Path,
+        destination_state: &Path,
+    ) -> Result<Self> {
+        boot.check_plan(plan)?;
+        let local_grant = plan.mailbox.as_ref().context("A has no mailbox")?;
+        let d = boot
+            .outbound_journal_v1
+            .context("A has no journal direction")?;
+        check_projection(local_grant, &d)?;
+        ensure!(
+            material.commitment == journal_direction_commitment(boot)?
+                && boot.authority_key == original.authority_key.verifying_key().to_bytes()
+                && original.sender_key.verifying_key().to_bytes() == *d.source.as_bytes()
+                && original.header.mailbox == boot.mailbox
+                && original.header.execution_epoch == boot.execution_epoch
+                && material.encryption != original.header.encryption
+                && material.routing.hop_limit == 1,
+            "original A helper or directional key binding differs"
+        );
+        let source = MailboxTemplate {
+            capability: original.capability.clone(),
+            header: original.header.clone(),
+            routing: original.routing.clone(),
+        };
+        let mut header = destination_header(original.header.clone(), &d, &grants.destination_send);
+        header.sender_boot = boot.boot;
+        header.encryption = material.encryption;
+        let mut routing = material.routing;
+        routing.expires_at_unix_ms = d.expires_at_unix_ms;
+        let sealer = GuestSealer {
+            encryption_key: material.key,
+            sender_key: original.sender_key.clone(),
+            authority_key: original.authority_key.clone(),
+            capability: grants.destination_send.grant.clone(),
+            header,
+            routing,
+            sent: 0,
+            intent_dir: Some(
+                original
+                    .intent_dir
+                    .as_ref()
+                    .context("A lacks durable source intents")?
+                    .join(hex::encode(material.commitment)),
+            ),
+        };
+        let mut result = Self {
+            source,
+            source_context: local.clone(),
+            destination_context: destination.clone(),
+            sealer,
+            direction: d,
+            grants,
+            verifier: VerifyingKey::from_bytes(&d.receipt_key)?,
+            source_revocations: crate::mailbox_process::reader::revocations_path(source_state),
+            destination_revocations: crate::mailbox_process::reader::revocations_path(
+                destination_state,
+            ),
+        };
+        result.authorize(d.max_payload_bytes)?;
+        Ok(result)
+    }
+    pub(crate) fn recipient(&self) -> PrincipalId {
+        self.direction.address.recipient
+    }
+
+    fn authorize(&mut self, length: u32) -> Result<i64, Refusal> {
+        self.source_context.revoked_capabilities =
+            super::durable::reader_revocations(&self.source_revocations)?;
+        self.destination_context.revoked_capabilities =
+            super::durable::reader_revocations(&self.destination_revocations)?;
+        let now = now_ms().map_err(|_| Refusal::Unavailable)?;
+        check_credentials(
+            &self.source,
+            &self.direction,
+            &self.grants,
+            &self.source_context,
+            &self.destination_context,
+            now,
+            length,
+        )
+        .map_err(|_| Refusal::NotAuthorized)?;
+        Ok(now)
+    }
+
+    /// Persist A's canonical credential/envelope before opening the
+    /// authenticated B connection. The same immutable bytes can be retried
+    /// after an ambiguous reply or subsequent guest redial.
+    pub(crate) fn forward(
+        &mut self,
+        message: OutboxMessage,
+        deadline: Instant,
+        connect: impl FnOnce(Instant) -> Result<UnixStream, Refusal>,
+    ) -> Result<SignedDestinationReceipt, Refusal> {
+        let len = u32::try_from(message.body.len()).map_err(|_| Refusal::Malformed)?;
+        if message.recipient != self.recipient() {
+            return Err(Refusal::NotAuthorized);
+        }
+        let now = self.authorize(len)?;
+        let window = (self.direction.expires_at_unix_ms - now) as u64;
+        let deadline = deadline.min(
+            Instant::now()
+                .checked_add(Duration::from_millis(window))
+                .unwrap_or(deadline),
+        );
+        if Instant::now() >= deadline {
+            return Err(Refusal::Unavailable);
+        }
+        let mut expected = self.sealer.header.clone();
+        expected.message_id = message.message_id;
+        let (cap, envelope) = self.sealer.seal_using(
+            message,
+            Some((&self.grants.destination_send, &self.verifier)),
+        )?;
+        self.authorize(len)?;
+        let mut stream = connect(deadline)?;
+        self.authorize(len)?;
+        let mut stream = super::durable::GuestDeadline {
+            stream: &mut stream,
+            until: deadline,
+        };
+        let receipt =
+            send_local_receipted_frame(&mut stream, &cap, &envelope, &expected, &self.verifier)?;
+        if Instant::now() >= deadline
+            || !(self.direction.not_before_unix_ms..self.direction.expires_at_unix_ms)
+                .contains(&receipt.receipt.observed_at_unix_ms)
+        {
+            return Err(Refusal::Unavailable);
+        }
+        self.authorize(len)?;
+        Ok(receipt)
+    }
+}

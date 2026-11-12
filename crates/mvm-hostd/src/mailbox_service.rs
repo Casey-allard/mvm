@@ -45,6 +45,7 @@ use mvm_core::mailbox::{
 use mvm_core::private_fs;
 use mvm_core::util::atomic_io::{FileLock, atomic_write_durable, atomic_write_new, sync_dir};
 
+pub(crate) mod directed_journal;
 /// Separate destination path that returns a signed, journal-backed verdict.
 pub mod durable;
 

@@ -50,7 +50,7 @@ use crate::plan_admission::{MailboxLaunchPosture, MailboxPostureHandoff};
 use crate::vm_lifetime::{endpoint_needed, launcher_is_alive};
 
 pub mod original_journal;
-mod reader;
+pub(crate) mod reader;
 
 /// The helper binary this module spawns.
 pub const MAILBOX_BIN: &str = "mvm-mailbox";
