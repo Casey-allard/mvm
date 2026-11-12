@@ -29,6 +29,9 @@ const ENVELOPE_AEAD_DOMAIN: &[u8] = b"mvm.mailbox.payload.v1\0";
 /// The one-frame exchange the guest and the host mailbox service share.
 pub mod frame;
 
+/// Original boot projection for one separately admitted remote journal.
+pub mod outbound;
+
 /// Bounded destination-side ciphertext journal and durable acceptance.
 pub mod journal;
 

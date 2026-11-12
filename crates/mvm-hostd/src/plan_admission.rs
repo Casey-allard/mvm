@@ -2359,6 +2359,7 @@ mod tests {
     #[test]
     fn local_retention_requires_a_configured_host_ceiling() {
         let mut grant = MailboxGrant {
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],
             epoch: ExecutionEpoch::new(1).expect("epoch"),
@@ -3927,6 +3928,7 @@ mod tests {
         let keys = tempfile::tempdir().expect("keystore");
         let mut input = fixture_input("vm-retention");
         input.mailbox = Some(MailboxGrant {
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],
             epoch: ExecutionEpoch::new(1).expect("epoch"),

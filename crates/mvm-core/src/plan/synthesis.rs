@@ -1631,6 +1631,7 @@ mod tests {
         assert!(synthesize_plan(&input("vm")).unwrap().mailbox.is_none());
 
         let grant = MailboxGrant {
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([7; 32]),
             authority_key: [9; 32],
             epoch: ExecutionEpoch::new(1).unwrap(),

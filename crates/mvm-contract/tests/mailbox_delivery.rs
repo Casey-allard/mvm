@@ -20,6 +20,7 @@ fn address() -> MailboxAddress {
 
 fn plan_grant() -> MailboxGrant {
     MailboxGrant {
+        outbound_journal_v1: None,
         mailbox: address().mailbox,
         authority_key: [5; 32],
         epoch: ExecutionEpoch::new(7).expect("epoch"),

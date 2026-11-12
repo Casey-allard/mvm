@@ -9,6 +9,12 @@ pub(super) fn enforce_mailbox_retention(
     mailbox: Option<&MailboxGrant>,
     max_ms: Option<u64>,
 ) -> Result<()> {
+    // The generic launch path has no authentic second participant from which
+    // to verify this proposal. Paired admission must provide both originals.
+    anyhow::ensure!(
+        mailbox.and_then(|g| g.outbound_journal_v1).is_none(),
+        "a remote journal direction requires paired admission"
+    );
     let Some(requested) = mailbox.and_then(|grant| grant.retention) else {
         return Ok(());
     };

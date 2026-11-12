@@ -541,6 +541,7 @@ mod tests {
 
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([8; 32]),
             authority_key: anchor.to_bytes(),
             epoch: ExecutionEpoch::new(3).unwrap(),
@@ -594,6 +595,7 @@ mod tests {
         use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([8; 32]),
             authority_key: host_key().verifying_key().to_bytes(),
             epoch: ExecutionEpoch::new(3).unwrap(),

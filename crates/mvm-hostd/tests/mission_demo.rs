@@ -841,6 +841,7 @@ fn plan_and_trust(channel: &Channel, granted: bool) -> (ExecutionPlan, MailboxPo
     let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
     if granted {
         plan.mailbox = Some(mvm_contract::protocol::mailbox::MailboxGrant {
+            outbound_journal_v1: None,
             mailbox: address().mailbox,
             authority_key: channel.authority_key.verifying_key().to_bytes(),
             epoch: MbEpoch::new(1).unwrap(),
@@ -983,6 +984,7 @@ fn host_keys(dir: &std::path::Path, seed: u8) {
 fn granted_plan(authority_key: [u8; 32]) -> ExecutionPlan {
     let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
     plan.mailbox = Some(mvm_contract::protocol::mailbox::MailboxGrant {
+        outbound_journal_v1: None,
         mailbox: address().mailbox,
         authority_key,
         epoch: MbEpoch::new(1).unwrap(),
@@ -1645,6 +1647,7 @@ fn signed_guest_lease_and_exact_ack_survive_mock_anchored_restart() {
     )
     .unwrap();
     let plan = MailboxGrant {
+        outbound_journal_v1: None,
         mailbox: address().mailbox,
         authority_key: authority.to_bytes(),
         epoch: MbEpoch::new(1).unwrap(),

@@ -43,7 +43,7 @@ pub(crate) struct PendingReader {
     reader: Arc<GuestReader>,
 }
 
-fn now_unix_ms() -> Result<i64, Refusal> {
+pub(crate) fn now_unix_ms() -> Result<i64, Refusal> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Refusal::Unavailable)?
@@ -184,6 +184,7 @@ fn perform_exchange(
             };
             let boot = &pending.reader.boot;
             let grant = MailboxGrant {
+                outbound_journal_v1: None,
                 mailbox: boot.mailbox,
                 authority_key: boot.authority_key,
                 epoch: boot.execution_epoch,
@@ -290,6 +291,7 @@ mod tests {
         let ack_seed = SEED.get_or_init(|| Zeroizing::new([7; 32]));
         let reader = Arc::new(GuestReader {
             boot: MailboxReaderBootBinding {
+                outbound_journal_v1: None,
                 plan_id: PlanId("current".into()),
                 plan_nonce: Nonce::from_bytes([1; 16]),
                 mailbox: MailboxId::from_bytes([2; 32]),

@@ -745,6 +745,7 @@ mod tests {
     fn grant(dir: &Path) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes([4; 32]);
         MailboxGrant {
+            outbound_journal_v1: None,
             mailbox,
             authority_key: crate::mailbox_launch::authority_key_for(
                 dir,

@@ -12,11 +12,13 @@ use std::path::Path;
 use std::sync::{OnceLock, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use mvm_agentd::flowmux_drive::{MAILBOX_ACK_SIGNING_KEY_FILE, RUN_MVM_DIR};
 use mvm_agentd::mailbox_outbox::{
     LOCAL_OUTBOX_PATH, MAILBOX_CMDLINE_TOKEN, MAILBOX_HOLD, MAILBOX_IO_TIMEOUT, OUTBOX_PATH,
-    forward_local_outbox, forward_outbox, peer_gone, wait_for_outbox,
+    forward_outbox,
+    journal_direction::{JournalAttempts, forward_for_original_boot},
+    peer_gone, wait_for_outbox,
 };
 use mvm_agentd::telemetry_capture::session::TimedStream;
 use mvm_contract::protocol::mailbox::MAILBOX_PORT;
@@ -244,6 +246,7 @@ fn accept_loop(
     reader_boot: Option<MailboxReaderBootBinding>,
 ) {
     let mut refused = 0u32;
+    let mut attempts = JournalAttempts::default();
     while !SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
         let Some(cfd) = accept_vsock(listener_fd, "mailbox") else {
             continue;
@@ -258,6 +261,7 @@ fn accept_loop(
         let mut deadline = MailboxDeadline::new(&mut stream);
         let result = wait_for_operation(
             &mut deadline,
+            &mut attempts,
             reader.as_ref(),
             reader_boot.as_ref(),
             Path::new(LOCAL_OUTBOX_PATH),
@@ -277,6 +281,7 @@ fn accept_loop(
 
 fn wait_for_operation(
     stream: &mut (impl Read + Write + AsRawFd),
+    attempts: &mut JournalAttempts,
     reader: Option<&std::sync::mpsc::Receiver<crate::mailbox_reader::PendingReader>>,
     reader_boot: Option<&MailboxReaderBootBinding>,
     local_outbox: &Path,
@@ -289,14 +294,12 @@ fn wait_for_operation(
         if local_outbox.exists()
             && let Some(binding) = reader_boot
         {
-            let authority =
-                VerifyingKey::from_bytes(&binding.authority_key).map_err(|_| Refusal::Malformed)?;
-            return forward_local_outbox(
+            return forward_for_original_boot(
                 stream,
                 local_outbox,
-                &authority,
-                binding.mailbox,
-                binding.execution_epoch,
+                binding,
+                attempts,
+                crate::mailbox_reader::now_unix_ms,
             )
             .map(|_| ());
         }
@@ -399,7 +402,15 @@ mod tests {
             host.write_all(&serde_json::to_vec(&Ok::<(), Refusal>(())).unwrap())
                 .unwrap();
         });
-        wait_for_operation(&mut guest, Some(&reader), None, &local_outbox, &outbox).unwrap();
+        wait_for_operation(
+            &mut guest,
+            &mut JournalAttempts::default(),
+            Some(&reader),
+            None,
+            &local_outbox,
+            &outbox,
+        )
+        .unwrap();
         peer.join().unwrap();
         assert!(!outbox.exists(), "accepted Send is removed as before");
         assert!(
@@ -426,7 +437,14 @@ mod tests {
         mvm_agentd::mailbox_outbox::write_outbox(&local, &operation).expect("pending report");
         let (mut guest, _host) = std::os::unix::net::UnixStream::pair().expect("socket");
         assert_eq!(
-            wait_for_operation(&mut guest, None, None, &local, &legacy),
+            wait_for_operation(
+                &mut guest,
+                &mut JournalAttempts::default(),
+                None,
+                None,
+                &local,
+                &legacy
+            ),
             Err(Refusal::Unavailable)
         );
         assert!(local.exists(), "no boot authority means no acceptance");
@@ -435,6 +453,7 @@ mod tests {
         let signer = SigningKey::from_bytes(&[51; 32]);
         let plan = mvm_core::plan::test_support::PlanFixture::new().build();
         let boot = MailboxReaderBootBinding {
+            outbound_journal_v1: None,
             plan_id: plan.plan_id,
             plan_nonce: plan.nonce,
             mailbox: MailboxId::from_bytes([52; 32]),
@@ -474,8 +493,15 @@ mod tests {
             host.write_all(&serde_json::to_vec(&Ok::<_, Refusal>(signed)).expect("receipt wire"))
                 .expect("reply");
         });
-        wait_for_operation(&mut guest, None, Some(&boot), &local, &legacy)
-            .expect("boot-pinned signed acceptance");
+        wait_for_operation(
+            &mut guest,
+            &mut JournalAttempts::default(),
+            None,
+            Some(&boot),
+            &local,
+            &legacy,
+        )
+        .expect("boot-pinned signed acceptance");
         responder.join().expect("host reply");
         assert!(!local.exists(), "verified V2 receipt closes pending send");
     }

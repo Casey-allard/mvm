@@ -581,6 +581,7 @@ mod tests {
     fn grant_at(dir: &Path, mailbox: [u8; 32], n: u64) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes(mailbox);
         MailboxGrant {
+            outbound_journal_v1: None,
             mailbox,
             authority_key: authority_key_for(dir, &mailbox, epoch(n))
                 .unwrap()

@@ -212,6 +212,7 @@ mod tests {
         crate::audit::host_keypair::load_or_init_at(keys.path()).unwrap();
         let mailbox = MailboxId::from_bytes([42; 32]);
         let grant = MailboxGrant {
+            outbound_journal_v1: None,
             mailbox,
             authority_key: crate::mailbox_launch::authority_key_for(
                 keys.path(),

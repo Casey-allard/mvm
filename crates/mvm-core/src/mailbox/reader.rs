@@ -23,13 +23,15 @@ use super::{MailboxError, canonical_bytes, sign_capability, verify_capability_si
 /// Name shared by the host writer and guest reader of one public boot binding.
 pub const MAILBOX_READER_BOOT_FILE: &str = "mailbox-reader-boot.json";
 /// Maximum encoded size before parsing a guest-visible boot binding.
-pub const MAX_MAILBOX_READER_BOOT_BYTES: u64 = 2048;
+pub const MAX_MAILBOX_READER_BOOT_BYTES: u64 = 8192;
 
 /// Public plan/boot/ACK-key binding projected into one cold guest identity
 /// drive and retained privately by the host for helper restart.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxReaderBootBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_journal_v1: Option<mvm_contract::protocol::mailbox::MailboxJournalDirectionV1>,
     pub plan_id: crate::plan::PlanId,
     pub plan_nonce: crate::plan::Nonce,
     pub mailbox: MailboxId,
@@ -59,7 +61,11 @@ impl MailboxReaderBootBinding {
         rand::rngs::SysRng
             .try_fill_bytes(&mut boot)
             .context("drawing system entropy for the mailbox reader boot")?;
+        if let Some(direction) = grant.outbound_journal_v1 {
+            super::outbound::check_projection(&grant, &direction)?;
+        }
         Ok(Self {
+            outbound_journal_v1: grant.outbound_journal_v1,
             plan_id: plan.plan_id.clone(),
             plan_nonce: plan.nonce.clone(),
             mailbox: grant.mailbox,
@@ -119,6 +125,7 @@ impl MailboxReaderBootBinding {
             plan.plan_id == crate::plan::compute_plan_id(plan)
                 && self.plan_id == plan.plan_id
                 && self.plan_nonce == plan.nonce
+                && self.outbound_journal_v1 == grant.outbound_journal_v1
                 && self.mailbox == grant.mailbox
                 && self.authority_key == grant.authority_key
                 && self.execution_epoch == grant.epoch

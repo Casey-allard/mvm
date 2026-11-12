@@ -19,6 +19,8 @@
 //! `outbox-local` is a separate, single-operation request that is removed only
 //! after [`forward_local_outbox`] verifies a boot-bound signed V2 receipt.
 
+pub mod journal_direction;
+
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;

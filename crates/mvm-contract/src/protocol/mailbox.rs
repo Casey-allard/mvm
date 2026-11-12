@@ -305,6 +305,27 @@ impl From<MailboxRetentionPolicy> for MailboxRetentionPolicyWire {
     }
 }
 
+/// One approved outbound trusted-host journal direction. B is admitted before A
+/// so none of these immutable fields refer circularly to A's eventual plan ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxJournalDirectionV1 {
+    pub source: PrincipalId,
+    pub destination_plan_sha256: [u8; 32],
+    pub destination_plan_nonce: [u8; 16],
+    pub destination_boot: BootId,
+    pub address: MailboxAddress,
+    pub execution_epoch: ExecutionEpoch,
+    pub policy_epoch: u64,
+    pub receipt_key: [u8; 32],
+    pub source_scope_grant_sha256: [u8; 32],
+    pub send_grant_sha256: [u8; 32],
+    pub receive_grant_sha256: [u8; 32],
+    pub not_before_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+    pub max_payload_bytes: u32,
+}
+
 /// What a signed `ExecutionPlan` admits for one workload's mailbox: which
 /// mailbox, the key whose capabilities are honored, and the execution epoch.
 /// Presence grants that workload its own mailbox, including the ability for
@@ -316,6 +337,10 @@ impl From<MailboxRetentionPolicy> for MailboxRetentionPolicyWire {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxGrant {
+    /// A single explicitly admitted remote direction. Existing signed bytes
+    /// and the legacy own-mailbox operation remain unchanged when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_journal_v1: Option<MailboxJournalDirectionV1>,
     pub mailbox: MailboxId,
     /// Ed25519 verifying key that must have signed any accepted capability.
     pub authority_key: [u8; 32],

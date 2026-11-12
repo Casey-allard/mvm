@@ -12,6 +12,7 @@ struct LegacyGrant {
 
 fn grant() -> MailboxGrant {
     MailboxGrant {
+        outbound_journal_v1: None,
         mailbox: MailboxId::from_bytes([1; 32]),
         authority_key: [2; 32],
         epoch: ExecutionEpoch::new(3).expect("epoch"),
