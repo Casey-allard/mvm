@@ -83,8 +83,10 @@ impl SenderWindow {
                 &serde_json::to_vec(&zero).map_err(|_| Refusal::Malformed)?,
             )
             .map_err(|_| Refusal::Unavailable)?;
-            sync_dir(root).map_err(|_| Refusal::Unavailable)?;
         }
+        // A previous initial root sync may have failed after publishing the state.
+        // A successful retry must make the generation directory entry durable.
+        sync_dir(root).map_err(|_| Refusal::Unavailable)?;
         Self::reopen(root, direction)?;
         Ok(())
     }
