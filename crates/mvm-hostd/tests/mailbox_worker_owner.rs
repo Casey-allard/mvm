@@ -37,7 +37,11 @@ impl MailboxWorkerFactory for FixtureHelper {
             .stdout(Stdio::from(std::os::fd::OwnedFd::from(child_control)))
             .stderr(Stdio::null())
             .spawn()?;
-        Ok(SpawnedMailboxWorker { child, control, parent_lease: None })
+        Ok(SpawnedMailboxWorker {
+            child,
+            control,
+            parent_lease: None,
+        })
     }
 }
 
@@ -280,7 +284,11 @@ impl MailboxWorkerFactory for ExitBeforeConfig {
                 .unwrap(),
             mvm_vmm::host::process_exit::ProcessExitWait::Exited
         );
-        Ok(SpawnedMailboxWorker { child, control, parent_lease: None })
+        Ok(SpawnedMailboxWorker {
+            child,
+            control,
+            parent_lease: None,
+        })
     }
 }
 
@@ -335,7 +343,11 @@ impl MailboxWorkerFactory for IgnoreLifetimeUntilReleased {
             .stdout(Stdio::from(std::os::fd::OwnedFd::from(child_control)))
             .stderr(Stdio::from(std::os::fd::OwnedFd::from(child_release)))
             .spawn()?;
-        Ok(SpawnedMailboxWorker { child, control, parent_lease: None })
+        Ok(SpawnedMailboxWorker {
+            child,
+            control,
+            parent_lease: None,
+        })
     }
 }
 
@@ -822,4 +834,124 @@ async fn all_reserved_handoff_cells_drain_across_two_tenants_without_new_budgets
     .await
     .unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn signed_release_unstarted_requires_original_owner_and_replays_without_refunding_twice() {
+    let budget = MailboxWorkerBudget::new(WorkerLimits {
+        host_workers: 2,
+        tenant_workers: 1,
+        host_bytes: 1_048_576,
+        tenant_bytes: 524_288,
+        bytes_per_worker: 65_536,
+    })
+    .unwrap();
+    let slot_bytes = budget.usage().unwrap().bytes + 65_536;
+    let (_dir, path, task) = serve("tenant", budget.clone()).await;
+    tokio::task::spawn_blocking(move || {
+        let mut r = request("tenant", "never-launched");
+        let original = call(&path, &r).unwrap().0.owner;
+        let settled_usage = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let usage = budget.usage().unwrap();
+                if usage.bytes == slot_bytes {
+                    return usage;
+                }
+                assert!(Instant::now() < deadline, "signed reply workspace retained");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let reserved = settled_usage();
+        // Decode the explicit wire tag; older peers must refuse this request.
+        let release = |owner| {
+            serde_json::from_value(serde_json::json!({
+                "operation":"release_unstarted_v1","owner":owner
+            }))
+            .unwrap()
+        };
+        let mut foreign = original.clone();
+        foreign.lease[0] ^= 1;
+        r.operation = release(foreign);
+        assert!(call(&path, &r).is_err());
+        assert_eq!(settled_usage(), reserved);
+        r.operation = release(original.clone());
+        for nonce in [2, 3] {
+            r.request_nonce = [nonce; 32];
+            let (result, fd) = call(&path, &r).unwrap();
+            assert!(fd.is_none());
+            assert_eq!(
+                serde_json::to_value(result.state).unwrap(),
+                serde_json::json!({"state":"released_before_spawn"})
+            );
+            assert_eq!(budget.usage().unwrap().workers, 0);
+            assert_eq!(settled_usage().bytes, reserved.bytes);
+        }
+        r.operation = MailboxWorkerOperation::Query {
+            owner: original.clone(),
+        };
+        assert_eq!(
+            call(&path, &r).unwrap().0.state,
+            MailboxWorkerState::Unresolved
+        );
+        r.operation = MailboxWorkerOperation::DelegateConfig { owner: original };
+        assert!(call(&path, &r).is_err());
+        // A different VM immediately reuses the single live worker credit.
+        let mut r = request("tenant", "spawned");
+        let owner = call(&path, &r).unwrap().0.owner;
+        r.operation = MailboxWorkerOperation::DelegateConfig {
+            owner: owner.clone(),
+        };
+        let (_, writer) = call(&path, &r).unwrap();
+        r.operation = release(owner.clone());
+        assert!(call(&path, &r).is_err());
+        assert_eq!(budget.usage().unwrap().workers, 1);
+        drop(writer);
+        r.operation = MailboxWorkerOperation::Stop { owner };
+        assert!(matches!(
+            call(&path, &r).unwrap().0.state,
+            MailboxWorkerState::Collected { .. }
+        ));
+    })
+    .await
+    .unwrap();
+    task.abort();
+}
+
+#[tokio::test]
+async fn signed_lookup_is_read_only_and_recovers_original_after_expiry() {
+    let budget = MailboxWorkerBudget::new(WorkerLimits {
+        host_workers: 1, tenant_workers: 1, host_bytes: 1_048_576,
+        tenant_bytes: 1_048_576, bytes_per_worker: 65_536,
+    }).unwrap();
+    let (_dir, path, task) = serve("tenant", budget.clone()).await;
+    tokio::task::spawn_blocking(move || {
+        let mut r = request("tenant", "recover");
+        r.admission_expires_at_unix_ms = now() + 250;
+        let lookup = serde_json::from_value::<MailboxWorkerOperation>(serde_json::json!({"operation": "lookup_existing_v1"})).unwrap();
+        r.operation = lookup.clone();
+        assert!(call(&path, &r).is_err());
+        assert_eq!(budget.usage().unwrap().workers, 0);
+        r.operation = MailboxWorkerOperation::Acquire;
+        let receipt = call(&path, &r).unwrap().0;
+        std::thread::sleep(Duration::from_millis(260));
+        r.operation = lookup.clone();
+        let mut other = r.clone();
+        other.request_nonce = [88; 32];
+        assert!(call(&path, &other).is_err());
+        other = r.clone();
+        other.plan_commitment = [88; 32];
+        assert!(call(&path, &other).is_err());
+        let (found, fd) = call(&path, &r).unwrap();
+        assert_eq!(found, receipt);
+        assert!(fd.is_none());
+        r.operation = MailboxWorkerOperation::DelegateConfig { owner: receipt.owner.clone() };
+        assert!(call(&path, &r).is_err());
+        r.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: receipt.owner };
+        assert_eq!(call(&path, &r).unwrap().0.state, MailboxWorkerState::ReleasedBeforeSpawn);
+        r.operation = lookup;
+        assert_eq!(call(&path, &r).unwrap().0.state, MailboxWorkerState::ReleasedBeforeSpawn);
+        assert_eq!(budget.usage().unwrap().workers, 0);
+    }).await.unwrap();
+    task.abort();
 }

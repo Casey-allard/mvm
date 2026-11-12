@@ -405,12 +405,12 @@ fn dispatch_worker_control(
 ) -> Result<()> {
     use mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation;
     let _admission = match request.operation {
-        MailboxWorkerOperation::Acquire | MailboxWorkerOperation::DelegateConfig { .. } => {
+        MailboxWorkerOperation::Acquire | MailboxWorkerOperation::ProvisionAdmittedV1 { .. } | MailboxWorkerOperation::DelegateConfig { .. } => {
             Some(active_worker_turn(lifecycle, deadline, || {
                 Ok(workers.try_activation()?)
             })?)
         }
-        MailboxWorkerOperation::Query { .. } | MailboxWorkerOperation::Stop { .. } => None,
+        MailboxWorkerOperation::LookupExistingV1 | MailboxWorkerOperation::Query { .. } | MailboxWorkerOperation::Stop { .. } | MailboxWorkerOperation::ReleaseUnstartedV1 { .. } => None,
     };
     let (result, fd) = workers.handle(request)?;
     let _publication = if fd.is_some() {
@@ -2706,8 +2706,10 @@ impl HostAgentDaemon {
                             )
                             .ok()
                             .filter(|request| !closing || matches!(request.operation,
-                                mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Query { .. }
-                                    | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Stop { .. }))
+                                mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::LookupExistingV1
+                                    | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Query { .. }
+                                    | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Stop { .. }
+                                    | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::ReleaseUnstartedV1 { .. }))
                             .cloned()
                         });
                         let Ok(mut stream) = stream.into_std() else {

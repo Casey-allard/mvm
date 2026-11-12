@@ -65,7 +65,10 @@ pub fn verify_request<'a>(
     }
     if !matches!(
         r.operation,
-        MailboxWorkerOperation::Stop { .. } | MailboxWorkerOperation::Query { .. }
+        MailboxWorkerOperation::LookupExistingV1
+            | MailboxWorkerOperation::Stop { .. }
+            | MailboxWorkerOperation::Query { .. }
+            | MailboxWorkerOperation::ReleaseUnstartedV1 { .. }
     ) && r.admission_expires_at_unix_ms <= now_unix_ms
     {
         return Err(WorkerControlError::Deadline);
@@ -90,6 +93,19 @@ pub fn verify_stop_locator<'a>(
     Ok(r)
 }
 
+/// A signed Pending acquisition is a lookup locator with no live operation deadline.
+pub fn verify_pending_locator<'a>(
+    signed: &'a SignedControl,
+    root: &VerifyingKey,
+    expected_vm: &str,
+) -> Result<&'a MailboxWorkerRequest, WorkerControlError> {
+    let r = verify_binding(signed, root)?;
+    if r.vm_id != expected_vm || r.deadline_unix_ms != 0 || !matches!(r.operation, MailboxWorkerOperation::Acquire) {
+        return Err(WorkerControlError::Binding);
+    }
+    Ok(r)
+}
+
 fn verify_binding<'a>(
     signed: &'a SignedControl,
     root: &VerifyingKey,
@@ -109,10 +125,12 @@ fn verify_binding<'a>(
         return Err(WorkerControlError::Binding);
     }
     match &r.operation {
-        MailboxWorkerOperation::Acquire => (),
+        MailboxWorkerOperation::Acquire | MailboxWorkerOperation::LookupExistingV1 => (),
+        MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch } if *resource_epoch != 0 => (),
         MailboxWorkerOperation::DelegateConfig { owner }
         | MailboxWorkerOperation::Query { owner }
         | MailboxWorkerOperation::Stop { owner }
+        | MailboxWorkerOperation::ReleaseUnstartedV1 { owner }
             if owner_valid(owner) && owner.context_commitment == context_commitment(r)? => {}
         _ => return Err(WorkerControlError::Binding),
     }
@@ -128,17 +146,30 @@ pub fn verify_result(
     if result.request_nonce != request.request_nonce || !owner_valid(&result.owner) {
         return Err(WorkerControlError::Binding);
     }
+    if matches!(request.operation, MailboxWorkerOperation::LookupExistingV1) {
+        return if result.owner.context_commitment == context_commitment(request)? && !result.delegates_config {
+            Ok(())
+        } else { Err(WorkerControlError::Binding) };
+    }
     match &request.operation {
-        MailboxWorkerOperation::Acquire
+        MailboxWorkerOperation::Acquire | MailboxWorkerOperation::ProvisionAdmittedV1 { .. }
             if result.owner.context_commitment == context_commitment(request)?
                 && matches!(result.state, MailboxWorkerState::Reserved)
                 && !result.delegates_config => {}
-        MailboxWorkerOperation::Acquire => return Err(WorkerControlError::Binding),
+        MailboxWorkerOperation::Acquire | MailboxWorkerOperation::ProvisionAdmittedV1 { .. } => return Err(WorkerControlError::Binding),
         MailboxWorkerOperation::DelegateConfig { owner }
         | MailboxWorkerOperation::Query { owner }
         | MailboxWorkerOperation::Stop { owner }
+        | MailboxWorkerOperation::ReleaseUnstartedV1 { owner }
             if owner == &result.owner => {}
         _ => return Err(WorkerControlError::Binding),
+    }
+    if matches!(
+        request.operation,
+        MailboxWorkerOperation::ReleaseUnstartedV1 { .. }
+    ) != matches!(result.state, MailboxWorkerState::ReleasedBeforeSpawn)
+    {
+        return Err(WorkerControlError::Binding);
     }
     if result.delegates_config
         && !(matches!(

@@ -56,6 +56,7 @@
 //! so the host stays the final authority over what it boots.
 
 mod rollback;
+pub use rollback::rollback_is_unconfirmed;
 use rollback::{FailureAuditPolicy, UndoLaunch, undo_launch, undo_launch_with};
 
 use anyhow::{Context, Result};

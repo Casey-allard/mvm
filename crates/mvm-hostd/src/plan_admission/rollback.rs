@@ -41,6 +41,12 @@ struct UndoLaunchFailure {
     stop: anyhow::Error,
 }
 
+/// A failed post-start decision may also have failed to stop its original VM.
+/// Callers holding resources must retain them until the original stop is confirmed.
+pub fn rollback_is_unconfirmed(error: &anyhow::Error) -> bool {
+    error.is::<UndoLaunchFailure>()
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum FailureAuditPolicy {
     LegacyImmediate,
@@ -76,5 +82,23 @@ pub(super) fn undo_launch_with(
             primary: undo.err,
             stop,
         }),
+    }
+}
+
+#[cfg(test)]
+mod mailbox_rollback_tests {
+    use super::*;
+
+    #[test]
+    fn original_stop_failure_survives_error_context() {
+        let error = anyhow::Error::new(UndoLaunchFailure {
+            primary: anyhow::anyhow!("grant application failed"),
+            stop: anyhow::anyhow!("stop failed"),
+        })
+        .context("persistent mailbox launch");
+        assert!(super::rollback_is_unconfirmed(&error));
+        assert!(!super::rollback_is_unconfirmed(&anyhow::anyhow!(
+            "grants refused"
+        )));
     }
 }

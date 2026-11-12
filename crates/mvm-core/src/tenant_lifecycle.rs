@@ -554,6 +554,16 @@ impl TenantLifecycleGate {
         Ok(gate)
     }
 
+    /// Read the active epoch for binding an installed host control request.
+    /// The receiving original worker rechecks the signed epoch and Active gate.
+    pub fn active_resource_epoch(&self, deadline: Instant) -> Result<u64> {
+        let _lock = self.lock(deadline)?;
+        let record = self.read_record()?;
+        ensure!(record.phase == LifecyclePhase::Active && !record.unresolved,
+            "tenant lifecycle is not Active");
+        Ok(record.generation.resource_epoch())
+    }
+
     /// Reserve before backend activation using the original admitted plan.
     /// Missing or unresolved daemon state is an error, never implicit Active.
     pub fn reserve_launch(

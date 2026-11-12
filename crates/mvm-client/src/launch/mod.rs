@@ -15,7 +15,9 @@ pub mod bundle_runtime;
 pub mod canonical_linux;
 pub mod detached;
 pub mod grants_report;
+pub mod host_agent_mailbox;
 pub mod machine_start;
+pub mod mailbox_owner;
 pub mod manifest_ref;
 pub mod offline_attachment;
 pub mod offline_revocation;
@@ -517,6 +519,8 @@ impl LocalBackend {
         // stale substitution-endpoint socket) make the fresh endpoint die
         // binding it before its ready handshake; a non-running machine owns
         // no live state there, so recover by starting from an empty dir.
+        let _vacant =
+            mailbox_owner::VacantOwner::claim(&params.name).map_err(crate::local::lifecycle_err)?;
         if !self.machine_running(&params.name) {
             remove_vm_runtime_dirs(&params.name)?;
         }
@@ -798,7 +802,15 @@ impl LocalBackend {
                 if self.machine_running(name) {
                     self.stop_for_recreate(name)?;
                 }
-                mp::overwrite_machine_spec(&desired).map_err(crate::local::backend_err)?;
+                mailbox_owner::without_owner(name, || {
+                    anyhow::ensure!(
+                        !self.machine_running(name),
+                        "machine started during recreate"
+                    );
+                    mp::overwrite_machine_spec(&desired)?;
+                    Ok(())
+                })
+                .map_err(crate::local::lifecycle_err)?;
                 mvm_core::audit_emit!(
                     ConfigChange,
                     vm: name,
@@ -811,14 +823,15 @@ impl LocalBackend {
 
     /// Refuse destructive follow-up when the existing instance cannot be stopped.
     fn stop_for_recreate(&self, name: &str) -> Result<()> {
-        let vid = VmId(name.to_string());
-        let result = match AnyBackend::for_started_vm(name) {
-            Some(owner) => owner.stop(&vid),
-            None => self.backend.stop(&vid),
-        };
-        result.map(|_| ()).map_err(|error| {
-            crate::local::backend_err(format!("stopping machine {name:?}: {error:#}"))
+        mailbox_owner::stop_with(name, self.installed_mailbox.as_deref(), || {
+            let vid = VmId(name.to_string());
+            match AnyBackend::for_started_vm(name) {
+                Some(owner) => owner.stop(&vid)?,
+                None => self.backend.stop(&vid)?,
+            };
+            Ok(())
         })
+        .map_err(crate::local::backend_err)
     }
 
     /// Launch a machine from a fully-validated typed request. Transient
@@ -833,10 +846,22 @@ impl LocalBackend {
             built_pack::resolve_built_pack_image(pin, backend.name(), &request.profile)
                 .map_err(|error| crate::local::backend_err(format!("{error:#}")))?;
         }
+        if self.installed_mailbox.is_some()
+            && request.mailbox.is_some()
+            && request.mode == LifecycleMode::Transient
+        {
+            return Err(crate::local::backend_err(
+                "installed mailbox ownership requires a persistent machine",
+            ));
+        }
         match request.mode {
             LifecycleMode::Transient => self.launch_transient(request).await,
             LifecycleMode::Persistent => {
                 let name = persistent_name(&request)?;
+                // An uncertain original owner must survive a failed recreate.
+                if !request.force {
+                    mailbox_owner::refuse_existing(&name).map_err(crate::local::backend_err)?;
+                }
                 let (_, origin) = self.create_definition(&request, &name)?;
                 let booted = self.boot_persistent(&name, &request).await;
                 let outcome = self.discard_definition_on_failure(&name, origin, booted)?;
@@ -975,9 +1000,7 @@ impl LocalBackend {
         let backend = backend_override
             .map(str::to_string)
             .unwrap_or_else(|| self.backend.name().to_string());
-        if !self.machine_running(&spec.name) {
-            remove_vm_runtime_dirs(&spec.name)?;
-        }
+
         let image = match spec.image.clone() {
             Some(reference) => Some(
                 machine_start::resolve_boot_image(&reference, &spec.name)
@@ -988,7 +1011,8 @@ impl LocalBackend {
         };
         let host = machine_start::EmbedderStartHost::new(image, &spec.profile)
             .with_secret_service(self.secrets()?)
-            .with_backend(&self.backend);
+            .with_backend(&self.backend)
+            .with_mailbox_provisioner(self.installed_mailbox.clone());
         let started = detached::boot_recorded(
             spec,
             &host,
@@ -1333,19 +1357,26 @@ impl LocalBackend {
         if self.machine_running(name) {
             self.stop_for_recreate(name)?;
         }
-        let retained = if machine_spec_path(name).exists() {
-            self.release_session_resources(name)?;
-            false
-        } else {
-            self.release_transient_resources(name)?
-        };
-        remove_vm_runtime_dirs(name)?;
-        // The state dir under machines/ only carries session sidecars for a
-        // transient (no machine.json); never touch a persistent definition.
-        if !retained && !machine_spec_path(name).exists() {
-            remove_dir_if_present(&machine_state_dir(name))?;
-        }
-        Ok(())
+        mailbox_owner::without_owner(name, || {
+            anyhow::ensure!(
+                !self.machine_running(name),
+                "machine started during transient cleanup"
+            );
+            let retained = if machine_spec_path(name).exists() {
+                self.release_session_resources(name)?;
+                false
+            } else {
+                self.release_transient_resources(name)?
+            };
+            remove_vm_runtime_dirs(name)?;
+            // The state dir under machines/ only carries session sidecars for a
+            // transient (no machine.json); never touch a persistent definition.
+            if !retained && !machine_spec_path(name).exists() {
+                remove_dir_if_present(&machine_state_dir(name))?;
+            }
+            Ok(())
+        })
+        .map_err(crate::local::lifecycle_err)
     }
 }
 

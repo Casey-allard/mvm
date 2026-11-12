@@ -12,7 +12,7 @@ use mvm_vmm::host::process_exit::{
     ProcessExitObserver, ProcessExitWait, collect_after_exit_event, require_owned_child_custody,
     wait_process_exit_events,
 };
-pub use owned_factory::OwnedMailboxWorkerFactory;
+pub use owned_factory::{InstalledMailboxWorkerFactory, OwnedMailboxWorkerFactory};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -647,6 +647,9 @@ impl Drop for WorkerControlPermit {
 /// Once a child exists the factory must return it even if later preparation
 /// fails; ownership must never disappear into an ordinary post-spawn error.
 pub trait MailboxWorkerFactory: Send + Sync {
+    /// A dynamically provisioned worker requires the launcher's signed
+    /// ProvisionAdmittedV1 before an Acquire can recover its reservation.
+    fn requires_signed_provision(&self) -> bool { false }
     fn admit(&self, _request: &MailboxWorkerRequest) -> io::Result<()> {
         Ok(())
     }
@@ -922,7 +925,7 @@ impl MailboxWorkers {
         }
         let activation = matches!(
             request.operation,
-            MailboxWorkerOperation::Acquire | MailboxWorkerOperation::DelegateConfig { .. }
+            MailboxWorkerOperation::Acquire | MailboxWorkerOperation::ProvisionAdmittedV1 { .. } | MailboxWorkerOperation::DelegateConfig { .. }
         );
         if activation && state.deadline.is_some() {
             return Err(refused("mailbox provider admission stopped"));
@@ -1290,7 +1293,8 @@ impl MailboxWorkers {
                 }
                 let state = slot.lock().ok()?;
                 (!state.busy
-                    && matches!(state.state, MailboxWorkerState::Collected { .. })
+                    && (state.reservation_released
+                        || matches!(state.state, MailboxWorkerState::Collected { .. }))
                     && state
                         .terminal_at
                         .is_some_and(|at| at.elapsed() >= TERMINAL_RETENTION))
@@ -1333,12 +1337,15 @@ impl MailboxWorkers {
         &self,
         request: &MailboxWorkerRequest,
     ) -> io::Result<(MailboxWorkerResult, Option<OwnedFd>)> {
+        let provision = matches!(request.operation, MailboxWorkerOperation::ProvisionAdmittedV1 { .. });
+        if provision && !self.factory.requires_signed_provision() {
+            return Err(refused("installed mailbox provisioning disabled"));
+        }
         self.factory.admit(request)?;
         let _operation = self.operation_permit(request)?;
         if request.tenant != self.tenant {
             return Err(refused("foreign worker tenant"));
         }
-        self.expire_terminals()?;
         let now = self.now_unix_ms()?;
         let remaining = request
             .deadline_unix_ms
@@ -1347,9 +1354,28 @@ impl MailboxWorkers {
             .ok_or_else(|| refused("worker deadline"))?;
         let deadline = Instant::now() + std::time::Duration::from_millis(remaining);
         let context = context_commitment(request).map_err(|_| refused("worker context"))?;
+        // Lookup has no budget or slot mutations, including terminal expiry.
+        // It never falls through to the original legacy Acquire path.
+        if matches!(request.operation, MailboxWorkerOperation::LookupExistingV1) {
+            let slots = lock(&self.slots)?;
+            let slot = lock(slots.get(&request.vm_id).ok_or_else(|| refused("original reservation absent"))?)?;
+            if slot.request.request_nonce != request.request_nonce || slot.owner.context_commitment != context
+                || slot.owner.daemon_boot_nonce != self.boot || slot.busy {
+                return Err(refused("original reservation unavailable"));
+            }
+            let state = if slot.reservation_released {
+                MailboxWorkerState::ReleasedBeforeSpawn
+            } else if slot.stop_requested && !matches!(slot.state, MailboxWorkerState::Collected { .. }) {
+                MailboxWorkerState::Unresolved
+            } else {
+                slot.state.clone()
+            };
+            return Ok((MailboxWorkerResult { request_nonce: request.request_nonce, owner: slot.owner.clone(), state, delegates_config: false }, None));
+        }
+        self.expire_terminals()?;
         let slot = {
             // SAME fence turn linearizes new reservation against retirement.
-            let admission = if matches!(request.operation, MailboxWorkerOperation::Acquire) {
+            let admission = if matches!(request.operation, MailboxWorkerOperation::Acquire | MailboxWorkerOperation::ProvisionAdmittedV1 { .. }) {
                 let guard = lock(&self.fence.state)?;
                 if guard.deadline.is_some() || guard.failed {
                     return Err(refused("provider acquisition stopped"));
@@ -1360,9 +1386,12 @@ impl MailboxWorkers {
             };
             let _admission = admission;
             let mut slots = lock(&self.slots)?;
-            if matches!(request.operation, MailboxWorkerOperation::Acquire) {
+            if matches!(request.operation, MailboxWorkerOperation::Acquire | MailboxWorkerOperation::ProvisionAdmittedV1 { .. }) {
                 if let Some(slot) = slots.get(&request.vm_id) {
                     let slot_guard = lock(slot)?;
+                    if slot_guard.reservation_released {
+                        return Err(refused("original reservation already released"));
+                    }
                     if slot_guard.request.request_nonce != request.request_nonce
                         || slot_guard.owner.context_commitment != context
                     {
@@ -1380,6 +1409,9 @@ impl MailboxWorkers {
                         },
                         None,
                     ));
+                }
+                if !provision && self.factory.requires_signed_provision() {
+                    return Err(refused("no installed reservation for this acquisition"));
                 }
                 let mut generation = lock(&self.generation)?;
                 let next = generation
@@ -1443,8 +1475,9 @@ impl MailboxWorkers {
             let supplied = match &request.operation {
                 MailboxWorkerOperation::DelegateConfig { owner }
                 | MailboxWorkerOperation::Query { owner }
-                | MailboxWorkerOperation::Stop { owner } => owner,
-                MailboxWorkerOperation::Acquire => unreachable!(),
+                | MailboxWorkerOperation::Stop { owner }
+                | MailboxWorkerOperation::ReleaseUnstartedV1 { owner } => owner,
+                MailboxWorkerOperation::Acquire | MailboxWorkerOperation::LookupExistingV1 | MailboxWorkerOperation::ProvisionAdmittedV1 { .. } => unreachable!(),
             };
             if supplied != &slot.owner
                 || slot.owner.context_commitment != context
@@ -1472,6 +1505,34 @@ impl MailboxWorkers {
             }
             if slot.busy {
                 return Err(refused("worker operation in progress"));
+            }
+            if matches!(
+                request.operation,
+                MailboxWorkerOperation::ReleaseUnstartedV1 { .. }
+            ) {
+                // Under the original slot lock a competing Delegate is either
+                // still busy, already attempted, or will see stop_requested.
+                if slot.spawn_attempted || slot.worker.is_some() || slot.delegated {
+                    return Err(refused("original worker spawn was attempted"));
+                }
+                if !slot.reservation_released {
+                    self.budget.collected(&self.tenant)?;
+                    slot.reservation_released = true;
+                    slot.stop_requested = true;
+                    slot.terminal_at = Some(Instant::now());
+                    if let Some(cell) = slot.cell.take() {
+                        self.budget.return_cell(cell);
+                    }
+                }
+                return Ok((
+                    MailboxWorkerResult {
+                        request_nonce: request.request_nonce,
+                        owner: slot.owner.clone(),
+                        state: MailboxWorkerState::ReleasedBeforeSpawn,
+                        delegates_config: false,
+                    },
+                    None,
+                ));
             }
             if slot.stop_requested
                 && matches!(

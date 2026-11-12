@@ -29,14 +29,22 @@ impl LocalBackend {
     /// resources, the per-VM runtime dir and the definition directory. The
     /// caller decides whether a running machine may be stopped first.
     pub(super) fn remove_definition(&self, name: &str) -> Result<()> {
-        self.release_session_resources(name)?;
-        // A stale substitution-endpoint socket left in the runtime dir blocks
-        // the next launch under the same name: the endpoint dies binding it,
-        // before its ready handshake.
-        remove_vm_runtime_dirs(name)?;
-        // The definition directory carries machine.json plus the secret-refs
-        // sidecar, already cleared above; drop it whole.
-        remove_dir_if_present(&machine_state_dir(name))
+        super::mailbox_owner::without_owner(name, || {
+            anyhow::ensure!(
+                !self.machine_running(name),
+                "machine started during removal"
+            );
+            self.release_session_resources(name)?;
+            // A stale substitution-endpoint socket left in the runtime dir blocks
+            // the next launch under the same name: the endpoint dies binding it,
+            // before its ready handshake.
+            remove_vm_runtime_dirs(name)?;
+            // The definition directory carries machine.json plus the secret-refs
+            // sidecar, already cleared above; drop it whole.
+            remove_dir_if_present(&machine_state_dir(name))?;
+            Ok(())
+        })
+        .map_err(crate::local::lifecycle_err)
     }
 
     /// Settle `result` for a launch whose definition has `origin`: a failure

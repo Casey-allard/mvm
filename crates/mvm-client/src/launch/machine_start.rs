@@ -19,13 +19,19 @@ use anyhow::{Context, Result, bail};
 use mvm_runtime::backend::AnyBackend;
 use mvm_runtime::machine::persist as mp;
 
-use super::persistent::{PersistentImageStartParams, start_persistent_oci_machine};
+use super::mailbox_owner::InstalledMailboxProvisioner;
+use super::persistent::{PersistentImageStartParams, start_persistent_with_mailbox};
 use crate::secret::SecretService;
 use crate::volume::LaunchPreparation;
 
 /// What the process starting a machine supplies that differs between the CLI
 /// and a library embedder.
 pub trait StartHost {
+    /// Installed provider authorized by the process that owns this launch.
+    fn installed_mailbox(&self) -> Option<&dyn InstalledMailboxProvisioner> {
+        None
+    }
+
     /// The workload kernel to boot on `backend`, or `None` when that backend
     /// carries its own.
     fn workload_kernel(&self, backend: &str) -> Result<Option<String>>;
@@ -240,6 +246,7 @@ pub fn start_machine_spec(
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
     AnyBackend::require_hypervisor_selectable(params.hypervisor)?;
+    let vacant = super::mailbox_owner::VacantOwner::claim(&spec.name)?;
     super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
     validate_registry_pack_source(spec)?;
     let network_policy = persisted_network_policy(spec)?;
@@ -273,32 +280,36 @@ pub fn start_machine_spec(
         .prepare_volumes(&spec.name, &spec.volumes)
         .context("resolving registered local volumes before admission")?;
     let workload_dir = persistent_workload_dir(spec);
-    let admitted = start_persistent_oci_machine(PersistentImageStartParams {
-        name: &spec.name,
-        image_label: &boot.label,
-        resolved_digest: &boot.digest,
-        rootfs_path: &boot.rootfs,
-        profile: &spec.profile,
-        cpus: spec.cpus,
-        memory_mib,
-        mem_initial_mib,
-        prepared_volumes,
-        network_policy,
-        ports: &spec.ports,
-        backend_name: params.hypervisor,
-        kernel_path,
-        agent_verb: spec.agent_verb.clone(),
-        caller_commitment: spec.caller_commitment.clone(),
-        registry_pack_image: spec.registry_pack_image.clone(),
-        has_ad_hoc_argv: params.has_ad_hoc_argv,
-        grants: spec.grants.clone(),
-        mailbox: params.mailbox,
-        gpu: spec.gpu,
-        gpu_device: spec.gpu_device,
-        workload_dir: workload_dir.as_deref(),
-        secrets,
-        backend: host.backend(params.hypervisor),
-    })?;
+    let admitted = start_persistent_with_mailbox(
+        PersistentImageStartParams {
+            name: &spec.name,
+            image_label: &boot.label,
+            resolved_digest: &boot.digest,
+            rootfs_path: &boot.rootfs,
+            profile: &spec.profile,
+            cpus: spec.cpus,
+            memory_mib,
+            mem_initial_mib,
+            prepared_volumes,
+            network_policy,
+            ports: &spec.ports,
+            backend_name: params.hypervisor,
+            kernel_path,
+            agent_verb: spec.agent_verb.clone(),
+            caller_commitment: spec.caller_commitment.clone(),
+            registry_pack_image: spec.registry_pack_image.clone(),
+            has_ad_hoc_argv: params.has_ad_hoc_argv,
+            grants: spec.grants.clone(),
+            mailbox: params.mailbox,
+            gpu: spec.gpu,
+            gpu_device: spec.gpu_device,
+            workload_dir: workload_dir.as_deref(),
+            secrets,
+            backend: host.backend(params.hypervisor),
+        },
+        host.installed_mailbox(),
+        vacant,
+    )?;
     Ok(MachineStart {
         resolved_digest: boot.digest,
         admitted,
@@ -358,6 +369,7 @@ pub struct EmbedderStartHost {
     profile: crate::volume::AdmittedProfile,
     secrets: Option<Arc<SecretService>>,
     backend: Option<AnyBackend>,
+    provisioner: Option<Arc<dyn InstalledMailboxProvisioner>>,
 }
 
 impl EmbedderStartHost {
@@ -369,7 +381,16 @@ impl EmbedderStartHost {
             profile: crate::volume::AdmittedProfile::from_profile_name(profile),
             secrets: None,
             backend: None,
+            provisioner: None,
         }
+    }
+
+    pub(crate) fn with_mailbox_provisioner(
+        mut self,
+        provider: Option<Arc<dyn InstalledMailboxProvisioner>>,
+    ) -> Self {
+        self.provisioner = provider;
+        self
     }
 
     /// Start on `backend` when the machine's hypervisor is the one it runs,
@@ -391,6 +412,10 @@ impl EmbedderStartHost {
 }
 
 impl StartHost for EmbedderStartHost {
+    fn installed_mailbox(&self) -> Option<&dyn InstalledMailboxProvisioner> {
+        self.provisioner.as_deref()
+    }
+
     fn workload_kernel(&self, backend: &str) -> Result<Option<String>> {
         cached_workload_kernel(backend)
     }
@@ -542,6 +567,32 @@ mod tests {
         super::super::discard_stopped_runtime_state("firecracker", "restarted").unwrap();
 
         assert!(!state.exists());
+    }
+
+    #[test]
+    fn persistent_start_preserves_runtime_while_an_original_mailbox_launch_holds_the_name() {
+        let home = tempfile::tempdir().unwrap();
+        let mut env = TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        let spec = spec("owned-start");
+        let state = mvm_core::config::vm_state_dir(&spec.name);
+        std::fs::create_dir_all(&state).unwrap();
+        let marker = state.join("original-state");
+        std::fs::write(&marker, b"original").unwrap();
+        let original = super::super::mailbox_owner::VacantOwner::claim(&spec.name).unwrap();
+        let error = start_machine_spec(
+            &spec,
+            &EmbedderStartHost::new(None, "standard"),
+            MachineStartParams {
+                hypervisor: "firecracker",
+                has_ad_hoc_argv: false,
+                mailbox: None,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("another operation owns this VM"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"original");
+        drop(original);
     }
 
     #[test]

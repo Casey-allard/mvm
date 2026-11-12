@@ -173,8 +173,11 @@ fn bind_context(r: &mut MailboxWorkerRequest) {
     match &mut r.operation {
         MailboxWorkerOperation::DelegateConfig { owner }
         | MailboxWorkerOperation::Query { owner }
-        | MailboxWorkerOperation::Stop { owner } => owner.context_commitment = context,
-        MailboxWorkerOperation::Acquire => (),
+        | MailboxWorkerOperation::Stop { owner }
+        | MailboxWorkerOperation::ReleaseUnstartedV1 { owner } => {
+            owner.context_commitment = context
+        }
+        MailboxWorkerOperation::Acquire | MailboxWorkerOperation::LookupExistingV1 | MailboxWorkerOperation::ProvisionAdmittedV1 { .. } => (),
     }
 }
 #[test]
@@ -230,4 +233,69 @@ fn cleanup_context_commitment_is_bound_even_with_valid_host_signature() {
             broker_control::sign(ControlRequest::MailboxWorkerV1(Box::new(r)), &[7; 32]).unwrap();
         assert!(verify_request(&signed, &key(), 10_000).is_err());
     }
+}
+
+#[test]
+fn release_before_spawn_proof_is_only_valid_for_the_explicit_operation() {
+    let mut r = request();
+    r.admission_expires_at_unix_ms = 9_000;
+    r.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: owner() };
+    bind_context(&mut r);
+    let signed = broker_control::sign(
+        ControlRequest::MailboxWorkerV1(Box::new(r.clone())),
+        &[7; 32],
+    )
+    .unwrap();
+    assert_eq!(verify_request(&signed, &key(), 10_000).unwrap(), &r);
+    assert!(verify_request(&signed, &key(), 12_000).is_err());
+    let MailboxWorkerOperation::ReleaseUnstartedV1 { owner } = r.operation.clone() else {
+        unreachable!()
+    };
+    let mut result = MailboxWorkerResult {
+        request_nonce: r.request_nonce,
+        owner: owner.clone(),
+        state: MailboxWorkerState::ReleasedBeforeSpawn,
+        delegates_config: false,
+    };
+    verify_result(&r, &result).unwrap();
+    result.state = MailboxWorkerState::Unresolved;
+    assert!(verify_result(&r, &result).is_err());
+    result.state = MailboxWorkerState::ReleasedBeforeSpawn;
+    for operation in [
+        MailboxWorkerOperation::Query {
+            owner: owner.clone(),
+        },
+        MailboxWorkerOperation::Stop { owner },
+    ] {
+        r.operation = operation;
+        assert!(verify_result(&r, &result).is_err());
+    }
+}
+
+#[test]
+fn lookup_requires_original_nonce_and_context_without_delegating_or_extending_admission() {
+    let mut r = request();
+    r.operation = MailboxWorkerOperation::LookupExistingV1;
+    r.admission_expires_at_unix_ms = 500;
+    let sign = |req| broker_control::sign(ControlRequest::MailboxWorkerV1(Box::new(req)), &[7; 32]).unwrap();
+    assert!(verify_request(&sign(r.clone()), &key(), 10_000).is_ok());
+    assert!(verify_request(&sign(r.clone()), &key(), r.deadline_unix_ms).is_err());
+    let mut proof = MailboxWorkerResult { owner: owner(), request_nonce: r.request_nonce,
+        delegates_config: false, state: MailboxWorkerState::ReleasedBeforeSpawn };
+    proof.owner.context_commitment = context_commitment(&r).unwrap();
+    assert!(verify_result(&r, &proof).is_ok());
+    proof.delegates_config = true;
+    assert!(verify_result(&r, &proof).is_err());
+    proof.delegates_config = false;
+    proof.request_nonce = [99; 32];
+    assert!(verify_result(&r, &proof).is_err());
+    proof.request_nonce = r.request_nonce;
+    proof.owner.context_commitment = [99; 32];
+    assert!(verify_result(&r, &proof).is_err());
+    r.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: 1 };
+    assert!(verify_request(&sign(r.clone()), &key(), 10_000).is_err());
+    r.admission_expires_at_unix_ms = 20_000;
+    assert!(verify_request(&sign(r.clone()), &key(), 10_000).is_ok());
+    r.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: 0 };
+    assert!(verify_request(&sign(r), &key(), 10_000).is_err());
 }

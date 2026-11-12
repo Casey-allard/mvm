@@ -28,9 +28,25 @@ pub struct MailboxWorkerOwner {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MailboxWorkerOperation {
     Acquire,
-    DelegateConfig { owner: MailboxWorkerOwner },
-    Query { owner: MailboxWorkerOwner },
-    Stop { owner: MailboxWorkerOwner },
+    /// Read an existing slot by original nonce and exact admission context.
+    LookupExistingV1,
+    /// Host launcher's signed attestation of an already admitted local plan.
+    /// An explicitly enabled worker reserves the original nonce and context.
+    ProvisionAdmittedV1 { resource_epoch: u64 },
+    DelegateConfig {
+        owner: MailboxWorkerOwner,
+    },
+    Query {
+        owner: MailboxWorkerOwner,
+    },
+    Stop {
+        owner: MailboxWorkerOwner,
+    },
+    /// Explicit extension for aborting a reservation before any spawn attempt.
+    /// Older peers reject the unknown operation.
+    ReleaseUnstartedV1 {
+        owner: MailboxWorkerOwner,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,8 +81,12 @@ pub enum MailboxWorkerState {
     Starting,
     Serving,
     Stopping,
-    Collected { exit: MailboxWorkerExit },
+    Collected {
+        exit: MailboxWorkerExit,
+    },
     Unresolved,
+    /// Returned exclusively to ReleaseUnstartedV1, never as a Child exit.
+    ReleasedBeforeSpawn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

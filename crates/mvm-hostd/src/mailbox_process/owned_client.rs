@@ -1,5 +1,8 @@
 //! Launcher control of one mailbox under an existing verified MVM admission.
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -10,17 +13,93 @@ use mvm_core::protocol::{
 };
 use mvm_runtime::backend::AnyBackend;
 use mvm_vmm::host::mailbox_worker_transport::{recv_response, send_request};
+use mvm_vmm::host::process_exit::{ProcessExitObserver, ProcessExitWait};
 
 use super::{build_config, write_delegated_config};
 use crate::audit::host_keypair::{PUBLIC_FILENAME, SECRET_FILENAME};
 use crate::plan_admission::AdmittedPlan;
+
+/// Kernel identity anchored while the installation controller holds its original Child.
+pub struct InstalledMailboxPeer {
+    observer: Mutex<Option<ProcessExitObserver>>,
+    pid: u32,
+    issuer: [u8; 16],
+}
+
+impl InstalledMailboxPeer {
+    pub fn from_original(original: Arc<Mutex<Child>>) -> Result<Self> {
+        let mut child = original
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("original daemon unavailable"))?;
+        Self::from_child(&mut child)
+    }
+
+    pub fn from_child(child: &mut Child) -> Result<Self> {
+        mvm_vmm::host::process_exit::require_owned_child_custody()?;
+        ensure!(
+            child.try_wait()?.is_none(),
+            "original mailbox daemon already exited"
+        );
+        let pid = child.id();
+        let observer = ProcessExitObserver::arm(i32::try_from(pid)?)?;
+        ensure!(
+            child.try_wait()?.is_none(),
+            "original mailbox daemon exited during binding"
+        );
+        Ok(Self {
+            observer: Mutex::new(Some(observer)),
+            pid,
+            issuer: rand::random(),
+        })
+    }
+
+    /// Match the issuer embedded in this installation's host-signed locator.
+    pub fn issued_nonce(&self, nonce: &[u8; 32]) -> bool {
+        nonce[..16] == self.issuer
+    }
+
+    fn authenticate(&self, stream: &UnixStream) -> Result<()> {
+        let peer = u32::try_from(mvm_vmm::host::uds_peer::connected_peer_pid(stream)?)?;
+        ensure!(
+            peer == self.pid,
+            "mailbox control socket differs from original daemon"
+        );
+        let mut original = self
+            .observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original daemon unavailable"))?;
+        // On Darwin the queued exit event is consumed once; permanently disarm
+        // on an exit or observer error. A new process reusing this PID cannot pass.
+        match original
+            .as_ref()
+            .context("original mailbox daemon exited")?
+            .wait_event(Instant::now())
+        {
+            Ok(ProcessExitWait::TimedOut) => Ok(()),
+            other => {
+                *original = None;
+                other?;
+                bail!("original mailbox daemon exited");
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Authority {
+    Fresh,
+    Admitted,
+    PendingLookup,
+    Stop,
+}
 
 /// A prepared original acquisition. Retain its nonce through uncertain replies;
 /// the daemon rejects a second acquisition for the same VM under another nonce.
 pub struct InstalledMailboxClient {
     acquire: MailboxWorkerRequest,
     owner: Option<MailboxWorkerOwner>,
-    stop_only: bool,
+    authority: Authority,
+    peer: Option<Arc<InstalledMailboxPeer>>,
 }
 
 fn now_ms() -> Result<u64> {
@@ -49,7 +128,9 @@ fn kind(backend: &AnyBackend) -> Result<MailboxWorkerBackend> {
 
 impl InstalledMailboxClient {
     pub fn prepare(admitted: &AdmittedPlan, backend: &AnyBackend, vm_name: &str) -> Result<Self> {
-        Self::with_nonce(admitted, backend, vm_name, rand::random())
+        let mut client = Self::with_nonce(admitted, backend, vm_name, rand::random())?;
+        client.authority = Authority::Fresh;
+        Ok(client)
     }
 
     fn with_nonce(
@@ -96,7 +177,8 @@ impl InstalledMailboxClient {
         Ok(Self {
             acquire,
             owner: None,
-            stop_only: false,
+            authority: Authority::Admitted,
+            peer: None,
         })
     }
 
@@ -122,6 +204,60 @@ impl InstalledMailboxClient {
             client.owner = Some(owner);
         }
         Ok(client)
+    }
+
+    /// Bind the original process identity before persisting an initial reservation.
+    /// Half the nonce uniquely identifies this original issuer; half is random
+    /// for this transfer. Both halves remain covered by the host signature.
+    pub fn bind_acquire_peer(&mut self, peer: Arc<InstalledMailboxPeer>) -> Result<()> {
+        ensure!(
+            self.authority == Authority::Fresh && self.peer.is_none(),
+            "initial acquisition already bound"
+        );
+        self.acquire.request_nonce[..16].copy_from_slice(&peer.issuer);
+        self.authority = Authority::Admitted;
+        self.bind_peer(peer)
+    }
+
+    pub fn signed_pending_locator(&self) -> Result<broker_control::SignedControl> {
+        ensure!(
+            self.authority == Authority::Admitted && self.peer.is_some() && self.owner.is_none(),
+            "pending locator requires the original bound acquisition"
+        );
+        let (secret, _) = host_key()?;
+        Ok(broker_control::sign(
+            ControlRequest::MailboxWorkerV1(Box::new(self.acquire.clone())),
+            secret.as_bytes(),
+        )?)
+    }
+
+    pub fn from_pending_locator(
+        vm_name: &str,
+        signed: &broker_control::SignedControl,
+    ) -> Result<Self> {
+        let (_, public) = host_key()?;
+        let request = verify_pending_locator(signed, &public, vm_name)?;
+        Ok(Self {
+            acquire: request.clone(),
+            owner: None,
+            authority: Authority::PendingLookup,
+            peer: None,
+        })
+    }
+
+    /// Lookup on a Pending locator must never reserve, publish or spawn.
+    pub fn recover_owner(&mut self, deadline: Instant) -> Result<&MailboxWorkerOwner> {
+        ensure!(
+            self.authority == Authority::PendingLookup,
+            "signed pending reservation required"
+        );
+        if self.owner.is_none() {
+            let (receipt, writer) =
+                self.call(MailboxWorkerOperation::LookupExistingV1, deadline)?;
+            ensure!(writer.is_none(), "lookup returned a delegated descriptor");
+            self.owner = Some(receipt.owner);
+        }
+        self.owner.as_ref().context("original reservation missing")
     }
 
     pub fn signed_stop_locator(&self) -> Result<broker_control::SignedControl> {
@@ -157,8 +293,32 @@ impl InstalledMailboxClient {
         Ok(Self {
             acquire,
             owner: Some(owner.clone()),
-            stop_only: true,
+            authority: Authority::Stop,
+            peer: None,
         })
+    }
+
+    /// Bind once, using the installed controller that owns the original daemon.
+    pub fn bind_peer(&mut self, peer: Arc<InstalledMailboxPeer>) -> Result<()> {
+        ensure!(
+            self.authority != Authority::Fresh,
+            "initial acquisition must bind its issuer"
+        );
+        if self.authority != Authority::Stop {
+            ensure!(
+                self.acquire.request_nonce[..16] == peer.issuer,
+                "original mailbox issuer differs"
+            );
+        }
+        if let Some(original) = &self.peer {
+            ensure!(
+                Arc::ptr_eq(original, &peer),
+                "cannot replace installed daemon binding"
+            );
+        } else {
+            self.peer = Some(peer);
+        }
+        Ok(())
     }
 
     pub fn acquire_request(&self) -> &MailboxWorkerRequest {
@@ -185,7 +345,12 @@ impl InstalledMailboxClient {
         )?;
         ensure!(left > 0, "mailbox operation deadline elapsed");
         request.deadline_unix_ms = now.checked_add(left).context("mailbox deadline overflow")?;
-        if !matches!(operation, MailboxWorkerOperation::Acquire) {
+        if !matches!(
+            operation,
+            MailboxWorkerOperation::Acquire
+                | MailboxWorkerOperation::ProvisionAdmittedV1 { .. }
+                | MailboxWorkerOperation::LookupExistingV1
+        ) {
             request.request_nonce = rand::random();
         }
         request.operation = operation;
@@ -195,16 +360,43 @@ impl InstalledMailboxClient {
             secret.as_bytes(),
         )?;
         verify_request(&signed, &public, now_ms()?)?;
+        let peer = self
+            .peer
+            .as_ref()
+            .context("installed mailbox daemon binding required")?;
         let mut stream = mvm_agentd::vsock::connect_unix_before(
             &mvm_core::config::host_agent_control_socket(&request.tenant),
             deadline,
         )?;
+        peer.authenticate(&stream)?;
         send_request(&stream, &signed, deadline)?;
         Ok(recv_response(&mut stream, &request, deadline)?)
     }
 
+    /// Attest this original admitted context and reserve its acquisition nonce.
+    pub fn provision_admitted_slot(&self, deadline: Instant) -> Result<MailboxWorkerOwner> {
+        ensure!(
+            self.authority == Authority::Admitted,
+            "stop locator cannot provision a worker"
+        );
+        let gate = mvm_core::tenant_lifecycle::TenantLifecycleGate::new(
+            mvm_core::config::mvm_home_strict()?,
+            &self.acquire.tenant,
+        )?;
+        let resource_epoch = gate.active_resource_epoch(deadline)?;
+        Ok(self
+            .call(
+                MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch },
+                deadline,
+            )?
+            .0
+            .owner)
+    }
     pub fn acquire(&mut self, deadline: Instant) -> Result<&MailboxWorkerOwner> {
-        ensure!(!self.stop_only, "stop locator cannot acquire a worker");
+        ensure!(
+            self.authority == Authority::Admitted,
+            "stop locator cannot acquire a worker"
+        );
         if self.owner.is_none() {
             let (receipt, _) = self.call(MailboxWorkerOperation::Acquire, deadline)?;
             self.owner = Some(receipt.owner);
@@ -240,12 +432,25 @@ impl InstalledMailboxClient {
             .state)
     }
 
+    /// Discard a reservation only if the original daemon certifies that it never spawned.
+    pub fn release_unstarted(&self, deadline: Instant) -> Result<MailboxWorkerState> {
+        Ok(self
+            .call(
+                MailboxWorkerOperation::ReleaseUnstartedV1 {
+                    owner: self.original()?,
+                },
+                deadline,
+            )?
+            .0
+            .state)
+    }
+
     /// Only the original, once-delegated FD may receive configuration. A retry
     /// that finds the helper starting just queries its state, keeping all
     /// derived bytes and epoch state out of the host-agent control connection.
     pub fn configure_and_wait(&self, backend: &AnyBackend, deadline: Instant) -> Result<()> {
         ensure!(
-            !self.stop_only,
+            self.authority == Authority::Admitted,
             "stop locator cannot delegate configuration"
         );
         ensure!(
@@ -284,5 +489,95 @@ impl InstalledMailboxClient {
             "mailbox worker did not reach Serving"
         );
         Ok(())
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    const CHILD_SOCKET: &str = "MVM_TEST_INSTALLED_ORIGINAL_PEER_SOCKET";
+
+    #[test]
+    fn original_peer_fixture() {
+        let Some(path) = std::env::var_os(CHILD_SOCKET) else {
+            return;
+        };
+        let listener = UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => panic!("fixture failed to accept: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"1").unwrap();
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [1]);
+    }
+
+    fn connect_child(path: &Path) -> Result<UnixStream> {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match UnixStream::connect(path) {
+                Ok(stream) => return Ok(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_socket_requires_original_live_child_after_path_replacement() -> Result<()> {
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let path = dir.path().join("control.sock");
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                "mailbox_process::owned_client::tests::original_peer_fixture",
+                "--exact",
+            ])
+            .env(CHILD_SOCKET, &path)
+            .stdin(Stdio::null())
+            .spawn()?;
+        let result = (|| -> Result<()> {
+            let peer = InstalledMailboxPeer::from_child(&mut child)?;
+            let mut original = connect_child(&path)?;
+            original.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut ack = [0];
+            original.read_exact(&mut ack)?;
+            ensure!(ack == *b"1");
+            peer.authenticate(&original)?;
+            std::fs::remove_file(&path)?;
+            let replacement = UnixListener::bind(&path)?;
+            let impostor = UnixStream::connect(&path)?;
+            let (_same_uid_peer, _) = replacement.accept()?;
+            assert!(peer.authenticate(&impostor).is_err());
+            peer.authenticate(&original)?;
+            original.write_all(&[1])?;
+            ensure!(child.wait()?.success());
+            assert!(peer.authenticate(&original).is_err());
+            assert!(peer.authenticate(&original).is_err());
+            assert!(InstalledMailboxPeer::from_child(&mut child).is_err());
+            Ok(())
+        })();
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+            child.wait()?;
+        }
+        result
     }
 }

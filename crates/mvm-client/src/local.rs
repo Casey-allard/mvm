@@ -55,6 +55,8 @@ use mvm_runtime::vm::name_registry::VmNameRegistry;
 /// Drives the host's VM backend directly. Construct with [`LocalBackend::new`]
 /// (auto-selected backend) or [`LocalBackend::with_hypervisor`].
 pub struct LocalBackend {
+    pub(crate) installed_mailbox:
+        Option<std::sync::Arc<dyn crate::launch::mailbox_owner::InstalledMailboxProvisioner>>,
     pub(crate) backend: AnyBackend,
     /// Injected secret lifecycle service for launch-time reference
     /// validation/recording. `None` builds the production-wired
@@ -92,6 +94,7 @@ impl LocalBackend {
         Self {
             backend: AnyBackend::auto_select(),
             secret_service: None,
+            installed_mailbox: None,
             command_starter: std::sync::Arc::new(crate::launch::detached::GuestAgentStarter),
         }
     }
@@ -100,6 +103,7 @@ impl LocalBackend {
         Self {
             backend: AnyBackend::from_hypervisor(name),
             secret_service: None,
+            installed_mailbox: None,
             command_starter: std::sync::Arc::new(crate::launch::detached::GuestAgentStarter),
         }
     }
@@ -116,8 +120,64 @@ impl LocalBackend {
         Self {
             backend: AnyBackend::for_started_vm(vm).unwrap_or_else(AnyBackend::auto_select),
             secret_service: None,
+            installed_mailbox: None,
             command_starter: std::sync::Arc::new(crate::launch::detached::GuestAgentStarter),
         }
+    }
+
+    /// Route persistent mailbox grants through this installation's original worker provider.
+    #[must_use]
+    pub fn with_installed_mailbox(
+        mut self,
+        provider: std::sync::Arc<dyn crate::launch::mailbox_owner::InstalledMailboxProvisioner>,
+    ) -> Self {
+        self.installed_mailbox = Some(provider);
+        self
+    }
+
+    fn stop_vm_and_release(&self, id: &MachineId) -> Result<()> {
+        let vid = VmId(id.0.clone());
+        // A persistent machine's session ends at its stop; a transient's ends
+        // when its exit is reported, which seals it. Read before the stop: the
+        // plan lives in the state dir the stop removes.
+        let stopped_session = mvm_core::config::machine_spec_path(&id.0)
+            .exists()
+            .then(|| mvm_hostd::audit::plan_persist::read_plan(&id.0).ok())
+            .flatten();
+        // Stop via the VMM that actually started this VM (resolved from its
+        // per-VM state-dir pid marker) so a QEMU/libkrun VM is torn down by its
+        // own hypervisor, not this client's default. A marker-less VM (mock or
+        // direct-boot) has no owning marker, so fall back to this client's
+        // configured backend — which keeps a `with_hypervisor("mock")` client
+        // hermetic rather than reaching a platform default.
+        let result = match AnyBackend::for_started_vm(&id.0) {
+            Some(owner) => owner.stop(&vid),
+            None => self.backend.stop(&vid),
+        };
+        // Deregister from the name registry only on a successful stop; on
+        // failure the entry (and any readiness the caller recorded) stays so
+        // the user can see what happened. A persistent machine's spec is
+        // never touched by stop — only remove deletes a definition.
+        if result.is_ok() {
+            // Seal first: the session ended with the stop, and nothing below
+            // may skip recording that.
+            if let Some(plan) = &stopped_session {
+                crate::launch::seal_stopped_session(plan, &id.0);
+            }
+            deregister_from_name_registry(&id.0);
+            // Release the stopped owner's volume-attachment leases (re-sealing
+            // any just-in-time unlocked volume). Best-effort: the stop itself
+            // already succeeded.
+            if let Err(e) = self.release_stopped_leases(&id.0) {
+                tracing::warn!(error = %e, machine = %id.0, "releasing volume leases after stop failed");
+            }
+            remove_stopped_runtime_state(&id.0)?;
+        } else if let (Err(e), Some(plan)) = (&result, &stopped_session) {
+            // The machine may still be running, so its session stays open; the
+            // failed stop is still put on the record under its plan.
+            crate::launch::record_session_stop_failure(Some(plan), &id.0, &format!("{e:#}"));
+        }
+        result.map(|_timing| ()).map_err(backend_err)
     }
 
     /// Replace the secret lifecycle service this client validates and
@@ -821,6 +881,10 @@ pub(crate) fn deregister_from_name_registry(name: &str) {
     }
 }
 
+pub(crate) fn lifecycle_err(e: anyhow::Error) -> MvmError {
+    e.downcast::<MvmError>().unwrap_or_else(backend_err)
+}
+
 pub(crate) fn backend_err(e: impl std::fmt::Display) -> MvmError {
     MvmError::Backend {
         reason: e.to_string(),
@@ -1259,48 +1323,10 @@ impl MvmClient for LocalBackend {
     }
 
     async fn stop_machine(&self, id: &MachineId) -> Result<()> {
-        let vid = VmId(id.0.clone());
-        // A persistent machine's session ends at its stop; a transient's ends
-        // when its exit is reported, which seals it. Read before the stop: the
-        // plan lives in the state dir the stop removes.
-        let stopped_session = mvm_core::config::machine_spec_path(&id.0)
-            .exists()
-            .then(|| mvm_hostd::audit::plan_persist::read_plan(&id.0).ok())
-            .flatten();
-        // Stop via the VMM that actually started this VM (resolved from its
-        // per-VM state-dir pid marker) so a QEMU/libkrun VM is torn down by its
-        // own hypervisor, not this client's default. A marker-less VM (mock or
-        // direct-boot) has no owning marker, so fall back to this client's
-        // configured backend — which keeps a `with_hypervisor("mock")` client
-        // hermetic rather than reaching a platform default.
-        let result = match AnyBackend::for_started_vm(&id.0) {
-            Some(owner) => owner.stop(&vid),
-            None => self.backend.stop(&vid),
-        };
-        // Deregister from the name registry only on a successful stop; on
-        // failure the entry (and any readiness the caller recorded) stays so
-        // the user can see what happened. A persistent machine's spec is
-        // never touched by stop — only remove deletes a definition.
-        if result.is_ok() {
-            // Seal first: the session ended with the stop, and nothing below
-            // may skip recording that.
-            if let Some(plan) = &stopped_session {
-                crate::launch::seal_stopped_session(plan, &id.0);
-            }
-            deregister_from_name_registry(&id.0);
-            // Release the stopped owner's volume-attachment leases (re-sealing
-            // any just-in-time unlocked volume). Best-effort: the stop itself
-            // already succeeded.
-            if let Err(e) = self.release_stopped_leases(&id.0) {
-                tracing::warn!(error = %e, machine = %id.0, "releasing volume leases after stop failed");
-            }
-            remove_stopped_runtime_state(&id.0)?;
-        } else if let (Err(e), Some(plan)) = (&result, &stopped_session) {
-            // The machine may still be running, so its session stays open; the
-            // failed stop is still put on the record under its plan.
-            crate::launch::record_session_stop_failure(Some(plan), &id.0, &format!("{e:#}"));
-        }
-        result.map(|_timing| ()).map_err(backend_err)
+        crate::launch::mailbox_owner::stop_with(&id.0, self.installed_mailbox.as_deref(), || {
+            self.stop_vm_and_release(id).map_err(anyhow::Error::from)
+        })
+        .map_err(lifecycle_err)
     }
 
     async fn pause_machine(&self, id: &MachineId, opts: PauseOpts) -> Result<PauseOutcome> {

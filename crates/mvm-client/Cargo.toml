@@ -151,6 +151,7 @@ schemars = { version = "0.8", optional = true }
 # O_NONBLOCK, so a path swapped for a symlink or a FIFO is refused, not read.
 # Already in this crate's closure through mvm-runtime.
 libc.workspace = true
+rustix = { version = "1.1", features = ["fs"] }
 
 [[bin]]
 name = "emit_policy_schema"

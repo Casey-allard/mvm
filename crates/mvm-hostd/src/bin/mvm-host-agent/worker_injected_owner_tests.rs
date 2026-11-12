@@ -99,6 +99,7 @@ fn call(
 
 struct ObservedFactory(Arc<std::sync::Mutex<Option<u32>>>, Arc<dyn MailboxWorkerFactory>);
 impl MailboxWorkerFactory for ObservedFactory {
+    fn requires_signed_provision(&self) -> bool { self.1.requires_signed_provision() }
     fn admit(&self, request: &MailboxWorkerRequest) -> io::Result<()> { self.1.admit(request) }
     fn spawn(
         &self,
@@ -167,7 +168,7 @@ fn run_installed(signed_stop: Option<bool>) -> Result<()> {
             let child_pid = Arc::new(std::sync::Mutex::new(None));
             let mut admitted = request("local", "installed-child");
             let (factory, config): (Arc<dyn MailboxWorkerFactory>, _) = if signed_stop.is_some() {
-                use mvm_hostd::broker::mailbox_workers::OwnedMailboxWorkerFactory;
+                use mvm_hostd::broker::mailbox_workers::InstalledMailboxWorkerFactory;
                 use mvm_hostd::{mailbox_launch, mailbox_process};
                 let profile = std::env::current_exe()?.parent().and_then(Path::parent).context("Cargo profile directory")?.to_owned();
                 let state = mvm_core::config::vm_state_dir_at(&home, &admitted.vm_id);
@@ -176,8 +177,11 @@ fn run_installed(signed_stop: Option<bool>) -> Result<()> {
                 let keys = home.join("keys");
                 let grant = &mut admitted.mailbox_grant;
                 grant.authority_key = mailbox_launch::authority_key_for(&keys, &grant.mailbox, grant.epoch)?.to_bytes();
-                let factory = OwnedMailboxWorkerFactory::new(&profile.join("mvm-mailbox"), worker.resources.binding.clone(), &admitted, &state)?;
-                let config = mailbox_process::build_config(&keys, &admitted.mailbox_grant, &state, factory.route().clone())?;
+                let factory = InstalledMailboxWorkerFactory::new(&profile.join("mvm-mailbox"), worker.resources.binding.clone(), &home)?;
+                let route = mvm_runtime::AnyBackend::from_hypervisor("firecracker")
+                    .host_dial_route(&state, mvm_contract::protocol::mailbox::MAILBOX_PORT)
+                    .context("canonical Firecracker mailbox route")?;
+                let config = mailbox_process::build_config(&keys, &admitted.mailbox_grant, &state, route)?;
                 (Arc::new(factory), Some(config))
             } else { (Arc::new(FixtureHelper), None) };
             let workers = Arc::new(MailboxWorkers::new(
@@ -209,13 +213,40 @@ fn run_installed(signed_stop: Option<bool>) -> Result<()> {
             worker.control = Some(ControlLoopHandle::spawn(worker.daemon.clone(), listener));
             let socket = worker.cfg.control_socket.clone();
             let key = signer.signing.to_bytes();
+            let resource_epoch = worker.generation.resource_epoch();
             let (mut current, owner) = tokio::task::spawn_blocking(move || -> io::Result<_> {
                 let mut current = admitted;
                 if config.is_some() {
+                    if call(&key, &socket, &current).is_ok() {
+                        return Err(io::Error::other("Acquire minted an unprovisioned worker"));
+                    }
+                    let mut probe = current.clone();
+                    probe.operation = MailboxWorkerOperation::LookupExistingV1;
+                    if call(&key, &socket, &probe).is_ok() {
+                        return Err(io::Error::other("lookup minted an unprovisioned worker"));
+                    }
+                    probe.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: resource_epoch + 1 };
+                    if call(&key, &socket, &probe).is_ok() {
+                        return Err(io::Error::other("foreign installation epoch provisioned a worker"));
+                    }
+                    probe.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch };
+                    let reserved = call(&key, &socket, &probe)?.0;
+                    probe.operation = MailboxWorkerOperation::LookupExistingV1;
+                    let (lookup, fd) = call(&key, &socket, &probe)?;
+                    if lookup != reserved || fd.is_some() {
+                        return Err(io::Error::other("lookup lost original reservation"));
+                    }
                     let mut foreign = current.clone();
                     foreign.plan_commitment = [99; 32];
                     if call(&key, &socket, &foreign).is_ok() {
                         return Err(io::Error::other("unadmitted VM context acquired a worker"));
+                    }
+                    foreign = current.clone();
+                    foreign.vm_id = "second-active".into();
+                    foreign.workload_id = foreign.vm_id.clone();
+                    foreign.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch };
+                    if call(&key, &socket, &foreign).is_ok() {
+                        return Err(io::Error::other("second live VM exceeded installed host budget"));
                     }
                 }
                 let acquired = call(&key, &socket, &current)?.0;

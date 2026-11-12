@@ -184,6 +184,15 @@ fn register_vm_name(vm_name: &str, network_name: &str) {
 pub fn start_persistent_oci_machine(
     params: PersistentImageStartParams<'_>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    let vacant = super::mailbox_owner::VacantOwner::claim(params.name)?;
+    start_persistent_with_mailbox(params, None, vacant)
+}
+
+pub(super) fn start_persistent_with_mailbox(
+    params: PersistentImageStartParams<'_>,
+    provisioner: Option<&dyn super::mailbox_owner::InstalledMailboxProvisioner>,
+    vacant: super::mailbox_owner::VacantOwner,
+) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
     let PreparedPersistentBoot {
         backend,
         start_config,
@@ -195,13 +204,15 @@ pub fn start_persistent_oci_machine(
     let name = name_label.as_str();
     let backend_label = backend.name().to_string();
     let backend_name = backend_label.as_str();
-    finish_legacy_persistent(
+    finish_persistent(
         backend,
         start_config,
         admission,
         prepared_volumes,
         name,
         backend_name,
+        provisioner,
+        vacant,
     )
 }
 
@@ -480,21 +491,32 @@ fn complete_writable_images(
     Ok(())
 }
 
-fn finish_legacy_persistent(
+fn finish_persistent(
     backend: mvm_runtime::backend::AnyBackend,
     start_config: mvm_core::vm_backend::VmStartConfig,
     admission: crate::admission::AdmissionContext,
     mut prepared_volumes: crate::volume::LaunchPreparation,
     name: &str,
     backend_name: &str,
+    provisioner: Option<&dyn super::mailbox_owner::InstalledMailboxProvisioner>,
+    vacant: super::mailbox_owner::VacantOwner,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    mvm_hostd::mailbox_process::require_servable(&start_config, &backend)?;
+    let mut owned = match (provisioner, admission.admitted.plan().mailbox.as_ref()) {
+        (Some(host), Some(_)) => Some(super::mailbox_owner::OwnedLaunch::begin(
+            host,
+            &admission.admitted,
+            &backend,
+            vacant,
+        )?),
+        _ => None,
+    };
     // VMM selection + workload-support check + start move behind the facade; the
     // admission gate (above) and the launched/failed emits stay here.
     #[cfg(unix)]
     let started = match (|| -> Result<_> {
         let mut images = prepared_volumes.take_writable_images();
         complete_writable_images(&start_config, &mut images)?;
-        mvm_hostd::mailbox_process::require_servable(&start_config, &backend)?;
         Ok(crate::boot::start_prepared_custodied(
             backend,
             &start_config,
@@ -519,12 +541,27 @@ fn finish_legacy_persistent(
     };
     // The guest asserts a mailbox exactly when the plan grants one, so the
     // host side starts here or the launch is rolled back.
-    if let Err(error) =
-        mvm_hostd::mailbox_process::serve_started(started.backend(), started.vm_id(), &start_config)
-    {
+    let serving = match &owned {
+        Some(worker) => worker.configure_and_wait(started.backend()),
+        None => mvm_hostd::mailbox_process::serve_started(
+            started.backend(),
+            started.vm_id(),
+            &start_config,
+        ),
+    };
+    if let Err(error) = serving {
+        if owned.is_some()
+            && let Err(abort) = started.backend().abort_start(started.vm_id())
+        {
+            prepared_volumes.commit();
+            emit_failed(&admission, "mailbox-process", &error);
+            return Err(error.context(format!(
+                "original backend could not abort mailbox launch: {abort:#}"
+            )));
+        }
         emit_failed(&admission, "mailbox-process", &error);
-        if let Err(cleanup_error) = crate::local::remove_stopped_runtime_state(name) {
-            tracing::warn!(error = %cleanup_error, machine = name, "removing runtime state after a refused mailbox failed");
+        if let Err(cleanup) = cleanup_aborted_mailbox(name, owned.as_mut(), &mut prepared_volumes) {
+            return Err(error.context(format!("mailbox rollback remains unresolved: {cleanup:#}")));
         }
         return Err(error);
     }
@@ -546,12 +583,11 @@ fn finish_legacy_persistent(
             audit_detached_readiness_failure(&admission, name, &error);
             // The failure record and session seal live under the runtime
             // state directory, so cleanup must follow audit finalization.
-            if let Err(cleanup_error) = crate::local::remove_stopped_runtime_state(name) {
-                tracing::warn!(
-                    error = %cleanup_error,
-                    machine = name,
-                    "removing runtime state after completed launch abort failed"
-                );
+            if let Err(cleanup) =
+                cleanup_aborted_mailbox(name, owned.as_mut(), &mut prepared_volumes)
+            {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("mailbox rollback remains unresolved: {cleanup:#}")));
             }
         }
         return Err(anyhow::Error::new(error));
@@ -561,19 +597,48 @@ fn finish_legacy_persistent(
     // `apply_grants` on the path `mvmctl` boots: without it the tier is
     // computed correctly and reported to nobody. A failure here has already
     // stopped the VM, so the volume leases are released rather than committed.
-    super::grants_report::report_enforced_grants(&admission, &started)?;
-    // File what this boot committed against the host budget before the volume
-    // leases commit: every later admission's committed-total check sums these
-    // per-VM records, and a boot that never wrote one was invisible to it.
-    // Fatal, like the grants step above — the VM stops rather than stay up as
-    // a machine the host's accounting never saw, and the uncommitted leases
-    // release with the rollback.
-    super::budget_charge::record_boot_charge(&admission, name, &started)?;
+    let enforce = super::grants_report::report_enforced_grants(&admission, &started)
+        .and_then(|_| super::budget_charge::record_boot_charge(&admission, name, &started));
+    if let Err(error) = enforce {
+        if owned.is_some() {
+            if mvm_hostd::plan_admission::rollback_is_unconfirmed(&error) {
+                prepared_volumes.commit();
+            } else if let Err(cleanup) =
+                cleanup_aborted_mailbox(name, owned.as_mut(), &mut prepared_volumes)
+            {
+                return Err(
+                    error.context(format!("mailbox rollback remains unresolved: {cleanup:#}"))
+                );
+            }
+        }
+        return Err(error);
+    }
     prepared_volumes.commit();
     emit_launched(&admission, backend_name, true);
     record_vm_readiness(name, InstanceReadiness::LaunchAccepted);
     mvm_core::audit_emit!(VmStart, vm: name);
+    if let Some(worker) = owned {
+        worker.commit();
+    }
     Ok(admission.admitted)
+}
+
+fn cleanup_aborted_mailbox(
+    name: &str,
+    worker: Option<&mut super::mailbox_owner::OwnedLaunch>,
+    volumes: &mut crate::volume::LaunchPreparation,
+) -> Result<()> {
+    let cleanup = || crate::local::remove_stopped_runtime_state(name).map_err(anyhow::Error::from);
+    if let Some(worker) = worker {
+        worker
+            .rollback_after_abort(cleanup)
+            .inspect_err(|_| volumes.commit())
+    } else {
+        if let Err(error) = cleanup() {
+            tracing::warn!(%error, machine = name, "removing runtime state after launch abort failed");
+        }
+        Ok(())
+    }
 }
 
 fn audit_detached_readiness_failure(
