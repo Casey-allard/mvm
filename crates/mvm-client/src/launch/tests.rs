@@ -1536,8 +1536,9 @@ async fn a_restart_re_admits_under_the_persisted_grants_not_deny_all() {
     });
     mp::save_machine_spec(&spec, false).unwrap();
 
+    let reservation = super::PairedBootReservation::for_lifecycle_mutation(&spec.name).unwrap();
     let (started, _) = client
-        .boot_spec(&mut spec, None, false, None, None)
+        .boot_spec(&mut spec, None, false, None, None, &reservation)
         .await
         .expect("the start boots");
     let admitted = started
@@ -2109,6 +2110,32 @@ async fn persistent_journal_request_without_original_owner_never_creates_a_machi
     assert!(error.to_string().contains("journal direction"), "{error}");
     assert!(!client.machine_running(name));
     assert!(!machine_spec_path(name).exists());
+}
+
+/// An already reserved machine must retain its original runtime through ordinary SDK calls.
+#[tokio::test]
+async fn persistent_ordinary_and_transient_starts_respect_the_original_reservation() {
+    use mvm_hostd::mailbox_process::original_journal::PairedBootReservation;
+    let home = Isolated::new();
+    let name = "reserved-sdk";
+    let client = mock_client();
+    let _reservation = PairedBootReservation::for_lifecycle_mutation(name).unwrap();
+    let state = mvm_core::config::vm_state_dir(name);
+    std::fs::create_dir_all(&state).unwrap();
+    let original = state.join("original-custody");
+    std::fs::write(&original, b"preserved").unwrap();
+    for request in [
+        persistent_request(&home.rootfs(), name).build().unwrap(),
+        transient_request(&home.rootfs())
+            .name(name)
+            .build()
+            .unwrap(),
+    ] {
+        let error = client.launch(request).await.unwrap_err();
+        assert!(error.to_string().contains("machine lifecycle"), "{error}");
+        assert_eq!(std::fs::read(&original).unwrap(), b"preserved");
+        assert!(!machine_spec_path(name).exists());
+    }
 }
 
 /// Persisting a definition never persists the request's mailbox authority.

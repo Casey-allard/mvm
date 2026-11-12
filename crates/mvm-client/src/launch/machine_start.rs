@@ -239,7 +239,8 @@ pub fn start_machine_spec(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
-    start_machine_spec_with_journal(spec, host, params, None)
+    let reservation = super::PairedBootReservation::for_lifecycle_mutation(&spec.name)?;
+    start_machine_spec_with_journal(spec, host, params, None, &reservation)
 }
 
 pub(super) fn start_machine_spec_with_journal(
@@ -247,15 +248,13 @@ pub(super) fn start_machine_spec_with_journal(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
     journal: Option<&mut InstalledJournal<'_>>,
+    reservation: &super::PairedBootReservation,
 ) -> Result<MachineStart> {
+    reservation.require_name(&spec.name)?;
     persistent::journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     AnyBackend::require_hypervisor_selectable(params.hypervisor)?;
-    let _boot_reservation = if journal.is_some() {
-        Some(
-            mvm_hostd::mailbox_process::original_journal::PairedBootReservation::acquire(
-                &spec.name,
-            )?,
-        )
+    let fresh_state = if journal.is_some() {
+        Some(reservation.prepare_journal_runtime(&spec.name)?)
     } else {
         super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
         None
@@ -320,6 +319,7 @@ pub(super) fn start_machine_spec_with_journal(
             backend: host.backend(params.hypervisor),
         },
         journal,
+        fresh_state,
     )?;
     Ok(MachineStart {
         resolved_digest: boot.digest,

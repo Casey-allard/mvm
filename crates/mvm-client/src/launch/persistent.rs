@@ -185,12 +185,14 @@ fn register_vm_name(vm_name: &str, network_name: &str) {
 pub fn start_persistent_oci_machine(
     params: PersistentImageStartParams<'_>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
-    start_persistent(params, None)
+    let _reservation = super::PairedBootReservation::for_lifecycle_mutation(params.name)?;
+    start_persistent(params, None, None)
 }
 
 pub(super) fn start_persistent(
     params: PersistentImageStartParams<'_>,
     journal: Option<&mut journal::InstalledJournal<'_>>,
+    fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
     journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     let PreparedPersistentBoot {
@@ -212,6 +214,7 @@ pub(super) fn start_persistent(
         name,
         backend_name,
         journal,
+        fresh_state,
     )
 }
 
@@ -500,6 +503,7 @@ fn finish_legacy_persistent(
     name: &str,
     backend_name: &str,
     journal: Option<&mut journal::InstalledJournal<'_>>,
+    fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
     let mailbox_posture = admission.admitted.mailbox_posture();
     // VMM selection + workload-support check + start move behind the facade; the
@@ -513,6 +517,9 @@ fn finish_legacy_persistent(
             &backend,
             mailbox_posture.as_ref(),
         )?;
+        if let Some(state) = fresh_state {
+            state.commit();
+        }
         Ok(crate::boot::start_prepared_custodied(
             backend,
             &start_config,
