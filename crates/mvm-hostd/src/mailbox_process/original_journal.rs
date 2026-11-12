@@ -344,6 +344,25 @@ mod tests {
     }
 
     #[test]
+    fn crash_before_child_publication_preserves_unresolved_custody() {
+        const CHILD: &str = "MVM_TEST_CRASH_BEFORE_ORIGINAL_JOURNAL_SPAWN";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = Path::new(&path);
+            let _guard = claim_launch(path, path, true).unwrap();
+            let _marker = OriginalMarker::claim(path).unwrap();
+            std::process::exit(71);
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let status = Command::new(std::env::current_exe().unwrap()).args([
+            "mailbox_process::original_journal::tests::crash_before_child_publication_preserves_unresolved_custody",
+            "--exact"
+        ]).env(CHILD,dir.path()).stdout(Stdio::null()).status().unwrap();
+        assert_eq!(status.code(), Some(71));
+        assert!(claim_launch(dir.path(), dir.path(), false).is_err());
+        assert!(claim_launch(dir.path(), dir.path(), true).is_err());
+    }
+
+    #[test]
     fn only_original_kernel_peer_can_receive_the_direction() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("b.sock");
