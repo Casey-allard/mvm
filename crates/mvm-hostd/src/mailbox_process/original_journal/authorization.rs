@@ -174,6 +174,15 @@ impl OriginalJournalDestination {
         grants: &JournalCredentials,
         deadline: Instant,
     ) -> Result<()> {
+        self.connect_for_proposal(plan, grants, deadline).map(drop)
+    }
+
+    pub(super) fn connect_for_proposal(
+        &mut self,
+        plan: &ExecutionPlan,
+        grants: &JournalCredentials,
+        deadline: Instant,
+    ) -> Result<std::os::unix::net::UnixStream> {
         let grant = plan.mailbox.as_ref().context("source has no mailbox")?;
         let d = grant
             .outbound_journal_v1
@@ -185,7 +194,10 @@ impl OriginalJournalDestination {
         );
         check_projection(grant, d)?;
         require_destination(d, &self.boot, self.address, self.policy_epoch)?;
-        ensure!(self.incoming.as_ref().is_some_and(|i|i.agrees(grants)), "B did not admit these original sender and reader credentials");
+        ensure!(
+            self.incoming.as_ref().is_some_and(|i| i.agrees(grants)),
+            "B did not admit these original sender and reader credentials"
+        );
         let now = now_ms()?;
         let source = journal_scope_before_launch(&self.keys_dir, grant, now)?;
         mvm_core::naming::validate_vm_name(&plan.image.name)?;
@@ -227,8 +239,7 @@ impl OriginalJournalDestination {
             now,
             d.max_payload_bytes,
         )?;
-        drop(self.connect(deadline)?);
-        Ok(())
+        self.connect(deadline)
     }
 }
 

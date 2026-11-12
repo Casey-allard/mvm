@@ -117,6 +117,20 @@ impl OriginalJournalSourceHost {
     /// Nonblocking on an idle listener. One shared action deadline for all
     /// socket traffic and revocation sampling once A has connected.
     pub fn forward_once(&mut self, until: Instant) -> Result<bool> {
+        let d = self
+            .plan
+            .mailbox
+            .as_ref()
+            .and_then(|g| g.outbound_journal_v1.as_ref())
+            .context("missing enrolled A direction")?;
+        let now = super::authorization::now_ms()?;
+        ensure!(
+            (d.not_before_unix_ms..d.expires_at_unix_ms).contains(&now),
+            "original A direction expired"
+        );
+        let window = std::time::Duration::from_millis((d.expires_at_unix_ms - now) as u64)
+            .min(std::time::Duration::from_secs(12));
+        let until = until.min(Instant::now() + window);
         ensure!(
             Instant::now() < until && self.source.try_wait()?.is_none(),
             "original A helper unavailable"
@@ -134,7 +148,6 @@ impl OriginalJournalSourceHost {
             .destination
             .try_lock()
             .map_err(|_| anyhow::anyhow!("original B helper is busy"))?;
-        dest.check_proposal(&self.plan, &self.grants, until)?;
         let mut a = crate::mailbox_service::durable::GuestDeadline {
             stream: &mut a,
             until,
@@ -151,8 +164,7 @@ impl OriginalJournalSourceHost {
                 && encode_frame(&send, &envelope).ok().as_ref() == Some(&body),
             "A ciphertext did not carry the original canonical Send credential"
         );
-        dest.check_proposal(&self.plan, &self.grants, until)?;
-        let mut b = dest.connect(until)?;
+        let mut b = dest.connect_for_proposal(&self.plan, &self.grants, until)?;
         let mut b = crate::mailbox_service::durable::GuestDeadline {
             stream: &mut b,
             until,
