@@ -129,6 +129,17 @@ impl OriginalJournalSourceHost {
     }
 
     pub fn forward_once_with_counts(&mut self, until: Instant) -> Result<Option<CompletedRelayIo>> {
+        self.forward_once_observed(until, |_, _| {})
+    }
+
+    /// Observe the original public envelope and exact verdict only after both
+    /// original helper exchanges have completed. The observer cannot alter them.
+    /// An observed verdict still requires signature, binding and outcome checks.
+    pub fn forward_once_observed(
+        &mut self,
+        until: Instant,
+        observe: impl FnOnce(&mvm_contract::protocol::mailbox::MailboxEnvelope, &[u8]),
+    ) -> Result<Option<CompletedRelayIo>> {
         let d = self
             .plan
             .mailbox
@@ -192,6 +203,7 @@ impl OriginalJournalSourceHost {
             "incomplete or oversized B journal reply"
         );
         a.write_all(&verdict)?;
+        observe(&envelope, &verdict);
         Ok(Some(CompletedRelayIo {
             sealed_to_destination: 4 + body.len(),
             reply_to_source: verdict.len(),
