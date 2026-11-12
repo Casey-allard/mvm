@@ -6,39 +6,7 @@ use mvm_core::{
     vm_backend::HostDialRoute,
 };
 
-#[derive(Default)]
-struct Meter<S> {
-    io: S,
-    read: usize,
-    written: usize,
-}
-impl<S: std::io::Read> std::io::Read for Meter<S> {
-    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.io.read(b)?;
-        self.read += n;
-        Ok(n)
-    }
-}
-impl<S: std::io::Write> std::io::Write for Meter<S> {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        let n = self.io.write(b)?;
-        self.written += n;
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.io.flush()
-    }
-}
-fn thread_cpu() -> u64 {
-    let mut t = std::mem::MaybeUninit::<libc::timespec>::uninit();
-    // SAFETY: on success clock_gettime initializes the provided timespec.
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, t.as_mut_ptr()) },
-        0
-    );
-    let t = unsafe { t.assume_init() };
-    (t.tv_sec as u64) * 1_000_000_000 + t.tv_nsec as u64
-}
+use crate::mailbox_process::destination_ingress::test_meter::{Meter, thread_cpu};
 fn owner(b: u8) -> MailboxWorkerOwner {
     MailboxWorkerOwner {
         daemon_boot_nonce: [42; 32],
@@ -173,7 +141,21 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         now,
     )
     .unwrap();
-    let offer = issue_scoped(&chan, sa, db, g, &src, &dest, now).unwrap();
+    let offer = issue_with_policy(
+        &chan,
+        sa,
+        db,
+        g,
+        &src,
+        &dest,
+        now,
+        Some(destination::policy_digest(&src, &dest).unwrap()),
+    )
+    .unwrap();
+    original_b.setup.destination = Some(Box::new(
+        destination::PrivateDestination::new(&offer, &left, &right, &trust, g, &src, &dest)
+            .unwrap(),
+    ));
     assert_ne!(offer.source.0, offer.destination.0);
     let d = &offer.direction;
     let public = d
@@ -260,14 +242,10 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         )
         .is_err()
     );
-    dst.accept(
-        d,
-        EndpointRole::Destination,
-        &bowner,
-        &offer.destination,
-        now,
-    )
-    .unwrap();
+    let ingress = dst
+        .open_immutable_destination(&bowner, &b.grant)
+        .unwrap()
+        .unwrap();
     assert!(
         dst.accept(
             d,
@@ -475,6 +453,7 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
             )
             .is_ok()
     );
+    crate::mailbox_process::destination_ingress::qualify(&ingress, &b.keys, second, &retry, bytes);
     let mut revoked = receiving.clone();
     revoked
         .revoked_capabilities
