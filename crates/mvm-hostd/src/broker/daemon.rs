@@ -394,6 +394,39 @@ fn active_worker_turn<T>(
     }
 }
 
+/// Wait on the daemon's original mutation lane without holding its mutex.
+async fn worker_reservation_lane(
+    daemon: &Arc<Mutex<HostAgentDaemon>>,
+    workers: &Arc<super::mailbox_workers::MailboxWorkers>,
+    signed: &SignedControl,
+    request: &mvm_core::protocol::mailbox_worker_control::MailboxWorkerRequest,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let ms = request.deadline_unix_ms.min(request.admission_expires_at_unix_ms)
+        .checked_sub(workers.now_unix_ms().ok()?)?;
+    let until = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+    tokio::time::timeout_at(until, async {
+        let lane = daemon.lock().await.mutation_lane();
+        let permit = tokio::select! {
+            biased;
+            _ = stop.changed() => return None,
+            result = lane.acquire_owned() => result.ok()?,
+        };
+        let original = daemon.lock().await;
+        if *stop.borrow() || stop.has_changed().is_err() || original.mailbox_retired
+            || !original.mailbox_workers.as_ref().is_some_and(|live| Arc::ptr_eq(live, workers))
+        {return None;}
+        mvm_core::protocol::mailbox_worker_control::verify_request(
+            signed, &original.verifying_key, workers.now_unix_ms().ok()?,
+        ).ok()?;
+        if let Some(existing) = original.registrations.get(&request.vm_id) {
+            let (owner,active) = workers.try_service_owner(&request.vm_id).ok()??;
+            if !active || existing.mailbox_owner_v1.as_ref() != Some(&owner) { return None; }
+        }
+        Some(permit)
+    }).await.ok().flatten()
+}
+
 /// Called after canonical verification. No durable or in-memory gate is held
 /// through a child operation, descriptor publication, or response write.
 fn dispatch_worker_control(
@@ -2743,17 +2776,24 @@ impl HostAgentDaemon {
             if let Some(workers) = workers {
                 // Reservation bounds pending connections, frames and blocking
                 // jobs. Never queue an unbounded task before admission.
-                let Ok(permit) = workers.reserve_control() else {
-                    continue;
+                // At most this one accepted socket can wait per listener. Other
+                // connections remain in the kernel backlog. No request bytes,
+                // task or blocking job are admitted before the original charge.
+                let ingress_until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                let permit = tokio::select! {
+                    biased;
+                    _ = stopped.changed(), if !stop_requested => continue,
+                    charged = tokio::time::timeout_at(ingress_until, workers.wait_control()) => {
+                        let Ok(Ok(permit)) = charged else {continue};
+                        permit
+                    }
                 };
                 let daemon = daemon.clone();
-                let control_stop = stopped.clone();
+                let mut control_stop = stopped.clone();
                 control_tasks.spawn(async move {
-                    let frame = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        read_frame::<SignedControl>(&mut stream, CONTROL_MAX_FRAME_BYTES),
-                    )
-                    .await;
+                    let frame = tokio::time::timeout_at(
+                        ingress_until, read_frame::<SignedControl>(&mut stream, CONTROL_MAX_FRAME_BYTES),
+                    ).await;
                     let Ok(Ok(signed)) = frame else {
                         return Ok(());
                     };
@@ -2778,26 +2818,24 @@ impl HostAgentDaemon {
                         // Share the mutation lane with original broker registration. A
                         // mailbox cannot appear between the latter's collision check
                         // and publication. Keep the lane through worker slot admission.
-                        let reservation_lane = if let Some(request) = verified.as_ref().filter(|req| matches!(req.operation,
+                        let needs_lane = verified.as_ref().is_some_and(|req| matches!(
+                            req.operation,
                             mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Acquire
-                            | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::ProvisionAdmittedV1 { .. })) {
-                            let original = daemon.lock().await;
-                            let Ok(lane) = original.mutation_lane().try_acquire_owned() else { return Ok(()) };
-                            if let Some(existing) = original.registrations.get(&request.vm_id) {
-                                let matching = workers.try_service_owner(&request.vm_id).ok().flatten()
-                                    .is_some_and(|(owner, active)| active && existing.mailbox_owner_v1.as_ref() == Some(&owner));
-                                if !matching { return Ok(()); }
-                            }
-                            Some(lane)
-                        } else { None };
+                            | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::ProvisionAdmittedV1 { .. }
+                        ));
+                        let reservation_lane = if needs_lane {
+                            worker_reservation_lane(&daemon,&workers,&signed,verified.as_ref().expect("matched request"),&mut control_stop).await
+                        } else {None};
+                        let verified = verified.filter(|_| !needs_lane || reservation_lane.is_some());
                         let Ok(mut stream) = stream.into_std() else {
                             return Ok(());
                         };
                         tokio::task::spawn_blocking(move || {
                             // A canceled async waiter cannot release workspace
                             // credit while this blocking operation still runs.
-                            let _permit = permit;
                             let _reservation_lane = reservation_lane;
+                            // Refund the finishing frame before admitting the next mutation.
+                            let _permit = permit;
                             let Some(request) = verified else {
                                 let _ = super::mailbox_workers::write_error(
                                     &mut stream,

@@ -69,6 +69,7 @@ pub struct MailboxWorkerBudget {
     ledger: Arc<Mutex<Ledger>>,
     origin: Instant,
     unix_origin_ms: u64,
+    control_released: tokio::sync::Notify,
     clock_high_water: Mutex<u64>,
     cleanup: Arc<CleanupState>,
     sender: Mutex<Option<mpsc::SyncSender<CleanupCell>>>,
@@ -169,6 +170,7 @@ impl MailboxWorkerBudget {
             origin: Instant::now(),
             unix_origin_ms,
             clock_high_water: Mutex::new(unix_origin_ms),
+            control_released: tokio::sync::Notify::new(),
             cleanup,
             sender: Mutex::new(Some(sender)),
             wake: Mutex::new(Some(wake_writer)),
@@ -249,7 +251,11 @@ impl MailboxWorkerBudget {
                 && (ledger.host.workers >= self.limits.host_workers
                     || old.workers >= self.limits.tenant_workers))
         {
-            return Err(refused("shared mailbox worker budget exhausted"));
+            return Err(if worker {
+                refused("shared mailbox worker budget exhausted")
+            } else {
+                io::Error::new(io::ErrorKind::WouldBlock, "shared mailbox control workspace occupied")
+            });
         }
         let cell = if worker {
             Some(
@@ -301,6 +307,7 @@ impl MailboxWorkerBudget {
                 ledger.tenants.remove(tenant);
             }
         }
+        self.control_released.notify_waiters();
     }
     fn collected(&self, tenant: &str) -> io::Result<()> {
         release_worker_credit(&self.ledger, tenant)
@@ -1295,6 +1302,19 @@ impl MailboxWorkers {
             budget: self.budget.clone(),
             tenant: self.tenant.clone(),
         })
+    }
+    /// Called only by the original listener, before reading or spawning a task.
+    /// Waiters subscribe before testing the ledger to avoid a lost refund.
+    pub(crate) async fn wait_control(&self) -> io::Result<WorkerControlPermit> {
+        loop {
+            let released = self.budget.control_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            match self.reserve_control() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => released.await,
+                result => return result,
+            }
+        }
     }
     pub(crate) fn registration_count(&self) -> io::Result<usize> {
         self.expire_terminals()?;
