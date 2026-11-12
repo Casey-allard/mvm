@@ -403,9 +403,52 @@ pub fn dispatch(
     call: EntrypointDispatch<'_>,
     observer: &mut dyn CallObserver,
 ) -> Result<CallOutcome> {
+    dispatch_with_deadline(call, observer, None)
+}
+
+/// Dispatch one complete stdin frame with an absolute transport deadline.
+/// Expiration closes only this caller's socket; guest-side termination,
+/// VM teardown and original-owner collection have separate lifecycles.
+pub fn dispatch_one_shot_before(
+    call: EntrypointDispatch<'_>,
+    observer: &mut dyn CallObserver,
+    deadline: std::time::Instant,
+) -> Result<CallOutcome> {
+    anyhow::ensure!(
+        matches!(call.stdin, DispatchStdin::OneShot(_)),
+        "bounded one-shot dispatch requires a complete stdin frame"
+    );
+    dispatch_with_deadline(call, observer, Some(deadline))
+}
+
+fn dispatch_with_deadline(
+    call: EntrypointDispatch<'_>,
+    observer: &mut dyn CallObserver,
+    deadline: Option<std::time::Instant>,
+) -> Result<CallOutcome> {
     let vm_name = call.vm_name;
     let session_id = call.session_id;
-    match dispatch_inner(call, observer) {
+    let result = (|| {
+        if let Some(deadline) = deadline {
+            let mut stream = mvm_runtime::vsock_transport::connect_for_vm_before(
+                vm_name,
+                mvm_agentd::vsock::GUEST_AGENT_PORT,
+                deadline,
+            )
+            .context("connecting bounded guest control stream")?;
+            return mvm_agentd::vsock::run_with_stream_deadline(&mut stream, deadline, |stream| {
+                dispatch_inner(call, observer, stream)
+            })
+            .context("exchanging bounded guest control frames");
+        }
+        let transport = mvm_runtime::vsock_transport::for_vm(vm_name)
+            .with_context(|| format!("Picking transport for guest agent on '{vm_name}'"))?;
+        let mut stream = transport
+            .connect(mvm_agentd::vsock::GUEST_AGENT_PORT)
+            .with_context(|| format!("Connecting to guest agent on '{vm_name}'"))?;
+        dispatch_inner(call, observer, &mut stream)
+    })();
+    match result {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
             if let Some(id) = session_id
@@ -431,6 +474,7 @@ pub fn dispatch(
 fn dispatch_inner(
     call: EntrypointDispatch<'_>,
     observer: &mut dyn CallObserver,
+    stream: &mut std::os::unix::net::UnixStream,
 ) -> Result<CallOutcome> {
     let EntrypointDispatch {
         vm_name,
@@ -438,12 +482,6 @@ fn dispatch_inner(
         timeout_secs,
         session_id: _,
     } = call;
-    let transport = mvm_runtime::vsock_transport::for_vm(vm_name)
-        .with_context(|| format!("Picking transport for guest agent on '{vm_name}'"))?;
-    let mut stream = transport
-        .connect(mvm_agentd::vsock::GUEST_AGENT_PORT)
-        .with_context(|| format!("Connecting to guest agent on '{vm_name}'"))?;
-
     // Opened before the call is sent, and deliberately: the guest has a stdin
     // to hand frames to only once the entrypoint's child exists, and the pump
     // is built to ride out that window. Opening afterwards would mean opening
@@ -491,7 +529,7 @@ fn dispatch_inner(
     let still_alive = || mvm_runtime::checkpoint::vm_is_running(vm_name);
     let terminal = if prompt {
         mvm_agentd::vsock::send_agent_prompt_while(
-            &mut stream,
+            stream,
             mvm_agentd::vsock::AgentPromptCall {
                 prompt: payload,
                 timeout_secs,
@@ -502,7 +540,7 @@ fn dispatch_inner(
         )
     } else {
         mvm_agentd::vsock::send_run_entrypoint_while(
-            &mut stream,
+            stream,
             mvm_agentd::vsock::RunEntrypointCall {
                 stdin: payload,
                 timeout_secs,
@@ -643,6 +681,50 @@ impl CallObserver for CapturedOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_control_deadline_closes_only_the_silent_original_connection() {
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(dir.path());
+        let keys = mvm_core::config::mvm_keys_dir();
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("host-signer.ed25519"), [31u8; 32]).unwrap();
+        let socket = mvm_core::config::vm_hvf_agent_socket("bounded");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(socket).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).unwrap();
+            input.len()
+        });
+        let start = Instant::now();
+        let error = dispatch_one_shot_before(
+            EntrypointDispatch {
+                vm_name: "bounded",
+                stdin: DispatchStdin::OneShot(vec![7]),
+                timeout_secs: 30,
+                session_id: None,
+            },
+            &mut CapturedOutput::default(),
+            start + Duration::from_millis(200),
+        )
+        .err()
+        .expect("silent guest deadline");
+        assert!(format!("{error:#}").contains("deadline"), "{error:#}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            peer.join().unwrap() > 0,
+            "expected negotiation bytes before shutdown"
+        );
+    }
 
     #[test]
     fn a_normal_exit_keeps_its_code() {
