@@ -2640,6 +2640,52 @@ mod anchor_tests {
     }
 
     #[test]
+    fn full_opportunistic_checkpoint_preserves_live_receipts_and_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (envelope, capability, mut context, key, sender, signer) = message();
+        let (reference, custody) = versioned_custody();
+        let anchor = FileJournalAnchor::open(
+            &dir.path().join("anchor/tip"),
+            address(),
+            [22; 32],
+        ).unwrap();
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root, reference, signer.verifying_key(), quota, &custody, &anchor,
+                local_retention(),
+            ).unwrap()
+        };
+        let mut journal = open(limits());
+        let admission = || super::tests::admission(&envelope, &capability, &context, &key, &sender, &signer);
+        let receipt = journal.admit_local(admission(), &anchor).unwrap();
+        let retained_tip = anchor.tip();
+        // A checkpoint needs temporary space beside the complete retained prefix.
+        let quota = JournalLimits { max_records: 10, max_bytes: journal.bytes + 1 };
+        drop(journal);
+        let mut journal = open(quota);
+        assert!(journal.local_compaction_due(context.now_unix_ms).unwrap());
+        journal.maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor).unwrap();
+        assert!(!journal.local_compaction_due(context.now_unix_ms).unwrap());
+        assert!(matches!(journal.compact_local(context.now_unix_ms, &signer, &anchor),Err(JournalError::Full)));
+        assert_eq!(journal.admit_local(admission(), &anchor).unwrap(), receipt);
+        let (next, cap, ctx, dek, a, b) = message_at(2, 2, context.now_unix_ms);
+        assert!(matches!(journal.admit_local(super::tests::admission(&next,&cap,&ctx,&dek,&a,&b), &anchor), Err(JournalError::Full)));
+        assert_eq!(anchor.tip(), retained_tip);
+        assert!(record_path(&root, 1).exists());
+        drop(journal);
+        let mut journal = open(quota);
+        journal.maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor).unwrap();
+        assert_eq!(journal.admit_local(admission(), &anchor).unwrap(), receipt);
+        // A pre-publication capacity refusal must never mask anchor disagreement.
+        let mut wrong = retained_tip;
+        wrong.cursor += 1;
+        anchor.advance(wrong).unwrap();
+        context.now_unix_ms += 1;
+        assert!(matches!(journal.maintain_local_checkpoint(context.now_unix_ms, &signer,&anchor),Err(JournalError::Rollback)));
+    }
+
+    #[test]
     fn interrupted_terminal_expiry_reconciles_without_an_early_receipt() {
         let dir = tempfile::tempdir().expect("journal root");
         let root = dir.path().join("journal");

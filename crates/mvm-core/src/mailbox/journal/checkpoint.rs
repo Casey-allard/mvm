@@ -225,6 +225,19 @@ impl MailboxJournal {
         Ok(false)
     }
 
+    /// Run opportunistic maintenance separately from explicitly requested checkpoints.
+    pub fn maintain_local_checkpoint(
+        &mut self,
+        now_unix_ms: i64,
+        signer: &SigningKey,
+        anchor: &FileJournalAnchor,
+    ) -> Result<(), JournalError> {
+        if self.local_compaction_due(now_unix_ms)? {
+            self.compact_local(now_unix_ms, signer, anchor)?;
+        }
+        Ok(())
+    }
+
     /// Commit a signed local snapshot before pruning the superseded prefix.
     ///
     /// A quota refusal leaves the old history untouched; uncertain I/O poisons
