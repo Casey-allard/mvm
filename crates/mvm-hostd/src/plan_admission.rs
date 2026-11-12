@@ -843,9 +843,8 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
-    paired_journal: Option<
-        &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission<'a>,
-    >,
+    paired_journal:
+        Option<&'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission>,
 }
 
 impl<'a> RunPosture<'a> {

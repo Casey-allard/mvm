@@ -7,8 +7,8 @@ use crate::mailbox_process::original_journal::authorization::{
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use mvm_contract::protocol::mailbox::{
-    EncryptionContext, MailboxJournalDirectionV1, MailboxOperation, MailboxRoutingFrame,
-    PrincipalId, SignedDestinationReceipt,
+    EncryptionContext, MailboxJournalDirectionV1, MailboxRoutingFrame, PrincipalId,
+    SignedDestinationReceipt,
 };
 use mvm_core::crypto::aead::Key;
 use mvm_core::mailbox::{
