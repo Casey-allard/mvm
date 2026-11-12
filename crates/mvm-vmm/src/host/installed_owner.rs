@@ -230,14 +230,19 @@ fn check_filesystem(file: &File) -> Result<()> {
     // SAFETY: successful fstatfs initialized the whole structure.
     let info = unsafe { info.assume_init() };
     #[cfg(target_os = "linux")]
-    let supported = matches!(
-        info.f_type,
-        libc::EXT4_SUPER_MAGIC
-            | libc::XFS_SUPER_MAGIC
-            | libc::BTRFS_SUPER_MAGIC
-            | libc::TMPFS_MAGIC
-            | libc::OVERLAYFS_SUPER_MAGIC
-    );
+    let supported = {
+        // Linux UAPI <linux/magic.h>. Compare at statfs.f_type's native
+        // width and signedness on GNU and musl; libc omits XFS on musl.
+        const XFS_MAGIC: u32 = 0x5846_5342;
+        [
+            libc::EXT4_SUPER_MAGIC as _,
+            XFS_MAGIC as _,
+            libc::BTRFS_SUPER_MAGIC as _,
+            libc::TMPFS_MAGIC as _,
+            libc::OVERLAYFS_SUPER_MAGIC as _,
+        ]
+        .contains(&info.f_type)
+    };
     #[cfg(target_os = "macos")]
     let supported = {
         let name: Vec<_> = info
