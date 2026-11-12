@@ -611,27 +611,6 @@ fn issue_with_policy(
     now: i64,
     immutable_policy: Option<[u8; 32]>,
 ) -> Result<DirectionDelivery> {
-    issue_with_policy(
-        channel,
-        source,
-        destination,
-        grants,
-        source_policy,
-        destination_policy,
-        now,
-        None,
-    )
-}
-fn issue_with_policy(
-    channel: &CastChannel,
-    source: LaunchCustody,
-    destination: LaunchCustody,
-    grants: AddressedCastGrants<'_>,
-    source_policy: &OpenContext,
-    destination_policy: &OpenContext,
-    now: i64,
-    immutable_policy: Option<[u8; 32]>,
-) -> Result<DirectionDelivery> {
     ensure!(
         source.end.role == EndpointRole::Source
             && destination.end.role == EndpointRole::Destination
