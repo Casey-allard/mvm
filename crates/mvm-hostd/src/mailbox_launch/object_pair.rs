@@ -296,7 +296,8 @@ pub struct InstalledObjectPair<'a> {
     caller: InstalledParticipant<'a>,
     callee: InstalledParticipant<'a>,
     prepared: PreparedObjectPair,
-    registration: crate::mailbox_process::original_journal::object_registration::Registration,
+    pub(crate) registration:
+        crate::mailbox_process::original_journal::object_registration::Registration,
     material: PairMaterial,
 }
 struct PairMaterial {

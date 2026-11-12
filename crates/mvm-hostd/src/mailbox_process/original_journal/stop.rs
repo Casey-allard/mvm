@@ -43,20 +43,6 @@ impl StopCustody {
         name: &str,
         mode: VmmMode,
     ) -> Result<Self> {
-        let state = File::options()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(&config.vm_state_dir)?;
-        let socket_dir = mvm_core::config::vm_socket_dir_at(&config.vm_state_dir);
-        let split_socket = if socket_dir != config.vm_state_dir {
-            let fd = File::options()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-                .open(&socket_dir)?;
-            Some((socket_dir, fd))
-        } else {
-            None
-        };
         let vmm = match mode {
             VmmMode::Installed => {
                 let pid = backend
@@ -74,10 +60,52 @@ impl StopCustody {
             #[cfg(test)]
             VmmMode::HelperFixture => None,
         };
+        Self::capture_state(&config.vm_state_dir, backend.kind(), vmm)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn capture_object(
+        state_dir: &std::path::Path,
+        original: crate::mailbox_launch::object_pair::bootstrap::OriginalVmmId,
+    ) -> Result<Self> {
+        let id = EndpointPid {
+            pid: original.pid.try_into()?,
+            started: Some(original.birth),
+        };
+        ensure!(
+            id.is_live_and_ours(),
+            "original Firecracker generation changed"
+        );
+        let observer = ProcessExitObserver::arm(id.pid)?;
+        ensure!(
+            id.is_live_and_ours(),
+            "original Firecracker generation changed during observation"
+        );
+        Self::capture_state(state_dir, BackendKind::Firecracker, Some((id, observer)))
+    }
+    fn capture_state(
+        state_dir: &std::path::Path,
+        kind: BackendKind,
+        vmm: Option<(EndpointPid, ProcessExitObserver)>,
+    ) -> Result<Self> {
+        let state = File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(state_dir)?;
+        let socket_dir = mvm_core::config::vm_socket_dir_at(state_dir);
+        let split_socket = if socket_dir != state_dir {
+            let fd = File::options()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(&socket_dir)?;
+            Some((socket_dir, fd))
+        } else {
+            None
+        };
         Ok(Self {
             state,
             split_socket,
-            kind: backend.kind(),
+            kind,
             vmm,
             sdk_abort_confirmed: false,
             vm_stopped: false,
@@ -136,6 +164,8 @@ impl StopCustody {
 pub enum JournalOwner<'a> {
     Source(&'a mut OriginalJournalSourceHost),
     Destination(&'a mut OriginalJournalDestination),
+    #[cfg(target_os = "linux")]
+    Object(&'a mut super::object_workers::OriginalObjectWorker),
 }
 
 #[derive(Debug)]
@@ -156,6 +186,15 @@ impl JournalOwner<'_> {
         &mut Child,
     ) {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::Object(w) => (
+                &w.name,
+                &w.boot,
+                &w.claim,
+                &mut w.stop,
+                &mut w.marker,
+                &mut w.child,
+            ),
             Self::Source(a) => (
                 &a.plan.image.name,
                 &a.boot,

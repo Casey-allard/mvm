@@ -4,6 +4,8 @@
 
 pub mod authorization;
 pub(crate) mod object_registration;
+#[cfg(target_os = "linux")]
+pub mod object_workers;
 #[cfg(test)]
 mod paired_process_tests;
 pub mod relay;

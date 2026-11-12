@@ -107,6 +107,21 @@ impl Registration {
         Ok(registration)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn original_claim(
+        &self,
+        role: mvm_core::mailbox::object_pair::role::ObjectParticipantRole,
+    ) -> Result<Arc<LaunchClaim>> {
+        self.require_originals()?;
+        Ok(Arc::clone(match role {
+            mvm_core::mailbox::object_pair::role::ObjectParticipantRole::Caller => {
+                &self.caller._claim
+            }
+            mvm_core::mailbox::object_pair::role::ObjectParticipantRole::Callee => {
+                &self.callee._claim
+            }
+        }))
+    }
     pub(crate) fn require_originals(&self) -> Result<()> {
         for original in [&self.caller, &self.callee] {
             original.state.require_current()?;
