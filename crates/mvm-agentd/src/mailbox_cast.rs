@@ -149,7 +149,10 @@ impl GuestCastEndpoint {
 }
 
 fn send(socket: &UnixDatagram, bytes: &[u8]) -> io::Result<()> {
-    if socket.send(bytes)? != bytes.len() {
+    let accepted = socket.send(bytes)?;
+    #[cfg(test)]
+    tests::record_write(accepted);
+    if accepted != bytes.len() {
         return Err(invalid("incomplete workload datagram"));
     }
     Ok(())
@@ -237,7 +240,8 @@ impl CastWorkloadReader {
 
     /// Supply the exact Cast to the workload and send its local receipt only
     /// after the callback succeeds. An identical retry re-ACKs without a
-    /// second callback. No recovery of application effects after process loss.
+    /// second callback. If the callback applies an effect and returns an error,
+    /// a retry may apply it again. No crash journal or processing receipt exists.
     pub fn receive_with(
         &mut self,
         consume: impl FnOnce(&LocalDelivery) -> io::Result<()>,

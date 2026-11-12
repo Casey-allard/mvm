@@ -1,4 +1,3 @@
-
 use super::*;
 use ed25519_dalek::SigningKey;
 use mvm_contract::protocol::mailbox::{
@@ -263,4 +262,127 @@ fn a_stream_or_named_socket_cannot_replace_the_private_workload_fd() {
     let path = dir.path().join("named");
     let named = UnixDatagram::bind(&path).unwrap();
     assert!(CastWorkloadReader::from_launch_fd(named.into(), context).is_err());
+}
+
+thread_local! { static ACCEPTED_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+pub(super) fn record_write(n: usize) {
+    ACCEPTED_WRITES.with(|v| v.set(v.get().checked_add(n).unwrap()));
+}
+
+fn cpu_ns() -> u64 {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: a successful clock_gettime initializes exactly one timespec.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) },
+        0
+    );
+    let time = unsafe { time.assume_init() };
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+}
+
+fn workload_payload() -> Vec<u8> {
+    let mut bytes: Vec<_> = (0..257).map(|i| (i * 43) as u8).collect();
+    bytes[255..].fill(0);
+    bytes
+}
+
+/// Original workload fd crosses an actual exec as stdin. The child reads from
+/// the production workload API and returns its positive canonical receipt.
+#[test]
+fn original_cast_crosses_process_boundary_with_verified_callback_and_role_counters() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::fd::AsFd;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    const CONTEXT: &str = "MVM_TEST_ORIGINAL_CAST_WORKLOAD_CONTEXT";
+    const SELECTOR: &str = "mailbox_cast::tests::original_cast_crosses_process_boundary_with_verified_callback_and_role_counters";
+    if let Some(config) = std::env::var_os(CONTEXT) {
+        let config = serde_json::from_slice(config.as_encoded_bytes()).unwrap();
+        let fd = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+        let mut reader = CastWorkloadReader::from_launch_fd(fd, config).unwrap();
+        let expected = workload_payload();
+        println!("CAST_WORKLOAD_READY");
+        std::io::stdout().flush().unwrap();
+        let start = Instant::now();
+        let cpu = cpu_ns();
+        ACCEPTED_WRITES.with(|n| n.set(0));
+        assert!(
+            reader
+                .receive_with(|item| {
+                    assert_eq!(item.delivery_sequence, 1);
+                    assert_eq!(item.message_id, MessageId::from_bytes([2; 32]));
+                    assert_eq!(item.body, expected);
+                    Ok(())
+                })
+                .unwrap()
+        );
+        let cpu = cpu_ns() - cpu;
+        let wall = start.elapsed().as_nanos();
+        println!(
+            "CAST_WORKLOAD_RESULT {}",
+            serde_json::json!({
+                "verified_payload_bytes":expected.len(), "expected_and_verified_digest":mvm_core::crypto::image_verify::sha256_generated_bytes(&expected).unwrap(),
+                "workload_cpu_ns":cpu,"workload_wait_and_callback_wall_ns":wall,"workload_to_agent_accepted_bytes":ACCEPTED_WRITES.with(|n|n.get()),
+            })
+        );
+        return;
+    }
+    let start = Instant::now();
+    let (mut guest, reader, hello, mut item) = fixture();
+    item.body = workload_payload();
+    assert_eq!(
+        admit(&mut guest, hello, &item),
+        LocalInboxDisposition::Accepted
+    );
+    guest
+        .workload
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (fd, config) = reader.into_launch_fd().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", SELECTOR, "--nocapture", "--test-threads=1"])
+        .env(CONTEXT, serde_json::to_string(&config).unwrap())
+        .stdin(Stdio::from(fd))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    // Child either reports readiness, exits with a diagnostic, or reaches its
+    // bounded socket read. No network or second helper is created by this test.
+    loop {
+        line.clear();
+        if output.read_line(&mut line).unwrap() == 0 {
+            panic!("workload exited before readiness: {:?}", child.wait());
+        }
+        if line.trim_end().ends_with("CAST_WORKLOAD_READY") {
+            break;
+        }
+    }
+    let setup = start.elapsed();
+    ACCEPTED_WRITES.with(|n| n.set(0));
+    let transfer = Instant::now();
+    let cpu = cpu_ns();
+    let confirmed = guest.offer_to_workload();
+    let cpu = cpu_ns() - cpu;
+    let wall = transfer.elapsed().as_nanos();
+    let total = start.elapsed().as_nanos();
+    let mut trailing = String::new();
+    output.take(8192).read_to_string(&mut trailing).unwrap();
+    assert!(child.wait().unwrap().success(), "{trailing}");
+    assert!(confirmed.unwrap());
+    assert!(!guest.offer_to_workload().unwrap());
+    let data = trailing
+        .lines()
+        .find_map(|line| line.strip_prefix("CAST_WORKLOAD_RESULT "))
+        .unwrap();
+    let mut measurements = serde_json::from_str::<serde_json::Value>(data).unwrap();
+    measurements["setup_through_workload_ready_wall_ns"] =
+        u64::try_from(setup.as_nanos()).unwrap().into();
+    measurements["agent_to_workload_accepted_bytes"] = ACCEPTED_WRITES.with(|n| n.get()).into();
+    measurements["agent_cpu_ns"] = cpu.into();
+    measurements["offer_through_confirmed_ack_wall_ns"] = u64::try_from(wall).unwrap().into();
+    measurements["start_through_confirmed_ack_wall_ns"] = u64::try_from(total).unwrap().into();
+    println!("CAST_COMPONENT {}", measurements);
 }
