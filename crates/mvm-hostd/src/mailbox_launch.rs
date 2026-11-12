@@ -18,6 +18,8 @@
 //! exists. The shred overwrites and unlinks the file; it is not a physical
 //! wipe, and a filesystem may keep the old blocks.
 
+#[cfg(feature = "installed-cast-witness")]
+pub mod cast_fixture;
 pub mod cast_pair;
 pub mod cast_enrollment;
 
