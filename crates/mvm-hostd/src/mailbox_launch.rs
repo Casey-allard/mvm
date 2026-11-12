@@ -485,6 +485,7 @@ fn serve_derived_with(
             &mut sealer,
             &thread_stop,
             fast_attempts,
+            None,
         );
     });
     MailboxLaunch { stop, service }
@@ -493,12 +494,19 @@ fn serve_derived_with(
 /// A helper owns the original dial thread until the parent closes FD 3.
 pub struct OwnedMailboxLaunch {
     stop: Arc<AtomicBool>,
-    dial: Option<std::thread::JoinHandle<()>>,
+    dial: Option<
+        std::thread::JoinHandle<Option<crate::mailbox_service::guest_io::GuestStreamCounts>>,
+    >,
 }
 
 impl OwnedMailboxLaunch {
     /// Stop and join the dialer, including the bound service it owns.
-    pub fn shutdown(mut self) -> Result<()> {
+    pub fn shutdown(self) -> Result<()> {
+        self.shutdown_with_counts().map(|_| ())
+    }
+    pub(crate) fn shutdown_with_counts(
+        mut self,
+    ) -> Result<Option<crate::mailbox_service::guest_io::GuestStreamCounts>> {
         self.stop.store(true, Ordering::SeqCst);
         self.dial
             .take()
@@ -525,6 +533,15 @@ pub fn serve_derived_owned(
     paths: ServePaths,
     limits: MailboxLimits,
 ) -> Result<OwnedMailboxLaunch> {
+    serve_owned_with_counts(grant, keys, paths, limits, false)
+}
+pub(crate) fn serve_owned_with_counts(
+    grant: MailboxGrant,
+    keys: DerivedMailboxKeys,
+    paths: ServePaths,
+    limits: MailboxLimits,
+    measured: bool,
+) -> Result<OwnedMailboxLaunch> {
     let (trust, sealer) = keys.trust();
     let (bound, mut sealer) = bind_grant(&grant, trust, sealer, limits, &paths.socket)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -532,13 +549,17 @@ pub fn serve_derived_owned(
     let dial = std::thread::Builder::new()
         .name("mvm-mailbox-dial".into())
         .spawn(move || {
+            let mut counts =
+                measured.then(crate::mailbox_service::guest_io::GuestStreamCounts::default);
             dial_guest(
                 &bound,
                 &paths.route,
                 &mut sealer,
                 &thread_stop,
                 FAST_DIAL_ATTEMPTS,
+                counts.as_mut(),
             );
+            counts
         })?;
     Ok(OwnedMailboxLaunch {
         stop,
@@ -552,12 +573,13 @@ fn dial_guest(
     sealer: &mut GuestSealer,
     stop: &AtomicBool,
     fast_attempts: u32,
+    mut counts: Option<&mut crate::mailbox_service::guest_io::GuestStreamCounts>,
 ) {
     let mut attempt = 0u32;
     while !stop.load(Ordering::SeqCst) {
         // Ok means a frame arrived, delivered or refused; Err means the
         // guest had nothing yet (or was not up). Neither ends the loop.
-        match service.serve_guest_until(route, sealer, stop) {
+        match service.serve_guest_measured(route, sealer, stop, counts.as_deref_mut()) {
             Ok(()) => {
                 attempt = 0;
                 sleep_unless_stopped(stop, POST_FRAME_PAUSE);

@@ -58,7 +58,7 @@ impl Write for Meter {
     }
 }
 
-fn transfer(socket: &std::path::Path, port: &std::path::Path, deadline: Instant) {
+fn transfer(socket: &std::path::Path, port: &std::path::Path, deadline: Instant) -> (u64, u64) {
     use mvm_core::mailbox::frame::{OutboxMessage, send_outbox_message};
     let guest = std::os::unix::net::UnixListener::bind(port).unwrap();
     guest.set_nonblocking(true).unwrap();
@@ -101,9 +101,10 @@ fn transfer(socket: &std::path::Path, port: &std::path::Path, deadline: Instant)
         io.read,
         started.elapsed().as_micros()
     );
+    (io.written as u64, io.read as u64)
 }
 
-fn run(mismatch: bool) {
+fn run(mismatch: bool, measured: bool) {
     let state = tempfile::tempdir_in("/tmp").unwrap();
     let keys = tempfile::tempdir().unwrap();
     mvm_hostd::audit::host_keypair::load_or_init_at(keys.path()).unwrap();
@@ -123,6 +124,13 @@ fn run(mismatch: bool) {
     let fd = helper.as_raw_fd();
     let mut command = Command::new(env!("CARGO_BIN_EXE_mvm-mailbox"));
     command.arg("--owned-v1").env_clear().stdin(Stdio::piped());
+    let (reader, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    if measured {
+        command
+            .env(mailbox_service::guest_io::ENABLE_ENV, "1")
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)));
+    }
+    let mut independent_counts = None;
     // SAFETY: the closure uses only async-signal-safe descriptor operations,
     // and helper remains live through spawn. Other descriptors are CLOEXEC.
     unsafe {
@@ -183,7 +191,11 @@ fn run(mismatch: bool) {
         assert!(!config.socket.exists());
     } else {
         status.unwrap();
-        transfer(&config.socket, &state.path().join("guest.sock"), deadline);
+        independent_counts = Some(transfer(
+            &config.socket,
+            &state.path().join("guest.sock"),
+            deadline,
+        ));
         assert!(
             mailbox_service::recv(&config.socket)
                 .unwrap()
@@ -204,6 +216,19 @@ fn run(mismatch: bool) {
         std::thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(status.success(), !mismatch);
+    if measured {
+        let report = mailbox_service::guest_io::receive_original(&reader, &prepare.owner).unwrap();
+        let (written, read) = independent_counts.unwrap();
+        assert!(written > 0 && read > 0);
+        assert_eq!(
+            (
+                report.guest_to_host_read_bytes,
+                report.host_to_guest_write_accepted_bytes
+            ),
+            (written, read)
+        );
+        assert!(!report.overflow);
+    }
     drop(parent_lease);
     installation.finish(epoch).unwrap();
     assert!(!config.socket.exists());
@@ -211,10 +236,15 @@ fn run(mismatch: bool) {
 
 #[test]
 fn owned_mailbox_binds_reports_ready_and_retires_on_parent_eof() {
-    run(false);
+    run(false, false);
 }
 
 #[test]
 fn owned_mailbox_refuses_mismatched_backend_route_before_bind() {
-    run(true);
+    run(true, false);
+}
+
+#[test]
+fn original_helper_post_io_matches_independent_guest_meter_and_excludes_host_receive() {
+    run(false, true);
 }

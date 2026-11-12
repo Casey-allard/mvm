@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use super::owned_wire::{OwnedStatusV1, read_prepare, write_status};
-use crate::mailbox_launch::{LAUNCH_LIMITS, ServePaths, serve_derived_owned};
+use crate::mailbox_launch::{LAUNCH_LIMITS, ServePaths, serve_owned_with_counts};
 
 use mvm_vmm::host::mailbox_worker_transport::MAX_CONFIG_BYTES as INPUT_LIMIT;
 
@@ -132,6 +132,7 @@ pub fn run(_lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut control = inherited_control()?;
     let prepare = read_prepare(&control, deadline)?;
+    let report = crate::mailbox_service::guest_io::inherited_report_socket()?;
     let start = || -> io::Result<_> {
         let raw = config_input(&mut std::io::stdin().lock(), &control, deadline)?;
         let config = super::parse(&raw)
@@ -139,7 +140,7 @@ pub fn run(_lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()
         drop(raw);
         // SAFETY: getppid has no preconditions.
         prepare.validate(&config, unsafe { libc::getppid() } as u32)?;
-        serve_derived_owned(
+        serve_owned_with_counts(
             config.grant,
             config.keys,
             ServePaths {
@@ -147,6 +148,7 @@ pub fn run(_lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()
                 route: config.route,
             },
             LAUNCH_LIMITS,
+            report.is_some(),
         )
     };
     let launch = match start() {
@@ -165,7 +167,7 @@ pub fn run(_lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()
     write_status(
         &control,
         &OwnedStatusV1::Ready {
-            owner: prepare.owner,
+            owner: prepare.owner.clone(),
         },
         deadline,
     )?;
@@ -178,8 +180,16 @@ pub fn run(_lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()
             Err(e) => break Err(e),
         }
     };
-    launch.shutdown()?;
-    closed
+    let counts = launch.shutdown_with_counts()?;
+    closed?;
+    if let (Some(socket), Some(counts)) = (report, counts) {
+        if let Err(error) =
+            crate::mailbox_service::guest_io::send_original(&socket, &prepare.owner, counts)
+        {
+            tracing::warn!(%error, "guest stream measurement unavailable after helper shutdown");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
