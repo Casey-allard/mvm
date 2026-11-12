@@ -1062,11 +1062,54 @@ mod tests {
     }
 
     #[test]
-    fn original_external_send_and_sealed_bytes_survive_an_ambiguous_turn() {
+    fn directed_intents_preserve_original_sequence_and_retry_when_full() {
         let dir = tempfile::tempdir().unwrap();
-        crate::audit::host_keypair::load_or_init_at(dir.path()).unwrap();
-        let keys =
-            derive_launch_keys(dir.path(), &grant_at(dir.path(), 1), &test_secret()).unwrap();
+        let (mut sealer, verifier, send) = external_fixture(dir.path());
+        let role = Some(OriginalSend {
+            signed: &send,
+            verifier: &verifier,
+            commitment: [29; 32],
+        });
+        let recipient = sealer.header.recipient;
+        let message = |n| OutboxMessage {
+            recipient,
+            message_id: MessageId::from_bytes([n; 32]),
+            body: vec![0, n, 0],
+        };
+        let first = sealer.seal_using(message(1), role).unwrap();
+        for n in 2..=MAX_SOURCE_INTENTS {
+            sealer.seal_using(message(n as u8), role).unwrap();
+            assert_eq!(sealer.sent, n as u64);
+        }
+        // The directed helper starts with sent=0 and recovers its floor from the
+        // retained files. A retry can still use its exact previously sealed frame.
+        let mut restarted = sealer;
+        restarted.sent = 0;
+        let first_frame = encode_frame(&first.0, &first.1).unwrap();
+        let again = restarted.seal_using(message(1), role).unwrap();
+        assert_eq!(encode_frame(&again.0, &again.1).unwrap(), first_frame);
+        assert_eq!(
+            restarted.seal_using(message(65), role),
+            Err(Refusal::QueueFull(MAX_SOURCE_INTENTS))
+        );
+        let mut changed = message(1);
+        changed.body.push(0);
+        assert!(restarted.seal_using(changed, role).is_err());
+        let store = restarted.intent_dir.as_ref().unwrap();
+        assert_eq!(
+            std::fs::read_dir(store).unwrap().count(),
+            MAX_SOURCE_INTENTS * 2 + 1
+        );
+        eprintln!(
+            "directed_source unique={} rejected_next=65 retry_frame_bytes={} application_bytes=3",
+            MAX_SOURCE_INTENTS,
+            first_frame.len()
+        );
+    }
+
+    fn external_fixture(dir: &Path) -> (GuestSealer, VerifyingKey, SignedMailboxCapability) {
+        crate::audit::host_keypair::load_or_init_at(dir).unwrap();
+        let keys = derive_launch_keys(dir, &grant_at(dir, 1), &test_secret()).unwrap();
         let (_, mut sealer) = keys.trust();
         let b = SigningKey::from_bytes(&[79; 32]);
         let verifier = b.verifying_key();
@@ -1076,8 +1119,15 @@ mod tests {
         sealer.header.reply_to = None;
         sealer.capability.message_kinds = vec![sealer.header.kind];
         let send = sign_capability(sealer.capability.clone(), &b).unwrap();
+        sealer.intent_dir = Some(dir.join("original-direction"));
+        (sealer, verifier, send)
+    }
+
+    #[test]
+    fn original_external_send_and_sealed_bytes_survive_an_ambiguous_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sealer, verifier, send) = external_fixture(dir.path());
         let message = OutboxMessage::new(sealer.header.recipient, vec![0, 7, 0]);
-        sealer.intent_dir = Some(dir.path().join("original-direction"));
         let wrong = sign_capability(send.grant.clone(), &sealer.authority_key).unwrap();
         assert!(
             sealer
