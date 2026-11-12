@@ -659,14 +659,18 @@ fn retained_warm_response_survives_original_child_reaped_between_calls() {
                 Err(mvm_agentd::lifecycle_hooks::ReadinessError::ScriptMissing { .. })
             ));
         }
-        mvm_agentd::lifecycle_hooks::poll_readiness(&ReadinessConfig::new("/usr/bin/true")).unwrap();
+        mvm_agentd::lifecycle_hooks::poll_readiness(&ReadinessConfig::new("/usr/bin/true"))
+            .unwrap();
         let holder = start_pool_with_behavior(cfg(1, 100, 1024), Some("exit_with_pipe_holder"));
         let began = Instant::now();
         let failed = holder.dispatch(b"call".to_vec(), 1, Vec::new()).unwrap();
         let elapsed = began.elapsed();
         println!("inherited_output_pipe call_ns={}", elapsed.as_nanos());
         assert!(matches!(failed.outcome, WorkerOutcome::Error { .. }));
-        assert!(elapsed < Duration::from_secs(3), "same-group holder retained pipe for {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "same-group holder retained pipe for {elapsed:?}"
+        );
         holder.shutdown(Duration::ZERO);
         let pool = start_pool_with_behavior(cfg(1, 100, 1024), Some("crash_after_n=1"));
         let original = idle_pid(&pool);

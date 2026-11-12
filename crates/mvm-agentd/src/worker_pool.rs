@@ -55,7 +55,7 @@ pub(crate) struct WorkerHandle {
     /// stderr drains in the background to avoid blocking the worker
     /// when its stderr pipe fills up. We don't surface the bytes —
     /// they go straight to the agent's own stderr (inherited as
-    /// "mvm-guest-agent: worker N: …"). Held so Drop joins the thread.
+    /// "mvm-guest-agent: worker N: …"). The thread finishes when the original pipe closes.
     _stderr_drain: thread::JoinHandle<()>,
     call_count: u64,
     last_rss_bytes: u64,
@@ -82,7 +82,7 @@ impl WorkerHandle {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
-        self.child.original.signal(true, libc::SIGTERM)?;
+        self.child.original.signal(libc::SIGTERM)?;
         let deadline = Instant::now() + DEFAULT_KILL_GRACE;
         while Instant::now() < deadline {
             if self.child.try_wait()?.is_some() {
@@ -90,7 +90,7 @@ impl WorkerHandle {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        self.child.original.signal(true, libc::SIGKILL)?;
+        self.child.original.signal(libc::SIGKILL)?;
         self.child.wait().map(|_| ())
     }
 }
@@ -431,11 +431,11 @@ impl WorkerPool {
     /// caller may sleep `grace` to let in-flight calls drain.
     pub fn shutdown(&self, grace: Duration) {
         self.shutdown.store(true, Ordering::Release);
-        self.cv.notify_all();
         // Pull original handles out of the state lock before any exit wait.
         let mut draining = Vec::new();
         {
             let mut st = self.state.lock().expect("worker pool state poisoned");
+            self.cv.notify_all();
             for slot in &mut st.slots {
                 if matches!(slot, WorkerSlot::Idle(_) | WorkerSlot::Unresolved(_)) {
                     match std::mem::replace(slot, WorkerSlot::Dead) {
@@ -676,8 +676,7 @@ fn spawn_worker(
     for (k, v) in worker_env {
         cmd.env(k, v);
     }
-    cmd.process_group(0)
-        .stdin(Stdio::piped())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::fd_hygiene::configure_close_fds(&mut cmd, 3, entrypoint::spawn_fd_to_keep(entrypoint));
@@ -695,7 +694,7 @@ fn spawn_worker(
     }
     crate::workload_seccomp::confine(&mut cmd);
 
-    let mut child = crate::child_wait::OriginalChild::spawn(&mut cmd)?;
+    let mut child = crate::child_wait::OriginalChild::spawn_group(&mut cmd)?;
     let pid = child.child.id();
     let stdin = child
         .child
@@ -746,7 +745,7 @@ fn spawn_worker(
 ///
 /// Holds a `Weak<WorkerPool>` so the pool can be dropped without
 /// the thread keeping it alive. The thread exits on the first
-/// `Weak::upgrade` failure (pool gone) or when `shutdown` is set.
+/// `Weak::upgrade` failure (pool gone); after shutdown it only drains originals.
 fn spawn_recycler(
     weak_pool: std::sync::Weak<WorkerPool>,
     rx: mpsc::Receiver<(usize, WorkerHandle)>,
@@ -860,7 +859,7 @@ fn spawn_watchdog(
         if cancelled.load(Ordering::Acquire) {
             return;
         }
-        let _ = original.signal(true, libc::SIGKILL);
+        let _ = original.signal(libc::SIGKILL);
     })
 }
 

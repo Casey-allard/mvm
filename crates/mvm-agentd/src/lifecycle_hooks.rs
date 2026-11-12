@@ -103,7 +103,7 @@ impl HookChild for RealHookChild {
         self.0.try_wait().map(|status| status.map(HookExit::from))
     }
     fn kill(&mut self) -> io::Result<()> {
-        self.0.original.signal(false, libc::SIGKILL)
+        self.0.original.signal(libc::SIGKILL)
     }
     fn wait(&mut self) -> io::Result<HookExit> {
         self.0.wait().map(HookExit::from)
