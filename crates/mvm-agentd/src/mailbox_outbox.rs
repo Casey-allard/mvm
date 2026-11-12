@@ -139,7 +139,8 @@ fn spooled(spool: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
 /// the next message. An empty spool, or an oversized or malformed message, is
 /// refused here, before a byte is sent to the host.
 ///
-/// The one verdict that keeps the message is [`Refusal::QueueFull`]: the host's
+/// The host capacity verdicts [`Refusal::Oversized`] and [`Refusal::QueueFull`]
+/// preserve valid spooled messages. For the latter, the host's
 /// queue has no room yet, so the message stays at the head of the spool for the
 /// next dial, in order, and nothing is lost. The writer meets the limit at the
 /// spool instead ([`write_outbox`]).
@@ -152,13 +153,22 @@ pub fn forward_outbox<S: Read + Write>(stream: &mut S, spool: &Path) -> Result<(
     let mut bytes = Vec::new();
     let read = std::fs::File::open(&oldest)
         .and_then(|file| file.take(MAX_OUTBOX_BYTES + 1).read_to_end(&mut bytes));
-    let verdict = read
+    let message = read
         .map_err(|_| Refusal::Malformed)
-        .and_then(|_| OutboxMessage::decode(&bytes))
-        .and_then(|message| send_outbox_message(stream, &message));
-    if !matches!(verdict, Err(Refusal::QueueFull(_))) {
-        let _ = std::fs::remove_file(&oldest);
-    }
+        .and_then(|_| OutboxMessage::decode(&bytes));
+    let verdict = match message {
+        Ok(message) => {
+            let reply = send_outbox_message(stream, &message);
+            // A valid local item can exceed a narrower installed host profile.
+            // Preserve it for explicit cancellation or a compatible admission.
+            if matches!(reply, Err(Refusal::QueueFull(_) | Refusal::Oversized(_))) {
+                return reply;
+            }
+            reply
+        }
+        Err(local_refusal) => Err(local_refusal),
+    };
+    let _ = std::fs::remove_file(&oldest);
     verdict
 }
 
