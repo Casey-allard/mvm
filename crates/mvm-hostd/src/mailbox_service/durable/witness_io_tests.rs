@@ -47,3 +47,20 @@ fn records_protocol_progress_before_an_exchange_returns() {
         assert_eq!(recorded.lines().last(), Some("phase 1 challenge_written"));
     });
 }
+
+#[test]
+fn only_clean_recorder_shutdown_closes_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report");
+    let recorder = Recorder::create(&file).unwrap();
+    recorder.observe(Cursor::new(vec![1]), |io, _| {
+        let mut byte = [0; 1];
+        io.read_exact(&mut byte).unwrap();
+    });
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("finish"));
+    drop(recorder);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap().lines().last(),
+        Some("finish 1")
+    );
+}

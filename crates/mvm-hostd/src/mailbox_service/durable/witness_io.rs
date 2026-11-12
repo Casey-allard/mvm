@@ -148,6 +148,18 @@ impl Recorder {
     }
 }
 
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        // A crash, write error, overflow or interrupted exchange must leave
+        // the observer unable to claim a full-session total.
+        if let Ok(Some(sink)) = self.0.get_mut()
+            && writeln!(sink.file, "finish {}", sink.exchanges).is_ok()
+        {
+            let _ = sink.file.flush();
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "witness_io_tests.rs"]
 mod tests;
