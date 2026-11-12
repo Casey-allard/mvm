@@ -8,6 +8,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
+#[cfg(feature = "sender-ordinal-io-witness")]
+pub(crate) mod aggregate;
+
 const MAX_EXCHANGES: usize = 64;
 pub(crate) const FILE_NAME: &str = "mailbox-guest-stream-v1.counts";
 
