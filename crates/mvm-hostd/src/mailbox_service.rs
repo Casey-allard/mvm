@@ -49,6 +49,7 @@ pub(crate) mod directed_journal;
 /// Separate destination path that returns a signed, journal-backed verdict.
 pub mod durable;
 mod object_intent;
+pub use object_intent::RetainedObjectSubmission;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SOURCE_INTENTS: usize = 64;
@@ -1354,12 +1355,12 @@ mod object_intent_slot_tests {
     fn original_slot_restart_retains_sequence_and_enforces_shared_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let name = "object-test";
-        let slot = ObjectIntentSlot::open(dir.path(), name).unwrap();
+        let slot = ObjectIntentSlot::open(dir.path(), name, [3; 32]).unwrap();
         assert_eq!(slot.sequence.get(), 1);
-        assert!(ObjectIntentSlot::open(dir.path(), "another").is_err());
+        assert!(ObjectIntentSlot::open(dir.path(), "another", [4; 32]).is_err());
         slot.publish(b"original sealed bytes").unwrap();
         drop(slot);
-        let existing = ObjectIntentSlot::open(dir.path(), name).unwrap();
+        let existing = ObjectIntentSlot::open(dir.path(), name, [3; 32]).unwrap();
         assert_eq!(existing.sequence.get(), 1);
         assert_eq!(
             existing.original.as_deref(),
@@ -1367,10 +1368,11 @@ mod object_intent_slot_tests {
         );
         assert!(existing.publish(b"other bytes").is_err());
         drop(existing);
+        assert!(ObjectIntentSlot::open(dir.path(), name, [6; 32]).is_err());
         for i in 1..MAX_SOURCE_INTENTS {
             std::fs::write(dir.path().join(format!("ordinary-{i}")), b"occupied").unwrap();
         }
-        assert!(ObjectIntentSlot::open(dir.path(), "next").is_err());
-        assert!(ObjectIntentSlot::open(dir.path(), name).is_ok());
+        assert!(ObjectIntentSlot::open(dir.path(), "next", [5; 32]).is_err());
+        assert!(ObjectIntentSlot::open(dir.path(), name, [3; 32]).is_ok());
     }
 }
