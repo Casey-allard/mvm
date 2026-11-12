@@ -290,6 +290,7 @@ fn run() -> Result<()> {
         retention: b_grant.retention,
         report: None,
         outbound_journal_v1: Some(direction),
+        durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: None,
     };
     let (ap, _, posture_a, _) = original_plan("journal-a", a_grant)?;

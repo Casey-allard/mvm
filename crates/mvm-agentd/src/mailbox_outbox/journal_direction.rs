@@ -243,6 +243,7 @@ mod tests {
             max_payload_bytes: 313,
         };
         let boot = MailboxReaderBootBinding {
+            durable_object_pair_sha256_v1: None,
             outbound_journal_v1: Some(direction),
             plan_id: PlanId(format!("sha256:{}", "ab".repeat(32))),
             plan_nonce: Nonce::from_bytes([6; 16]),
@@ -351,6 +352,7 @@ mod tests {
         let (boot, _, _, _) = fixture();
         let key = SigningKey::from_bytes(&[31; 32]);
         let mut grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox: boot.mailbox,

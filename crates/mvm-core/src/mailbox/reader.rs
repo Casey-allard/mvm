@@ -77,6 +77,9 @@ pub const MAX_MAILBOX_READER_BOOT_BYTES: u64 = 8192;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxReaderBootBinding {
+    /// Original signed pair selector. Legacy boot records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_object_pair_sha256_v1: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_journal_v1: Option<mvm_contract::protocol::mailbox::MailboxJournalDirectionV1>,
     pub plan_id: crate::plan::PlanId,
@@ -112,6 +115,7 @@ impl MailboxReaderBootBinding {
             super::outbound::check_projection(&grant, &direction)?;
         }
         Ok(Self {
+            durable_object_pair_sha256_v1: grant.durable_object_pair_sha256_v1,
             outbound_journal_v1: grant.outbound_journal_v1,
             plan_id: plan.plan_id.clone(),
             plan_nonce: plan.nonce.clone(),
@@ -172,6 +176,7 @@ impl MailboxReaderBootBinding {
             plan.plan_id == crate::plan::compute_plan_id(plan)
                 && self.plan_id == plan.plan_id
                 && self.plan_nonce == plan.nonce
+                && self.durable_object_pair_sha256_v1 == grant.durable_object_pair_sha256_v1
                 && self.outbound_journal_v1 == grant.outbound_journal_v1
                 && self.mailbox == grant.mailbox
                 && self.authority_key == grant.authority_key

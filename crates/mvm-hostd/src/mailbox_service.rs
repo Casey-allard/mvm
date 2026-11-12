@@ -905,6 +905,7 @@ mod accept_loop_tests {
         crate::audit::host_keypair::load_or_init_at(dir).unwrap();
         let mailbox = mvm_contract::protocol::mailbox::MailboxId::from_bytes([5; 32]);
         let grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox,
@@ -1043,6 +1044,7 @@ mod tests {
         let mailbox = MailboxId::from_bytes(MAILBOX);
         let epoch = ExecutionEpoch::new(epoch).unwrap();
         MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox,

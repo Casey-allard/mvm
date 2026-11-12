@@ -415,6 +415,7 @@ mod tests {
         let mailbox = MailboxId::from_bytes([4; 32]);
         let mut plan = PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox,

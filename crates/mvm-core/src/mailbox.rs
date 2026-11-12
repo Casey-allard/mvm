@@ -32,6 +32,9 @@ pub mod frame;
 /// Original boot projection for one separately admitted remote journal.
 pub mod outbound;
 
+/// Signed-plan preflight for the optional durable object Call/Reply mapping.
+pub mod object_pair;
+
 /// Bounded destination-side ciphertext journal and durable acceptance.
 pub mod journal;
 
@@ -903,6 +906,30 @@ pub fn open_verified_envelope(
     authority_key: &VerifyingKey,
     replay: &mut impl ReplayProtector,
 ) -> Result<OpenedMailboxEnvelope, MailboxError> {
+    let opened = decrypt_authorized_envelope(
+        envelope,
+        capability,
+        context,
+        encryption_key,
+        sender_key,
+        authority_key,
+    )?;
+    if !replay.check_and_record(ReplayIdentity::from_header(opened.header())) {
+        return Err(MailboxError::Replay);
+    }
+    Ok(opened)
+}
+
+// Private until the original replay transaction and any profile-specific
+// correlation checks complete. Never expose this intermediate to an endpoint.
+fn decrypt_authorized_envelope(
+    envelope: &MailboxEnvelope,
+    capability: &SignedMailboxCapability,
+    context: &OpenContext,
+    encryption_key: &Key,
+    sender_key: &VerifyingKey,
+    authority_key: &VerifyingKey,
+) -> Result<OpenedMailboxEnvelope, MailboxError> {
     envelope.validate_bounds()?;
     validate_outer_versions(envelope)?;
     let actual_commitment: [u8; 32] = Sha256::digest(&envelope.ciphertext).into();
@@ -941,9 +968,6 @@ pub fn open_verified_envelope(
     verify_capability_signature(capability, authority_key)?;
     verify_capability_scope(&message.header, capability, context, true)?;
 
-    if !replay.check_and_record(ReplayIdentity::from_header(&message.header)) {
-        return Err(MailboxError::Replay);
-    }
     Ok(OpenedMailboxEnvelope {
         header: message.header,
         payload: message.payload,

@@ -561,6 +561,7 @@ fn guest_lease_and_signed_ack_are_durable_replay_fenced_and_boot_bound() {
         sender_key: &sender,
     };
     let plan = MailboxGrant {
+        durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,
         mailbox: address().mailbox,

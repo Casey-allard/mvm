@@ -766,6 +766,7 @@ mod tests {
         std::fs::write(&anchor, host.verifying_key().as_bytes()).unwrap();
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([9; 32]),

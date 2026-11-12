@@ -906,6 +906,7 @@ mod tests {
     fn grant(dir: &Path) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes([4; 32]);
         MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox,

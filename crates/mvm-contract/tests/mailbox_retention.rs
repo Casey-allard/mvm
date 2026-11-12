@@ -12,6 +12,7 @@ struct LegacyGrant {
 
 fn grant() -> MailboxGrant {
     MailboxGrant {
+        durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,
         mailbox: MailboxId::from_bytes([1; 32]),
@@ -90,4 +91,12 @@ fn malformed_or_unbounded_retention_cannot_enter_a_signed_grant() {
             "{raw}"
         );
     }
+}
+
+#[test]
+fn explicitly_selected_durable_object_pair_commitment_survives_plan_roundtrip() {
+    let mut selected = serde_json::to_value(grant()).unwrap();
+    selected["durable_object_pair_sha256_v1"] = serde_json::json!([7u8; 32].to_vec());
+    let decoded: MailboxGrant = serde_json::from_value(selected.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), selected);
 }

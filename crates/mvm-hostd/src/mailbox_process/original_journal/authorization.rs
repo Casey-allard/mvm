@@ -271,6 +271,7 @@ mod tests {
                 .to_bytes(),
                 report: None,
                 retention: None,
+                durable_object_pair_sha256_v1: None,
                 incoming_journal_policy_sha256_v1: None,
                 outbound_journal_v1: None,
             };

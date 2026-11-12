@@ -216,6 +216,7 @@ mod tests {
         crate::audit::host_keypair::load_or_init_at(keys.path()).unwrap();
         let mailbox = MailboxId::from_bytes([42; 32]);
         let grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox,
