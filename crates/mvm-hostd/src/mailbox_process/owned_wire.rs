@@ -26,6 +26,11 @@ pub struct PrepareOwnedV1 {
 
 impl PrepareOwnedV1 {
     pub fn validate(&self, config: &MailboxProcessConfig, actual_parent: u32) -> io::Result<()> {
+        self.validate_binding(config,actual_parent)?;
+        self.grant.require_implemented_local_service().map_err(|e|Error::new(ErrorKind::Unsupported,e))
+    }
+
+    pub(super) fn validate_binding(&self,config:&MailboxProcessConfig,actual_parent:u32)->io::Result<()>{
         let same_route = match (&self.route, &config.route) {
             (HostDialRoute::PortSocket(a), HostDialRoute::PortSocket(b))
             | (HostDialRoute::Mux(a), HostDialRoute::Mux(b)) => a.as_os_str() == b.as_os_str(),
@@ -45,9 +50,7 @@ impl PrepareOwnedV1 {
                 "owned mailbox config mismatch",
             ));
         }
-        self.grant
-            .require_implemented_local_service()
-            .map_err(|_| Error::new(ErrorKind::Unsupported, "unsupported mailbox grant"))
+        Ok(())
     }
 }
 

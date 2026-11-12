@@ -509,7 +509,7 @@ fn finish_persistent(
     provisioner: Option<&dyn super::mailbox_owner::InstalledMailboxProvisioner>,
     vacant: super::mailbox_owner::VacantOwner,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
-    mvm_hostd::mailbox_process::require_servable(&start_config, &backend)?;
+    if provisioner.and_then(|p|p.original_cast_pair()).is_none() {mvm_hostd::mailbox_process::require_servable(&start_config,&backend)?;}
     let mut owned = match (provisioner, admission.admitted.plan().mailbox.as_ref()) {
         (Some(host), Some(_)) => Some(super::mailbox_owner::OwnedLaunch::begin(
             host,
@@ -533,6 +533,7 @@ fn finish_persistent(
             })?;
         }
     }
+    mvm_hostd::mailbox_process::require_servable(&start_config,&backend)?;
     // VMM selection + workload-support check + start move behind the facade; the
     // admission gate (above) and the launched/failed emits stay here.
     #[cfg(unix)]

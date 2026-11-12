@@ -306,6 +306,7 @@ pub struct VmStartConfig {
 /// Attests a connected broker socket against the original installed host
 /// process retained by the admitted SDK launch.
 pub trait InstalledBrokerPeer: Send + Sync {
+    fn original_cast_published(&self,_name:&str,_plan:&[u8;32],_owner:&mvm_contract::protocol::mailbox_worker::MailboxWorkerOwner)->bool {false}
     #[cfg(unix)]
     fn authenticate(&self, stream: &std::os::unix::net::UnixStream) -> anyhow::Result<()>;
 }
@@ -322,6 +323,15 @@ impl std::fmt::Debug for InstalledBrokerBinding {
     }
 }
 impl VmStartConfig {
+    pub fn original_cast_grant(&self, plan:&crate::plan::ExecutionPlan)->bool {
+        use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+        let Some(binding)=&self.installed_mailbox_owner else{return false};
+        self.name==plan.workload.0 && plan.tenant.0=="local"
+            && plan.mailbox.and_then(|g|g.local_service)==Some(MailboxLocalServiceGrant::original_cast_v1())
+            && crate::plan::verify_plan_id(plan).is_ok()
+            && plan.plan_id.0==format!("sha256:{}",hex::encode(binding.plan_commitment))
+            && binding.peer.original_cast_published(&self.name,&binding.plan_commitment,&binding.owner)
+    }
     /// Wait for the admission's audit sync when it is still in flight; see
     /// [`Self::admission_durability`]. Waiting again once the sync has
     /// finished costs nothing, so every path that is about to let the

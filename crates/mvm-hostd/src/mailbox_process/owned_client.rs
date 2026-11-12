@@ -27,6 +27,7 @@ pub struct InstalledMailboxPeer {
     observer: Mutex<Option<ProcessExitObserver>>,
     pid: u32,
     prepared_direction: Mutex<Option<[u8; 32]>>,
+    published_cast:Mutex<Option<(MailboxWorkerOwner,[u8;32],std::ops::Range<i64>)>>,
     issuer: [u8; 16],
     admitted_vm: Option<String>,
     native_start: native_start::NativeStartCustody,
@@ -78,6 +79,7 @@ impl InstalledMailboxPeer {
             native_start: Default::default(),
             terminal_acceptance: Default::default(),
             prepared_direction: Default::default(),
+            published_cast:Default::default(),
         })
     }
 
@@ -118,6 +120,10 @@ impl InstalledMailboxPeer {
 }
 
 impl mvm_core::vm_backend::InstalledBrokerPeer for InstalledMailboxPeer {
+    fn original_cast_published(&self, name:&str, plan:&[u8;32], owner:&MailboxWorkerOwner) -> bool {
+        self.admitted_vm.as_deref()==Some(name) && self.check_original_alive().is_ok()
+            && self.published_cast.try_lock().is_ok_and(|cell|cell.as_ref().is_some_and(|(o,p,w)|o==owner && p==plan && w.contains(&crate::mailbox_launch::now_unix_ms())))
+    }
     fn authenticate(&self, stream: &UnixStream) -> Result<()> {
         InstalledMailboxPeer::authenticate(self, stream)
     }
@@ -190,9 +196,20 @@ fn kind(backend: &AnyBackend) -> Result<MailboxWorkerBackend> {
 
 impl InstalledMailboxClient {
     pub fn prepare(admitted: &AdmittedPlan, backend: &AnyBackend, vm_name: &str) -> Result<Self> {
-        let mut client = Self::with_nonce(admitted, backend, vm_name, rand::random())?;
+        let mut client = Self::with_nonce(admitted, backend, vm_name, rand::random(),false)?;
         client.authority = Authority::Fresh;
         Ok(client)
+    }
+
+    /// Prepare only a reservation; the separately provisioned host rejects any
+    /// name outside its explicitly configured two-original installation.
+    pub fn prepare_cast_reservation(admitted:&AdmittedPlan,backend:&AnyBackend,vm_name:&str)->Result<Self> {
+        let mut client=Self::with_nonce(admitted,backend,vm_name,rand::random(),true)?;
+        client.authority=Authority::Fresh;
+        Ok(client)
+    }
+    pub fn reconnect_cast_reservation(admitted:&AdmittedPlan,backend:&AnyBackend,vm_name:&str,nonce:[u8;32])->Result<Self>{
+        Self::with_nonce(admitted,backend,vm_name,nonce,true)
     }
 
     fn with_nonce(
@@ -200,6 +217,7 @@ impl InstalledMailboxClient {
         backend: &AnyBackend,
         vm_name: &str,
         nonce: [u8; 32],
+        cast: bool,
     ) -> Result<Self> {
         mvm_core::naming::validate_vm_name(vm_name)?;
         let plan = admitted.plan();
@@ -210,7 +228,11 @@ impl InstalledMailboxClient {
         let grant = plan
             .mailbox
             .context("admitted plan requires a mailbox grant")?;
-        grant.require_implemented_local_service()?;
+        if cast {
+            ensure!(kind(backend)?==MailboxWorkerBackend::Firecracker && plan.tenant.0=="local" &&
+                grant.local_service==Some(mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant::original_cast_v1()),
+                "explicit compact local Firecracker Cast required");
+        } else {grant.require_implemented_local_service()?;}
         let mut commitment = [0u8; 32];
         let digest = admitted
             .plan_id()
@@ -253,7 +275,7 @@ impl InstalledMailboxClient {
         original_nonce: [u8; 32],
         original_owner: Option<MailboxWorkerOwner>,
     ) -> Result<Self> {
-        let mut client = Self::with_nonce(admitted, backend, vm_name, original_nonce)?;
+        let mut client = Self::with_nonce(admitted, backend, vm_name, original_nonce,false)?;
         if let Some(owner) = original_owner {
             let proof = MailboxWorkerResult {
                 owner: owner.clone(),
@@ -656,8 +678,18 @@ impl InstalledMailboxClient {
     /// Only the original, once-delegated FD may receive configuration. A retry
     /// that finds the helper starting just queries its state, keeping all
     /// derived bytes and epoch state out of the host-agent control connection.
+    pub fn mark_cast_published(&self, role:&crate::mailbox_launch::cast_pair::development::PreparedRole)->Result<()> {
+        self.check_prepared_development_role(role)?;
+        let window=role.immutable_window.clone().context("original boot requires fixed-generation Cast")?;
+        ensure!(window.contains(&crate::mailbox_launch::now_unix_ms()),"original Cast expired");
+        let mut cell=self.development_peer()?.published_cast.try_lock().map_err(|_|anyhow::anyhow!("original publication busy"))?;
+        ensure!(cell.is_none(),"original Cast already published");
+        *cell=Some((self.original()?,self.acquire.plan_commitment,window));
+        Ok(())
+    }
     pub fn configure_and_wait(&self, backend: &AnyBackend, deadline: Instant) -> Result<()> {
-        self.configure_with(backend, deadline, |_| Ok(()))?;
+        self.acquire.mailbox_grant.require_implemented_local_service()?;
+        self.configure_with(backend, deadline, false, |_| Ok(()))?;
         Ok(())
     }
 
@@ -683,13 +715,17 @@ impl InstalledMailboxClient {
     ) -> Result<()> {
         self.check_prepared_development_role(&prepared)?;
         let owner = self.original()?;
-        self.configure_with(backend, deadline, |config| prepared.install(config, &owner))?
+        use mvm_core::vm_backend::InstalledBrokerPeer;
+        let joined=prepared.immutable_window.is_some() && self.development_peer()?.original_cast_published(&self.acquire.vm_id,&self.acquire.plan_commitment,&owner);
+        ensure!(joined, "private immutable boot has not been published");
+        self.configure_with(backend, deadline, joined, |config| prepared.install(config, &owner))?
             .context("original config pipe already delegated: cannot change its enrollment")
     }
     fn configure_with<T>(
         &self,
         backend: &AnyBackend,
         deadline: Instant,
+        joined:bool,
         prepare: impl FnOnce(&mut super::MailboxProcessConfig) -> Result<T>,
     ) -> Result<Option<T>> {
         ensure!(
@@ -712,7 +748,8 @@ impl InstalledMailboxClient {
         )?;
         let mut installed = None;
         if let Some(fd) = writer {
-            let mut config = build_config(
+            let build=if joined {super::build_cast_config} else {build_config};
+            let mut config = build(
                 &mvm_core::config::mvm_keys_dir(),
                 &self.acquire.mailbox_grant,
                 &dir,

@@ -50,7 +50,7 @@ pub fn seccomp_cmdline_token(config: &mvm_core::vm_backend::VmStartConfig) -> Op
 pub fn mailbox_cmdline_token(config: &mvm_core::vm_backend::VmStartConfig) -> Option<String> {
     let plan = mvm_core::plan::plan_from_admitted_json(config.plan_json.as_deref()?).ok()?;
     let grant = plan.mailbox?;
-    grant.require_implemented_local_service().ok()?;
+    if !config.original_cast_grant(&plan) {grant.require_implemented_local_service().ok()?;}
     match grant.local_service {
         None => Some("mvm.mailbox=1".to_string()),
         Some(service) => Some(format!(

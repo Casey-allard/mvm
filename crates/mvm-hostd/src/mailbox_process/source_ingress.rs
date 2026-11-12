@@ -187,7 +187,7 @@ pub(super) fn run(
         );
         // A failed turn closes its two streams. Keep its original state for
         // the next authenticated pull; parent death is observed by next_original.
-        let _ = exchange(
+        if let Err(error) = exchange(
             &mut peer,
             &mut guest,
             &role,
@@ -196,7 +196,9 @@ pub(super) fn run(
             held,
             &limits,
             || fence(control, parent),
-        );
+        ) {
+            tracing::debug!(kind = ?error.kind(), "original source turn ended without a complete guest result");
+        }
     }
     Ok(counts)
 }

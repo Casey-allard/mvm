@@ -114,6 +114,12 @@ pub(crate) struct PrivateLaunch {
     wrapping: [u8; 32],
     scope: SignedMailboxCapability,
 }
+impl PrivateLaunch {
+    pub(crate) fn original_bundle(&self)->bool {
+        self.direction.is_some() && matches!((self.end.role,self.source.is_some(),self.destination.is_some()),
+            (EndpointRole::Source,true,false)|(EndpointRole::Destination,false,true))
+    }
+}
 impl Drop for PrivateLaunch {
     fn drop(&mut self) {
         self.wrapping.zeroize();
@@ -159,7 +165,7 @@ impl LaunchCustody {
                 original,
                 routing,
             },
-            PreparedRole { setup, grant },
+            PreparedRole { setup, grant, immutable_window: None },
         ))
     }
     pub fn greeting(&self) -> LocalGreeting {
@@ -380,6 +386,7 @@ pub struct DirectionDelivery {
 /// Only the original SDK holds this nonclone secret. Its exclusive config
 /// descriptor is consumed once, later, without a second key mint or rebind.
 pub struct PreparedRole {
+    pub(crate) immutable_window: Option<std::ops::Range<i64>>,
     setup: PrivateLaunch,
     grant: MailboxGrant,
 }
@@ -394,6 +401,7 @@ impl PreparedRole {
             "cannot change original role direction"
         );
         self.setup.direction = Some(d.commitment());
+        self.immutable_window = d.fields.immutable_policy.map(|_|d.fields.start..d.fields.end);
         Ok(())
     }
     pub(crate) fn check_recipient(
@@ -601,27 +609,6 @@ fn prepare_profile(
         source: source_setup,
         destination: destination_setup,
     })
-}
-fn issue_with_policy(
-    channel: &CastChannel,
-    source: LaunchCustody,
-    destination: LaunchCustody,
-    grants: AddressedCastGrants<'_>,
-    source_policy: &OpenContext,
-    destination_policy: &OpenContext,
-    now: i64,
-    immutable_policy: Option<[u8; 32]>,
-) -> Result<DirectionDelivery> {
-    issue_with_policy(
-        channel,
-        source,
-        destination,
-        grants,
-        source_policy,
-        destination_policy,
-        now,
-        None,
-    )
 }
 fn issue_with_policy(
     channel: &CastChannel,

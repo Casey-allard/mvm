@@ -112,6 +112,20 @@ impl MailboxLocalServiceGrant {
         }
     }
 
+    /// Compact shape for a single explicitly enrolled original pair. Selecting
+    /// this grant alone does not activate a runtime.
+    pub const fn original_cast_v1() -> Self {
+        let mut service = Self::reliable_v1();
+        service.limits.payload_bytes = 1024;
+        service.limits.max_frame_bytes = 4096;
+        service.limits.spooled_requests = 1;
+        service.limits.queued_messages = 1;
+        service.limits.active_calls = 1;
+        service.limits.retained_guest_bytes = 8192;
+        service.limits.retained_host_bytes = 16384;
+        service
+    }
+
     pub fn validate(self) -> Result<(), MailboxLocalServiceError> {
         self.limits.validate()
     }

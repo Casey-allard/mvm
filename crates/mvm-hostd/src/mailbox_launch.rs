@@ -18,6 +18,8 @@
 //! exists. The shred overwrites and unlinks the file; it is not a physical
 //! wipe, and a filesystem may keep the old blocks.
 
+#[cfg(feature = "installed-cast-witness")]
+pub mod cast_fixture;
 pub mod cast_pair;
 pub mod cast_enrollment;
 
@@ -275,6 +277,10 @@ pub fn derive_launch_keys(
     grant
         .require_implemented_local_service()
         .map_err(|error| Error::new(ErrorKind::Unsupported, error))?;
+    derive_admitted_keys(keys_dir, grant, secret)
+}
+
+pub(super) fn derive_admitted_keys(keys_dir:&Path,grant:&MailboxGrant,secret:&Key)->Result<DerivedMailboxKeys>{
     let derived = derived_keys(keys_dir, &grant.mailbox, grant.epoch)?;
     // After the signing seed above, so a wrong directory never mints a root.
     let encryption_root = Key::load_or_create(&keys_dir.join(ENCRYPTION_ROOT))?;

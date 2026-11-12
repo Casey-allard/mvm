@@ -327,7 +327,10 @@ impl OwnedLaunch {
         vacant: VacantOwner,
     ) -> Result<Self> {
         let VacantOwner(claim) = vacant;
-        let mut client = InstalledMailboxClient::prepare(admitted, backend, &claim.name)?;
+        let mut client = if let Some(pair)=provisioner.original_cast_pair(){
+            pair.index(&claim.name)?;
+            InstalledMailboxClient::prepare_cast_reservation(admitted,backend,&claim.name)?
+        } else {InstalledMailboxClient::prepare(admitted, backend, &claim.name)?};
         let original = provisioner.original_peer(admitted, backend, client.acquire_request())?;
         client.bind_acquire_peer(original.clone())?;
         // The original issuer and acquisition nonce are covered by the host
@@ -383,6 +386,7 @@ impl OwnedLaunch {
         stage_pair_boot(&path, &prior, &bytes, || {
             pair.published(&self.claim.name, until)
         })?;
+        self.client.mark_cast_published(&prepared.role)?;
         self.cast_role = Some((prepared.role, validity));
         cancellation.disarm();
         Ok(())

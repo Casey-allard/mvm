@@ -19,14 +19,16 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     if let Some(mode) = args.next() {
         let paired = mode == mvm_hostd::mailbox_process::installed_profile::PAIR_HELPER_FLAG;
+        let cast = mode==mvm_hostd::mailbox_process::installed_profile::CAST_HELPER_FLAG;
         anyhow::ensure!(
-            (paired || mode == "--owned-v1") && args.next().is_none(),
+            (cast || paired || mode == "--owned-v1") && args.next().is_none(),
             "invalid mailbox helper mode"
         );
         // SAFETY: the installed launcher hands unowned descriptors to this
         // single-threaded process. No threads or descendants have started.
         let lease = unsafe { mvm_vmm::host::installed_owner::receive_resource_lease_at_startup() }?
             .context("owned mailbox requires an installation resource lease")?;
+        if cast {return mvm_hostd::mailbox_process::owned::run_original_cast(lease).context("original Cast helper failed");}
         return mvm_hostd::mailbox_process::owned::run_profile(lease, paired)
             .context("owned mailbox helper failed");
     }
