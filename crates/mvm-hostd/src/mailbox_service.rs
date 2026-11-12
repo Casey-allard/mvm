@@ -715,7 +715,7 @@ mod accept_loop_tests {
     #[test]
     fn paired_installed_queue_and_replay_reservations_survive_plaintext_drain() {
         use crate::mailbox_process::installed_profile::{PAIR_REPLAY_ENTRIES, pair_queue_limits};
-        use mvm_agentd::mailbox_outbox::{forward_outbox, write_outbox};
+        use mvm_agentd::mailbox_outbox::write_outbox;
         let dir = tempfile::tempdir().unwrap();
         crate::audit::host_keypair::load_or_init_at(dir.path()).unwrap();
         let mailbox = mvm_contract::protocol::mailbox::MailboxId::from_bytes([5; 32]);
@@ -745,19 +745,7 @@ mod accept_loop_tests {
         // refusal that the legacy guest treats as terminal unlinks its claim.
         let spool = dir.path().join("outbox");
         std::fs::create_dir(&spool).unwrap();
-        let mut forward = || {
-            let (mut host, mut guest) = UnixStream::pair().unwrap();
-            arm(&host);
-            arm(&guest);
-            std::thread::scope(|scope| {
-                let reply = scope.spawn(|| forward_outbox(&mut guest, &spool));
-                let served = serve_frame(&svc.shared, &mut host, |bytes| {
-                    sealer.seal(OutboxMessage::decode(bytes)?)
-                });
-                drop(host);
-                (served, reply.join().unwrap())
-            })
-        };
+        let mut forward = || forward_paired_spool(&svc, &mut sealer, &spool);
         let limit = usize::try_from(PAIR_REPLAY_ENTRIES).unwrap();
         let message = |n| OutboxMessage {
             recipient: PrincipalId::from_bytes(OWN_MAILBOX_RECIPIENT),
@@ -781,6 +769,71 @@ mod accept_loop_tests {
             assert!(matches!(served, Served::QueueFull));
             assert_eq!(verdict, Err(Refusal::QueueFull(limit)));
             assert_eq!(svc.shared.take(), (None, PAIR_REPLAY_ENTRIES, PAIR_REPLAY_ENTRIES));
+        }
+    }
+
+    fn forward_paired_spool(
+        service: &MailboxService,
+        sealer: &mut GuestSealer,
+        spool: &Path,
+    ) -> (Served, Result<(), Refusal>) {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        arm(&host);
+        arm(&guest);
+        std::thread::scope(|scope| {
+            let reply = scope.spawn(|| mvm_agentd::mailbox_outbox::forward_outbox(&mut guest, spool));
+            let served = serve_frame(&service.shared, &mut host, |bytes| {
+                sealer.seal(OutboxMessage::decode(bytes)?)
+            });
+            drop(host);
+            (served, reply.join().unwrap())
+        })
+    }
+
+    #[test]
+    fn paired_installed_frame_boundary_retains_valid_oversized_original() {
+        use crate::mailbox_process::installed_profile::{pair_queue_limits, PAIR_REPLAY_ENTRIES};
+        use mvm_agentd::mailbox_outbox::write_outbox;
+        let dir = tempfile::tempdir().unwrap();
+        crate::audit::host_keypair::load_or_init_at(dir.path()).unwrap();
+        let mailbox = mvm_contract::protocol::mailbox::MailboxId::from_bytes([5; 32]);
+        let epoch = ExecutionEpoch::new(1).unwrap();
+        let grant = MailboxGrant {
+            local_service: None, mailbox, epoch,
+            authority_key: crate::mailbox_launch::authority_key_for(dir.path(), &mailbox, epoch).unwrap().to_bytes(),
+        };
+        let (policy, sealer) = crate::mailbox_launch::host_trust(dir.path(), &grant, &test_secret()).unwrap();
+        let limits = pair_queue_limits();
+        let frame_bytes = limits.max_frame_bytes;
+        let (svc, mut sealer) = bind_grant_with_admission_limit(
+            &grant, policy, sealer, limits, &dir.path().join("m.sock"), Some(PAIR_REPLAY_ENTRIES),
+        ).unwrap();
+        let spool = dir.path().join("outbox");
+        std::fs::create_dir(&spool).unwrap();
+        // 8,160 user bytes + 32 recipient bytes fit the 8,192-byte frame
+        // body. The four-byte outer length is transmitted separately.
+        let largest = OutboxMessage {
+            recipient: PrincipalId::from_bytes(OWN_MAILBOX_RECIPIENT),
+            body: (0..8160).map(|i| (i % 256) as u8).collect(),
+        };
+        assert_eq!(largest.encode().len(), frame_bytes);
+        write_outbox(&spool, &largest).unwrap();
+        assert!(matches!(forward_paired_spool(&svc, &mut sealer, &spool), (Served::Frame, Ok(()))));
+        assert_eq!(svc.shared.take().0.as_deref(), Some(largest.body.as_slice()));
+        assert!(std::fs::read_dir(&spool).unwrap().next().is_none());
+        let mut oversized = largest;
+        oversized.body.push(0);
+        let expected = oversized.encode();
+        assert_eq!(expected.len(), frame_bytes + 1);
+        write_outbox(&spool, &oversized).unwrap();
+        let mut entries = std::fs::read_dir(&spool).unwrap();
+        let original = entries.next().unwrap().unwrap().path();
+        assert!(entries.next().is_none());
+        for _ in 0..2 {
+            let (_, verdict) = forward_paired_spool(&svc, &mut sealer, &spool);
+            assert_eq!(std::fs::read(&original).unwrap(), expected);
+            assert_eq!(verdict, Err(Refusal::Oversized(frame_bytes)));
+            assert_eq!(svc.shared.take(), (None, 1, 1));
         }
     }
 
