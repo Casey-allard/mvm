@@ -550,68 +550,84 @@ fn finish_persistent(
         ),
     };
     if let Err(error) = serving {
-        if owned.is_some()
-            && let Err(abort) = started.backend().abort_start(started.vm_id())
-        {
-            prepared_volumes.commit();
-            emit_failed(&admission, "mailbox-process", &error);
-            return Err(error.context(format!(
-                "original backend could not abort mailbox launch: {abort:#}"
-            )));
+        if let Some(worker) = owned.as_mut() {
+            return Err(settle_mailbox_failure(
+                &admission,
+                name,
+                "mailbox-process",
+                error,
+                worker,
+                &mut prepared_volumes,
+                started.backend().abort_start(started.vm_id()).map(|_| ()),
+            ));
         }
         emit_failed(&admission, "mailbox-process", &error);
-        if let Err(cleanup) = cleanup_aborted_mailbox(name, owned.as_mut(), &mut prepared_volumes) {
-            return Err(error.context(format!("mailbox rollback remains unresolved: {cleanup:#}")));
-        }
+        cleanup_after_refusal(name);
         return Err(error);
     }
-    // A backend accepting a start only means its host process was spawned.
-    // Detached callers must not observe success until the authenticated guest
-    // control plane is actually serving; failure rolls the partial start back
-    // before any launch acceptance, lease commit, or launched audit record.
     if let Err(error) =
         super::detached::require_serving_guest(name, &started, std::time::Duration::from_secs(30))
     {
-        let abort_is_unresolved = error.abort_is_unresolved();
-        if abort_is_unresolved {
-            // The VMM may still hold block-device file descriptors. Preserve
-            // the owner leases and registry for recovery; releasing or
-            // re-sealing here could admit a second attachment while it lives.
+        if let Some(worker) = owned.as_mut() {
+            let abort = match &error {
+                super::detached::DetachedReadinessError::AbortUnresolved { source, .. } => {
+                    Err(anyhow::anyhow!("{source:#}"))
+                }
+                _ => Ok(()),
+            };
+            return Err(settle_mailbox_failure(
+                &admission,
+                name,
+                "guest-readiness",
+                error.into(),
+                worker,
+                &mut prepared_volumes,
+                abort,
+            ));
+        }
+        audit_detached_readiness_failure(&admission, name, &error);
+        if error.abort_is_unresolved() {
             prepared_volumes.commit();
-            audit_detached_readiness_failure(&admission, name, &error);
         } else {
-            audit_detached_readiness_failure(&admission, name, &error);
-            // The failure record and session seal live under the runtime
-            // state directory, so cleanup must follow audit finalization.
-            if let Err(cleanup) =
-                cleanup_aborted_mailbox(name, owned.as_mut(), &mut prepared_volumes)
-            {
-                return Err(anyhow::Error::new(error)
-                    .context(format!("mailbox rollback remains unresolved: {cleanup:#}")));
-            }
+            cleanup_after_refusal(name);
         }
-        return Err(anyhow::Error::new(error));
+        return Err(error.into());
     }
-    // After the start, because a cgroup quota is read back off a process that
-    // does not exist until then. This is the call that puts the backend's
-    // `apply_grants` on the path `mvmctl` boots: without it the tier is
-    // computed correctly and reported to nobody. A failure here has already
-    // stopped the VM, so the volume leases are released rather than committed.
-    let enforce = super::grants_report::report_enforced_grants(&admission, &started)
-        .and_then(|_| super::budget_charge::record_boot_charge(&admission, name, &started));
-    if let Err(error) = enforce {
-        if owned.is_some() {
-            if mvm_hostd::plan_admission::rollback_is_unconfirmed(&error) {
-                prepared_volumes.commit();
-            } else if let Err(cleanup) =
-                cleanup_aborted_mailbox(name, owned.as_mut(), &mut prepared_volumes)
-            {
-                return Err(
-                    error.context(format!("mailbox rollback remains unresolved: {cleanup:#}"))
-                );
-            }
+
+    if let Some(worker) = owned.as_mut() {
+        // Both original owners must be collected before the session can be sealed.
+        let enforce =
+            super::grants_report::report_enforced_grants_with_emitter(&admission, &started, None)
+                .map_err(|e| ("grants", e))
+                .and_then(|_| {
+                    mvm_hostd::plan_admission::record_charge_or_undo_launch(
+                        started.backend(),
+                        started.vm_id(),
+                        name,
+                        &admission.admitted,
+                        None,
+                    )
+                    .map_err(|e| ("host-budget", e))
+                });
+        if let Err((stage, error)) = enforce {
+            let abort = if mvm_hostd::plan_admission::rollback_is_unconfirmed(&error) {
+                Err(anyhow::anyhow!("original VM stop was unconfirmed"))
+            } else {
+                Ok(())
+            };
+            return Err(settle_mailbox_failure(
+                &admission,
+                name,
+                stage,
+                error,
+                worker,
+                &mut prepared_volumes,
+                abort,
+            ));
         }
-        return Err(error);
+    } else {
+        super::grants_report::report_enforced_grants(&admission, &started)?;
+        super::budget_charge::record_boot_charge(&admission, name, &started)?;
     }
     prepared_volumes.commit();
     emit_launched(&admission, backend_name, true);
@@ -623,22 +639,45 @@ fn finish_persistent(
     Ok(admission.admitted)
 }
 
-fn cleanup_aborted_mailbox(
-    name: &str,
-    worker: Option<&mut super::mailbox_owner::OwnedLaunch>,
-    volumes: &mut crate::volume::LaunchPreparation,
-) -> Result<()> {
-    let cleanup = || crate::local::remove_stopped_runtime_state(name).map_err(anyhow::Error::from);
-    if let Some(worker) = worker {
-        worker
-            .rollback_after_abort(cleanup)
-            .inspect_err(|_| volumes.commit())
-    } else {
-        if let Err(error) = cleanup() {
-            tracing::warn!(%error, machine = name, "removing runtime state after launch abort failed");
-        }
-        Ok(())
+fn cleanup_after_refusal(name: &str) {
+    if let Err(error) = crate::local::remove_stopped_runtime_state(name) {
+        tracing::warn!(%error, machine = name, "removing runtime state after launch abort failed");
     }
+}
+
+/// Record a terminal failure only after both the VMM and its mailbox worker have stopped.
+fn settle_mailbox_failure(
+    ctx: &crate::admission::AdmissionContext,
+    name: &str,
+    stage: &str,
+    cause: anyhow::Error,
+    worker: &mut super::mailbox_owner::OwnedLaunch,
+    volumes: &mut crate::volume::LaunchPreparation,
+    backend_abort: Result<()>,
+) -> anyhow::Error {
+    let mut terminal = false;
+    let outcome = backend_abort.and_then(|_| {
+        worker.rollback_after_abort(|| {
+            emit_failed(ctx, stage, &cause);
+            terminal = true;
+            crate::local::remove_stopped_runtime_state(name)?;
+            Ok(())
+        })
+    });
+    if let Err(error) = outcome {
+        volumes.commit();
+        if !terminal {
+            super::record_unsealed_end(
+                Some((&ctx.emitter, ctx.admitted.plan())),
+                super::UnsealedEnd::new(name, super::UnsealedReason::StopFailed)
+                    .error(format!("{cause:#}; {error:#}")),
+            );
+        }
+        return cause.context(format!(
+            "installed mailbox rollback remains unresolved: {error:#}"
+        ));
+    }
+    cause
 }
 
 fn audit_detached_readiness_failure(

@@ -53,7 +53,9 @@ use mvm_core::protocol::vm_backend::{VmId, VmStatus};
 use mvm_hostd::audit::emitter::{AuditEmitter, ExitRecord};
 pub(crate) use mvm_hostd::audit::unsealed::{UnsealedEnd, UnsealedReason, record_unsealed_end};
 use mvm_hostd::plan_admission::{AdmittedPlan, InMemoryNonceLedger, StartedMachine, SystemClock};
-use mvm_hostd::run::{LocalRunContext, LocalRunRequest, admit_and_boot_local};
+use mvm_hostd::run::{
+    LocalMailboxPolicy, LocalRunContext, LocalRunRequest, admit_and_boot_local_with_mailbox_policy,
+};
 use mvm_runtime::AnyBackend;
 use mvm_runtime::machine::persist as mp;
 
@@ -612,7 +614,7 @@ impl LocalBackend {
             (None, _) => None,
         };
 
-        admit_and_boot_local(
+        admit_and_boot_local_with_mailbox_policy(
             &backend,
             &req,
             LocalRunContext {
@@ -621,6 +623,11 @@ impl LocalBackend {
                 host_signer_keys_dir: None,
                 emitter: emitter.as_deref(),
                 assurance: campaign.as_ref(),
+            },
+            if self.installed_mailbox.is_some() {
+                LocalMailboxPolicy::RequirePersistentOwner
+            } else {
+                LocalMailboxPolicy::ServeGranted
             },
         )
         .map_err(|e| crate::local::backend_err(format!("{e:#}")))

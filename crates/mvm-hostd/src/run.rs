@@ -237,6 +237,33 @@ pub fn admit_and_boot_local(
     req: &LocalRunRequest,
     ctx: LocalRunContext<'_>,
 ) -> Result<StartedMachine> {
+    admit_and_boot_local_with_mailbox_policy(backend, req, ctx, LocalMailboxPolicy::ServeGranted)
+}
+
+/// How this host serves grants on the transient launch path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LocalMailboxPolicy {
+    ServeGranted,
+    RequirePersistentOwner,
+}
+
+impl LocalMailboxPolicy {
+    fn check(self, grant: Option<mvm_contract::protocol::mailbox::MailboxGrant>) -> Result<()> {
+        anyhow::ensure!(
+            self != Self::RequirePersistentOwner || grant.is_none(),
+            "installed mailbox ownership requires a persistent machine"
+        );
+        Ok(())
+    }
+}
+
+/// Apply the installed endpoint policy to the grant from the authoritative plan.
+pub fn admit_and_boot_local_with_mailbox_policy(
+    backend: &AnyBackend,
+    req: &LocalRunRequest,
+    ctx: LocalRunContext<'_>,
+    mailbox_policy: LocalMailboxPolicy,
+) -> Result<StartedMachine> {
     anyhow::ensure!(
         req.volumes
             .iter()
@@ -251,8 +278,10 @@ pub fn admit_and_boot_local(
     // against the operator-pinned signer set, never synthesized or re-signed
     // under the host key.
     if let Some(signed) = req.signed_plan.as_ref() {
-        return admit_signed_and_boot_local(backend, req, signed, &sha, ctx);
+        return admit_signed_and_boot_local(backend, req, signed, &sha, ctx, mailbox_policy);
     }
+
+    mailbox_policy.check(req.mailbox)?;
 
     // Pin the kernel into the signed plan. Deliberately the uncached digest: a
     // path+mtime-keyed cache can hand back a stale hash, which for an integrity
@@ -393,6 +422,7 @@ fn admit_signed_and_boot_local(
     signed: &mvm_core::plan::SignedExecutionPlan,
     rootfs_sha: &str,
     ctx: LocalRunContext<'_>,
+    mailbox_policy: LocalMailboxPolicy,
 ) -> Result<StartedMachine> {
     use crate::plan_admission::{RunPosture, StartAdmittedParams, start_admitted};
 
@@ -401,6 +431,7 @@ fn admit_signed_and_boot_local(
         signed, ctx.clock, ctx.ledger, None, posture,
     )?;
     let plan = admitted.plan();
+    mailbox_policy.check(plan.mailbox)?;
     if let Some(pin) = &req.registry_pack_image {
         anyhow::ensure!(
             plan.asset_identities.iter().any(|asset| {
@@ -1053,6 +1084,42 @@ mod signed_boot_tests {
                 assurance: None,
             },
         )
+    }
+
+    #[test]
+    fn installed_mailbox_rejects_a_fleet_grant_absent_from_the_transient_request() {
+        use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
+        let (_env, home) = pinned_host();
+        let rootfs = home.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"fleet bytes").unwrap();
+        let mut plan = PlanFixture::new().runtime_profile("mock").build();
+        plan.image.sha256 = mvm_core::crypto::image_verify::sha256_file(&rootfs).unwrap();
+        plan.mailbox = Some(MailboxGrant {
+            mailbox: MailboxId::from_bytes([3; 32]),
+            authority_key: fleet_key().verifying_key().to_bytes(),
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            local_service: None,
+        });
+        let req = signed_request("fleet-mailbox", &rootfs, plan);
+        assert!(req.mailbox.is_none());
+        let error = admit_and_boot_local_with_mailbox_policy(
+            &AnyBackend::from_hypervisor("mock"),
+            &req,
+            LocalRunContext {
+                clock: &SystemClock,
+                ledger: &InMemoryNonceLedger::new(),
+                host_signer_keys_dir: None,
+                emitter: None,
+                assurance: None,
+            },
+            LocalMailboxPolicy::RequirePersistentOwner,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("installed mailbox ownership requires a persistent machine"),
+            "{error:#}"
+        );
     }
 
     #[test]

@@ -43,14 +43,22 @@ pub fn report_enforced_grants(
     ctx: &AdmissionContext,
     started: &StartedVm,
 ) -> anyhow::Result<EnforcedGrants> {
+    report_enforced_grants_with_emitter(ctx, started, Some(&ctx.emitter))
+}
+
+/// Installed launches defer the terminal audit until both original owners have stopped.
+pub(super) fn report_enforced_grants_with_emitter(
+    ctx: &AdmissionContext,
+    started: &StartedVm,
+    failure_emitter: Option<&mvm_hostd::audit::emitter::AuditEmitter>,
+) -> anyhow::Result<EnforcedGrants> {
     let undeclared = Grants::default();
     let requested = ctx.admitted.plan().grants.as_ref().unwrap_or(&undeclared);
-
     let enforced = mvm_hostd::plan_admission::apply_admitted_grants_or_undo_launch(
         started.backend(),
         started.vm_id(),
         &ctx.admitted,
-        Some(&ctx.emitter),
+        failure_emitter,
     )?;
 
     crate::record_enforced_grants(&started.vm_id().0, &enforced);
