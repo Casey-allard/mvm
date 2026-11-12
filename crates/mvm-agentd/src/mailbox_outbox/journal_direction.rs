@@ -249,4 +249,101 @@ mod tests {
         );
         assert_eq!(std::fs::read(&files[0]).unwrap(), msg.encode());
     }
+    #[test]
+    fn original_signed_plan_and_boot_commit_the_destination_and_both_credentials() {
+        use mvm_core::mailbox::outbound::journal_direction_commitment;
+        use mvm_core::plan::{
+            signing::{sign_plan, verify_plan},
+            test_support::PlanFixture,
+        };
+        let (boot, _, _, _) = fixture();
+        let key = SigningKey::from_bytes(&[31; 32]);
+        let mut grant = MailboxGrant {
+            outbound_journal_v1: None,
+            mailbox: boot.mailbox,
+            authority_key: boot.authority_key,
+            epoch: boot.execution_epoch,
+            report: None,
+            retention: Some(MailboxRetentionPolicy::new(1000).unwrap()),
+        };
+        assert!(
+            serde_json::to_value(grant)
+                .unwrap()
+                .get("outbound_journal_v1")
+                .is_none()
+        );
+        grant.outbound_journal_v1 = boot.outbound_journal_v1;
+        let mut plan = PlanFixture::new().build();
+        plan.mailbox = Some(grant);
+        let signed = sign_plan(&plan, &key, "original-host");
+        let checked = verify_plan(&signed, &[("original-host", &key.verifying_key())]).unwrap();
+        let original = MailboxReaderBootBinding::mint(
+            &checked,
+            key.verifying_key(),
+            key.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        original.check_plan(&checked).unwrap();
+        let commitment = journal_direction_commitment(&original).unwrap();
+        for edit in 0..4 {
+            let mut changed = original.clone();
+            let d = changed.outbound_journal_v1.as_mut().unwrap();
+            match edit {
+                0 => d.receipt_key = key.verifying_key().to_bytes(),
+                1 => d.source_scope_grant_sha256[0] ^= 1,
+                2 => d.send_grant_sha256[0] ^= 1,
+                _ => d.receive_grant_sha256[0] ^= 1,
+            }
+            assert!(changed.check_plan(&checked).is_err());
+            assert_ne!(journal_direction_commitment(&changed).unwrap(), commitment);
+        }
+        let other_boot = MailboxReaderBootBinding::mint(
+            &checked,
+            key.verifying_key(),
+            key.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        assert_ne!(
+            journal_direction_commitment(&other_boot).unwrap(),
+            commitment
+        );
+    }
+
+    #[test]
+    fn expiry_after_dispatch_retains_original_in_uncertain_archive() {
+        use std::cell::Cell;
+        let (boot, msg, receipt, b) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("local");
+        write_outbox(&slot, &msg).unwrap();
+        let mut attempts = JournalAttempts::default();
+        let mut peer = Peer::new(Some(sign_receipt(receipt, &b).unwrap()));
+        let time = Cell::new(150);
+        assert_eq!(
+            forward_for_original_boot(&mut peer, &slot, &boot, &mut attempts, || Ok(
+                time.replace(200)
+            )),
+            Err(Refusal::Unavailable)
+        );
+        assert_eq!(std::fs::read(&slot).unwrap(), msg.encode());
+        let mut retry = Peer::new(None);
+        assert_eq!(
+            forward_for_original_boot(&mut retry, &slot, &boot, &mut attempts, || Ok(200)),
+            Err(Refusal::RetriesExhausted)
+        );
+        assert!(retry.sent.is_empty());
+        let stored = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .file_name()
+                .to_str()
+                .unwrap()
+                .starts_with("uncertain-")
+        );
+        assert_eq!(std::fs::read(stored.path()).unwrap(), msg.encode());
+    }
 }
