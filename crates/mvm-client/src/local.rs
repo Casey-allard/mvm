@@ -1243,6 +1243,7 @@ impl MvmClient for LocalBackend {
     }
 
     async fn stop_machine(&self, id: &MachineId) -> Result<()> {
+        let _reservation = crate::launch::reserve_named_lifecycle(&id.0)?;
         let vid = VmId(id.0.clone());
         // A persistent machine's session ends at its stop; a transient's ends
         // when its exit is reported, which seals it. Read before the stop: the

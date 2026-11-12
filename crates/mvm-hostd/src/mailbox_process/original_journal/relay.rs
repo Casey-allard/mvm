@@ -100,12 +100,15 @@ impl Drop for OwnedListener {
 /// The caller can service one original A guest transaction at a time. A
 /// transport error or missing reply leaves A's retained intent untouched.
 pub struct OriginalJournalSourceHost {
-    source: Child,
-    _guard: std::sync::Arc<super::LaunchClaim>,
-    marker: super::OriginalMarker,
+    pub(super) source: Child,
+    readiness: Option<String>,
+    pub(super) stop: super::stop::StopCustody,
+    pub(super) boot: mvm_core::mailbox::reader::MailboxReaderBootBinding,
+    pub(super) _guard: std::sync::Arc<super::LaunchClaim>,
+    pub(super) marker: super::OriginalMarker,
     listener: OwnedListener,
     destination: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
-    plan: ExecutionPlan,
+    pub(super) plan: ExecutionPlan,
     grants: std::sync::Arc<JournalCredentials>,
 }
 
@@ -118,6 +121,13 @@ pub struct CompletedRelayIo {
 }
 
 impl OriginalJournalSourceHost {
+    pub fn require_ready(&self) -> Result<()> {
+        if let Some(e) = &self.readiness {
+            anyhow::bail!("original A did not become ready: {e}");
+        }
+        Ok(())
+    }
+
     pub fn try_collect(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.marker.collect(&mut self.source)
     }
@@ -140,6 +150,7 @@ impl OriginalJournalSourceHost {
         until: Instant,
         observe: impl FnOnce(&mvm_contract::protocol::mailbox::MailboxEnvelope, &[u8]),
     ) -> Result<Option<CompletedRelayIo>> {
+        self.require_ready()?;
         let d = self
             .plan
             .mailbox
@@ -219,6 +230,20 @@ impl PairedJournalAdmission {
         name: &str,
         posture: &super::MailboxLaunchPosture,
     ) -> Result<OriginalJournalSourceHost> {
+        let owner = self.launch_custodied_source(plan, backend, name, posture)?;
+        if let Err(error) = owner.require_ready() {
+            return Err(super::IncompleteJournalStart::new(error, owner).into());
+        }
+        Ok(owner)
+    }
+
+    pub fn launch_custodied_source(
+        &self,
+        plan: &ExecutionPlan,
+        backend: &mvm_runtime::backend::AnyBackend,
+        name: &str,
+        posture: &super::MailboxLaunchPosture,
+    ) -> Result<OriginalJournalSourceHost> {
         ensure!(
             posture.variant() == mvm_core::plan::Variant::Prod,
             "paired source requires production posture"
@@ -261,10 +286,17 @@ impl PairedJournalAdmission {
                     };
                     config.keys.outbound_source = Some(delegated);
                     let listener = OwnedListener::bind(&config.vm_state_dir)?;
-                    let marker = super::OriginalMarker::claim(&guard.owner_dir)?;
-                    let source = super::super::spawn_serving(config, &config.vm_state_dir)?;
+                    let stop = super::stop::StopCustody::capture(config, backend, name)?;
+                    let (mut source, marker) =
+                        super::spawn_claimed(&guard.owner_dir, super::super::serving_command()?)?;
+                    let readiness = super::super::configure_serving(config, &mut source)
+                        .err()
+                        .map(|e| e.to_string());
                     Ok(OriginalJournalSourceHost {
                         source,
+                        boot: boot.clone(),
+                        readiness,
+                        stop,
                         _guard: guard,
                         marker,
                         listener,
