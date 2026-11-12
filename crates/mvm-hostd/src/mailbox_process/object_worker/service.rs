@@ -43,9 +43,11 @@ fn refusal(e: &anyhow::Error) -> Refusal {
     if let Some(error) = e.downcast_ref::<JournalError>() {
         return match error {
             JournalError::Full => Refusal::StorageFull,
-            JournalError::MaintenancePending
+            JournalError::Busy
+            | JournalError::MaintenancePending
             | JournalError::Storage(_)
             | JournalError::Uncertain => Refusal::Unavailable,
+            JournalError::Mailbox(mvm_core::mailbox::MailboxError::Expired) => Refusal::Expired,
             _ => Refusal::NotAuthorized,
         };
     }
@@ -71,7 +73,7 @@ impl Local<'_> {
     fn guest_request(
         &self,
         io: &mut (impl Read + Write),
-        out: &UnixStream,
+        out: &carrier::Link,
         until: Instant,
     ) -> Result<ReaderResponse> {
         let request = read_request(io)?;
@@ -148,41 +150,41 @@ impl Local<'_> {
         }
     }
 
-    fn incoming(&self, incoming: &UnixStream) -> Result<()> {
+    fn incoming(&self, incoming: &carrier::Link) -> Result<()> {
         while self.active() {
-            if !await_first_byte(incoming, Duration::from_millis(200), || self.active()) {
+            if !await_first_byte(&incoming.socket, Duration::from_millis(200), || {
+                self.active()
+            }) {
                 continue;
             }
-            let mut io = GuestDeadline::new(
-                incoming.try_clone()?,
-                Instant::now() + GUEST_EXCHANGE_TIMEOUT,
-            )?;
-            let raw = read_frame(LAUNCH_LIMITS.max_frame_bytes, &mut io)?;
-            let result = (|| -> Result<_> {
-                self.current()?;
-                let (cap, envelope) = decode_frame(&raw)?;
-                let receipt = self.owner.config.admit_original(
-                    &mut *self.lock()?,
-                    &self.anchor,
-                    &cap,
-                    &envelope,
-                )?;
-                self.current()?;
-                Ok(receipt)
-            })();
-            let verdict: carrier::Verdict = result.map_err(|e| refusal(&e));
-            carrier::write_record(
-                &mut io,
-                &serde_json::to_vec(&verdict)?,
-                MAX_VERDICT_BYTES as usize,
-            )?;
+            incoming.record(Instant::now() + GUEST_EXCHANGE_TIMEOUT, |mut io| {
+                let raw = read_frame(LAUNCH_LIMITS.max_frame_bytes, &mut io)?;
+                let result = (|| -> Result<_> {
+                    self.current()?;
+                    let (cap, envelope) = decode_frame(&raw)?;
+                    let receipt = self.owner.config.admit_original(
+                        &mut *self.lock()?,
+                        &self.anchor,
+                        &cap,
+                        &envelope,
+                    )?;
+                    self.current()?;
+                    Ok(receipt)
+                })();
+                let verdict: carrier::Verdict = result.map_err(|e| refusal(&e));
+                carrier::write_record(
+                    &mut io,
+                    &serde_json::to_vec(&verdict)?,
+                    MAX_VERDICT_BYTES as usize,
+                )
+            })?;
         }
         Ok(())
     }
 
     fn guest(
         &self,
-        out: &UnixStream,
+        out: &carrier::Link,
         #[cfg(feature = "durable-guest-io-witness")]
         meter: &crate::mailbox_service::durable::witness_io::Recorder,
     ) -> Result<()> {
@@ -222,7 +224,12 @@ impl Local<'_> {
         );
         self.owner.require_live()
     }
-    fn answer(&self, io: &mut (impl Read + Write), out: &UnixStream, until: Instant) -> Result<()> {
+    fn answer(
+        &self,
+        io: &mut (impl Read + Write),
+        out: &carrier::Link,
+        until: Instant,
+    ) -> Result<()> {
         let response =
             self.guest_request(io, out, until)
                 .unwrap_or_else(|error| ReaderResponse::Refused {
@@ -238,6 +245,9 @@ impl Local<'_> {
 
 pub(super) fn run(owner: WorkerLaunch, [out, incoming]: [UnixStream; 2]) -> Result<()> {
     let (journal, anchor) = owner.config.open_journal()?;
+    let state = owner.config.validate_current()?.local_state;
+    let out = carrier::Link::new(out, &state, true)?;
+    let incoming = carrier::Link::new(incoming, &state, false)?;
     let local = Local {
         owner: &owner,
         local: owner.config.endpoint_material()?,
@@ -268,7 +278,7 @@ pub(super) fn run(owner: WorkerLaunch, [out, incoming]: [UnixStream; 2]) -> Resu
             )
         })();
         local.stop.store(true, Ordering::Release);
-        let _ = incoming.shutdown(Shutdown::Both);
+        let _ = incoming.socket.shutdown(Shutdown::Both);
         let result = peer
             .join()
             .map_err(|_| anyhow::anyhow!("original peer listener panicked"))?;

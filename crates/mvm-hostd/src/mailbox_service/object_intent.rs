@@ -77,8 +77,7 @@ impl ObjectIntentSlot {
     pub(super) fn open(dir: &Path, name: &str, intent: [u8; 32]) -> Result<Self> {
         private_fs::create_owned_private_dir(dir)?;
         sync_dir(dir.parent().context("missing mailbox custody parent")?)?;
-        let owner =
-            FileLock::try_acquire(&dir.join("intent"))?.context("original source writer busy")?;
+        let owner = FileLock::try_acquire(&dir.join("intent"))?.ok_or(Refusal::Unavailable)?;
         let (sequence, original) = match read_original_object(&dir.join(name))? {
             Some((ordinal, digest, frame)) => {
                 ensure!(
@@ -236,10 +235,7 @@ impl OutboundObject<'_> {
         current: impl Fn() -> Result<i64>,
         exchange: impl FnOnce(&SealedObjectTurn, Instant) -> Result<SignedDestinationReceipt>,
     ) -> Result<ReaderResponse> {
-        ensure!(
-            Instant::now() < deadline,
-            "original peer exchange deadline passed"
-        );
+        ensure!(Instant::now() < deadline, Refusal::Unavailable);
         self.retain(local, dir, &current)?
             .send(local, deadline, current, exchange)
     }
@@ -259,23 +255,18 @@ impl RetainedObjectSubmission {
         let window = header.issued_at_unix_ms..expires;
         let start = Instant::now();
         let now = current()?;
-        ensure!(window.contains(&now), "original source seal expired");
+        ensure!(window.contains(&now), Refusal::Expired);
         let until = deadline.min(start + durable::GUEST_EXCHANGE_TIMEOUT).min(
             start
                 .checked_add(Duration::from_millis(expires.abs_diff(now)))
                 .unwrap_or(deadline),
         );
-        ensure!(
-            Instant::now() < until,
-            "source preparation exceeded exchange deadline"
-        );
+        ensure!(Instant::now() < until, Refusal::Unavailable);
         let receipt = exchange(&held.turn, until)?;
         let now = current()?;
         local.verify_accepted(local.public_role.role.role, &held.turn, &receipt)?;
-        ensure!(
-            Instant::now() < until && window.contains(&now),
-            "original peer verdict expired"
-        );
+        ensure!(window.contains(&now), Refusal::Expired);
+        ensure!(Instant::now() < until, Refusal::Unavailable);
         Ok(ReaderResponse::ObjectSealAcceptedV1 {
             original: held.original,
             receipt: Box::new(receipt),
