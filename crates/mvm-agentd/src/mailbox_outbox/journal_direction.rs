@@ -96,6 +96,21 @@ fn stage_in<S: Read + Write>(
     }
 }
 
+/// A terminal archive fences this same ID even after an intervening message.
+pub(super) fn require_unarchived(slot: &Path, message: &OutboxMessage) -> Result<(), Refusal> {
+    for (prefix, reason) in [
+        ("uncertain", Refusal::RetriesExhausted),
+        ("rejected", Refusal::NotAuthorized),
+    ] {
+        match std::fs::symlink_metadata(super::archive_path(slot, message, prefix)?) {
+            Ok(_) => return Err(reason),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Refusal::Unavailable),
+        }
+    }
+    Ok(())
+}
+
 pub fn forward_for_original_boot<S: Read + Write>(
     stream: &mut S,
     outbox: &Path,
@@ -111,6 +126,7 @@ pub fn forward_for_original_boot<S: Read + Write>(
         .as_ref()
         .ok_or(Refusal::NotAuthorized)?;
     forward_with(stream, outbox, |stream, message| {
+        require_unarchived(outbox, message)?;
         if message.recipient != remote.address.recipient {
             return Err(Refusal::NotAuthorized);
         }
@@ -319,6 +335,11 @@ mod tests {
                 .starts_with("uncertain-")
         );
         assert_eq!(std::fs::read(&files[0]).unwrap(), msg.encode());
+        assert_eq!(
+            write_single_outbox(&slot, &msg),
+            Err(Refusal::RetriesExhausted)
+        );
+        assert!(!slot.exists());
     }
     #[test]
     fn original_signed_plan_and_boot_commit_the_destination_and_both_credentials() {
