@@ -460,6 +460,7 @@ mod tests {
                 .collect(),
             plan_nonce_hex: plan.nonce.as_hex().to_string(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: verb_grant,

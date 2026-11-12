@@ -474,6 +474,7 @@ fn original_boot_grant_binds_delivery_to_workload_owner_direction_and_root() {
         drive: None,
         application_terminal: None,
         cast_delivery_v1: Some(projection.commitment().unwrap()),
+        cast_submit_v1: None,
         sig: Vec::new(),
     };
     grant.sig = anchor.sign(&grant.signing_bytes()).to_bytes().to_vec();
@@ -484,6 +485,7 @@ fn original_boot_grant_binds_delivery_to_workload_owner_direction_and_root() {
         predecessor_plan_nonce_hex: None,
         grant: grant.clone(),
         cast_delivery_v1: Some(projection.clone()),
+        cast_submit_v1: None,
     };
     let compact = mvm_core::vm_backend::encode_verb_grant_cmdline(&stored).unwrap();
     let boot = mvm_core::vm_backend::decode_verb_grant_cmdline(

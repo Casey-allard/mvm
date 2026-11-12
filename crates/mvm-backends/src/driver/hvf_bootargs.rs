@@ -48,6 +48,7 @@ mod tests {
             pubkey_hex: "cc".repeat(32),
             plan_nonce_hex: nonce.as_hex().to_string(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: VerbGrant {
@@ -58,6 +59,7 @@ mod tests {
                 drive: None,
                 application_terminal: None,
                 cast_delivery_v1: None,
+                cast_submit_v1: None,
                 sig: vec![0u8; 64],
             },
         };

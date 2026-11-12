@@ -29,6 +29,7 @@ pub fn mint_verb_grant(
         drive: authority.drive,
         application_terminal: authority.application_terminal,
         cast_delivery_v1: None,
+        cast_submit_v1: None,
         sig: vec![],
     };
     let result = signer.sign(&grant.signing_bytes());

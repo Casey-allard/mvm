@@ -354,6 +354,9 @@ pub struct VerbGrantEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
     pub cast_delivery_v1: Option<crate::mailbox::frame::cast::enrollment::DeliverEnrollmentV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+    pub cast_submit_v1: Option<crate::mailbox::frame::cast::submit_enrollment::SubmitEnrollmentV1>,
     pub pubkey_hex: String,
     pub plan_nonce_hex: String,
     /// When present on a restore-time re-pin envelope, proves which pinned
@@ -381,6 +384,7 @@ pub fn encode_verb_grant_cmdline(env: &VerbGrantEnvelope) -> Option<String> {
     }
     let mut compact = env.clone();
     compact.cast_delivery_v1 = None;
+    compact.cast_submit_v1 = None;
     let json = serde_json::to_vec(&compact).ok()?;
     Some(format!("mvm.verb_grant={}", B64.encode(&json)))
 }
@@ -992,6 +996,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         grant.sig = k.sign(&grant.signing_bytes()).to_bytes().to_vec();
@@ -999,6 +1004,7 @@ mod tests {
             pubkey_hex: String::new(),
             plan_nonce_hex: nonce.as_hex().to_string(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant,
@@ -1026,6 +1032,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         grant.sig = k.sign(&grant.signing_bytes()).to_bytes().to_vec();
@@ -1042,6 +1049,7 @@ mod tests {
             pubkey_hex: pubkey_hex.clone(),
             plan_nonce_hex: plan_nonce_hex.clone(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: grant.clone(),

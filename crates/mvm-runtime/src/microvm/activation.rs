@@ -299,7 +299,7 @@ pub fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEn
     let volumes = build_volume_configs(config)?;
     let extensions = build_extension_configs(config)?;
     let mut verb_grant_envelope = read_verb_grant_envelope(&config.name)?;
-    let cast_delivery_v1 = match verb_grant_envelope.as_mut() {
+    let (cast_delivery_v1, cast_submit_v1) = match verb_grant_envelope.as_mut() {
         Some(g) => {
             let enrollment = g.cast_delivery_v1.take();
             anyhow::ensure!(
@@ -307,9 +307,12 @@ pub fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEn
                     == g.grant.cast_delivery_v1,
                 "original Cast activation differs from the boot grant"
             );
-            enrollment
+            let submit = g.cast_submit_v1.take();
+            anyhow::ensure!(submit.as_ref().map(|v| v.commitment()).transpose()? == g.grant.cast_submit_v1
+                && !(submit.is_some() && enrollment.is_some()), "ambiguous or unbound original Submit activation");
+            (enrollment, submit)
         }
-        None => None,
+        None => (None, None),
     };
     refuse_legacy_tool_authority(config)?;
 
@@ -319,6 +322,7 @@ pub fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEn
         volumes,
         extensions,
         cast_delivery_v1,
+        cast_submit_v1,
         verb_grant_envelope,
     })
 }
@@ -459,6 +463,7 @@ mod tests {
             pubkey_hex: "ab".repeat(32),
             plan_nonce_hex: "00".repeat(16),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: mvm_core::plan::VerbGrant {
@@ -469,6 +474,7 @@ mod tests {
                 drive: None,
                 application_terminal: None,
                 cast_delivery_v1: None,
+                cast_submit_v1: None,
                 sig: vec![0u8; 64],
             },
         }
@@ -862,12 +868,14 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![0u8; 64],
         };
         let envelope = VerbGrantEnvelope {
             pubkey_hex: VALID_HASH.into(),
             plan_nonce_hex: VALID_HASH.into(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant,
@@ -979,6 +987,7 @@ mod tests {
             pubkey_hex: VALID_HASH.into(),
             plan_nonce_hex: VALID_HASH.into(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: mvm_core::plan::VerbGrant {
@@ -990,6 +999,7 @@ mod tests {
                 drive: None,
                 application_terminal: None,
                 cast_delivery_v1: None,
+                cast_submit_v1: None,
                 sig: vec![0u8; 64],
             },
         };

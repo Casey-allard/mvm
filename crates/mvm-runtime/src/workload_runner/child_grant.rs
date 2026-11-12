@@ -176,6 +176,7 @@ mod tests {
             pubkey_hex: "ab".repeat(32),
             plan_nonce_hex: plan.nonce.as_hex().to_string(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: VerbGrant {
@@ -190,6 +191,7 @@ mod tests {
                     .and_then(|grants| grants.application_terminal.as_ref())
                     .map(mvm_contract::grants::ApplicationTerminalBinding::from),
                 cast_delivery_v1: None,
+                cast_submit_v1: None,
                 sig: vec![3u8; 64],
             },
         }

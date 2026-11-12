@@ -6,6 +6,8 @@
 //! path never constructs this service.
 #[cfg(target_os = "linux")]
 pub mod exec;
+#[cfg(target_os = "linux")]
+pub mod submit;
 
 use std::io;
 use std::os::fd::OwnedFd;
@@ -50,6 +52,27 @@ pub struct CastWorkloadReader {
 pub struct WorkloadCastContext {
     limits: MailboxLocalLimits,
     validity: std::ops::Range<i64>,
+}
+
+#[cfg(target_os = "linux")]
+fn check_host_port(fd: &OwnedFd) -> io::Result<()> {
+    use nix::sys::socket::{
+        SockType as SocketType, VsockAddr, getpeername, getsockname, getsockopt, sockopt::SockType,
+    };
+    use std::os::fd::AsRawFd;
+
+    let peer: VsockAddr = getpeername(fd.as_raw_fd())?;
+    let local: VsockAddr = getsockname(fd.as_raw_fd())?;
+    if peer.cid() != crate::vsock::HOST_CID
+        || local.port() != mvm_contract::protocol::mailbox::MAILBOX_PORT
+        || getsockopt(fd, SockType)? != SocketType::Stream
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "expected original host mailbox port",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -113,23 +136,8 @@ impl GuestCastEndpoint {
     /// before reading any bytes. Never use the greeting to authorize the peer.
     #[cfg(target_os = "linux")]
     pub fn receive_on_host_port(&mut self, fd: OwnedFd) -> io::Result<()> {
-        use nix::sys::socket::{
-            SockType as SocketType, VsockAddr, getpeername, getsockname, getsockopt,
-            sockopt::SockType,
-        };
-        use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
-        let peer: VsockAddr = getpeername(fd.as_raw_fd())?;
-        let local: VsockAddr = getsockname(fd.as_raw_fd())?;
-        if peer.cid() != crate::vsock::HOST_CID
-            || local.port() != mvm_contract::protocol::mailbox::MAILBOX_PORT
-            || getsockopt(&fd, SockType)? != SocketType::Stream
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "expected original host mailbox port",
-            ));
-        }
+        check_host_port(&fd)?;
         let mut stream = UnixStream::from(fd);
         crate::vsock::run_with_stream_deadline(
             &mut stream,
