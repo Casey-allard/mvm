@@ -29,6 +29,54 @@ pub struct OriginalCastBoot<'a> {
     pub direction_commitment: [u8; 32],
 }
 
+/// One prepared publication for the SDK's still-held destination VM claim.
+pub struct PreparedOriginalCastBoot {
+    owner: MailboxWorkerOwner,
+    plan: [u8; 32],
+    prior: VerbGrantEnvelope,
+    boot: VerbGrantEnvelope,
+}
+
+impl PreparedOriginalCastBoot {
+    /// Called inside the original SDK per-name lock, before starting the VMM.
+    /// The projection and its signed digest replace one existing file atomically.
+    pub fn into_bytes_for_original(
+        self,
+        destination: &crate::mailbox_process::owned_client::InstalledMailboxClient,
+        config: &mvm_core::vm_backend::VmStartConfig,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            destination.owner() == Some(&self.owner)
+                && destination.acquire_request().plan_commitment == self.plan
+                && config.name == destination.acquire_request().vm_id
+                && config
+                    .installed_mailbox_owner
+                    .as_ref()
+                    .is_some_and(|b| b.owner == self.owner && b.plan_commitment == self.plan)
+                && destination.query(deadline)? == MailboxWorkerState::Reserved,
+            "original destination lost before boot"
+        );
+        let current = mvm_runtime::microvm::read_verb_grant_envelope(&config.name)?
+            .context("missing original gate")?;
+        ensure!(
+            serde_json::to_vec(&current)? == serde_json::to_vec(&self.prior)?,
+            "original boot sidecar changed"
+        );
+        let actual = mvm_runtime::microvm::build_activation_environment(config)?;
+        ensure!(
+            self.boot
+                .cast_delivery_v1
+                .as_ref()
+                .is_some_and(|p| Some(p.mount_commitment) == actual.cast_mount_commitment().ok()),
+            "original mounts changed"
+        );
+        let bytes = serde_json::to_vec(&self.boot)?;
+        ensure!(bytes.len() <= 16384, "oversized Cast boot grant");
+        Ok(bytes)
+    }
+}
+
 fn original(
     participant: &InstalledCastParticipant<'_>,
     destination: bool,
@@ -68,10 +116,7 @@ impl OriginalCastBoot<'_> {
         original_grant: &VerbGrantEnvelope,
         config: &mvm_core::vm_backend::VmStartConfig,
         deadline: Instant,
-    ) -> Result<(
-        VerbGrantEnvelope,
-        mvm_core::mailbox::frame::cast::enrollment::DeliverEnrollmentV1,
-    )> {
+    ) -> Result<PreparedOriginalCastBoot> {
         let left = original(&self.source, false, deadline)?;
         let right = original(&self.destination, true, deadline)?;
         ensure!(
@@ -109,7 +154,8 @@ impl OriginalCastBoot<'_> {
                 && original_grant.plan_nonce_hex == dst.nonce.as_hex()
                 && original_grant.predecessor_session_id.is_none()
                 && original_grant.predecessor_plan_nonce_hex.is_none()
-                && original_grant.grant.cast_delivery_v1.is_none(),
+                && original_grant.grant.cast_delivery_v1.is_none()
+                && original_grant.cast_delivery_v1.is_none(),
             "expected an original unbound boot grant"
         );
         let now = chrono::Utc::now();
@@ -123,20 +169,17 @@ impl OriginalCastBoot<'_> {
             hash == dst.image.sha256,
             "selected root image differs from admitted workload"
         );
-        let root = if config.verity_path.is_some() {
-            Some(
-                hex::decode(
-                    config
-                        .roothash
-                        .as_deref()
-                        .context("missing selected verity root")?,
-                )?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid verity root"))?,
-            )
-        } else {
-            None
-        };
+        let activation = mvm_runtime::microvm::build_activation_environment(config)?;
+        let root = activation
+            .rootfs
+            .roothash
+            .as_deref()
+            .map(|v| -> Result<[u8; 32]> {
+                Ok(hex::decode(v)?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid verity root"))?)
+            })
+            .transpose()?;
         let mut origin = self.source_policy.clone();
         let mut target = self.destination_policy.clone();
         origin.now_unix_ms = now.timestamp_millis();
@@ -166,6 +209,7 @@ impl OriginalCastBoot<'_> {
             hex::decode(hash)?
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid image digest"))?,
+            activation.cast_mount_commitment()?,
             root,
             config.name.clone(),
         )?;
@@ -183,6 +227,12 @@ impl OriginalCastBoot<'_> {
         let mut boot = original_grant.clone();
         boot.grant.cast_delivery_v1 = Some(projection.commitment()?);
         boot.grant.sig = signer.sign(&boot.grant.signing_bytes()).signature;
-        Ok((boot, projection))
+        boot.cast_delivery_v1 = Some(projection);
+        Ok(PreparedOriginalCastBoot {
+            owner: right,
+            plan: self.destination.worker.acquire_request().plan_commitment,
+            prior: original_grant.clone(),
+            boot,
+        })
     }
 }

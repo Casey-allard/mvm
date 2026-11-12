@@ -42,6 +42,16 @@ pub struct ActivateEnvironment {
     pub verb_grant_envelope: Option<mvm_core::protocol::vm_backend::VerbGrantEnvelope>,
 }
 
+impl ActivateEnvironment {
+    /// The canonical host mount projection checked again by PID 1 before
+    /// mounting it. The boot grant and enrollment do not hash themselves.
+    pub fn cast_mount_commitment(&self) -> serde_json::Result<[u8; 32]> {
+        Ok(mvm_core::mailbox::frame::cast::enrollment::mount_context(
+            &serde_json::to_vec(&(&self.rootfs, &self.runtime, &self.volumes, &self.extensions))?,
+        ))
+    }
+}
+
 /// One read-only extension artifact mounted for identity-only dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

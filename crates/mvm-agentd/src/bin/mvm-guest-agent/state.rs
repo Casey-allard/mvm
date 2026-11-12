@@ -674,6 +674,7 @@ mod tests {
         mvm_core::protocol::vm_backend::VerbGrantEnvelope {
             pubkey_hex,
             plan_nonce_hex: nonce.as_hex().to_string(),
+            cast_delivery_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: g,

@@ -349,6 +349,11 @@ impl VmStartConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct VerbGrantEnvelope {
+    /// Optional public activation body saved with the signed grant. The kernel
+    /// cmdline carries only the signed commitment; this body goes over vsock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+    pub cast_delivery_v1: Option<crate::mailbox::frame::cast::enrollment::DeliverEnrollmentV1>,
     pub pubkey_hex: String,
     pub plan_nonce_hex: String,
     /// When present on a restore-time re-pin envelope, proves which pinned
@@ -374,7 +379,9 @@ pub fn encode_verb_grant_cmdline(env: &VerbGrantEnvelope) -> Option<String> {
     if env.pubkey_hex.is_empty() {
         return None;
     }
-    let json = serde_json::to_vec(env).ok()?;
+    let mut compact = env.clone();
+    compact.cast_delivery_v1 = None;
+    let json = serde_json::to_vec(&compact).ok()?;
     Some(format!("mvm.verb_grant={}", B64.encode(&json)))
 }
 
@@ -991,6 +998,7 @@ mod tests {
         let env = VerbGrantEnvelope {
             pubkey_hex: String::new(),
             plan_nonce_hex: nonce.as_hex().to_string(),
+            cast_delivery_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant,
@@ -1033,6 +1041,7 @@ mod tests {
         let env = VerbGrantEnvelope {
             pubkey_hex: pubkey_hex.clone(),
             plan_nonce_hex: plan_nonce_hex.clone(),
+            cast_delivery_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: grant.clone(),

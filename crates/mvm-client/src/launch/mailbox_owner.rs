@@ -34,6 +34,16 @@ pub trait InstalledMailboxProvisioner: Send + Sync {
         backend: &AnyBackend,
         request: &MailboxWorkerRequest,
     ) -> anyhow::Result<Arc<InstalledMailboxPeer>>;
+    /// Optional directed Cast installation. Called after durable destination
+    /// ownership and before VMM start, while the SDK holds its per-name lock.
+    fn original_cast_boot(
+        &self,
+        _admission: &AdmittedPlan,
+        _destination: &InstalledMailboxClient,
+        _config: &mvm_core::vm_backend::VmStartConfig,
+    ) -> Result<Option<mvm_hostd::mailbox_launch::cast_enrollment::PreparedOriginalCastBoot>> {
+        Ok(None)
+    }
     /// Resolve the original daemon from trusted installation custody.
     fn resolve_original(
         &self,
@@ -342,6 +352,18 @@ impl OwnedLaunch {
             stop: Box::new(launch.client.signed_stop_locator()?),
         })?;
         Ok(launch)
+    }
+    pub(crate) fn bind_original_cast(
+        &self,
+        provisioner: &dyn InstalledMailboxProvisioner,
+        admission: &AdmittedPlan,
+        config: &mvm_core::vm_backend::VmStartConfig,
+    ) -> Result<()> {
+        if let Some(prepared) = provisioner.original_cast_boot(admission, &self.client, config)? {
+            let bytes=prepared.into_bytes_for_original(&self.client,config,deadline())?;
+            mvm_core::atomic_io::write_private_ephemeral(&mvm_core::config::vm_state_dir(&self.claim.name).join("verb-grant.json"),&bytes)?;
+        }
+        Ok(())
     }
     pub(crate) fn broker_binding(&self) -> Result<mvm_core::vm_backend::InstalledBrokerBinding> {
         Ok(mvm_core::vm_backend::InstalledBrokerBinding {

@@ -274,10 +274,10 @@ impl ControlOperations for NativeControlOperations {
         environment: &mvm_agentd::vsock::ActivateEnvironment,
         boot: &Arc<AgentBootState>,
     ) -> anyhow::Result<()> {
-        #[cfg(target_os="linux")]
-        let original=mailbox::prepare_delivery(environment,boot)?;
+        #[cfg(target_os = "linux")]
+        let original = mailbox::prepare_delivery(environment, boot)?;
         init::apply_activation(environment, boot)?;
-        #[cfg(target_os="linux")]
+        #[cfg(target_os = "linux")]
         mailbox::install_delivery(original)?;
         if init::is_pid1() {
             let boot = Arc::clone(boot);

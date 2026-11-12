@@ -621,6 +621,12 @@ pub(crate) fn handle_post_restore(
     ctx: &mut HandlerCtx,
     inputs: PostRestoreInputs,
 ) -> GuestResponse {
+    #[cfg(target_os = "linux")]
+    if crate::mailbox::retire_for_restore() {
+        return GuestResponse::Error {
+            message: "original Cast generation retired; fresh admission required".into(),
+        };
+    }
     let PostRestoreInputs {
         token,
         hostname,

@@ -84,7 +84,7 @@ pub fn configure_oci(
         return Ok(());
     };
     if first != FLAG {
-        return Err(io::Error::other("unexpected OCI wrapper argument"));
+        return Ok(());
     }
     let raw: RawFd = args
         .next()

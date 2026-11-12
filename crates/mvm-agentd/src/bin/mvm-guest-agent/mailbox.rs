@@ -27,51 +27,147 @@ use crate::globals::SHUTDOWN_REQUESTED;
 use crate::telemetry::cmdline_asserts;
 use crate::transport::{accept_vsock, bind_vsock_listener, unix_transport_selected};
 
-#[cfg(target_os="linux")]
+#[cfg(target_os = "linux")]
 struct OriginalDelivery {
-    endpoint: std::sync::Mutex<mvm_agentd::mailbox_cast::GuestCastEndpoint>,
+    endpoint: std::sync::Mutex<Option<mvm_agentd::mailbox_cast::GuestCastEndpoint>>,
     descriptor: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
 }
-#[cfg(target_os="linux")]
+#[cfg(target_os = "linux")]
 static ORIGINAL: std::sync::OnceLock<OriginalDelivery> = std::sync::OnceLock::new();
 
 /// Check the original boot authority before accepting any mount or starting a
 /// worker. The activation message cannot supply a replacement trust anchor.
-#[cfg(target_os="linux")]
-pub(crate) fn prepare_delivery(env:&mvm_agentd::vsock::ActivateEnvironment, boot:&crate::state::AgentBootState)
- -> anyhow::Result<Option<(mvm_agentd::mailbox_cast::GuestCastEndpoint,std::os::fd::OwnedFd)>> {
-    use anyhow::{Context,ensure};
-    let (_,held)=boot.grant_state();
-    let Some(enrollment)=env.cast_delivery_v1.as_ref() else {
-        ensure!(held.as_ref().is_none_or(|g|g.cast_delivery_v1.is_none()),"missing committed Deliver enrollment");
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_delivery(
+    env: &mvm_agentd::vsock::ActivateEnvironment,
+    boot: &crate::state::AgentBootState,
+) -> anyhow::Result<
+    Option<(
+        mvm_agentd::mailbox_cast::GuestCastEndpoint,
+        std::os::fd::OwnedFd,
+    )>,
+> {
+    use anyhow::{Context, ensure};
+    let (denied, held) = boot.grant_state();
+    let Some(enrollment) = env.cast_delivery_v1.as_ref() else {
+        ensure!(
+            held.as_ref().is_none_or(|g| g.cast_delivery_v1.is_none()),
+            "missing committed Deliver enrollment"
+        );
         return Ok(None);
     };
-    ensure!(crate::init::is_pid1() && !env.rootfs.in_place && env.rootfs.virtiofs_tag.is_none() &&
-       env.rootfs.data_dev=="/dev/vda", "expected original PID 1 block-root activation");
-    let selected=parse_mailbox_service_cmdline(&std::fs::read_to_string("/proc/cmdline")?)?;
-    ensure!(selected==MailboxGuestService::ReliableV1,"missing signed reliable service selection");
+    ensure!(!denied, "boot grant authority denied");
+    ensure!(
+        crate::init::is_pid1()
+            && !env.rootfs.in_place
+            && env.rootfs.virtiofs_tag.is_none()
+            && !env.rootfs.data_dev.is_empty(),
+        "expected original PID 1 block-root activation"
+    );
+    let selected = parse_mailbox_service_cmdline(&std::fs::read_to_string("/proc/cmdline")?)?;
+    ensure!(
+        selected == MailboxGuestService::ReliableV1,
+        "missing signed reliable service selection"
+    );
     selected.require_implemented()?;
-    let held=held.context("missing original boot grant")?;
-    let anchor=boot.host_signer_key().context("missing original boot anchor")?;
+    let held = held.context("missing original boot grant")?;
+    let anchor = boot
+        .host_signer_key()
+        .context("missing original boot anchor")?;
     // The root hash is a digest, not an Ed25519 point.
-    let root=env.rootfs.roothash.as_deref().map(|h| {
-        ensure!(h.len()==64 && h.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "invalid root digest");
-        let mut bytes=[0;32];for (i,x) in bytes.iter_mut().enumerate(){*x=u8::from_str_radix(&h[2*i..2*i+2],16)?;} Ok::<_,anyhow::Error>(bytes)
-    }).transpose()?;
-    let channel=enrollment.open_original(&held,&anchor,&held.session_id,&held.plan_nonce,root,chrono::Utc::now())?;
-    Ok(Some(mvm_agentd::mailbox_cast::GuestCastEndpoint::prepare_original_worker(channel,enrollment.limits())?))
+    let root = env
+        .rootfs
+        .roothash
+        .as_deref()
+        .map(|h| {
+            ensure!(
+                h.len() == 64
+                    && h.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "invalid root digest"
+            );
+            let mut bytes = [0; 32];
+            for (i, x) in bytes.iter_mut().enumerate() {
+                *x = u8::from_str_radix(&h[2 * i..2 * i + 2], 16)?;
+            }
+            Ok::<_, anyhow::Error>(bytes)
+        })
+        .transpose()?;
+    let channel = enrollment.open_original(
+        &held,
+        &anchor,
+        &held.session_id,
+        &held.plan_nonce,
+        root,
+        env.cast_mount_commitment()?,
+        chrono::Utc::now(),
+    )?;
+    Ok(Some(
+        mvm_agentd::mailbox_cast::GuestCastEndpoint::prepare_original_worker(
+            channel,
+            enrollment.limits(),
+        )?,
+    ))
 }
 
-#[cfg(target_os="linux")]
-pub(crate) fn install_delivery(pair:Option<(mvm_agentd::mailbox_cast::GuestCastEndpoint,std::os::fd::OwnedFd)>)->anyhow::Result<()> {
-    if let Some((endpoint,fd))=pair { ORIGINAL.set(OriginalDelivery{endpoint:std::sync::Mutex::new(endpoint),descriptor:std::sync::Mutex::new(Some(fd))}).map_err(|_|anyhow::anyhow!("original Deliver already installed"))?; }
+#[cfg(target_os = "linux")]
+pub(crate) fn install_delivery(
+    pair: Option<(
+        mvm_agentd::mailbox_cast::GuestCastEndpoint,
+        std::os::fd::OwnedFd,
+    )>,
+) -> anyhow::Result<()> {
+    if let Some((endpoint, fd)) = pair {
+        use mvm_agentd::runtime_config::ConcurrencyConfig;
+        let runtime = mvm_agentd::runtime_config::load()?
+            .ok_or_else(|| anyhow::anyhow!("Cast requires an installed workload runtime"))?;
+        anyhow::ensure!(
+            matches!(runtime.concurrency,Some(ConcurrencyConfig::WarmProcess(cfg)) if cfg.pool_size==1),
+            "one original OCI worker required"
+        );
+        ORIGINAL
+            .set(OriginalDelivery {
+                endpoint: std::sync::Mutex::new(Some(endpoint)),
+                descriptor: std::sync::Mutex::new(Some(fd)),
+            })
+            .map_err(|_| anyhow::anyhow!("original Deliver already installed"))?;
+    }
     Ok(())
 }
 
-#[cfg(target_os="linux")]
-pub(crate) fn take_original()->std::io::Result<Option<std::os::fd::OwnedFd>> {
-    ORIGINAL.get().map(|o|o.descriptor.lock().map_err(|_|std::io::Error::other("original descriptor poisoned"))?.take().ok_or_else(||std::io::Error::other("original descriptor already delegated"))).transpose()
+#[cfg(target_os = "linux")]
+pub(crate) fn take_original() -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    ORIGINAL
+        .get()
+        .map(|o| {
+            o.descriptor
+                .lock()
+                .map_err(|_| std::io::Error::other("original descriptor poisoned"))?
+                .take()
+                .ok_or_else(|| std::io::Error::other("original descriptor already delegated"))
+        })
+        .transpose()
 }
+/// A restored original does not inherit this ephemeral mailbox lane. Close its
+/// queue and any unclaimed FD before the guest can accept a new restore lineage.
+#[cfg(target_os = "linux")]
+pub(crate) fn retire_for_restore() -> bool {
+    let Some(original) = ORIGINAL.get() else {
+        return false;
+    };
+    original
+        .endpoint
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    original
+        .descriptor
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    true
+}
+
 /// Spawn the mailbox listener on a boot that asserts one. Called after PID-1
 /// activation; a bind failure is logged and abandoned, never boot-fatal.
 pub(crate) fn init_mailbox() {
@@ -92,28 +188,36 @@ pub(crate) fn init_mailbox() {
     if service == MailboxGuestService::Disabled || unix_transport_selected() {
         return;
     }
-    let _ = mvm_agentd::detached::spawn_named("mailbox-listener", move || {
-        match bind_vsock_listener(MAILBOX_PORT) {
-            #[cfg(target_os="linux")]
-            Ok(fd) if service == MailboxGuestService::ReliableV1 => {
-                use std::os::fd::{AsRawFd,OwnedFd};
-                let listener=unsafe{OwnedFd::from_raw_fd(fd)};
-                let Some(original)=ORIGINAL.get() else {return};
-                while !SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
-                    if let Some(fd)=accept_vsock(listener.as_raw_fd(),"mailbox Deliver"){
-                        let original_fd=unsafe{OwnedFd::from_raw_fd(fd)};
-                        let Ok(mut endpoint)=original.endpoint.lock() else {return};
-                        let _=endpoint.receive_on_host_port(original_fd);
-                        let _=endpoint.offer_to_workload();
+    let _ =
+        mvm_agentd::detached::spawn_named("mailbox-listener", move || {
+            match bind_vsock_listener(MAILBOX_PORT) {
+                #[cfg(target_os = "linux")]
+                Ok(fd) if service == MailboxGuestService::ReliableV1 => {
+                    use std::os::fd::{AsRawFd, OwnedFd};
+                    let listener = unsafe { OwnedFd::from_raw_fd(fd) };
+                    let Some(original) = ORIGINAL.get() else {
+                        return;
+                    };
+                    while !SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+                        if let Some(fd) = accept_vsock(listener.as_raw_fd(), "mailbox Deliver") {
+                            let original_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                            let Ok(mut guard) = original.endpoint.lock() else {
+                                return;
+                            };
+                            let Some(endpoint) = guard.as_mut() else {
+                                return;
+                            };
+                            let _ = endpoint.receive_on_host_port(original_fd);
+                            let _ = endpoint.offer_to_workload();
+                        }
                     }
                 }
+                Ok(fd) => accept_loop(fd),
+                Err(e) => eprintln!(
+                    "mvm-guest-agent: mailbox listener bind failed (port {MAILBOX_PORT}): {e}"
+                ),
             }
-            Ok(fd) => accept_loop(fd),
-            Err(e) => eprintln!(
-                "mvm-guest-agent: mailbox listener bind failed (port {MAILBOX_PORT}): {e}"
-            ),
-        }
-    });
+        });
 }
 
 /// The host re-dials an idle guest forever, so only the first few refusals

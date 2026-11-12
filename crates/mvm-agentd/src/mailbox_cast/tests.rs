@@ -394,68 +394,205 @@ fn original_cast_crosses_process_boundary_with_verified_callback_and_role_counte
 #[test]
 #[ignore = "requires namespace PID 1 and a prepared canonical OCI root"]
 fn original_worker_oci_exec_reads_exact_cast_alongside_standard_pipes() {
-    use crate::{entrypoint::EntrypointPolicy,worker_pool::{WorkerPool,SlotSnapshot}};
-    assert_eq!(std::process::id(),1);
-    let start=std::time::Instant::now();
-    let cpu=cpu_ns();
-    let (mut endpoint,reader,greeting,mut item)=fixture();
-    item.body=workload_payload();
-    let (fd,context)=reader.into_launch_fd().unwrap();
-    exec::queue_context(&endpoint.workload,&context).unwrap();
-    endpoint.workload.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
-    assert_eq!(admit(&mut endpoint,greeting,&item),LocalInboxDisposition::Accepted);
-    let entry=EntrypointPolicy::production().validate().unwrap();
-    let cfg=serde_json::from_str(r#"{"max_calls_per_worker":1,"max_rss_mb":64,"pool_size":1,"in_process":"serial"}"#).unwrap();
-    let pool=WorkerPool::start_original_cast(cfg,std::sync::Arc::new(entry),fd).unwrap();
+    use crate::{
+        entrypoint::EntrypointPolicy,
+        worker_pool::{SlotSnapshot, WorkerPool},
+    };
+    assert_eq!(std::process::id(), 1);
+    let start = std::time::Instant::now();
+    let cpu = cpu_ns();
+    let (mut endpoint, reader, greeting, mut item) = fixture();
+    item.body = workload_payload();
+    let (fd, context) = reader.into_launch_fd().unwrap();
+    exec::queue_context(&endpoint.workload, &context).unwrap();
+    endpoint
+        .workload
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    assert_eq!(
+        admit(&mut endpoint, greeting, &item),
+        LocalInboxDisposition::Accepted
+    );
+    let entry = EntrypointPolicy::production().validate().unwrap();
+    let cfg = serde_json::from_str(
+        r#"{"max_calls_per_worker":1,"max_rss_mb":64,"pool_size":1,"in_process":"serial"}"#,
+    )
+    .unwrap();
+    let pool = WorkerPool::start_original_cast(cfg, std::sync::Arc::new(entry), fd).unwrap();
     pool.mark_ready();
-    let setup=start.elapsed().as_nanos();
+    let setup = start.elapsed().as_nanos();
+    let caller = {
+        let pool = pool.clone();
+        std::thread::spawn(move || pool.dispatch(b"ordinary-stdin".to_vec(),4,Vec::new()).unwrap())
+    };
     assert!(endpoint.offer_to_workload().unwrap());
-    let out=pool.dispatch(b"ordinary-stdin".to_vec(),4,Vec::new()).unwrap();
-    assert_eq!(out.stdout,[item.body.as_slice(),b"ordinary-stdin"].concat());
-    assert_eq!(out.outcome,crate::worker_protocol::WorkerOutcome::Exit{code:0});
-    assert_eq!(pool.snapshot(),vec![SlotSnapshot::Dead]);
-    let mut metrics:serde_json::Value=serde_json::from_slice(&out.stderr).unwrap();
-    metrics["agent_thread_cpu_ns"]=(cpu_ns()-cpu).into();
-    metrics["total_wall_ns"]=(start.elapsed().as_nanos() as u64).into();
-    metrics["setup_wall_ns"]=(setup as u64).into();
-    metrics["verified_cast_bytes"]=item.body.len().into();
-    metrics["agent_to_workload_cast_accepted_bytes"]=ACCEPTED_WRITES.with(|n|n.get()).into();
-    metrics["workload_to_agent_cast_read_bytes"]=ACK_READ.with(|n|n.get()).into();
-    metrics["context_datagram_bytes"]=serde_json::to_vec(&context).unwrap().len().into();
+    let out=caller.join().unwrap();
+    assert_eq!(
+        out.stdout,
+        [item.body.as_slice(), b"ordinary-stdin"].concat()
+    );
+    assert_eq!(
+        out.outcome,
+        crate::worker_protocol::WorkerOutcome::Exit { code: 0 }
+    );
+    assert_eq!(pool.snapshot(), vec![SlotSnapshot::Dead]);
+    let mut metrics: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    metrics["agent_thread_cpu_ns"] = (cpu_ns() - cpu).into();
+    metrics["total_wall_ns"] = (start.elapsed().as_nanos() as u64).into();
+    metrics["setup_wall_ns"] = (setup as u64).into();
+    metrics["verified_cast_bytes"] = item.body.len().into();
+    metrics["agent_to_workload_cast_accepted_bytes"] = ACCEPTED_WRITES.with(|n| n.get()).into();
+    metrics["workload_to_agent_cast_read_bytes"] = ACK_READ.with(|n| n.get()).into();
+    metrics["context_datagram_bytes"] = serde_json::to_vec(&context).unwrap().len().into();
     println!("ORIGINAL_OCI_CAST_RESULT {metrics}");
 }
 
 #[test]
 fn original_boot_grant_binds_delivery_to_workload_owner_direction_and_root() {
-    use mvm_core::plan::{Nonce,VerbGrant};
     use ed25519_dalek::Signer;
-    let (endpoint,_,_,_)=fixture();
-    let mut projection=endpoint.channel.guest_enrollment([1;32],[2;32],[3;32],[4;32],[5;32],Some([6;32]),"dest".into()).unwrap();
-    let anchor=SigningKey::from_bytes(&[7;32]);
-    let nonce=Nonce::from_bytes([8;16]);
-    let now=chrono::Utc::now();
-    let mut grant=VerbGrant{session_id:"dest".into(),plan_nonce:nonce.clone(),not_after:now+chrono::Duration::minutes(2),verbs:vec![],drive:None,application_terminal:None,cast_delivery_v1:Some(projection.commitment().unwrap()),sig:Vec::new()};
-    grant.sig=anchor.sign(&grant.signing_bytes()).to_bytes().to_vec();
-    let open=|value:&mvm_core::mailbox::frame::cast::enrollment::DeliverEnrollmentV1,w:&str,n:&Nonce,root:Option<[u8;32]>,k:&ed25519_dalek::VerifyingKey|value.open_original(&grant,k,w,n,root,now);
-    let vk=anchor.verifying_key();
-    assert!(open(&projection,"dest",&nonce,Some([6;32]),&vk).is_ok());
-    assert!(open(&projection,"other",&nonce,Some([6;32]),&vk).is_err());
-    assert!(open(&projection,"dest",&Nonce::from_bytes([9;16]),Some([6;32]),&vk).is_err());
-    assert!(open(&projection,"dest",&nonce,None,&vk).is_err());
-    assert!(open(&projection,"dest",&nonce,Some([6;32]),&SigningKey::from_bytes(&[9;32]).verifying_key()).is_err());
-    assert!(projection.open_original(&grant,&vk,"dest",&nonce,Some([6;32]),now+chrono::Duration::hours(1)).is_err());
-    for change in ["destination_owner","source_plan","destination_plan","pair_commitment","image_sha256","binding","generation","workload"] {
-        let mut altered=serde_json::to_value(&projection).unwrap();
-        altered[change]=match change{"generation"=>999.into(),"workload"=>"another".into(),_=>serde_json::to_value([9u8;32]).unwrap()};
-        let altered=serde_json::from_value(altered).unwrap();
-        assert!(open(&altered,"dest",&nonce,Some([6;32]),&vk).is_err(),"{change}");
+    use mvm_core::plan::{Nonce, VerbGrant};
+    let (endpoint, _, _, _) = fixture();
+    let mut projection = endpoint
+        .channel
+        .guest_enrollment(
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+            [5; 32],
+            [10; 32],
+            Some([6; 32]),
+            "dest".into(),
+        )
+        .unwrap();
+    let anchor = SigningKey::from_bytes(&[7; 32]);
+    let nonce = Nonce::from_bytes([8; 16]);
+    let now = chrono::Utc::now();
+    let mut grant = VerbGrant {
+        session_id: "dest".into(),
+        plan_nonce: nonce.clone(),
+        not_after: now + chrono::Duration::minutes(2),
+        verbs: vec![],
+        drive: None,
+        application_terminal: None,
+        cast_delivery_v1: Some(projection.commitment().unwrap()),
+        sig: Vec::new(),
+    };
+    grant.sig = anchor.sign(&grant.signing_bytes()).to_bytes().to_vec();
+    let stored = mvm_core::vm_backend::VerbGrantEnvelope {
+        pubkey_hex: "07".repeat(32),
+        plan_nonce_hex: nonce.as_hex().to_string(),
+        predecessor_session_id: None,
+        predecessor_plan_nonce_hex: None,
+        grant: grant.clone(),
+        cast_delivery_v1: Some(projection.clone()),
+    };
+    let compact = mvm_core::vm_backend::encode_verb_grant_cmdline(&stored).unwrap();
+    let boot = mvm_core::vm_backend::decode_verb_grant_cmdline(
+        compact.strip_prefix("mvm.verb_grant=").unwrap(),
+    )
+    .unwrap();
+    assert!(boot.cast_delivery_v1.is_none());
+    assert_eq!(
+        boot.grant.cast_delivery_v1,
+        Some(projection.commitment().unwrap())
+    );
+    assert!(serde_json::to_vec(&stored).unwrap().len() > compact.len());
+    assert!(
+        projection
+            .open_original(
+                &boot.grant,
+                &anchor.verifying_key(),
+                "dest",
+                &nonce,
+                Some([6; 32]),
+                [11; 32],
+                now
+            )
+            .is_err()
+    );
+    let open = |value: &mvm_core::mailbox::frame::cast::enrollment::DeliverEnrollmentV1,
+                w: &str,
+                n: &Nonce,
+                root: Option<[u8; 32]>,
+                k: &ed25519_dalek::VerifyingKey| {
+        value.open_original(&grant, k, w, n, root, [10; 32], now)
+    };
+    let vk = anchor.verifying_key();
+    assert!(open(&projection, "dest", &nonce, Some([6; 32]), &vk).is_ok());
+    assert!(open(&projection, "other", &nonce, Some([6; 32]), &vk).is_err());
+    assert!(
+        open(
+            &projection,
+            "dest",
+            &Nonce::from_bytes([9; 16]),
+            Some([6; 32]),
+            &vk
+        )
+        .is_err()
+    );
+    assert!(open(&projection, "dest", &nonce, None, &vk).is_err());
+    assert!(
+        open(
+            &projection,
+            "dest",
+            &nonce,
+            Some([6; 32]),
+            &SigningKey::from_bytes(&[9; 32]).verifying_key()
+        )
+        .is_err()
+    );
+    assert!(
+        projection
+            .open_original(
+                &grant,
+                &vk,
+                "dest",
+                &nonce,
+                Some([6; 32]),
+                [10; 32],
+                now + chrono::Duration::hours(1)
+            )
+            .is_err()
+    );
+    for change in [
+        "destination_owner",
+        "source_plan",
+        "destination_plan",
+        "pair_commitment",
+        "image_sha256",
+        "mount_commitment",
+        "binding",
+        "generation",
+        "workload",
+    ] {
+        let mut altered = serde_json::to_value(&projection).unwrap();
+        altered[change] = match change {
+            "generation" => 999.into(),
+            "workload" => "another".into(),
+            _ => serde_json::to_value([9u8; 32]).unwrap(),
+        };
+        let altered = serde_json::from_value(altered).unwrap();
+        assert!(
+            open(&altered, "dest", &nonce, Some([6; 32]), &vk).is_err(),
+            "{change}"
+        );
     }
-    projection.verity_root=None;
-    grant.cast_delivery_v1=Some(projection.commitment().unwrap());
-    grant.sig=anchor.sign(&grant.signing_bytes()).to_bytes().to_vec();
-    assert!(projection.open_original(&grant,&vk,"dest",&nonce,None,now).is_ok());
-    grant.cast_delivery_v1=None;grant.sig=anchor.sign(&grant.signing_bytes()).to_bytes().to_vec();
-    assert!(projection.open_original(&grant,&vk,"dest",&nonce,None,now).is_err());
-    let legacy=String::from_utf8(grant.signing_bytes()).unwrap();
+    projection.verity_root = None;
+    grant.cast_delivery_v1 = Some(projection.commitment().unwrap());
+    grant.sig = anchor.sign(&grant.signing_bytes()).to_bytes().to_vec();
+    assert!(
+        projection
+            .open_original(&grant, &vk, "dest", &nonce, None, [10; 32], now)
+            .is_ok()
+    );
+    grant.cast_delivery_v1 = None;
+    grant.sig = anchor.sign(&grant.signing_bytes()).to_bytes().to_vec();
+    assert!(
+        projection
+            .open_original(&grant, &vk, "dest", &nonce, None, [10; 32], now)
+            .is_err()
+    );
+    let legacy = String::from_utf8(grant.signing_bytes()).unwrap();
     assert!(!legacy.contains("cast_delivery_v1"));
 }

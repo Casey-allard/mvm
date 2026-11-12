@@ -40,7 +40,9 @@ mod linux {
         command.current_dir(resolved.working_dir());
         mvm_agentd::fd_hygiene::configure_close_fds(&mut command, 3, None);
 
-        if let Err(e) = mvm_agentd::mailbox_cast::exec::configure_oci(&mut command, std::env::args_os().skip(1)) {
+        if let Err(e) =
+            mvm_agentd::mailbox_cast::exec::configure_oci(&mut command, std::env::args_os().skip(1))
+        {
             eprintln!("mvm-oci-entrypoint: {e}");
             std::process::exit(127);
         }

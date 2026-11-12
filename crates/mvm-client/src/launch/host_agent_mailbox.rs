@@ -24,6 +24,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Called by the original installed controller under the destination's
+/// launch claim. Only the canonical checked host producer can make the reply.
+pub type OriginalCastPreparation = dyn Fn(
+        &AdmittedPlan,
+        &InstalledMailboxClient,
+        &mvm_core::vm_backend::VmStartConfig,
+    ) -> Result<mvm_hostd::mailbox_launch::cast_enrollment::PreparedOriginalCastBoot>
+    + Send
+    + Sync;
+
 /// One original installed local worker. The kernel exit observer and the
 /// connected control socket's peer credentials must match on every exchange.
 pub struct HostAgentMailboxProvisioner {
@@ -31,6 +41,7 @@ pub struct HostAgentMailboxProvisioner {
     original: Arc<Mutex<Child>>,
     peers: InstallationPeers,
     boot: Mutex<Option<[u8; 32]>>,
+    cast: Option<(String, Arc<OriginalCastPreparation>)>,
 }
 
 enum InstallationPeers {
@@ -108,11 +119,25 @@ impl HostAgentMailboxProvisioner {
             peers,
             original,
             boot: Mutex::new(None),
+            cast: None,
         };
         value.check_installation()?;
         Ok(value)
     }
 
+    /// Opt one named member of this installed pair into original Deliver boot.
+    pub fn with_original_cast_destination(
+        mut self,
+        destination: &str,
+        prepare: Arc<OriginalCastPreparation>,
+    ) -> Result<Self> {
+        let InstallationPeers::Pair { names, .. } = &self.peers else {
+            anyhow::bail!("Cast requires an installed pair")
+        };
+        names.index(destination)?;
+        self.cast = Some((destination.to_owned(), prepare));
+        Ok(self)
+    }
     fn check_installation(&self) -> Result<()> {
         let current = open_home(&mvm_core::config::mvm_home_strict()?)?.metadata()?;
         let original = self.home.metadata()?;
@@ -158,6 +183,26 @@ impl HostAgentMailboxProvisioner {
 }
 
 impl InstalledMailboxProvisioner for HostAgentMailboxProvisioner {
+    fn original_cast_boot(
+        &self,
+        plan: &AdmittedPlan,
+        worker: &InstalledMailboxClient,
+        config: &mvm_core::vm_backend::VmStartConfig,
+    ) -> Result<Option<mvm_hostd::mailbox_launch::cast_enrollment::PreparedOriginalCastBoot>> {
+        let Some((name, prepare)) = &self.cast else {
+            return Ok(None);
+        };
+        if name != &config.name {
+            return Ok(None);
+        }
+        self.check_installation()?;
+        ensure!(
+            worker.acquire_request().vm_id == *name && plan.plan().workload.0 == *name,
+            "wrong Cast destination in original mailbox pair"
+        );
+        Ok(Some(prepare(plan, worker, config)?))
+    }
+
     fn original_peer(
         &self,
         plan: &AdmittedPlan,

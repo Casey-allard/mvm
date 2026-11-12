@@ -243,7 +243,7 @@ fn find_block_device(blocks: &[mvm_vmm::driver::spec::BlockDev], source: &str) -
         .map(|b| b.device_node())
 }
 
-fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEnvironment> {
+pub fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEnvironment> {
     // Verity is keyed off the hash device: `verity_path` set means the
     // backend attached the Merkle sidecar at the hash slot, so the root mounts
     // as dm-verity and must carry a roothash. No sidecar device means a plain
@@ -298,19 +298,18 @@ fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEnviro
 
     let volumes = build_volume_configs(config)?;
     let extensions = build_extension_configs(config)?;
-    let verb_grant_envelope = read_verb_grant_envelope(&config.name)?;
-    let cast_delivery_v1 = match verb_grant_envelope.as_ref().and_then(|g|g.grant.cast_delivery_v1) {
-        None => None,
-        Some(digest) => {
-            use std::io::Read;
-            let path=mvm_core::config::vm_state_dir(&config.name).join("cast-deliver-v1.json");
-            let mut bytes=Vec::new();
-            std::fs::File::open(path)?.take(8193).read_to_end(&mut bytes)?;
-            anyhow::ensure!(bytes.len()<=8192,"oversized original Cast activation");
-            let enrollment: mvm_core::mailbox::frame::cast::enrollment::DeliverEnrollmentV1=serde_json::from_slice(&bytes)?;
-            anyhow::ensure!(enrollment.commitment()? == digest,"original Cast activation differs from the boot grant");
-            Some(enrollment)
+    let mut verb_grant_envelope = read_verb_grant_envelope(&config.name)?;
+    let cast_delivery_v1 = match verb_grant_envelope.as_mut() {
+        Some(g) => {
+            let enrollment = g.cast_delivery_v1.take();
+            anyhow::ensure!(
+                enrollment.as_ref().map(|v| v.commitment()).transpose()?
+                    == g.grant.cast_delivery_v1,
+                "original Cast activation differs from the boot grant"
+            );
+            enrollment
         }
+        None => None,
     };
     refuse_legacy_tool_authority(config)?;
 
@@ -459,6 +458,7 @@ mod tests {
         VerbGrantEnvelope {
             pubkey_hex: "ab".repeat(32),
             plan_nonce_hex: "00".repeat(16),
+            cast_delivery_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: mvm_core::plan::VerbGrant {
@@ -867,6 +867,7 @@ mod tests {
         let envelope = VerbGrantEnvelope {
             pubkey_hex: VALID_HASH.into(),
             plan_nonce_hex: VALID_HASH.into(),
+            cast_delivery_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant,
@@ -977,6 +978,7 @@ mod tests {
         let envelope = VerbGrantEnvelope {
             pubkey_hex: VALID_HASH.into(),
             plan_nonce_hex: VALID_HASH.into(),
+            cast_delivery_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant: mvm_core::plan::VerbGrant {

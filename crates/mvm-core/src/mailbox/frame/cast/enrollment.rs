@@ -20,6 +20,7 @@ pub struct DeliverEnrollmentV1 {
     pub destination_owner: [u8; 32],
     pub pair_commitment: [u8; 32],
     pub image_sha256: [u8; 32],
+    pub mount_commitment: [u8; 32],
     pub verity_root: Option<[u8; 32]>,
     pub workload: String,
     origin: MailboxGrant,
@@ -43,6 +44,7 @@ impl CastChannel {
         destination_owner: [u8; 32],
         pair_commitment: [u8; 32],
         image_sha256: [u8; 32],
+        mount_commitment: [u8; 32],
         verity_root: Option<[u8; 32]>,
         workload: String,
     ) -> Result<DeliverEnrollmentV1, Refusal> {
@@ -52,6 +54,7 @@ impl CastChannel {
             destination_owner,
             pair_commitment,
             image_sha256,
+            mount_commitment,
             verity_root,
             workload,
             origin: self.source,
@@ -92,6 +95,7 @@ impl DeliverEnrollmentV1 {
                 self.destination_owner,
                 self.pair_commitment,
                 self.image_sha256,
+                self.mount_commitment,
                 self.binding,
             ]
             .contains(&[0; 32])
@@ -114,6 +118,7 @@ impl DeliverEnrollmentV1 {
         original_session: &str,
         original_nonce: &Nonce,
         mounted_verity: Option<[u8; 32]>,
+        mounted_context: [u8; 32],
         now: DateTime<Utc>,
     ) -> Result<CastChannel, Refusal> {
         boot_grant
@@ -121,6 +126,7 @@ impl DeliverEnrollmentV1 {
             .map_err(|_| deny())?;
         if boot_grant.cast_delivery_v1 != Some(self.commitment()?)
             || original_session != self.workload
+            || self.mount_commitment != mounted_context
             || self.verity_root != mounted_verity
             || now.timestamp_millis() < self.valid_from
             || now.timestamp_millis() >= self.valid_until
@@ -146,4 +152,13 @@ impl DeliverEnrollmentV1 {
     pub fn limits(&self) -> MailboxLocalLimits {
         self.limits
     }
+}
+
+/// Hash the fixed-order canonical activation tuple supplied by the shared guest
+/// configuration module. No application data or secret is included.
+pub fn mount_context(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"mvm-original-cast-mount-config-v1\0");
+    h.update(bytes);
+    h.finalize().into()
 }

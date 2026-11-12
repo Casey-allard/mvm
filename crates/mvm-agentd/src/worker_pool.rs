@@ -216,15 +216,29 @@ impl WorkerPool {
     /// The original guest launcher transfers one already admitted workload
     /// endpoint. A retired original is never respawned with its descriptor.
     #[cfg(target_os = "linux")]
-    pub fn start_original_cast(cfg: WarmProcessConfig, entrypoint: Arc<ValidatedEntrypoint>, fd: std::os::fd::OwnedFd) -> io::Result<Arc<Self>> {
-        if cfg.pool_size != 1 || entrypoint.use_resolved_path || entrypoint.resolved != std::path::Path::new("/usr/lib/mvm/wrappers/oci-entrypoint") {
-            return Err(io::Error::other("Cast requires one original validated OCI worker"));
+    pub fn start_original_cast(
+        cfg: WarmProcessConfig,
+        entrypoint: Arc<ValidatedEntrypoint>,
+        fd: std::os::fd::OwnedFd,
+    ) -> io::Result<Arc<Self>> {
+        if cfg.pool_size != 1
+            || entrypoint.use_resolved_path
+            || entrypoint.resolved != std::path::Path::new("/usr/lib/mvm/wrappers/oci-entrypoint")
+        {
+            return Err(io::Error::other(
+                "Cast requires one original validated OCI worker",
+            ));
         }
-        Self::start_inner(cfg,entrypoint,Vec::new(),Some(fd))
+        Self::start_inner(cfg, entrypoint, Vec::new(), Some(fd))
     }
 
-    fn start_inner(cfg: WarmProcessConfig, entrypoint: Arc<ValidatedEntrypoint>, worker_env:Vec<(String,String)>, mut original:Option<std::os::fd::OwnedFd>) -> io::Result<Arc<Self>> {
-        let original_cast_worker=original.is_some();
+    fn start_inner(
+        cfg: WarmProcessConfig,
+        entrypoint: Arc<ValidatedEntrypoint>,
+        worker_env: Vec<(String, String)>,
+        mut original: Option<std::os::fd::OwnedFd>,
+    ) -> io::Result<Arc<Self>> {
+        let original_cast_worker = original.is_some();
         // Set RLIMIT_CORE=0 on the agent so all child workers
         // inherit it. Mirrors the cold-path one-shot in
         // `entrypoint::execute`.
@@ -232,7 +246,7 @@ impl WorkerPool {
 
         let mut slots = Vec::with_capacity(cfg.pool_size);
         for i in 0..cfg.pool_size {
-            let handle = spawn_worker(&entrypoint, &worker_env,original.take())
+            let handle = spawn_worker(&entrypoint, &worker_env, original.take())
                 .map_err(|e| io::Error::other(format!("spawn worker {i}: {e}")))?;
             eprintln!(
                 "mvm-guest-agent: warm-process worker {i} spawned pid={}",
@@ -491,9 +505,11 @@ impl WorkerPool {
         }
     }
 
-    fn replacement(&self)->io::Result<WorkerHandle>{
-        if self.original_cast_worker {return Err(io::Error::other("original Cast worker retired"));}
-        spawn_worker(&self.entrypoint,&self.worker_env,None)
+    fn replacement(&self) -> io::Result<WorkerHandle> {
+        if self.original_cast_worker {
+            return Err(io::Error::other("original Cast worker retired"));
+        }
+        spawn_worker(&self.entrypoint, &self.worker_env, None)
     }
 
     fn release(self: &Arc<Self>, idx: usize, mut handle: WorkerHandle, recycle: bool) {
@@ -618,7 +634,7 @@ fn run_one_call(
 fn spawn_worker(
     entrypoint: &Arc<ValidatedEntrypoint>,
     worker_env: &[(String, String)],
-    original:Option<std::os::fd::OwnedFd>,
+    original: Option<std::os::fd::OwnedFd>,
 ) -> io::Result<WorkerHandle> {
     let program = entrypoint::spawn_path(entrypoint);
     #[cfg(target_os = "linux")]
@@ -657,10 +673,16 @@ fn spawn_worker(
         });
     }
     if let Some(original) = original {
-        #[cfg(target_os="linux")]
+        #[cfg(target_os = "linux")]
         crate::mailbox_cast::exec::configure_worker(&mut cmd, original)?;
-        #[cfg(not(target_os="linux"))]
-        { drop(original); return Err(io::Error::new(io::ErrorKind::Unsupported,"guest Cast requires Linux")); }
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(original);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "guest Cast requires Linux",
+            ));
+        }
     }
     crate::workload_seccomp::confine(&mut cmd);
 

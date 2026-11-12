@@ -511,8 +511,9 @@ fn finish_persistent(
         )?),
         _ => None,
     };
-    if let Some(worker) = &owned {
+    if let (Some(worker), Some(host)) = (&owned, provisioner) {
         start_config.installed_mailbox_owner = Some(worker.broker_binding()?);
+        worker.bind_original_cast(host, &admission.admitted, &start_config)?;
     }
     // VMM selection + workload-support check + start move behind the facade; the
     // admission gate (above) and the launched/failed emits stay here.
