@@ -548,13 +548,16 @@ mod tests {
             .prefix("sc")
             .tempdir_in("/tmp")
             .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut env = mvm_core::util::test_env::TestEnv::new();
         env.isolate_mvm_home(root.path());
         let name = "short";
         let owner = owner_dir(&mvm_core::config::mvm_keys_dir(), name).unwrap();
         let state = mvm_core::config::vm_state_dir(name);
         let instance = mvm_core::config::instance_dir(name);
-        std::fs::create_dir_all(&state).unwrap();
+        mvm_core::private_fs::ensure_private_dir(state.parent().unwrap()).unwrap();
+        mvm_core::private_fs::ensure_private_dir(&state).unwrap();
         let sample = state.join("preserved");
         std::fs::write(&sample, b"original").unwrap();
         let mut marker = OriginalMarker::claim(&owner).unwrap();
