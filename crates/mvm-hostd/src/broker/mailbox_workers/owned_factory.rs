@@ -129,7 +129,7 @@ impl MailboxWorkerFactory for OwnedMailboxWorkerFactory {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        if let Some(socket) = crate::mailbox_service::guest_io::inherited_report_socket()? {
+        if let Some(socket) = crate::mailbox_service::guest_io::worker_report_socket(owner)? {
             let fd: std::os::fd::OwnedFd=socket.into();
             cmd.env(crate::mailbox_service::guest_io::ENABLE_ENV, "1").stdout(Stdio::from(fd));
         }
