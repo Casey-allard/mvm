@@ -10,7 +10,7 @@ use std::{
     os::{
         fd::OwnedFd,
         unix::{
-            fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+            fs::{MetadataExt, OpenOptionsExt},
             net::UnixStream,
         },
     },
@@ -19,12 +19,28 @@ use std::{
     time::Instant,
 };
 
+#[cfg(target_os = "macos")]
+mod darwin_socket;
+
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::fs::FileTypeExt;
+
 struct SocketOriginal {
+    #[cfg(target_os = "macos")]
+    watch: darwin_socket::DirectoryWatch,
     #[cfg(target_os = "linux")]
     file: File,
 }
 impl SocketOriginal {
-    fn capture(path: &Path) -> io::Result<Self> {
+    fn capture(path: &Path, parent: &File, until: Instant) -> io::Result<Self> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = (parent, until);
+        #[cfg(target_os = "macos")]
+        {
+            Ok(Self {
+                watch: darwin_socket::DirectoryWatch::capture(parent, path, until)?,
+            })
+        }
         #[cfg(target_os = "linux")]
         {
             let file = File::options()
@@ -36,7 +52,7 @@ impl SocketOriginal {
             }
             Ok(Self { file })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             if !std::fs::symlink_metadata(path)?.file_type().is_socket() {
                 return Err(io::Error::other("original socket is not a socket"));
@@ -44,10 +60,16 @@ impl SocketOriginal {
             Ok(Self {})
         }
     }
-    fn retire(&self, path: &Path, until: Instant) -> io::Result<()> {
+    fn retire(&mut self, path: &Path, until: Instant) -> io::Result<()> {
         if Instant::now() >= until {
             return Err(io::ErrorKind::TimedOut.into());
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.watch
+                .retire(path, until, || require_refused(path, until))
+        }
+        #[cfg(not(target_os = "macos"))]
         match std::fs::symlink_metadata(path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -57,21 +79,7 @@ impl SocketOriginal {
                     && named.file_type().is_socket()
                     && named.nlink() == 1 =>
             {
-                let probe = mvm_agentd::vsock::connect_unix_before(path, until);
-                match probe {
-                    Err(error)
-                        if error
-                            .downcast_ref::<io::Error>()
-                            .is_some_and(|e| e.kind() == io::ErrorKind::ConnectionRefused) =>
-                    {
-                        ()
-                    }
-                    _ => {
-                        return Err(io::Error::other(
-                            "original socket still accepts or is uncertain",
-                        ));
-                    }
-                }
+                require_refused(path, until)?;
                 if !same_inode(&self.file.metadata()?, &std::fs::symlink_metadata(path)?) {
                     return Err(io::Error::other("stale socket was replaced"));
                 }
@@ -81,6 +89,21 @@ impl SocketOriginal {
                 "occupied socket cannot be proved original",
             )),
         }
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn require_refused(path: &Path, until: Instant) -> io::Result<()> {
+    match mvm_agentd::vsock::connect_unix_before(path, until) {
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::ConnectionRefused) =>
+        {
+            Ok(())
+        }
+        _ => Err(io::Error::other(
+            "original socket still accepts or is uncertain",
+        )),
     }
 }
 fn same_inode(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
@@ -159,7 +182,14 @@ impl RestartInput {
             socket: None,
         })
     }
-    pub(super) fn capture_socket(&mut self) -> io::Result<()> {
+    pub(super) fn capture_socket(
+        &mut self,
+        child: &mut Child,
+        parent: &File,
+        until: Instant,
+    ) -> io::Result<()> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = child;
         let digest = super::super::reader::original_enrollment_digest(&self.config.vm_state_dir)?;
         if self
             .reader_digest
@@ -168,7 +198,37 @@ impl RestartInput {
             return Err(io::Error::other("original reader enrollment changed"));
         }
         self.reader_digest = Some(digest);
-        self.socket = Some(SocketOriginal::capture(&self.config.socket)?);
+        #[cfg(target_os = "macos")]
+        let authenticate = |c: &mut Child| {
+            super::authenticated_connect(c, &self.config.socket, until)
+                .map(drop)
+                .map_err(io::Error::other)
+        };
+        #[cfg(target_os = "macos")]
+        authenticate(child)?;
+        let socket = SocketOriginal::capture(&self.config.socket, parent, until)?;
+        #[cfg(target_os = "macos")]
+        {
+            authenticate(child)?;
+            let mut socket = socket;
+            socket.watch.current(&self.config.socket, until)?;
+            self.socket = Some(socket);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.socket = Some(socket);
+        }
+        Ok(())
+    }
+    fn before_interrupt(&mut self, until: Instant) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        self.socket
+            .as_mut()
+            .context("unconfirmed original socket")?
+            .watch
+            .current(&self.config.socket, until)?;
+        #[cfg(not(target_os = "macos"))]
+        let _ = until;
         Ok(())
     }
     fn current(
@@ -234,6 +294,7 @@ impl RestartInput {
         &mut self,
         child: &mut Child,
         readiness: &mut Option<String>,
+        parent: &File,
         original: super::super::lifetime::OriginalVmm,
         until: Instant,
     ) -> Result<ExitStatus> {
@@ -242,7 +303,7 @@ impl RestartInput {
             .context("original helper is still running")?;
         // Keep a previously failed/ambiguous replacement fenced until its
         // own Child is definitively collected; never touch a substitute name.
-        if let Some(socket) = &self.socket {
+        if let Some(socket) = &mut self.socket {
             socket.retire(&self.config.socket, until)?;
         } else {
             ensure!(
@@ -277,7 +338,7 @@ impl RestartInput {
             &ready == super::super::READY_MARKER && child.try_wait()?.is_none(),
             "replacement helper not ready"
         );
-        self.capture_socket()?;
+        self.capture_socket(child, parent, until)?;
         Ok(previous)
     }
 }
@@ -290,15 +351,16 @@ pub enum JournalHelper {
 
 enum RecoveryAction {
     ReopenCollected,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     InterruptOwned,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn collect_interrupted_helper(
     child: &mut Child,
     readiness: &mut Option<String>,
     until: Instant,
+    before_interrupt: impl FnOnce() -> Result<()>,
 ) -> Result<ExitStatus> {
     use mvm_vmm::host::process_exit::{
         ProcessExitObserver, ProcessExitWait, collect_after_exit_event,
@@ -318,6 +380,7 @@ fn collect_interrupted_helper(
         Instant::now() < until,
         "helper interruption deadline elapsed"
     );
+    before_interrupt()?;
     *readiness = Some("original helper interruption awaits recovery".into());
     child.kill()?;
     ensure!(
@@ -335,15 +398,15 @@ impl OriginalJournalSourceHost {
         self.recover_helper(which, until, RecoveryAction::ReopenCollected)
     }
 
-    /// Interrupt and replace one owned Linux helper while both admitted VMs
+    /// Interrupt and replace one owned Linux or macOS helper while both admitted VMs
     /// remain live. Outstanding operations require their original retry.
     /// Other platforms refuse before interrupting a helper.
     pub fn restart_helper(&mut self, which: JournalHelper, until: Instant) -> Result<ExitStatus> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             self.recover_helper(which, until, RecoveryAction::InterruptOwned)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (which, until);
             Err(io::Error::new(
@@ -360,7 +423,7 @@ impl OriginalJournalSourceHost {
         until: Instant,
         action: RecoveryAction,
     ) -> Result<ExitStatus> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = action;
         self.require_original_relay()?;
         let until = until.min(Instant::now() + super::super::READY_TIMEOUT);
@@ -376,11 +439,16 @@ impl OriginalJournalSourceHost {
             .restart
             .current(&b._original, &b.marker, &mut b.stop, until)?;
         b.check_current_credentials(&self.plan, &self.grants)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if matches!(action, RecoveryAction::InterruptOwned) {
             match which {
                 JournalHelper::Source => {
-                    collect_interrupted_helper(&mut self.source, &mut self.readiness, until)?;
+                    collect_interrupted_helper(
+                        &mut self.source,
+                        &mut self.readiness,
+                        until,
+                        || self.restart.before_interrupt(until),
+                    )?;
                 }
                 JournalHelper::Destination => {
                     let destination = &mut *b;
@@ -388,6 +456,7 @@ impl OriginalJournalSourceHost {
                         &mut destination.child,
                         &mut destination.readiness,
                         until,
+                        || destination.restart.before_interrupt(until),
                     )?;
                 }
             }
@@ -398,14 +467,22 @@ impl OriginalJournalSourceHost {
             b.check_current_credentials(&self.plan, &self.grants)?;
         }
         let prior = match which {
-            JournalHelper::Source => {
-                self.restart
-                    .replace(&mut self.source, &mut self.readiness, a_vmm, until)?
-            }
+            JournalHelper::Source => self.restart.replace(
+                &mut self.source,
+                &mut self.readiness,
+                self.stop.socket_parent(),
+                a_vmm,
+                until,
+            )?,
             JournalHelper::Destination => {
                 let dest = &mut *b;
-                dest.restart
-                    .replace(&mut dest.child, &mut dest.readiness, b_vmm, until)?
+                dest.restart.replace(
+                    &mut dest.child,
+                    &mut dest.readiness,
+                    dest.stop.socket_parent(),
+                    b_vmm,
+                    until,
+                )?
             }
         };
         self.restart
@@ -444,7 +521,7 @@ mod tests {
         let mut child = owned_helper();
         let mut readiness = None;
         let until = Instant::now() + std::time::Duration::from_secs(3);
-        let status = collect_interrupted_helper(&mut child, &mut readiness, until)
+        let status = collect_interrupted_helper(&mut child, &mut readiness, until, || Ok(()))
             .expect("collect original helper through its exit observer");
         assert!(!status.success());
         assert_eq!(
@@ -453,7 +530,7 @@ mod tests {
         );
         assert!(readiness.is_some());
         assert_eq!(
-            collect_interrupted_helper(&mut child, &mut readiness, until)
+            collect_interrupted_helper(&mut child, &mut readiness, until, || Ok(()))
                 .expect("retry retains original status"),
             status
         );
@@ -463,7 +540,8 @@ mod tests {
     fn expired_interruption_deadline_leaves_the_original_child_running() {
         let mut child = owned_helper();
         let mut readiness = None;
-        let result = collect_interrupted_helper(&mut child, &mut readiness, Instant::now());
+        let result =
+            collect_interrupted_helper(&mut child, &mut readiness, Instant::now(), || Ok(()));
         assert!(result.is_err());
         assert!(child.try_wait().expect("original child status").is_none());
         assert!(readiness.is_none());
@@ -473,10 +551,18 @@ mod tests {
 
     #[test]
     fn recovered_socket_never_removes_a_substituted_endpoint() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let path = root.path().join("mailbox.sock");
         let old = UnixListener::bind(&path).unwrap();
-        let pin = SocketOriginal::capture(&path).unwrap();
+        let mut pin = SocketOriginal::capture(
+            &path,
+            &File::open(root.path()).unwrap(),
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
         drop(old);
         std::fs::remove_file(&path).unwrap();
         let replacement = UnixListener::bind(&path).unwrap();
@@ -510,13 +596,21 @@ mod tests {
         assert!(require_trusted_image(&bin).is_err());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn collected_helper_can_retire_only_its_original_stale_socket() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let path = root.path().join("original");
         let listener = UnixListener::bind(&path).unwrap();
-        let pin = SocketOriginal::capture(&path).unwrap();
+        let mut pin = SocketOriginal::capture(
+            &path,
+            &File::open(root.path()).unwrap(),
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
         assert!(
             pin.retire(&path, Instant::now() + std::time::Duration::from_secs(1))
                 .is_err()

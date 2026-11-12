@@ -146,6 +146,9 @@ impl StopCustody {
         ensure!(identity.is_live_and_ours(), "original VM has exited");
         Ok(super::super::lifetime::OriginalVmm::from_held(*identity)?)
     }
+    pub(super) fn socket_parent(&self) -> &File {
+        self.split_socket.as_ref().map_or(&self.state, |(_, fd)| fd)
+    }
     pub(super) fn spawn_helper(
         &self,
         config: &crate::mailbox_process::MailboxProcessConfig,
@@ -169,6 +172,7 @@ impl StopCustody {
             command.arg(super::super::ORIGINAL_JOURNAL_V1);
         }
         let (mut child, marker) = super::spawn_claimed(owner_dir, command)?;
+        let until = Instant::now() + super::super::READY_TIMEOUT;
         let readiness = match original {
             Some(original_vmm_v1) => super::super::configure_serving(
                 &super::super::OriginalJournalStartup {
@@ -180,7 +184,8 @@ impl StopCustody {
             ),
             None => super::super::configure_serving(config, &mut child),
         };
-        let readiness = readiness.and_then(|()| restart.capture_socket());
+        let readiness = readiness
+            .and_then(|()| restart.capture_socket(&mut child, self.socket_parent(), until));
         Ok((
             child,
             marker,

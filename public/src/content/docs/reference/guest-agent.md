@@ -57,7 +57,7 @@ builder protocols, raw channels and their availability restrictions.
 
 Boot-binding file authority and local journal storage currently require the supported Unix filesystem checks. Portable clients can verify mailbox signatures and receipts on Windows. Loading a host or guest boot-binding file on an unsupported platform returns an explicit unsupported-operation error.
 
-The installed Linux controller can interrupt and replace one of its owned mailbox helpers through `OriginalJournalSourceHost::restart_helper`. It retains the original guest boots, launch claims and signed credentials. Readiness is fenced before interruption, the original child is collected through its exit observer, and replacement revalidates current authority before readiness. Retry an unsettled operation with its original identity. Controlled live restart returns `Unsupported` on other platforms before interrupting a helper. `reconnect_helper` remains available for an already-collected helper whose original socket can be retired safely.
+The installed Linux or macOS controller can interrupt and replace one of its owned mailbox helpers through `OriginalJournalSourceHost::restart_helper`. It retains the original guest boots, launch claims and signed credentials. Readiness is fenced before interruption, the original child is collected through its exit observer, and replacement revalidates current authority before readiness. Retry an unsettled operation with its original identity. Controlled live restart returns `Unsupported` on other platforms before interrupting a helper. `reconnect_helper` remains available for an already-collected helper whose original socket can be retired safely.
 
 ### Original mailbox sender settlement
 
@@ -86,7 +86,15 @@ original socket inode and can retire its stale pathname after helper exit.
 The host operator and root are trusted. The executable and its ancestors must be
 protected against modification by other users, including any extended ACLs.
 The SDK checks owner and POSIX mode along the canonical executable path.
-On macOS an occupied pathname refuses recovery. A controller restart loses the
+On macOS the controller watches the private socket directory held by the SDK.
+It arms the directory watch after readiness and checks the live original peer
+before and after arming. An unchanged socket that returns a kernel connection
+refusal after the helper exits can be removed through that directory descriptor.
+Any observed directory entry change, even an unrelated one or a rename that is
+later reversed, fences interruption of a live helper and retirement of an
+occupied socket. The controller keeps that refusal for the life of the helper.
+A genuinely vacant name still permits exclusive bind after collection.
+A controller restart loses the
 original process handles and requires separate recovery.
 
 ### Guest telemetry
