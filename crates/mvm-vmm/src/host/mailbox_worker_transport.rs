@@ -1,7 +1,7 @@
 //! Inactive worker-owner IPC foundation. Use only a verified private canonical
 //! tenant-control connection and a previously verified signed request.
 //! This transports data and one pipe writer; it does not establish child custody.
-use mvm_core::protocol::broker_control::ControlResponse;
+use mvm_core::protocol::broker_control::{ControlRequest, ControlResponse, SignedControl};
 use mvm_core::protocol::mailbox_worker_control::{
     MAX_WORKER_CONTROL_BYTES, MailboxWorkerRequest, MailboxWorkerResult, MailboxWorkerState,
     verify_result,
@@ -150,6 +150,37 @@ fn prepare_received(fd: &OwnedFd) -> io::Result<()> {
     }
     Ok(())
 }
+/// Maximum serialized canonical configuration accepted by the owned helper.
+pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+
+/// Deliver configuration directly to the delegated anonymous pipe. Taking
+/// ownership closes the writer on success and on every error, delimiting stdin.
+pub fn write_config(fd: OwnedFd, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    use std::io::Write as _;
+    if bytes.is_empty() || bytes.len() > MAX_CONFIG_BYTES {
+        return Err(invalid("invalid delegated config size"));
+    }
+    prepare_received(&fd)?;
+    let mut writer = std::fs::File::from(fd);
+    let mut pending = bytes;
+    while !pending.is_empty() {
+        ready(writer.as_raw_fd(), libc::POLLOUT, deadline)?;
+        match writer.write(pending) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => pending = &pending[n..],
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 fn send_chunk(
     stream: &UnixStream,
     bytes: &[u8],
@@ -207,6 +238,58 @@ fn send_chunk(
         return Ok(n as usize);
     }
 }
+fn suppress_sigpipe(_stream: &UnixStream) -> io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let one: libc::c_int = 1;
+        // SAFETY: correct scalar buffer for SO_NOSIGPIPE; borrowed socket live.
+        if unsafe {
+            libc::setsockopt(
+                _stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&one as *const libc::c_int).cast(),
+                mem::size_of_val(&one) as _,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn send_body(stream: &UnixStream, body: &[u8], deadline: Instant) -> io::Result<()> {
+    let len = (body.len() as u32).to_be_bytes();
+    for bytes in [&len[..], body] {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            offset += send_chunk(stream, &bytes[offset..], None, deadline)?
+        }
+    }
+    Ok(())
+}
+
+/// Send one signed mailbox operation to the verified private tenant socket.
+/// An error after a partial write requires closing this connection.
+pub fn send_request(
+    stream: &UnixStream,
+    signed: &SignedControl,
+    deadline: Instant,
+) -> io::Result<()> {
+    peer(stream)?;
+    remaining(deadline)?;
+    if !matches!(signed.request, ControlRequest::MailboxWorkerV1(_)) {
+        return Err(invalid("expected a signed mailbox worker request"));
+    }
+    let mut buffer = vec![0u8; MAX_WORKER_CONTROL_BYTES];
+    let mut body = io::Cursor::new(buffer.as_mut_slice());
+    serde_json::to_writer(&mut body, signed).map_err(invalid_encoding)?;
+    let size = body.position() as usize;
+    suppress_sigpipe(stream)?;
+    send_body(stream, &buffer[..size], deadline)
+}
+
 /// Consumes the daemon's writer copy even on error. The caller must retain the
 /// original Child/credit and run owned cleanup after any uncertain handoff.
 pub fn send_response(
@@ -231,33 +314,10 @@ pub fn send_response(
     if body.is_empty() || body.len() > MAX_WORKER_CONTROL_BYTES {
         return Err(invalid("worker frame length"));
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let one: libc::c_int = 1;
-        // SAFETY: correct scalar buffer for SO_NOSIGPIPE; borrowed socket live.
-        if unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                (&one as *const libc::c_int).cast(),
-                mem::size_of_val(&one) as _,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-    }
+    suppress_sigpipe(stream)?;
     send_chunk(stream, &[MARKER], fd.as_ref(), deadline)?;
     drop(fd);
-    let len = (body.len() as u32).to_be_bytes();
-    for bytes in [&len[..], &body[..]] {
-        let mut offset = 0;
-        while offset < bytes.len() {
-            offset += send_chunk(stream, &bytes[offset..], None, deadline)?
-        }
-    }
-    Ok(())
+    send_body(stream, &body, deadline)
 }
 fn invalid_encoding(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)

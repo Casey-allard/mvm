@@ -154,7 +154,7 @@ fn signer_helper_fixture() {
     if std::env::var_os(HELPER).is_none() {
         return;
     }
-    let raw = read_stdin_blocking().unwrap();
+    let raw = mvm_hostd::read_launch_config("mvm-signer-helper").unwrap();
     let config: SignerHelperConfig = serde_json::from_slice(&raw).unwrap();
     if std::env::var_os("SC_SIGNER_CUSTODY_HOLD").is_some() {
         loop {
@@ -166,7 +166,7 @@ fn signer_helper_fixture() {
         let release = PathBuf::from(std::env::var_os("SC_SIGNER_RPC_RELEASE").unwrap());
         for connection in listener.incoming() {
             let mut stream = connection.unwrap();
-            if stream.read(&mut [0]).unwrap() == 0 {
+            if std::io::Read::read(&mut stream, &mut [0]).unwrap() == 0 {
                 continue; // Real readiness probe, not the canonical RPC.
             }
             std::fs::write(marker, b"canonical-rpc-received").unwrap();

@@ -43,7 +43,7 @@ impl MailboxWorkerFactory for FixtureHelper {
             .stdout(Stdio::from(std::os::fd::OwnedFd::from(child_control)))
             .stderr(Stdio::null())
             .spawn()?;
-        Ok(SpawnedMailboxWorker { child, control })
+        Ok(SpawnedMailboxWorker { child, control, parent_lease: None })
     }
 }
 
@@ -97,8 +97,9 @@ fn call(
     )
 }
 
-struct ObservedFactory(Arc<std::sync::Mutex<Option<u32>>>);
+struct ObservedFactory(Arc<std::sync::Mutex<Option<u32>>>, Arc<dyn MailboxWorkerFactory>);
 impl MailboxWorkerFactory for ObservedFactory {
+    fn admit(&self, request: &MailboxWorkerRequest) -> io::Result<()> { self.1.admit(request) }
     fn spawn(
         &self,
         r: &MailboxWorkerRequest,
@@ -110,7 +111,7 @@ impl MailboxWorkerFactory for ObservedFactory {
             .0
             .lock()
             .map_err(|_| io::Error::other("fixture observer poisoned"))?;
-        let spawned = FixtureHelper.spawn(r, owner)?;
+        let spawned = self.1.spawn(r, owner)?;
         *observed = Some(spawned.child.id());
         Ok(spawned)
     }
@@ -118,6 +119,19 @@ impl MailboxWorkerFactory for ObservedFactory {
 
 #[test]
 fn installed_retirement_collects_injected_original_mailbox_child() -> Result<()> {
+    run_installed(None)
+}
+#[test]
+#[ignore = "requires the built mvm-mailbox executable beside this Cargo profile's deps directory"]
+fn installed_owned_helper_signed_stop() -> Result<()> {
+    run_installed(Some(true))
+}
+#[test]
+#[ignore = "requires the built mvm-mailbox executable beside this Cargo profile's deps directory"]
+fn installed_owned_helper_coordinator_shutdown() -> Result<()> {
+    run_installed(Some(false))
+}
+fn run_installed(signed_stop: Option<bool>) -> Result<()> {
     let mut env = TestEnv::new();
     let base = tempfile::tempdir()?;
     std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))?;
@@ -151,10 +165,25 @@ fn installed_retirement_collects_injected_original_mailbox_child() -> Result<()>
             })?;
             let initial_budget = budget.usage()?;
             let child_pid = Arc::new(std::sync::Mutex::new(None));
+            let mut admitted = request("local", "installed-child");
+            let (factory, config): (Arc<dyn MailboxWorkerFactory>, _) = if signed_stop.is_some() {
+                use mvm_hostd::broker::mailbox_workers::OwnedMailboxWorkerFactory;
+                use mvm_hostd::{mailbox_launch, mailbox_process};
+                let profile = std::env::current_exe()?.parent().and_then(Path::parent).context("Cargo profile directory")?.to_owned();
+                let state = mvm_core::config::vm_state_dir_at(&home, &admitted.vm_id);
+                std::fs::create_dir_all(&state)?;
+                mvm_core::config::secure_fallback_socket_dir_at(&state)?;
+                let keys = home.join("keys");
+                let grant = &mut admitted.mailbox_grant;
+                grant.authority_key = mailbox_launch::authority_key_for(&keys, &grant.mailbox, grant.epoch)?.to_bytes();
+                let factory = OwnedMailboxWorkerFactory::new(&profile.join("mvm-mailbox"), worker.resources.binding.clone(), &admitted, &state)?;
+                let config = mailbox_process::build_config(&keys, &admitted.mailbox_grant, &state, factory.route().clone())?;
+                (Arc::new(factory), Some(config))
+            } else { (Arc::new(FixtureHelper), None) };
             let workers = Arc::new(MailboxWorkers::new(
                 "local",
                 budget.clone(),
-                Arc::new(ObservedFactory(child_pid.clone())),
+                Arc::new(ObservedFactory(child_pid.clone(), factory)),
             )?);
             let daemon = HostAgentDaemon::new("local", signer.verifying, 65_536)
                 .with_resource_binding(worker.resources.binding.clone())
@@ -181,18 +210,27 @@ fn installed_retirement_collects_injected_original_mailbox_child() -> Result<()>
             let socket = worker.cfg.control_socket.clone();
             let key = signer.signing.to_bytes();
             let (mut current, owner) = tokio::task::spawn_blocking(move || -> io::Result<_> {
-                let mut current = request("local", "installed-child");
+                let mut current = admitted;
+                if config.is_some() {
+                    let mut foreign = current.clone();
+                    foreign.plan_commitment = [99; 32];
+                    if call(&key, &socket, &foreign).is_ok() {
+                        return Err(io::Error::other("unadmitted VM context acquired a worker"));
+                    }
+                }
                 let acquired = call(&key, &socket, &current)?.0;
                 current.request_nonce = [2; 32];
                 current.operation = MailboxWorkerOperation::DelegateConfig {
                     owner: acquired.owner.clone(),
                 };
                 let (_, fd) = call(&key, &socket, &current)?;
-                let mut pipe = std::fs::File::from(
-                    fd.ok_or_else(|| io::Error::other("original writer absent"))?,
-                );
-                pipe.write_all(b"private-fixture-config")?;
-                drop(pipe);
+                let fd = fd.ok_or_else(|| io::Error::other("original writer absent"))?;
+                if let Some(config) = &config {
+                    mvm_hostd::mailbox_process::write_delegated_config(fd, config, Instant::now()+Duration::from_secs(2))?;
+                } else {
+                    let mut pipe = std::fs::File::from(fd);
+                    pipe.write_all(b"private-fixture-config")?;
+                }
                 current.operation = MailboxWorkerOperation::Query {
                     owner: acquired.owner.clone(),
                 };
@@ -206,6 +244,21 @@ fn installed_retirement_collects_injected_original_mailbox_child() -> Result<()>
                         return Err(io::Error::other("actual pipe child never became Serving"));
                     }
                     std::thread::sleep(Duration::from_millis(5));
+                }
+                if let Some(config) = &config {
+                    if mvm_hostd::mailbox_service::recv(&config.socket)?.message.is_some() {
+                        return Err(io::Error::other("expected newly bound empty mailbox"));
+                    }
+                }
+                if signed_stop == Some(true) {
+                    current.request_nonce = [44; 32];
+                    current.operation = MailboxWorkerOperation::Stop { owner: acquired.owner.clone() };
+                    let status = call(&key, &socket, &current)?.0.state;
+                    current.request_nonce = [45; 32];
+                    current.operation = MailboxWorkerOperation::Query { owner: acquired.owner.clone() };
+                    if !matches!(status, MailboxWorkerState::Collected { exit: MailboxWorkerExit::Code { code: 0 } }) || call(&key, &socket, &current)?.0.state != status {
+                        return Err(io::Error::other("signed stop/query did not collect the original helper"));
+                    }
                 }
                 Ok((current, acquired.owner))
             })
@@ -265,7 +318,7 @@ fn installed_retirement_collects_injected_original_mailbox_child() -> Result<()>
                     matches!(receipt.original_exit(&requested_owner), Some(MailboxWorkerExit::Code { code: 0 })),
                     "original helper exit status was not preserved"
                 );
-                anyhow::ensure!(original_usage == initial_budget, "original worker reservation or control workspace remains charged");
+                anyhow::ensure!(original_usage.workers == initial_budget.workers && original_usage.bytes == initial_budget.bytes + receipt.retained_bytes() && receipt.retained_bytes() > 0, "original worker reservation or control workspace remains charged");
                 // GREEN must come from the REAL collector joining this loop.
                 // No fixture cancellation may manufacture that completion.
                 anyhow::ensure!(worker.control.as_ref().is_some_and(|control|

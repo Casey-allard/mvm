@@ -58,6 +58,42 @@ pub fn verify_request<'a>(
     root: &VerifyingKey,
     now_unix_ms: u64,
 ) -> Result<&'a MailboxWorkerRequest, WorkerControlError> {
+    let r = verify_binding(signed, root)?;
+    match r.deadline_unix_ms.checked_sub(now_unix_ms) {
+        Some(1..=MAX_WORKER_OPERATION_MS) => (),
+        _ => return Err(WorkerControlError::Deadline),
+    }
+    if !matches!(
+        r.operation,
+        MailboxWorkerOperation::Stop { .. } | MailboxWorkerOperation::Query { .. }
+    ) && r.admission_expires_at_unix_ms <= now_unix_ms
+    {
+        return Err(WorkerControlError::Deadline);
+    }
+    Ok(r)
+}
+
+/// Authenticate a persisted original Stop locator without authorizing a live
+/// operation. Recovery sends a newly signed Query or Stop with a fresh deadline.
+pub fn verify_stop_locator<'a>(
+    signed: &'a SignedControl,
+    root: &VerifyingKey,
+    expected_vm: &str,
+) -> Result<&'a MailboxWorkerRequest, WorkerControlError> {
+    let r = verify_binding(signed, root)?;
+    if r.deadline_unix_ms != 0
+        || r.vm_id != expected_vm
+        || !matches!(r.operation, MailboxWorkerOperation::Stop { .. })
+    {
+        return Err(WorkerControlError::Binding);
+    }
+    Ok(r)
+}
+
+fn verify_binding<'a>(
+    signed: &'a SignedControl,
+    root: &VerifyingKey,
+) -> Result<&'a MailboxWorkerRequest, WorkerControlError> {
     let ControlRequest::MailboxWorkerV1(r) = broker_control::verify(signed, root)? else {
         return Err(WorkerControlError::Binding);
     };
@@ -71,17 +107,6 @@ pub fn verify_request<'a>(
         || serde_json::to_vec(signed)?.len() > MAX_WORKER_CONTROL_BYTES
     {
         return Err(WorkerControlError::Binding);
-    }
-    match r.deadline_unix_ms.checked_sub(now_unix_ms) {
-        Some(1..=MAX_WORKER_OPERATION_MS) => (),
-        _ => return Err(WorkerControlError::Deadline),
-    }
-    if !matches!(
-        r.operation,
-        MailboxWorkerOperation::Stop { .. } | MailboxWorkerOperation::Query { .. }
-    ) && r.admission_expires_at_unix_ms <= now_unix_ms
-    {
-        return Err(WorkerControlError::Deadline);
     }
     match &r.operation {
         MailboxWorkerOperation::Acquire => (),
