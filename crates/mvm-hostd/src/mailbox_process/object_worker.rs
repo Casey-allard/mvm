@@ -12,7 +12,7 @@ use std::{
     io::{IoSlice, IoSliceMut},
     mem::MaybeUninit,
     os::{
-        fd::{AsRawFd, BorrowedFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
         unix::net::UnixStream,
     },
     time::{Duration, Instant},
@@ -35,8 +35,9 @@ fn before_deadline<T>(until: Instant, mut io: impl FnMut() -> rustix::io::Result
     }
 }
 
-pub(crate) fn send_originals(
+fn send_rights(
     channel: &UnixStream,
+    tag: u8,
     originals: [BorrowedFd<'_>; 2],
     until: Instant,
 ) -> Result<()> {
@@ -49,7 +50,7 @@ pub(crate) fn send_originals(
     let n = before_deadline(until, || {
         sendmsg(
             channel,
-            &[IoSlice::new(&TAG)],
+            &[IoSlice::new(&[tag])],
             &mut control,
             SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
         )
@@ -60,7 +61,7 @@ pub(crate) fn send_originals(
 
 pub(crate) struct Originals([OwnedFd; 2]);
 
-pub(crate) fn receive_originals(channel: &UnixStream, until: Instant) -> Result<Originals> {
+fn receive_rights(channel: &UnixStream, expected: u8, until: Instant) -> Result<[OwnedFd; 2]> {
     let mut tag = [0];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
@@ -74,7 +75,7 @@ pub(crate) fn receive_originals(channel: &UnixStream, until: Instant) -> Result<
     })?;
     ensure!(
         msg.bytes == 1
-            && tag == TAG
+            && tag == [expected]
             && !msg
                 .flags
                 .intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC),
@@ -84,15 +85,44 @@ pub(crate) fn receive_originals(channel: &UnixStream, until: Instant) -> Result<
     let Some(RecvAncillaryMessage::ScmRights(mut fds)) = messages.next() else {
         anyhow::bail!("missing original VMM handles");
     };
-    let pair = Originals([
+    let pair = [
         fds.next().context("missing caller VMM handle")?,
-        fds.next().context("missing callee VMM handle")?,
-    ]);
+        fds.next().context("missing second original descriptor")?,
+    ];
     ensure!(
         fds.next().is_none() && messages.next().is_none(),
         "extra original worker control data"
     );
     Ok(pair)
+}
+
+fn receive_originals(channel: &UnixStream, until: Instant) -> Result<Originals> {
+    Ok(Originals(receive_rights(channel, TAG[0], until)?))
+}
+
+fn receive_links(channel: &UnixStream, until: Instant) -> Result<[UnixStream; 2]> {
+    let streams = receive_rights(channel, 2, until)?.map(UnixStream::from);
+    let controller = rustix::net::sockopt::socket_peercred(channel)?;
+    let own = rustix::fs::fstat(channel)?;
+    let mut identities = vec![(own.st_dev, own.st_ino)];
+    for stream in &streams {
+        ensure!(
+            rustix::net::sockopt::socket_type(stream)? == rustix::net::SocketType::STREAM
+                && rustix::net::sockopt::socket_domain(stream)? == rustix::net::AddressFamily::UNIX
+                && stream.local_addr()?.is_unnamed()
+                && stream.peer_addr()?.is_unnamed()
+                && rustix::net::sockopt::socket_peercred(stream)? == controller,
+            "wrong original worker data socket"
+        );
+        let stat = rustix::fs::fstat(stream)?;
+        let identity = (stat.st_dev, stat.st_ino);
+        ensure!(
+            !identities.contains(&identity),
+            "aliased original data socket"
+        );
+        identities.push(identity);
+    }
+    Ok(streams)
 }
 
 impl Originals {
@@ -172,6 +202,7 @@ pub(crate) fn send_launch(
     channel: &UnixStream,
     config: &ObjectWorkerBootstrapV1,
     originals: [BorrowedFd<'_>; 2],
+    links: [&UnixStream; 2],
     until: Instant,
 ) -> Result<()> {
     let mut storage = Zeroizing::new(vec![0u8; MAX_CONFIG]);
@@ -179,7 +210,8 @@ pub(crate) fn send_launch(
     serde_json::to_writer(&mut cursor, config)
         .context("object worker config exceeds launch buffer or cannot be serialized")?;
     let len = cursor.position() as usize;
-    send_originals(channel, originals, until)?;
+    send_rights(channel, TAG[0], originals, until)?;
+    send_rights(channel, 2, links.map(AsFd::as_fd), until)?;
     let mut remaining = &storage[..len];
     while !remaining.is_empty() {
         let n = before_deadline(until, || {
@@ -238,9 +270,10 @@ pub(crate) struct WorkerLaunch {
 }
 
 impl WorkerLaunch {
-    pub(crate) fn receive(channel: UnixStream, until: Instant) -> Result<Self> {
+    pub(crate) fn receive(channel: UnixStream, until: Instant) -> Result<(Self, [UnixStream; 2])> {
         let controller = Controller::capture(&channel)?;
         let originals = receive_originals(&channel, until)?;
+        let links = receive_links(&channel, until)?;
         let body = read_body(&channel, MAX_CONFIG, until)?;
         // Deserializer messages can quote private input; only report the structural failure.
         let config = serde_json::from_slice(&body)
@@ -252,11 +285,13 @@ impl WorkerLaunch {
             channel,
         };
         launch.require_live()?;
+        launch.config.validate_current()?;
+        launch.require_live()?;
         ensure!(
             Instant::now() < until,
             "original object worker bootstrap timed out"
         );
-        Ok(launch)
+        Ok((launch, links))
     }
 
     pub(crate) fn require_live(&self) -> Result<()> {
@@ -272,3 +307,12 @@ impl WorkerLaunch {
 #[cfg(test)]
 #[path = "object_worker/handoff_tests.rs"]
 mod tests;
+
+mod carrier;
+mod service;
+
+pub fn serve_original_object() -> Result<()> {
+    let channel = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    let (owner, links) = WorkerLaunch::receive(channel, Instant::now() + Duration::from_secs(10))?;
+    service::run(owner, links)
+}

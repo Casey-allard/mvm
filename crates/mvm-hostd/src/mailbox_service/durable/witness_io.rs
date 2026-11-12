@@ -103,7 +103,7 @@ impl Recorder {
     // Measurements must never change the protocol result. If measurement
     // storage fails, stop emitting rows. Consumers must require the expected
     // complete exchanges and reject truncated, missing and overflow rows.
-    pub(super) fn observe<S, T>(
+    pub(crate) fn observe<S, T>(
         &self,
         stream: S,
         exchange: impl FnOnce(&mut Measured<'_, S>, &mut dyn FnMut(&'static str)) -> T,

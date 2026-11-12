@@ -24,7 +24,7 @@ fn hands_off_both_original_handles_and_fences_exit_and_swapped_order() {
     let fds =
         identity.map(|id| pidfd_open(Pid::from_raw(id.pid).unwrap(), PidfdFlags::empty()).unwrap());
     let (parent, worker) = UnixStream::pair().unwrap();
-    send_originals(&parent, [fds[0].as_fd(), fds[1].as_fd()], until()).unwrap();
+    send_rights(&parent, 1, [fds[0].as_fd(), fds[1].as_fd()], until()).unwrap();
     let received = receive_originals(&worker, until()).unwrap();
     received.require_live(identity).unwrap();
     assert!(received.require_live([identity[1], identity[0]]).is_err());
@@ -135,4 +135,15 @@ fn original_controller_is_the_parent_and_may_half_close_only_its_writes() {
     assert_eq!(signal, *b"K");
     drop(parent);
     assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn data_links_require_two_distinct_unnamed_streams_from_original_controller() {
+    let (control, child) = UnixStream::pair().unwrap();
+    let (a, _peer_a) = UnixStream::pair().unwrap();
+    let (b, _peer_b) = UnixStream::pair().unwrap();
+    for (ends, accepted) in [([&a, &b], true), ([&a, &a], false), ([&child, &a], false)] {
+        send_rights(&control, 2, ends.map(AsFd::as_fd), until()).unwrap();
+        assert_eq!(receive_links(&child, until()).is_ok(), accepted);
+    }
 }

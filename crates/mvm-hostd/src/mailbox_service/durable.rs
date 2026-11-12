@@ -42,7 +42,7 @@ pub(crate) const GUEST_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_EXPIRY_RECORDS_PER_REQUEST: usize = 8;
 
 #[cfg(feature = "durable-guest-io-witness")]
-mod witness_io;
+pub(crate) mod witness_io;
 
 mod guest_deadline;
 pub(crate) use guest_deadline::GuestDeadline;
