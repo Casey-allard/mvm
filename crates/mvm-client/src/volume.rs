@@ -106,6 +106,39 @@ mod tests {
     }
 
     #[test]
+    fn launch_volume_contention_keeps_original_owner_at_deadline_and_propagates_io_errors() {
+        use mvm_core::util::atomic_io::FileLock;
+        use std::time::{Duration, Instant};
+
+        let _home = TestVolumeHome::new();
+        let path = LocalVolumeCatalog::path();
+        let held = super::lifecycle::acquire_volume_lifecycle_lock().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let err = FileLock::acquire_until(&path, deadline).err().unwrap();
+        assert!(Instant::now() >= deadline);
+        assert!(err.to_string().contains("deadline expired"));
+        assert!(FileLock::try_acquire(&path).unwrap().is_none());
+        assert!(!AttachmentLeaseCatalog::path().exists());
+        drop(held);
+
+        let name = path.with_extension("lock");
+        let previous = path.with_extension("old");
+        fs::rename(&name, &previous).unwrap();
+        std::os::unix::fs::symlink(&previous, &name).unwrap();
+        let err = service()
+            .acquire_launch_lease(&jit_launch("vm-2"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("original lock file was replaced"));
+        fs::remove_file(&name).unwrap();
+        fs::create_dir(&name).unwrap();
+        let err = service()
+            .acquire_launch_lease(&jit_launch("vm-2"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("failed to open lock file"));
+        assert!(!AttachmentLeaseCatalog::path().exists());
+    }
+
+    #[test]
     fn launch_volume_contention_waits_and_reads_committed_catalog() {
         use std::sync::mpsc::{self, RecvTimeoutError};
         use std::time::Duration;
@@ -118,7 +151,8 @@ mod tests {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
                     started.send(()).unwrap();
-                    let outcome = service().acquire_launch_lease(&jit_launch("vm-2"))
+                    let outcome = service()
+                        .acquire_launch_lease(&jit_launch("vm-2"))
                         .map(|prepared| prepared.volumes.len())
                         .map_err(|error| format!("{error:#}"));
                     result.send(outcome).unwrap();
@@ -133,7 +167,10 @@ mod tests {
                 let outcome = completed.recv_timeout(Duration::from_secs(2)).unwrap();
                 if corrupt {
                     assert!(outcome.unwrap_err().contains("parsing volume leases"));
-                    assert_eq!(fs::read(AttachmentLeaseCatalog::path()).unwrap(), b"invalid catalog");
+                    assert_eq!(
+                        fs::read(AttachmentLeaseCatalog::path()).unwrap(),
+                        b"invalid catalog"
+                    );
                 } else {
                     assert_eq!(outcome.unwrap(), 0);
                 }

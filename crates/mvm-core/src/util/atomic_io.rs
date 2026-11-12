@@ -764,21 +764,73 @@ impl FileLock {
         self._file.metadata()
     }
 
+    fn open_lock_file(lock_path: &Path) -> Result<fs::File> {
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)
+            .with_context(|| format!("failed to open lock file: {}", lock_path.display()))
+    }
+
+    /// Acquire the original, still-named Unix lock before a monotonic deadline.
+    /// Only kernel-reported contention is retried. All attempts use one open file.
+    #[cfg(unix)]
+    pub fn acquire_until(path: &Path, deadline: std::time::Instant) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, Instant};
+
+        let lock_path = path.with_extension("lock");
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "lock acquisition deadline expired"
+        );
+        let file = Self::open_lock_file(&lock_path)?;
+        let mut delay = Duration::from_millis(1);
+        loop {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "lock acquisition deadline expired"
+            );
+            match file.try_lock() {
+                Ok(()) => {
+                    let guard = Self { _file: file };
+                    let held = guard.metadata()?;
+                    let named = fs::symlink_metadata(&lock_path)?;
+                    anyhow::ensure!(
+                        held.is_file() && held.dev() == named.dev() && held.ino() == named.ino(),
+                        "original lock file was replaced"
+                    );
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "lock acquisition deadline expired"
+                    );
+                    return Ok(guard);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(
+                        delay.min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    delay = (delay * 2).min(Duration::from_millis(16));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to try lock: {}", lock_path.display()));
+                }
+            }
+        }
+    }
+
     /// Acquire an exclusive lock for operations on `path`.
     ///
     /// Creates `<path>.lock` if it doesn't exist, then acquires an exclusive
     /// flock. Blocks until the lock is available.
     pub fn acquire(path: &Path) -> Result<Self> {
         let lock_path = path.with_extension("lock");
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("failed to open lock file: {}", lock_path.display()))?;
+        let file = Self::open_lock_file(&lock_path)?;
         file.lock()
             .with_context(|| format!("failed to acquire lock: {}", lock_path.display()))?;
         Ok(Self { _file: file })
@@ -789,15 +841,7 @@ impl FileLock {
     /// Returns `None` if another process holds the lock.
     pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let lock_path = path.with_extension("lock");
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("failed to open lock file: {}", lock_path.display()))?;
+        let file = Self::open_lock_file(&lock_path)?;
         // std distinguishes contention from a real error in the type, so
         // "another process holds it" no longer rides on an errno comparison.
         match file.try_lock() {

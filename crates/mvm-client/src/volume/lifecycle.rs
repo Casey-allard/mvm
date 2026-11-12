@@ -98,6 +98,19 @@ pub(crate) fn acquire_volume_lifecycle_lock() -> Result<mvm_core::util::atomic_i
         .context("another local volume lifecycle operation is already in progress")
 }
 
+/// Independent starts share one catalog even when neither requests mounts.
+/// Wait briefly for the current writer, then resolve under the same exclusive lock.
+pub(crate) fn acquire_launch_volume_lifecycle_lock() -> Result<mvm_core::util::atomic_io::FileLock>
+{
+    use std::time::{Duration, Instant};
+
+    mvm_core::util::atomic_io::FileLock::acquire_until(
+        &LocalVolumeCatalog::path(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .context("acquiring the volume lifecycle lock for launch")
+}
+
 pub(crate) fn unlock_staging_path(host_path: &Path) -> PathBuf {
     host_path.with_extension("unlocking")
 }
