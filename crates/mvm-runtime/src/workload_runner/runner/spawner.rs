@@ -336,6 +336,7 @@ fn spawn_local_endpoint(
             let material = FlowMuxIdentityMaterial::mint_from_host_signer(req.vm_name)
                 .context("minting this boot's FlowMux identity")?;
             let reader_boot = mint_mailbox_reader_boot(req, material.guest_verifying_key())?;
+            observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
             let drive = req.state_dir.join(IDENTITY_DRIVE_FILE);
             material.write_drive_with(
                 &drive,
@@ -347,7 +348,6 @@ fn spawn_local_endpoint(
                 },
             )?;
             persist_mailbox_reader_boot(req, reader_boot.as_ref().map(|(_, binding)| binding))?;
-            observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
             // Persisted so a warm child claimed from this VM pins the key
             // its restored guest actually holds.
             material.persist_inheritable(req.state_dir)?;
@@ -488,6 +488,7 @@ fn prepare_observation_identity_inner(
                 .context("guest observations require the host signer public anchor")?;
             let guest = GuestIdentityMaterial::mint(anchor)?;
             let reader_boot = mint_mailbox_reader_boot(req, guest.verifying_key())?;
+            observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
             let drive = req.state_dir.join(IDENTITY_DRIVE_FILE);
             guest.write_drive_with(
                 &drive,
@@ -498,7 +499,6 @@ fn prepare_observation_identity_inner(
                 },
             )?;
             persist_mailbox_reader_boot(req, reader_boot.as_ref().map(|(_, binding)| binding))?;
-            observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
             (
                 InheritableIdentity {
                     session_id: req.vm_name.to_string(),
@@ -879,6 +879,54 @@ mod tests {
             .is_none()
         );
         assert!(!child.join(MAILBOX_READER_BOOT_FILE).exists());
+    }
+
+    #[test]
+    fn original_selected_reader_is_the_boot_written_to_its_single_cold_drive() {
+        use mvm_contract::protocol::mailbox::{
+            ExecutionEpoch, MailboxGrant, MailboxId, MailboxRetentionPolicy,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let anchor = root.path().join("signer.pub");
+        let host = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+        std::fs::write(&anchor, host.verifying_key().as_bytes()).unwrap();
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.mailbox = Some(MailboxGrant {
+            durable_object_pair_sha256_v1: Some([4; 32]),
+            mailbox: MailboxId::from_bytes([5; 32]),
+            authority_key: host.verifying_key().to_bytes(),
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: Some(MailboxRetentionPolicy::new(60_000).unwrap()),
+            outbound_journal_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+        });
+        plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+        let state = root.path().join("selected");
+        let request = NetworkEndpointSpawnRequest {
+            vm_name: &plan.image.name,
+            state_dir: &state,
+            tenant: "tenant",
+            secrets: &[],
+            redaction: &RedactionPolicy::default(),
+            network_policy: &NetworkPolicy::deny_all(),
+            network_limits: Default::default(),
+            ingress: &[],
+            reader_plan: Some(&plan),
+            identity: FlowMuxIdentitySource::Mint,
+        };
+        let slot = Capture::new();
+        let drive = prepare_observation_identity_inner(&request, &anchor, Some(&slot))
+            .unwrap()
+            .unwrap();
+        let expected = slot.get().unwrap();
+        let image = std::fs::read(&drive).unwrap();
+        let encoded = serde_json::to_vec(expected).unwrap();
+        assert!(image.windows(encoded.len()).any(|bytes| bytes == encoded));
+        assert_eq!(ReaderBoot::load(&state).unwrap(), *expected);
+        assert!(prepare_observation_identity_inner(&request, &anchor, Some(&slot)).is_err());
+        assert_eq!(std::fs::read(drive).unwrap(), image);
+        assert_eq!(ReaderBoot::load(&state).unwrap(), *expected);
     }
 
     #[test]
