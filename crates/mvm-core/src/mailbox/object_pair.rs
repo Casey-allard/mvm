@@ -321,6 +321,17 @@ impl<'a> ObjectPairV1<'a> {
         Ok(())
     }
 
+    pub(super) fn retained_capability(
+        &self,
+        pending: Option<&PendingObjectCall>,
+    ) -> &SignedMailboxCapability {
+        if pending.is_some() {
+            self.grants.reply
+        } else {
+            self.grants.call
+        }
+    }
+
     /// For the canonical journal's already accepted retained row only, after
     /// independent current Receive authorization and before lease mutation.
     /// No new replay entry or receipt. No side effect or plaintext return.
