@@ -658,8 +658,11 @@ fn admit(
     }
     // The original replay set is never evicted while a grant is live. Stop
     // admission when its reserved entries are consumed, even after queue reads.
-    if shared.lifetime_admissions.is_some_and(|max| state.accepted >= max) {
-        return Err(Refusal::Mailbox("installed mailbox replay reservation exhausted".into()));
+    if let Some(max) = shared.lifetime_admissions.filter(|&max| state.accepted >= max) {
+        // QueueFull is the legacy guest verdict that preserves its spool item.
+        // A fresh admitted helper is required to regain lifetime credit.
+        let capacity = usize::try_from(max).unwrap_or(usize::MAX);
+        return Err(Refusal::QueueFull(capacity));
     }
     let p = &state.policy;
     let plaintext = open_envelope(
