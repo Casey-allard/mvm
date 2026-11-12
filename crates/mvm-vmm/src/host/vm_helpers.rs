@@ -23,6 +23,22 @@ pub fn reap_vm_host_helpers(state_dir: &Path, vm_name: &str) {
     super::gpu_endpoint_spawn::reap_gpu_endpoint(state_dir);
     super::broker_services_spawn::reap_broker_services(state_dir);
     super::host_agent_spawn::reap_host_agent_services_from_state(state_dir, vm_name);
+    // A held original journal owns its Child and epoch. A VM/supervisor stop
+    // may still reap its *other* helpers. Only the original journal owner can
+    // collect this one; even an unreadable claim must fence mailbox teardown.
+    if let Some(home) = state_dir.parent().and_then(Path::parent)
+        && mvm_core::config::vm_state_dir_at(home, vm_name) == state_dir
+    {
+        let marker = mvm_core::config::vm_mailbox_original_owner_at(
+            &mvm_core::config::mvm_keys_dir_at(home),
+            vm_name,
+        )
+        .join(mvm_core::config::ORIGINAL_MAILBOX_CLAIM);
+        if !matches!(std::fs::symlink_metadata(marker), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+    }
     super::gpu_endpoint_spawn::reap_pid_file(&state_dir.join(MAILBOX_PID_FILE));
     // The mailbox's per-epoch secret goes with its process: after this, the
     // sealed frames of this launch cannot be reopened from the host seed alone.
@@ -58,6 +74,23 @@ mod tests {
 
         assert!(!mailbox.wait().expect("reaped").success());
         assert!(!pid_file.exists());
+    }
+
+    #[test]
+    fn paired_original_keeps_epoch_custody_until_owner_collection() {
+        let home = tempfile::tempdir().unwrap();
+        let name = "original";
+        let state = mvm_core::config::vm_state_dir_at(home.path(), name);
+        std::fs::create_dir_all(&state).unwrap();
+        let owner = mvm_core::config::mvm_keys_dir_at(home.path())
+            .join("mailbox-original-owners-v1")
+            .join("0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(owner.join("mailbox-paired-original-v1"), [1u8; 32]).unwrap();
+        let secret = mvm_core::config::vm_mailbox_secret_at(&state);
+        mvm_core::atomic_io::write_private(&secret, &[8; 32]).unwrap();
+        reap_vm_host_helpers(&state, name);
+        assert_eq!(std::fs::read(secret).unwrap(), [8; 32]);
     }
 
     #[test]

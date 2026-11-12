@@ -502,7 +502,7 @@ fn finish_legacy_persistent(
     mut prepared_volumes: crate::volume::LaunchPreparation,
     name: &str,
     backend_name: &str,
-    journal: Option<&mut journal::InstalledJournal<'_>>,
+    mut journal: Option<&mut journal::InstalledJournal<'_>>,
     fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
     let mailbox_posture = admission.admitted.mailbox_posture();
@@ -545,10 +545,10 @@ fn finish_legacy_persistent(
     // The guest asserts a mailbox exactly when the plan grants one, so the
     // host side starts here or the launch is rolled back.
     let paired = journal.is_some();
-    if let Some(endpoint) = journal {
+    if let Some(endpoint) = journal.as_deref_mut() {
         if let Err(error) = endpoint.serve(&admission.admitted, &started) {
-            match started.backend().abort_start(started.vm_id()) {
-                Ok(_) => {
+            match endpoint.abort_original(admission.admitted.plan(), &started) {
+                Ok(()) => {
                     crate::local::deregister_from_name_registry(name);
                     emit_failed(&admission, "mailbox-process", &error);
                 }
@@ -586,9 +586,16 @@ fn finish_legacy_persistent(
     // Detached callers must not observe success until the authenticated guest
     // control plane is actually serving; failure rolls the partial start back
     // before any launch acceptance, lease commit, or launched audit record.
-    if let Err(error) =
-        super::detached::require_serving_guest(name, &started, std::time::Duration::from_secs(30))
-    {
+    let timeout = std::time::Duration::from_secs(30);
+    let ready = match journal.as_deref_mut() {
+        Some(endpoint) => {
+            super::detached::require_serving_guest_with_rollback(name, &started, timeout, || {
+                endpoint.abort_original(admission.admitted.plan(), &started)
+            })
+        }
+        None => super::detached::require_serving_guest(name, &started, timeout),
+    };
+    if let Err(error) = ready {
         let abort_is_unresolved = error.abort_is_unresolved();
         if abort_is_unresolved {
             // The VMM may still hold block-device file descriptors. Preserve
@@ -611,12 +618,12 @@ fn finish_legacy_persistent(
         }
         return Err(anyhow::Error::new(error));
     }
-    if paired {
+    if let Some(endpoint) = journal {
         journal::account_started(
             &admission,
             &started,
             name,
-            || started.backend().abort_start(started.vm_id()).map(|_| ()),
+            || endpoint.abort_original(admission.admitted.plan(), &started),
             || prepared_volumes.commit(),
         )?;
     } else {

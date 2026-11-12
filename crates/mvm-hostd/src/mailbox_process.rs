@@ -709,37 +709,37 @@ fn spawn_with_original<T>(
     started
 }
 
-fn spawn_serving(config: &MailboxProcessConfig, state_dir: &Path) -> Result<std::process::Child> {
+fn serving_command() -> Result<Command> {
     let bin = mvm_vmm::host::broker_services_spawn::resolve_subprocess_bin_to_spawn(&AuxBin::new(
         MAILBOX_BIN,
         MAILBOX_BIN_ENV,
         "mvm-hostd",
     ))
     .map_err(|e| Error::new(ErrorKind::NotFound, format!("{e:#}")))?;
-    let mut child = command(&bin).spawn()?;
-    let written = child
+    Ok(command(&bin))
+}
+
+// Keep this handshake separate from exec: a rejected configuration can have
+// a real Child while a failed executable lookup or failed exec has none.
+fn configure_serving(config: &MailboxProcessConfig, child: &mut std::process::Child) -> Result<()> {
+    let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| Error::other("mvm-mailbox stdin was not piped"))
-        .and_then(|mut stdin| {
-            stdin.write_all(&zeroize::Zeroizing::new(serde_json::to_vec(config)?))
-        });
-    if let Err(error) = written {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    let ready = child
+        .ok_or_else(|| Error::other("mvm-mailbox stdin was not piped"))?;
+    stdin.write_all(&zeroize::Zeroizing::new(serde_json::to_vec(config)?))?;
+    drop(stdin);
+    let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| Error::other("mvm-mailbox stdout was not piped"))
-        .and_then(|stdout| wait_ready(stdout, READY_TIMEOUT));
-    if let Err(error) = ready {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    if let Err(error) = std::fs::write(state_dir.join(MAILBOX_PID_FILE), child.id().to_string()) {
+        .ok_or_else(|| Error::other("mvm-mailbox stdout was not piped"))?;
+    wait_ready(stdout, READY_TIMEOUT)
+}
+
+fn spawn_serving(config: &MailboxProcessConfig, state_dir: &Path) -> Result<std::process::Child> {
+    let mut child = serving_command()?.spawn()?;
+    let setup = configure_serving(config, &mut child)
+        .and_then(|()| std::fs::write(state_dir.join(MAILBOX_PID_FILE), child.id().to_string()));
+    if let Err(error) = setup {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);

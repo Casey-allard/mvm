@@ -1337,6 +1337,7 @@ impl LocalBackend {
     /// force does not bypass that failure.
     pub async fn remove_machine_with(&self, id: &MachineId, options: RemoveOptions) -> Result<()> {
         let name = id.0.as_str();
+        let reservation = reserve_named_lifecycle(name)?;
         let has_spec = machine_spec_path(name).exists();
         if has_spec {
             if self.machine_running(name) {
@@ -1360,7 +1361,7 @@ impl LocalBackend {
             return Ok(());
         }
         // Transient semantics: stop whatever is live, then idempotent cleanup.
-        self.cleanup_transient(name)
+        self.cleanup_transient_reserved(name, &reservation)
     }
 
     /// Release every session-owned resource `name` holds: registered volume

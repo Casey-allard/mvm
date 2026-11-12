@@ -6,10 +6,12 @@ pub mod authorization;
 #[cfg(test)]
 mod paired_process_tests;
 pub mod relay;
+mod stop;
+pub use stop::{JournalOwner, JournalStopOutcome};
 mod runtime_state;
 pub use runtime_state::FreshState;
 
-use super::{MailboxLaunchPosture, MailboxProcessConfig, spawn_serving, spawn_with_original};
+use super::{MailboxLaunchPosture, MailboxProcessConfig, spawn_with_original};
 use anyhow::{Context, Result, ensure};
 use mvm_agentd::vsock::connect_unix_before;
 use mvm_contract::protocol::mailbox::{MailboxAddress, PrincipalId};
@@ -28,6 +30,8 @@ use std::time::Instant;
 pub struct OriginalJournalDestination {
     pub(super) incoming: Option<super::paired_incoming::EnrolledIncoming>,
     child: Child,
+    readiness: Option<String>,
+    stop: stop::StopCustody,
     _original: std::sync::Arc<LaunchClaim>,
     marker: OriginalMarker,
     socket: PathBuf,
@@ -52,6 +56,23 @@ impl OriginalJournalDestination {
         vm_name: &str,
         posture: &MailboxLaunchPosture,
     ) -> Result<Self> {
+        let owner = Self::start_custodied(plan, backend, vm_name, posture)?;
+        if let Err(err) = owner.require_ready() {
+            // The convenience API cannot hand an unready endpoint to a caller.
+            // Return its actual child as a typed error for explicit collection.
+            return Err(IncompleteJournalStart::new(err, owner).into());
+        }
+        Ok(owner)
+    }
+
+    /// Return custody even on a post-exec configuration/readiness failure.
+    /// Call require_ready before advertising the endpoint.
+    pub fn start_custodied(
+        plan: &ExecutionPlan,
+        backend: &AnyBackend,
+        vm_name: &str,
+        posture: &MailboxLaunchPosture,
+    ) -> Result<Self> {
         ensure!(
             posture.variant() == Variant::Prod,
             "paired journal requires production admission"
@@ -62,7 +83,9 @@ impl OriginalJournalDestination {
             vm_name,
             Some(posture),
             true,
-            |config, plan, guard| Self::spawn(config, plan, guard).map_err(std::io::Error::other),
+            |config, plan, guard| {
+                Self::spawn(config, plan, backend, guard).map_err(std::io::Error::other)
+            },
         )?
         .context("destination VM has no admitted mailbox")
     }
@@ -70,6 +93,7 @@ impl OriginalJournalDestination {
     fn spawn(
         config: &MailboxProcessConfig,
         plan: &ExecutionPlan,
+        backend: &AnyBackend,
         guard: std::sync::Arc<LaunchClaim>,
     ) -> Result<Self> {
         let boot = config
@@ -124,10 +148,15 @@ impl OriginalJournalDestination {
             None
         };
         let current = &policy.context;
-        let marker = OriginalMarker::claim(&guard.owner_dir)?;
-        let child = spawn_serving(config, &config.vm_state_dir)?;
+        let stop = stop::StopCustody::capture(config, backend, &plan.image.name)?;
+        let (mut child, marker) = spawn_claimed(&guard.owner_dir, super::serving_command()?)?;
+        let readiness = super::configure_serving(config, &mut child)
+            .err()
+            .map(|e| e.to_string());
         Ok(Self {
             child,
+            readiness,
+            stop,
             incoming,
             _original: guard,
             marker,
@@ -156,6 +185,7 @@ impl OriginalJournalDestination {
     /// Before sending any credential or ciphertext, authenticate the connected
     /// kernel peer against the exclusively owned, still-live original Child.
     pub fn connect(&mut self, deadline: Instant) -> Result<UnixStream> {
+        self.require_ready()?;
         authenticated_connect(&mut self.child, &self.socket, deadline)
     }
 
@@ -169,6 +199,13 @@ impl OriginalJournalDestination {
     /// Only try_collect can clear this helper's persistent ownership record.
     pub fn request_original_exit_after_vm_stop(&mut self) -> std::io::Result<()> {
         request_original_exit(&mut self.child)
+    }
+
+    pub fn require_ready(&self) -> Result<()> {
+        if let Some(e) = &self.readiness {
+            anyhow::bail!("original B did not become ready: {e}");
+        }
+        Ok(())
     }
 
     pub fn binding(&self) -> &MailboxReaderBootBinding {
@@ -185,16 +222,55 @@ impl OriginalJournalDestination {
     }
 }
 
+/// A convenience launch that crossed exec but failed its readiness handshake.
+/// Retains the exact original owner for inspection, stop and collection.
+pub struct IncompleteJournalStart<T> {
+    reason: String,
+    pub owner: std::sync::Mutex<T>,
+}
+impl<T> IncompleteJournalStart<T> {
+    fn new(error: anyhow::Error, owner: T) -> Self {
+        Self {
+            reason: error.to_string(),
+            owner: std::sync::Mutex::new(owner),
+        }
+    }
+}
+impl<T> std::fmt::Debug for IncompleteJournalStart<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+impl<T> std::fmt::Display for IncompleteJournalStart<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+impl<T> std::error::Error for IncompleteJournalStart<T> {}
+
+fn spawn_claimed(
+    dir: &std::path::Path,
+    mut command: std::process::Command,
+) -> std::io::Result<(Child, OriginalMarker)> {
+    let mut marker = OriginalMarker::claim(dir)?;
+    match command.spawn() {
+        Ok(child) => Ok((child, marker)),
+        Err(exec) => {
+            marker.clear_original()?;
+            Err(exec)
+        }
+    }
+}
+
 pub(super) struct LaunchClaim {
     _guard: FileLock,
     pub(super) owner_dir: PathBuf,
 }
 
 pub(super) fn owner_dir(keys_dir: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
-    use sha2::{Digest, Sha256};
     let root = keys_dir.join("mailbox-original-owners-v1");
     mvm_core::private_fs::ensure_private_dir(&root).map_err(std::io::Error::other)?;
-    let dir = root.join(hex::encode(Sha256::digest(name.as_bytes())));
+    let dir = mvm_core::config::vm_mailbox_original_owner_at(keys_dir, name);
     mvm_core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::other)?;
     mvm_core::util::atomic_io::sync_dir(keys_dir).map_err(std::io::Error::other)?;
     mvm_core::util::atomic_io::sync_dir(&root).map_err(std::io::Error::other)?;
@@ -329,7 +405,7 @@ fn request_original_exit(child: &mut std::process::Child) -> std::io::Result<()>
     Ok(())
 }
 
-pub(super) const MARKER: &str = "mailbox-paired-original-v1";
+pub(super) const MARKER: &str = mvm_core::config::ORIGINAL_MAILBOX_CLAIM;
 
 /// Kept on disk through either launcher crash or an uncollected Child. The
 /// ordinary Drop of Child/FileLock is never proof that a subprocess exited.
@@ -337,6 +413,7 @@ struct OriginalMarker {
     path: PathBuf,
     original: std::fs::File,
     token: [u8; 32],
+    unlinked: bool,
     cleared: bool,
 }
 
@@ -360,33 +437,55 @@ impl OriginalMarker {
             path,
             original,
             token,
+            unlinked: false,
             cleared: false,
         })
     }
 
     fn collect(&mut self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
-        use std::os::unix::fs::{FileExt, MetadataExt};
         let Some(status) = child.try_wait()? else {
             return Ok(None);
         };
-        if !self.cleared {
-            let original = self.original.metadata()?;
-            let named = std::fs::symlink_metadata(&self.path)?;
-            let mut token = [0u8; 32];
-            self.original.read_exact_at(&mut token, 0)?;
-            if (original.dev(), original.ino()) != (named.dev(), named.ino())
-                || named.nlink() != 1
-                || named.len() != 32
-                || token != self.token
-            {
-                return Err(std::io::Error::other("original marker was replaced"));
-            }
-            std::fs::remove_file(&self.path)?;
-            mvm_core::util::atomic_io::sync_dir(self.path.parent().unwrap())
-                .map_err(std::io::Error::other)?;
-            self.cleared = true;
-        }
+        self.clear_original()?;
         Ok(Some(status))
+    }
+
+    // Called only after collecting the actual Child, or after Command::spawn
+    // returned Err before yielding a Child. A crash at any other point fences.
+    fn clear_original(&mut self) -> std::io::Result<()> {
+        if self.cleared {
+            return Ok(());
+        }
+        if !self.unlinked {
+            self.require_original()?;
+            std::fs::remove_file(&self.path)?;
+            self.unlinked = true;
+        } else if !matches!(std::fs::symlink_metadata(&self.path), Err(e) if e.kind()==std::io::ErrorKind::NotFound)
+        {
+            return Err(std::io::Error::other(
+                "original claim was replaced after unlink",
+            ));
+        }
+        mvm_core::util::atomic_io::sync_dir(self.path.parent().unwrap())
+            .map_err(std::io::Error::other)?;
+        self.cleared = true;
+        Ok(())
+    }
+
+    fn require_original(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let original = self.original.metadata()?;
+        let named = std::fs::symlink_metadata(&self.path)?;
+        let mut token = [0u8; 32];
+        self.original.read_exact_at(&mut token, 0)?;
+        if (original.dev(), original.ino()) != (named.dev(), named.ino())
+            || named.nlink() != 1
+            || named.len() != 32
+            || token != self.token
+        {
+            return Err(std::io::Error::other("original marker was replaced"));
+        }
+        Ok(())
     }
 }
 
@@ -416,6 +515,25 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::time::Duration;
+
+    #[test]
+    fn original_exec_refusal_releases_only_its_unstarted_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = std::process::Command::new(dir.path().join("no-executable"));
+        let Err(error) = spawn_claimed(dir.path(), missing) else {
+            panic!("unexpected exec");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!dir.path().join(MARKER).exists());
+        let mut command = std::process::Command::new("sleep");
+        command.arg("15");
+        let (mut child, mut marker) = spawn_claimed(dir.path(), command).unwrap();
+        assert!(marker.collect(&mut child).unwrap().is_none());
+        assert!(dir.path().join(MARKER).is_file());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(marker.collect(&mut child).unwrap().is_some());
+    }
 
     #[test]
     fn unpaired_names_leave_only_bounded_lock_shards() {

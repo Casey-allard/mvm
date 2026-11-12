@@ -80,6 +80,22 @@ impl InstalledJournal<'_> {
         }
     }
 
+    pub(super) fn abort_original(
+        &mut self,
+        plan: &mvm_core::plan::ExecutionPlan,
+        started: &crate::StartedVm,
+    ) -> Result<()> {
+        use mvm_hostd::mailbox_process::original_journal::JournalOwner;
+        let original = match self {
+            Self::Destination { owner, .. } => owner.as_mut().map(JournalOwner::Destination),
+            Self::Source { owner, .. } => owner.as_mut().map(JournalOwner::Source),
+        };
+        match original {
+            Some(mut held) => held.abort_original_launch(plan, started.backend(), started.vm_id()),
+            None => started.backend().abort_start(started.vm_id()).map(|_| ()),
+        }
+    }
+
     pub(super) fn serve(
         &mut self,
         admitted: &AdmittedPlan,
@@ -92,20 +108,22 @@ impl InstalledJournal<'_> {
         let backend = started.backend();
         match self {
             Self::Destination { owner, .. } => {
-                **owner = Some(OriginalJournalDestination::start(
+                **owner = Some(OriginalJournalDestination::start_custodied(
                     admitted.plan(),
                     backend,
                     name,
                     &posture,
                 )?);
+                owner.as_ref().expect("retained original").require_ready()?;
             }
             Self::Source { admission, owner } => {
-                **owner = Some(admission.launch_original_source(
+                **owner = Some(admission.launch_custodied_source(
                     admitted.plan(),
                     backend,
                     name,
                     &posture,
                 )?);
+                owner.as_ref().expect("retained original").require_ready()?;
             }
         }
         Ok(())
@@ -149,6 +167,32 @@ pub(super) fn account_started(
         Some(&ctx.emitter),
         rollback,
     )
+}
+
+impl crate::LocalBackend {
+    /// Keep the actual helper and runtime state in custody until the original
+    /// VM stop and helper collection both succeed. The deadline bounds helper
+    /// collection; native VM stop retains the backend's own shutdown bounds.
+    pub async fn stop_persistent_journal(
+        &self,
+        id: &mvm_core::client::dto::MachineId,
+        original: &mut mvm_hostd::mailbox_process::original_journal::JournalOwner<'_>,
+        until: std::time::Instant,
+    ) -> mvm_core::client::Result<mvm_hostd::mailbox_process::original_journal::JournalStopOutcome>
+    {
+        let name = &id.0;
+        original
+            .stop_and_collect(name, until, |plan, aborted| {
+                if !aborted {
+                    crate::launch::seal_stopped_session(plan, name);
+                }
+                self.release_stopped_leases(name)?;
+                crate::local::deregister_from_name_registry(name);
+                crate::local::remove_stopped_runtime_state(name)?;
+                Ok(())
+            })
+            .map_err(crate::local::backend_err)
+    }
 }
 
 #[cfg(test)]
