@@ -29,6 +29,7 @@ pub fn grant_for(
     epoch: ExecutionEpoch,
 ) -> MailboxGrant {
     MailboxGrant {
+        incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,
         mailbox,
         authority_key: authority.to_bytes(),
@@ -56,6 +57,7 @@ pub fn at_workload_epoch(grant: MailboxGrant, workload: &str) -> Result<MailboxG
     current.retention = grant.retention;
     // Never silently turn a requested directed send into own-mailbox access.
     current.outbound_journal_v1 = grant.outbound_journal_v1;
+    current.incoming_journal_policy_sha256_v1 = grant.incoming_journal_policy_sha256_v1;
     Ok(current)
 }
 

@@ -548,6 +548,7 @@ mod tests {
             workload_cmdline(&config, dir.path(), hvf_like_workload_bootargs).expect("cmdline")
         };
         let granted = build(Some(MailboxGrant {
+            incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],

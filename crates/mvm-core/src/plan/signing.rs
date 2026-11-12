@@ -500,6 +500,7 @@ mod tests {
     fn mailbox_grant() -> mvm_contract::protocol::mailbox::MailboxGrant {
         use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
         MailboxGrant {
+            incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([7; 32]),
             authority_key: [9; 32],

@@ -50,6 +50,7 @@ use crate::plan_admission::{MailboxLaunchPosture, MailboxPostureHandoff};
 use crate::vm_lifetime::{endpoint_needed, launcher_is_alive};
 
 pub mod original_journal;
+pub mod paired_incoming;
 pub(crate) mod reader;
 
 /// The helper binary this module spawns.
@@ -308,13 +309,20 @@ fn serve_local(
         &sealer.capability,
         &signer,
     )?;
-    let service = DurableMailboxService::bind_local(
+    let mut policy=policy.with_grant(&grant)?;
+    let enrolled=paired_incoming::EnrolledIncoming::open(&keys_dir,&grant,&retained,binding,&reader).map_err(Error::other)?;
+    let inbound=if let Some(enrolled)=enrolled {
+        enrolled.apply(&mut policy).map_err(Error::other)?;
+        Some(enrolled.send_guard(reader.revocations_path.clone()).map_err(Error::other)?)
+    } else {None};
+    let service = DurableMailboxService::bind_local_incoming(
         &socket,
         LAUNCH_LIMITS,
-        policy.with_grant(&grant)?,
+        policy,
         signer,
         journal,
         anchor,
+        inbound,
     )?;
     service.install_guest_reader(reader)?;
     let mut turn = crate::mailbox_service::directed_journal::SourceTurn::from_boot(&binding)
@@ -771,6 +779,7 @@ mod tests {
     fn grant(dir: &Path) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes([4; 32]);
         MailboxGrant {
+            incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox,
             authority_key: crate::mailbox_launch::authority_key_for(

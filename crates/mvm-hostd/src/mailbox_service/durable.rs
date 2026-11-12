@@ -104,7 +104,13 @@ struct State {
     journal: MailboxJournal,
 }
 
+pub(crate) struct IncomingSendGuard {
+    pub(crate) digest:[u8;32],
+    pub(crate) revocations:PathBuf,
+}
+
 struct Shared {
+    incoming: Option<IncomingSendGuard>,
     limits: MailboxLimits,
     state: Mutex<State>,
     signer: SigningKey,
@@ -194,6 +200,7 @@ impl DurableMailboxService {
             journal,
             Box::new(anchor),
             None,
+            None,
         )
     }
 
@@ -207,6 +214,18 @@ impl DurableMailboxService {
         signer: SigningKey,
         journal: MailboxJournal,
         anchor: FileJournalAnchor,
+    ) -> std::io::Result<Self> {
+        Self::bind_local_incoming(path,limits,policy,signer,journal,anchor,None)
+    }
+
+    pub(crate) fn bind_local_incoming(
+        path: &Path,
+        limits: MailboxLimits,
+        policy: MailboxPolicy,
+        signer: SigningKey,
+        journal: MailboxJournal,
+        anchor: FileJournalAnchor,
+        incoming:Option<IncomingSendGuard>,
     ) -> std::io::Result<Self> {
         journal
             .local_ready(&anchor, &signer.verifying_key())
@@ -224,6 +243,7 @@ impl DurableMailboxService {
             journal,
             Box::new(commit),
             Some(anchor),
+            incoming,
         )
     }
 
@@ -235,6 +255,7 @@ impl DurableMailboxService {
         journal: MailboxJournal,
         anchor: Box<dyn JournalAnchor>,
         local_anchor: Option<Arc<FileJournalAnchor>>,
+        incoming:Option<IncomingSendGuard>,
     ) -> std::io::Result<Self> {
         if signer.verifying_key() != policy.authority_key {
             return Err(std::io::Error::new(
@@ -257,6 +278,7 @@ impl DurableMailboxService {
             signer,
             anchor,
             local_anchor,
+            incoming,
             reader: OnceLock::new(),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -674,6 +696,12 @@ fn admit(
         .as_millis();
     let now: i64 = now.try_into().map_err(|_| Refusal::Unavailable)?;
     let mut state = shared.state.lock().expect("mailbox journal lock poisoned");
+    if let Some(incoming)=&shared.incoming {
+        if mvm_core::mailbox::outbound::journal_capability_digest(capability).map_err(|_|Refusal::NotAuthorized)?!=incoming.digest {
+            return Err(Refusal::NotAuthorized);
+        }
+        state.policy.context.revoked_capabilities=reader_revocations(&incoming.revocations)?;
+    }
     state.policy.context.now_unix_ms = now;
     let State { policy, journal } = &mut *state;
     settle_expired(shared, journal, now).map_err(reader_refusal)?;

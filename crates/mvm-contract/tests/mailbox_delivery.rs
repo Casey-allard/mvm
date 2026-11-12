@@ -20,6 +20,7 @@ fn address() -> MailboxAddress {
 
 fn plan_grant() -> MailboxGrant {
     MailboxGrant {
+        incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,
         mailbox: address().mailbox,
         authority_key: [5; 32],

@@ -21,6 +21,7 @@ use std::time::Instant;
 /// The program which starts B owns its real process. Borrowing the handle
 /// cannot transfer the mailbox keys, change its recipient, or reopen a PID.
 pub struct OriginalJournalDestination {
+    pub(super) incoming:Option<super::paired_incoming::EnrolledIncoming>,
     child: Child,
     _original: std::sync::Arc<LaunchClaim>,
     marker: OriginalMarker,
@@ -74,7 +75,7 @@ impl OriginalJournalDestination {
             config.grant.retention.is_some(),
             "destination has no admitted retention"
         );
-        let (policy, _) = config.keys.trust();
+        let (mut policy, sealer) = config.keys.trust();
         let current = &policy.context;
         let address = MailboxAddress {
             tenant: current.expected_tenant,
@@ -82,10 +83,21 @@ impl OriginalJournalDestination {
             mailbox: config.grant.mailbox,
             recipient: current.expected_recipient,
         };
+        let incoming=if config.grant.incoming_journal_policy_sha256_v1.is_some(){
+            let posture=config.posture.as_ref().context("missing original destination posture")?;
+            let retained=crate::mailbox_custody::RetainedMailboxKeys::open_existing(&config.keys_dir,plan,&plan.image.name,posture,Some(boot.boot),address)?;
+            let signer=config.keys.durable_material().0;
+            let reader=super::reader::load_or_enroll(&config.vm_state_dir,&config.grant,boot.clone(),&sealer.capability,&signer)?;
+            let enrolled=super::paired_incoming::EnrolledIncoming::open(&config.keys_dir,&config.grant,&retained,&boot,&reader)?.context("B incoming policy absent")?;
+            enrolled.apply(&mut policy)?;
+            Some(enrolled)
+        } else {None};
+        let current=&policy.context;
         let marker = OriginalMarker::claim(&guard.owner_dir)?;
         let child = spawn_serving(config, &config.vm_state_dir)?;
         Ok(Self {
             child,
+            incoming,
             _original: guard,
             marker,
             socket: config.socket.clone(),

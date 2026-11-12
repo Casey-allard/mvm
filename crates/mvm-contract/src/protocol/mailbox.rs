@@ -337,6 +337,9 @@ pub struct MailboxJournalDirectionV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxGrant {
+    /// Canonical hash of a separately provisioned, destination operator-approved incoming policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_journal_policy_sha256_v1: Option<[u8; 32]>,
     /// A single explicitly admitted remote direction. Existing signed bytes
     /// and the legacy own-mailbox operation remain unchanged when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]

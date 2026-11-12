@@ -198,6 +198,7 @@ fn perform_exchange(
             };
             let boot = &pending.reader.boot;
             let grant = MailboxGrant {
+                incoming_journal_policy_sha256_v1: None,
                 outbound_journal_v1: None,
                 mailbox: boot.mailbox,
                 authority_key: boot.authority_key,

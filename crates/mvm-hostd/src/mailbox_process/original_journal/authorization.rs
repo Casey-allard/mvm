@@ -183,6 +183,7 @@ impl OriginalJournalDestination {
         );
         check_projection(grant, d)?;
         require_destination(d, &self.boot, self.address, self.policy_epoch)?;
+        ensure!(self.incoming.as_ref().is_some_and(|i|i.agrees(grants)), "B did not admit these original sender and reader credentials");
         let now = now_ms()?;
         let source = journal_scope_before_launch(&self.keys_dir, grant, now)?;
         mvm_core::naming::validate_vm_name(&plan.image.name)?;
@@ -257,6 +258,7 @@ mod tests {
                 .to_bytes(),
                 report: None,
                 retention: None,
+                incoming_journal_policy_sha256_v1: None,
                 outbound_journal_v1: None,
             };
             crate::mailbox_launch::derive_launch_keys(dir.path(), &grant, &Key::random())

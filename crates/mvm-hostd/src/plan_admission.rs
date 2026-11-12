@@ -843,6 +843,7 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
+    incoming_journal: Option<&'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission>,
     paired_journal: Option<
         &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission<'a>,
     >,
@@ -857,6 +858,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
+            incoming_journal: None,
             paired_journal: None,
         }
     }
@@ -874,6 +876,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
+            incoming_journal: None,
             paired_journal: None,
         }
     }
@@ -897,7 +900,20 @@ impl<'a> RunPosture<'a> {
         self
     }
 
+    pub fn with_incoming_journal(mut self, incoming: &'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission) -> Self {
+        self.incoming_journal=Some(incoming);
+        self
+    }
+
     fn enforce_journal(&self, plan: &ExecutionPlan, max_ms: Option<u64>) -> Result<()> {
+        if let Some(incoming)=self.incoming_journal {
+            anyhow::ensure!(self.paired_journal.is_none() && self.variant==Variant::Prod && self.backend.is_some(),
+                "incoming journal requires an original production destination backend");
+            grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(),max_ms)?;
+            return incoming.verify(plan);
+        }
+        anyhow::ensure!(plan.mailbox.and_then(|g|g.incoming_journal_policy_sha256_v1).is_none(),
+            "incoming journal needs explicit original destination authorization");
         let Some(pair) = self.paired_journal else {
             return enforce_mailbox_retention(plan.mailbox.as_ref(), max_ms);
         };
@@ -2388,6 +2404,7 @@ mod tests {
     #[test]
     fn local_retention_requires_a_configured_host_ceiling() {
         let mut grant = MailboxGrant {
+            incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],
@@ -3957,6 +3974,7 @@ mod tests {
         let keys = tempfile::tempdir().expect("keystore");
         let mut input = fixture_input("vm-retention");
         input.mailbox = Some(MailboxGrant {
+            incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],

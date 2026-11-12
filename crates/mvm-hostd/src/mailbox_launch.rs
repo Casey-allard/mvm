@@ -175,6 +175,10 @@ pub fn authority_key_for(
         .verifying_key())
 }
 
+pub(crate) fn journal_sender_for(keys: &Path, grant: &MailboxGrant) -> Result<VerifyingKey> {
+    Ok(derived_keys(keys,&grant.mailbox,grant.epoch)?.sender.verifying_key())
+}
+
 /// Public identities only, derived by the original host before signing a
 /// prospective A plan. An operator template cannot replace the signing key.
 pub(crate) fn journal_scope_before_launch(
@@ -389,6 +393,9 @@ fn template_for(
     grant: &MailboxGrant,
     now_ms: i64,
 ) -> Result<MailboxTemplate> {
+    if let Some(digest)=grant.incoming_journal_policy_sha256_v1 {
+        return crate::mailbox_process::paired_incoming::IncomingJournalPolicy::template(keys_dir,digest);
+    }
     match std::fs::read(keys_dir.join(TEMPLATE_FILE)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|e| Error::new(ErrorKind::InvalidData, format!("mailbox template: {e}"))),
@@ -605,6 +612,7 @@ mod tests {
     fn grant_at(dir: &Path, mailbox: [u8; 32], n: u64) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes(mailbox);
         MailboxGrant {
+            incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox,
             authority_key: authority_key_for(dir, &mailbox, epoch(n))
