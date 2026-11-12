@@ -237,6 +237,24 @@ pub struct WorkloadRunner<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegi
     console_streamer: Arc<dyn ConsoleStreamer>,
 }
 
+#[cfg(target_os = "linux")]
+impl
+    WorkloadRunner<mvm_backends::driver::FcDriver, RealNetworkEndpointSpawner, RealBrokerRegistrar>
+{
+    pub(crate) fn with_original_object_observation(
+        &self,
+        observation: mvm_backends::driver::fc::original::LaunchObservation,
+    ) -> WorkloadRunner<mvm_backends::driver::FcDriver, OriginalObjectSpawner, RealBrokerRegistrar>
+    {
+        WorkloadRunner {
+            driver: mvm_backends::driver::FcDriver::for_original_config(observation.clone()),
+            spawner: OriginalObjectSpawner(observation.reader),
+            broker: RealBrokerRegistrar,
+            console_streamer: self.console_streamer.clone(),
+        }
+    }
+}
+
 /// Timings for the shared workload-runner stop sequence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StopTiming {

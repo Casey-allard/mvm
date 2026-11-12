@@ -852,11 +852,9 @@ impl AnyBackend {
         &self,
         config: &VmStartConfig,
     ) -> Result<(VmId, OriginalObjectFirecracker)> {
-        use crate::workload_runner::runner::OriginalObjectSpawner;
-        anyhow::ensure!(
-            matches!(self, Self::Firecracker(_)),
-            "requires Linux Firecracker"
-        );
+        let Self::Firecracker(runner) = self else {
+            anyhow::bail!("requires Linux Firecracker")
+        };
         let plan = mvm_core::plan::plan_from_admitted_json(
             config
                 .plan_json
@@ -871,12 +869,9 @@ impl AnyBackend {
             "requires original selected object plan"
         );
         let observation = mvm_backends::driver::fc::original::LaunchObservation::default();
-        let runner = WorkloadRunner::new(
-            FcDriver::for_original_config(observation.clone()),
-            OriginalObjectSpawner(observation.reader.clone()),
-            RealBrokerRegistrar,
-        );
-        let id = runner.start(config)?;
+        let id = runner
+            .with_original_object_observation(observation.clone())
+            .start(config)?;
         Ok((id, OriginalObjectFirecracker { observation }))
     }
 
