@@ -21,6 +21,7 @@ use std::time::Instant;
 pub struct OriginalJournalDestination {
     child: Child,
     _original: FileLock,
+    marker: OriginalMarker,
     socket: PathBuf,
     boot: MailboxReaderBootBinding,
     address: MailboxAddress,
@@ -71,10 +72,12 @@ impl OriginalJournalDestination {
             mailbox: config.grant.mailbox,
             recipient: current.expected_recipient,
         };
+        let marker = OriginalMarker::claim(&config.vm_state_dir)?;
         let child = spawn_serving(config, &config.vm_state_dir)?;
         Ok(Self {
             child,
             _original: guard,
+            marker,
             socket: config.socket.clone(),
             boot,
             address,
@@ -91,7 +94,7 @@ impl OriginalJournalDestination {
 
     /// Observe terminal status only by collecting the original Child.
     pub fn try_collect(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        self.marker.collect(&mut self.child)
     }
 
     pub fn binding(&self) -> &MailboxReaderBootBinding {
@@ -113,6 +116,17 @@ pub(super) fn claim_launch(state: &std::path::Path, exclusive: bool) -> std::io:
     let guard = FileLock::try_acquire(&state.join("mailbox-launch"))
         .map_err(Error::other)?
         .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "mailbox launch is owned"))?;
+    let path = state.join(MARKER);
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                "original paired helper has unresolved custody",
+            ));
+        }
+    }
     if exclusive {
         for path in [
             state.join(super::MAILBOX_PID_FILE),
@@ -131,6 +145,67 @@ pub(super) fn claim_launch(state: &std::path::Path, exclusive: bool) -> std::io:
         }
     }
     Ok(guard)
+}
+
+const MARKER: &str = "mailbox-paired-original-v1";
+
+/// Kept on disk through either launcher crash or an uncollected Child. The
+/// ordinary Drop of Child/FileLock is never proof that a subprocess exited.
+struct OriginalMarker {
+    path: PathBuf,
+    original: std::fs::File,
+    token: [u8; 32],
+    cleared: bool,
+}
+
+impl OriginalMarker {
+    fn claim(state: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = state.join(MARKER);
+        let token: [u8; 32] = rand::random();
+        let mut original = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        original.write_all(&token)?;
+        original.sync_all()?;
+        mvm_core::util::atomic_io::sync_dir(state).map_err(std::io::Error::other)?;
+        Ok(Self {
+            path,
+            original,
+            token,
+            cleared: false,
+        })
+    }
+
+    fn collect(&mut self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let Some(status) = child.try_wait()? else {
+            return Ok(None);
+        };
+        if !self.cleared {
+            let original = self.original.metadata()?;
+            let named = std::fs::symlink_metadata(&self.path)?;
+            let mut token = [0u8; 32];
+            self.original.read_exact_at(&mut token, 0)?;
+            if (original.dev(), original.ino()) != (named.dev(), named.ino())
+                || named.nlink() != 1
+                || named.len() != 32
+                || token != self.token
+            {
+                return Err(std::io::Error::other("original marker was replaced"));
+            }
+            std::fs::remove_file(&self.path)?;
+            mvm_core::util::atomic_io::sync_dir(self.path.parent().unwrap())
+                .map_err(std::io::Error::other)?;
+            self.cleared = true;
+        }
+        Ok(Some(status))
+    }
 }
 
 fn authenticated_connect(
@@ -205,6 +280,40 @@ mod tests {
         std::fs::write(&path, "original marker").unwrap();
         assert!(claim_launch(dir.path(), true).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"original marker");
+    }
+
+    #[test]
+    fn dropping_original_custody_keeps_both_normal_and_paired_starts_fenced() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let guard = claim_launch(dir.path(), true).unwrap();
+        let mut marker = OriginalMarker::claim(dir.path()).unwrap();
+        let socket = dir.path().join("peer");
+        let mut child = listener(&socket);
+        assert!(marker.collect(&mut child).unwrap().is_none());
+        drop(marker);
+        drop(guard);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(claim_launch(dir.path(), false).is_err());
+        assert!(claim_launch(dir.path(), true).is_err());
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert!(claim_launch(dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn definitive_original_collection_is_idempotent_and_protects_the_marker() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let mut marker = OriginalMarker::claim(dir.path()).unwrap();
+        let mut child = listener(&dir.path().join("peer"));
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert!(marker.collect(&mut child).unwrap().unwrap().success());
+        assert!(marker.collect(&mut child).unwrap().unwrap().success());
+        let mut other = OriginalMarker::claim(dir.path()).unwrap();
+        std::fs::rename(&other.path, dir.path().join("original")).unwrap();
+        std::fs::write(&other.path, [0; 32]).unwrap();
+        assert!(other.collect(&mut child).is_err());
+        assert!(other.path.is_file());
     }
 
     #[test]
