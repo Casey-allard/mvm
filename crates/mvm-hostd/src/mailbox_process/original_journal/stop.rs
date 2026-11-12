@@ -17,6 +17,7 @@ use std::{
 
 pub(super) struct StopCustody {
     state: File,
+    split_socket: Option<(std::path::PathBuf, File)>,
     kind: BackendKind,
     // Component-only helper fixtures need no VMM. A real typed stop always
     // requires the originally observed kernel identity before touching a VMM.
@@ -39,6 +40,16 @@ impl StopCustody {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
             .open(&config.vm_state_dir)?;
+        let socket_dir = mvm_core::config::vm_socket_dir_at(&config.vm_state_dir);
+        let split_socket = if socket_dir != config.vm_state_dir {
+            let fd = File::options()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(&socket_dir)?;
+            Some((socket_dir, fd))
+        } else {
+            None
+        };
         let vmm = backend
             .host_process_id(&VmId(name.into()))
             .ok()
@@ -51,6 +62,7 @@ impl StopCustody {
             });
         Ok(Self {
             state,
+            split_socket,
             kind: backend.kind(),
             vmm,
             sdk_abort_confirmed: false,
@@ -158,12 +170,10 @@ impl JournalOwner<'_> {
             });
         }
         let same_state = || -> Result<()> {
-            let held = state.state.metadata()?;
-            let current = std::fs::symlink_metadata(&dir)?;
-            ensure!(
-                current.is_dir() && (held.dev(), held.ino()) == (current.dev(), current.ino()),
-                "VM runtime directory changed since original launch"
-            );
+            require_directory(&state.state, &dir)?;
+            if let Some((path, fd)) = &state.split_socket {
+                require_directory(fd, path)?;
+            }
             Ok(())
         };
         same_state()?;
@@ -225,6 +235,16 @@ impl JournalOwner<'_> {
     }
 }
 
+fn require_directory(original: &File, path: &std::path::Path) -> Result<()> {
+    let held = original.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    ensure!(
+        current.is_dir() && (held.dev(), held.ino()) == (current.dev(), current.ino()),
+        "VM runtime or socket directory changed since original launch"
+    );
+    Ok(())
+}
+
 fn collect_after_vm(
     observer: &ProcessExitObserver,
     kernel_exit_observed: &mut bool,
@@ -258,6 +278,20 @@ fn collect_after_vm(
 mod tests {
     use super::*;
     use std::process::Command;
+    #[test]
+    fn replaced_socket_directory_cannot_be_cleaned_as_the_original() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("socket");
+        std::fs::create_dir(&path).unwrap();
+        let original = File::open(&path).unwrap();
+        require_directory(&original, &path).unwrap();
+        std::fs::rename(&path, root.path().join("old")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"replacement").unwrap();
+        assert!(require_directory(&original, &path).is_err());
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"replacement");
+    }
+
     #[test]
     fn unresolved_vmm_keeps_actual_helper_until_original_kernel_exit() {
         let directory = tempfile::tempdir().unwrap();
