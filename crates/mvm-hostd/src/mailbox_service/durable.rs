@@ -543,7 +543,8 @@ fn serve_reader(
                     .map_err(reader_refusal)?;
                 Ok(ReaderResponse::Acknowledged { ack: signed })
             }
-            ReaderRequest::GetObjectRoleV1 { .. }
+            ReaderRequest::AuthorizeObjectCallV1 { .. }
+            | ReaderRequest::GetObjectRoleV1 { .. }
             | ReaderRequest::SubmitObjectV1 { .. }
             | ReaderRequest::Possession { .. } => Err(Refusal::NotAuthorized),
         }
