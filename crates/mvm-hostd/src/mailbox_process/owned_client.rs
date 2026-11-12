@@ -27,6 +27,7 @@ pub struct InstalledMailboxPeer {
     observer: Mutex<Option<ProcessExitObserver>>,
     pid: u32,
     issuer: [u8; 16],
+    admitted_vm: Option<String>,
     native_start: native_start::NativeStartCustody,
     terminal_acceptance: terminal_acceptance::TerminalAcceptance,
 }
@@ -37,6 +38,21 @@ impl InstalledMailboxPeer {
             .try_lock()
             .map_err(|_| anyhow::anyhow!("original daemon unavailable"))?;
         Self::from_child(&mut child)
+    }
+
+    /// Pin an issuer to one VM lane even if its trusted Arc is passed to
+    /// another client. Signed plan and peer credential checks still apply.
+    pub fn from_original_for_vm(original: Arc<Mutex<Child>>, vm: &str) -> Result<Self> {
+        mvm_core::naming::validate_vm_name(vm)?;
+        let mut peer = Self::from_original(original)?;
+        peer.admitted_vm = Some(vm.to_owned());
+        Ok(peer)
+    }
+
+    fn require_vm(&self, vm: &str) -> Result<()> {
+        ensure!(self.admitted_vm.as_deref().is_none_or(|named| named == vm),
+                "VM differs from original mailbox issuer lane");
+        Ok(())
     }
 
     pub fn from_child(child: &mut Child) -> Result<Self> {
@@ -55,6 +71,7 @@ impl InstalledMailboxPeer {
             observer: Mutex::new(Some(observer)),
             pid,
             issuer: rand::random(),
+            admitted_vm: None,
             native_start: Default::default(),
             terminal_acceptance: Default::default(),
         })
@@ -235,6 +252,7 @@ impl InstalledMailboxClient {
             self.authority == Authority::Fresh && self.peer.is_none(),
             "initial acquisition already bound"
         );
+        peer.require_vm(&self.acquire.vm_id)?;
         peer.terminal_acceptance.while_vacant(|| Ok(()))?;
         self.acquire.request_nonce[..16].copy_from_slice(&peer.issuer);
         self.authority = Authority::Admitted;
@@ -322,6 +340,7 @@ impl InstalledMailboxClient {
 
     /// Bind once, using the installed controller that owns the original daemon.
     pub fn bind_peer(&mut self, peer: Arc<InstalledMailboxPeer>) -> Result<()> {
+        peer.require_vm(&self.acquire.vm_id)?;
         ensure!(
             self.authority != Authority::Fresh,
             "initial acquisition must bind its issuer"
@@ -625,6 +644,28 @@ mod tests {
         let mut byte = [0];
         stream.read_exact(&mut byte).unwrap();
         assert_eq!(byte, [1]);
+    }
+
+    #[test]
+    fn paired_installed_original_issuer_cannot_cross_vm_lanes() -> Result<()> {
+        let child = Arc::new(Mutex::new(Command::new("sleep").arg("20").spawn()?));
+        let check = (|| -> Result<()> {
+            let first = InstalledMailboxPeer::from_original_for_vm(child.clone(), "alpha")?;
+            let second = InstalledMailboxPeer::from_original_for_vm(child.clone(), "beta")?;
+            first.require_vm("alpha")?;
+            second.require_vm("beta")?;
+            assert!(first.require_vm("beta").is_err());
+            assert!(second.require_vm("alpha").is_err());
+            let mut nonce = [4; 32];
+            nonce[..16].copy_from_slice(&first.issuer);
+            assert!(first.issued_nonce(&nonce));
+            assert!(!second.issued_nonce(&nonce));
+            Ok(())
+        })();
+        let mut original = child.lock().unwrap();
+        let _ = original.kill();
+        original.wait()?;
+        check
     }
 
     fn connect_child(path: &Path) -> Result<UnixStream> {

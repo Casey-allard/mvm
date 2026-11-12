@@ -79,14 +79,20 @@ impl HostAgentMailboxProvisioner {
         original: Arc<Mutex<Child>>,
         names: [&str; 2],
     ) -> Result<Self> {
-        let names = MailboxPair::new(names)?;
-        let first = Arc::new(InstalledMailboxPeer::from_original(original.clone())?);
-        let second = Arc::new(InstalledMailboxPeer::from_original(original.clone())?);
+        let pair = MailboxPair::new(names)?;
+        let first = Arc::new(InstalledMailboxPeer::from_original_for_vm(
+            original.clone(),
+            names[0],
+        )?);
+        let second = Arc::new(InstalledMailboxPeer::from_original_for_vm(
+            original.clone(),
+            names[1],
+        )?);
         Self::with_peers(
             home,
             original,
             InstallationPeers::Pair {
-                names,
+                names: pair,
                 peers: [first, second],
             },
         )
