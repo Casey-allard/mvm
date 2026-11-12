@@ -2060,7 +2060,14 @@ async fn persistent_request_mailbox_reaches_canonical_backend_admission() {
     let home = Isolated::new();
     let client = mock_client();
     let name = "p-mailbox-one-start";
-    let grant = crate::admission::mailbox_grant::resolve(Some(&"ab".repeat(32)), None, None)
+    // This test reaches the backend gate only after the production retention
+    // authorization has passed in its private host configuration.
+    let host = mvm_core::user_config::MvmConfig {
+        max_mailbox_retention_ms: Some(30_000),
+        ..Default::default()
+    };
+    mvm_core::user_config::save(&host, None).expect("host retention ceiling");
+    let grant = crate::admission::mailbox_grant::resolve(Some(&"ab".repeat(32)), Some(10_000), None)
         .expect("host-authorized grant")
         .expect("requested grant");
     let request = persistent_request(&home.rootfs(), name)
