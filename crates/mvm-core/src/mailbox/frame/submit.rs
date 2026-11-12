@@ -50,6 +50,25 @@ impl PreparedSubmit {
         service_generation: &[u8; 32],
         publish_and_retire: impl FnOnce(&[u8], &LocalSubmitResult) -> io::Result<()>,
     ) -> io::Result<LocalDisposition> {
+        self.forward_on_current(
+            io,
+            admitted,
+            service_generation,
+            || Ok(()),
+            publish_and_retire,
+        )
+    }
+
+    /// The greeting and result may block independently. Recheck the owner's
+    /// authority before releasing the claim and again before accepting a result.
+    pub fn forward_on_current(
+        &self,
+        io: &mut (impl Read + Write),
+        admitted: &LocalGreeting,
+        service_generation: &[u8; 32],
+        current: impl Fn() -> io::Result<()>,
+        publish_and_retire: impl FnOnce(&[u8], &LocalSubmitResult) -> io::Result<()>,
+    ) -> io::Result<LocalDisposition> {
         if admitted.role != LocalRole::Submit
             || admitted.binding != self.binding
             || *service_generation == [0; 32]
@@ -62,7 +81,9 @@ impl PreparedSubmit {
         let mut hello = [0; LOCAL_GREETING_BYTES];
         io.read_exact(&mut hello)?;
         verify_local_greeting_echo(admitted, &hello).map_err(invalid_data)?;
+        current()?;
         io.write_all(&hello)?;
+        current()?;
         io.write_all(&self.bytes)?;
         io.flush()?;
 
@@ -103,6 +124,7 @@ impl PreparedSubmit {
             if !valid {
                 return Err(invalid_data("unexpected SubmitResult correlation"));
             }
+            current()?;
             publish_and_retire(&self.bytes, &result)?;
         }
         Ok(result.disposition)
