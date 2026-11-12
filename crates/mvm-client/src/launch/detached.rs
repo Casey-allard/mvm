@@ -442,6 +442,79 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_sdk_name_updates_keep_both_originals_and_existing_rows() {
+        use mvm_runtime::vm::name_registry::{RegisterParams, VmNameRegistry, update_registry};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_env, _dir) = isolated();
+        let path = crate::name_registry_path();
+        crate::register_machine(&crate::MachineRegistration::minimal(
+            "older",
+            "original-net",
+        ));
+        crate::register_machine(&crate::MachineRegistration::minimal("alpha", "alpha-net"));
+
+        // Hold an already-loaded writer across B's publication. A's real SDK
+        // mutation must read the committed version when that writer releases.
+        for operation in ["register", "expiry", "readiness", "stop"] {
+            let (entered, starts) = mpsc::channel();
+            let (finished, ends) = mpsc::channel();
+            let mut caller = None;
+            let pending = format!("pending-{operation}");
+            let route = pending.clone();
+            update_registry(&path, |registry| {
+                registry.register(RegisterParams::minimal(&pending, "/original-b", "beta-net"))?;
+                caller = Some(std::thread::spawn(move || {
+                    entered.send(()).unwrap();
+                    match operation {
+                        "register" => crate::register_machine(
+                            &crate::MachineRegistration::minimal("beta", "sdk-net"),
+                        ),
+                        "expiry" => crate::local::set_machine_expiry(
+                            &route,
+                            Some("2030-01-01T00:00:00Z".into()),
+                        )
+                        .unwrap(),
+                        "readiness" => crate::record_readiness(
+                            &route,
+                            mvm_core::domain::instance::InstanceReadiness::LaunchAccepted,
+                        ),
+                        "stop" => crate::local::deregister_from_name_registry("alpha"),
+                        _ => unreachable!(),
+                    }
+                    finished.send(()).unwrap();
+                }));
+                starts.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(
+                    ends.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    "{operation} ignored the already-held name registry lock"
+                );
+                Ok(())
+            })
+            .unwrap();
+            caller.unwrap().join().unwrap();
+            let rows = VmNameRegistry::load(&path).unwrap();
+            assert_eq!(rows.lookup("older").unwrap().network, "original-net");
+            assert_eq!(rows.lookup(&pending).unwrap().vm_dir, "/original-b");
+        }
+        let rows = VmNameRegistry::load(&path).unwrap();
+        assert_eq!(rows.lookup("beta").unwrap().network, "sdk-net");
+        assert_eq!(
+            rows.lookup("pending-expiry").unwrap().expires_at.as_deref(),
+            Some("2030-01-01T00:00:00Z")
+        );
+        assert!(
+            rows.lookup("pending-readiness")
+                .unwrap()
+                .readiness
+                .is_some()
+        );
+        assert!(rows.lookup("alpha").is_none());
+    }
+
+    #[test]
     fn a_ttl_on_an_unregistered_machine_is_refused() {
         let (_env, _dir) = isolated();
         let err = apply_ttl("ghost", std::time::Duration::from_secs(60)).unwrap_err();
