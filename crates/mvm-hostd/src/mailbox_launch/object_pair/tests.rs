@@ -727,3 +727,59 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
             .is_err()
     );
 }
+
+#[test]
+fn measured_originals_bind_opposite_nonces_before_signing_and_reject_substitution() {
+    let _env = mvm_core::util::test_env::TestEnv::new();
+    let f = Originals::new();
+    let installed = mvm_core::config::mvm_keys_dir();
+    std::fs::create_dir_all(&installed).unwrap();
+    for file in [super::super::SIGNER_SECRET, super::super::SIGNER_PUBLIC] {
+        std::fs::copy(f.dir.path().join(file), installed.join(file)).unwrap();
+    }
+    let prepared = f.prepare(f.credentials.clone()).unwrap();
+    let (a, b) = prepared
+        .select_original_plans("vm-1", [0x31; 32], "vm-2", [0x32; 32])
+        .unwrap();
+    let signer = host_keypair::load_or_init_at(&installed).unwrap();
+    let issuer = host_keypair::host_signer_id();
+    let trusted = [(issuer.as_str(), &signer.verifying)];
+    let mut first = None;
+    for (selection, other, n) in [(a, b, 1u8), (b, a, 2)] {
+        let mut p = PlanFixture::new()
+            .workload(format!("vm-{n}"))
+            .mailbox(selection.grant())
+            .build();
+        p.image.name = format!("vm-{n}");
+        p.image.sha256 = hex::encode([0x30 + n; 32]);
+        p.plan_id = mvm_core::plan::compute_plan_id(&p);
+        let before = p.plan_id.clone();
+        assert!(other.apply_unsigned(&mut p, f.now).is_err());
+        p.image.sha256 = hex::encode([0x40; 32]);
+        assert!(selection.apply_unsigned(&mut p, f.now).is_err());
+        p.image.sha256 = hex::encode([0x30 + n; 32]);
+        selection.apply_unsigned(&mut p, f.now).unwrap();
+        assert_ne!(p.plan_id, before);
+        assert_eq!(p.nonce, Nonce::from_bytes([n; 16]));
+        let signed = sign_plan(&p, &signer.signing, &issuer);
+        let verified = verify_plan(&signed, &trusted).unwrap();
+        selection.verify_selected_plan(&verified, f.now).unwrap();
+        assert!(other.verify_selected_plan(&verified, f.now).is_err());
+        assert!(
+            selection
+                .verify_selected_plan(&verified, f.now + 120_000)
+                .is_err()
+        );
+        if n == 1 {
+            first = Some(verified);
+        }
+    }
+    let state = mvm_core::config::vm_state_dir("vm-2");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        revocations_path(&state),
+        serde_json::to_vec(&vec![f.credentials.receive_at_callee.grant.revocation_id]).unwrap(),
+    )
+    .unwrap();
+    assert!(a.verify_selected_plan(&first.unwrap(), f.now).is_err());
+}

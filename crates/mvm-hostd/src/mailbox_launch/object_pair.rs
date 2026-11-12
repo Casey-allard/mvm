@@ -6,6 +6,8 @@ use mvm_contract::protocol::mailbox::*;
 use mvm_core::mailbox::{object_pair::ObjectPairGrants, verify_capability_signature};
 use mvm_core::plan::Nonce;
 use std::path::Path;
+pub mod plan;
+pub use plan::OriginalObjectPlan;
 
 /// Four original independent signed credentials. Neither transport direction
 /// nor the original journal receipt is authority to read a mailbox.

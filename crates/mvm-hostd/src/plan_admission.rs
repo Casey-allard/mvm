@@ -830,7 +830,10 @@ pub fn admit_for_run(
     // Build the unsigned plan first. Synthesis failures are caught
     // before we touch the keystore — keeps "signed bad plan" from
     // being an outcome.
-    let plan = synthesize_plan(input).context("synthesizing plan")?;
+    let mut plan = synthesize_plan(input).context("synthesizing plan")?;
+    if let Some(original) = posture.object_plan {
+        original.apply_unsigned(&mut plan, clock.now().timestamp_millis())?;
+    }
     admit_plan_for_run(
         &plan,
         clock,
@@ -857,6 +860,7 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
+    object_plan: Option<&'a crate::mailbox_launch::object_pair::OriginalObjectPlan<'a>>,
     incoming_journal: Option<&'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission>,
     paired_journal:
         Option<&'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission>,
@@ -871,6 +875,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
+            object_plan: None,
             incoming_journal: None,
             paired_journal: None,
         }
@@ -889,6 +894,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
+            object_plan: None,
             incoming_journal: None,
             paired_journal: None,
         }
@@ -898,6 +904,16 @@ impl<'a> RunPosture<'a> {
     #[must_use]
     pub fn with_runtime(mut self, runtime_config: Option<&'a VmStartConfig>) -> Self {
         self.runtime_config = runtime_config;
+        self
+    }
+
+    /// Select a previously authorized original nonce and image before signing.
+    /// The installed service readiness check remains independently required.
+    pub fn with_original_object_plan(
+        mut self,
+        original: &'a crate::mailbox_launch::object_pair::OriginalObjectPlan<'a>,
+    ) -> Self {
+        self.object_plan = Some(original);
         self
     }
 
@@ -920,6 +936,19 @@ impl<'a> RunPosture<'a> {
     }
 
     fn enforce_journal(&self, plan: &ExecutionPlan, max_ms: Option<u64>) -> Result<()> {
+        if let Some(original) = self.object_plan {
+            anyhow::ensure!(
+                self.variant == Variant::Prod
+                    && matches!(
+                        self.backend,
+                        Some(BackendKind::Firecracker | BackendKind::Hvf)
+                    )
+                    && self.incoming_journal.is_none()
+                    && self.paired_journal.is_none(),
+                "object selection requires a dedicated sealed native participant"
+            );
+            original.verify_selected_plan(plan, SystemClock.now().timestamp_millis())?;
+        }
         anyhow::ensure!(
             plan.mailbox
                 .and_then(|g| g.durable_object_pair_sha256_v1)
