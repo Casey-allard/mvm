@@ -193,6 +193,7 @@ pub(super) fn start_persistent_with_mailbox(
     provisioner: Option<&dyn super::mailbox_owner::InstalledMailboxProvisioner>,
     vacant: super::mailbox_owner::VacantOwner,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    let mut cancellation=provisioner.and_then(|p|p.original_cast_pair()).map(|pair|pair.cancel_on_drop(params.name));
     let PreparedPersistentBoot {
         backend,
         start_config,
@@ -204,7 +205,7 @@ pub(super) fn start_persistent_with_mailbox(
     let name = name_label.as_str();
     let backend_label = backend.name().to_string();
     let backend_name = backend_label.as_str();
-    finish_persistent(
+    let result=finish_persistent(
         backend,
         start_config,
         admission,
@@ -213,9 +214,10 @@ pub(super) fn start_persistent_with_mailbox(
         backend_name,
         provisioner,
         vacant,
-    )
+    );
+    if result.is_ok() {if let Some(c)=&mut cancellation {c.disarm();}}
+    result
 }
-
 struct PreparedPersistentBoot {
     backend: mvm_runtime::backend::AnyBackend,
     start_config: mvm_core::vm_backend::VmStartConfig,
@@ -494,7 +496,7 @@ fn complete_writable_images(
 fn finish_persistent(
     backend: mvm_runtime::backend::AnyBackend,
     mut start_config: mvm_core::vm_backend::VmStartConfig,
-    admission: crate::admission::AdmissionContext,
+    mut admission: crate::admission::AdmissionContext,
     mut prepared_volumes: crate::volume::LaunchPreparation,
     name: &str,
     backend_name: &str,
@@ -511,9 +513,15 @@ fn finish_persistent(
         )?),
         _ => None,
     };
-    if let (Some(worker), Some(host)) = (&owned, provisioner) {
+    if let (Some(worker),Some(host)) = (&mut owned,provisioner) {
         start_config.installed_mailbox_owner = Some(worker.broker_binding()?);
-        worker.bind_original_cast(host, &admission.admitted, &start_config)?;
+        if let Some(pair)=host.original_cast_pair(){
+            let original=std::sync::Arc::new(admission.admitted);
+            let config=std::sync::Arc::new(start_config);
+            worker.bind_original_cast(pair,original.clone(),config.clone())?;
+            admission.admitted=std::sync::Arc::try_unwrap(original).map_err(|_|anyhow::anyhow!("original admission still held after Cast rendezvous"))?;
+            start_config=std::sync::Arc::try_unwrap(config).map_err(|_|anyhow::anyhow!("original VMM config still held after Cast rendezvous"))?;
+        }
     }
     // VMM selection + workload-support check + start move behind the facade; the
     // admission gate (above) and the launched/failed emits stay here.
@@ -554,7 +562,7 @@ fn finish_persistent(
     };
     // The guest asserts a mailbox exactly when the plan grants one, so the
     // host side starts here or the launch is rolled back.
-    let serving = match &owned {
+    let serving = match &mut owned {
         Some(worker) => worker.configure_and_wait(started.backend()),
         None => mvm_hostd::mailbox_process::serve_started(
             started.backend(),

@@ -34,16 +34,9 @@ pub trait InstalledMailboxProvisioner: Send + Sync {
         backend: &AnyBackend,
         request: &MailboxWorkerRequest,
     ) -> anyhow::Result<Arc<InstalledMailboxPeer>>;
-    /// Optional directed Cast installation. Called after durable destination
-    /// ownership and before VMM start, while the SDK holds its per-name lock.
-    fn original_cast_boot(
-        &self,
-        _admission: &AdmittedPlan,
-        _destination: &InstalledMailboxClient,
-        _config: &mvm_core::vm_backend::VmStartConfig,
-    ) -> Result<Option<mvm_hostd::mailbox_launch::cast_enrollment::PreparedOriginalCastBoot>> {
-        Ok(None)
-    }
+    /// An explicitly installed two-VM development ceremony. Ordinary installed
+    /// workers use the legacy one-VM lifecycle.
+    fn original_cast_pair(&self)->Option<&super::cast_rendezvous::OriginalCastPair>{ None }
     /// Resolve the original daemon from trusted installation custody.
     fn resolve_original(
         &self,
@@ -316,7 +309,8 @@ pub(crate) fn without_owner<T>(name: &str, action: impl FnOnce() -> Result<T>) -
 
 pub(crate) struct OwnedLaunch {
     claim: Claim,
-    client: InstalledMailboxClient,
+    client: Arc<InstalledMailboxClient>,
+    cast_role:Option<mvm_hostd::mailbox_launch::cast_pair::development::PreparedRole>,
     original_peer: Arc<InstalledMailboxPeer>,
     rollback_on_drop: bool,
 }
@@ -338,7 +332,8 @@ impl OwnedLaunch {
         })?;
         let mut launch = Self {
             claim,
-            client,
+            client:Arc::new(client),
+            cast_role:None,
             original_peer: original.clone(),
             rollback_on_drop: true,
         };
@@ -347,22 +342,22 @@ impl OwnedLaunch {
             Arc::ptr_eq(&original, &peer),
             "mailbox provisioner changed original daemon"
         );
-        launch.client.acquire(deadline())?;
+        Arc::get_mut(&mut launch.client).context("unreleased original before Acquire")?.acquire(deadline())?;
         launch.claim.write(&Record::Owned {
             stop: Box::new(launch.client.signed_stop_locator()?),
         })?;
         Ok(launch)
     }
-    pub(crate) fn bind_original_cast(
-        &self,
-        provisioner: &dyn InstalledMailboxProvisioner,
-        admission: &AdmittedPlan,
-        config: &mvm_core::vm_backend::VmStartConfig,
-    ) -> Result<()> {
-        if let Some(prepared) = provisioner.original_cast_boot(admission, &self.client, config)? {
-            let bytes=prepared.into_bytes_for_original(&self.client,config,deadline())?;
-            mvm_core::atomic_io::write_private_ephemeral(&mvm_core::config::vm_state_dir(&self.claim.name).join("verb-grant.json"),&bytes)?;
-        }
+    pub(crate) fn bind_original_cast(&mut self,pair:&super::cast_rendezvous::OriginalCastPair,
+      admission:Arc<AdmittedPlan>,config:Arc<mvm_core::vm_backend::VmStartConfig>)->Result<()>{
+        let mut cancellation=pair.cancel_on_drop(&self.claim.name);
+        let (prepared,until)=pair.admit(super::cast_rendezvous::ReservedLaunch{plan:admission,worker:self.client.clone(),config:config.clone()})?;
+        self.client.check_prepared_development_role(&prepared.role)?;
+        let (prior,bytes)=prepared.boot.into_bytes_for_original(&self.client,&config,deadline().min(until))?;
+        let path=mvm_core::config::vm_state_dir(&self.claim.name).join("verb-grant.json");
+        stage_pair_boot(&path,&prior,&bytes,||pair.published(&self.claim.name,until))?;
+        self.cast_role=Some(prepared.role);
+        cancellation.disarm();
         Ok(())
     }
     pub(crate) fn broker_binding(&self) -> Result<mvm_core::vm_backend::InstalledBrokerBinding> {
@@ -382,7 +377,10 @@ impl OwnedLaunch {
     pub(crate) fn settle_native_start(&self) -> Result<()> {
         self.client.settle_native_start()
     }
-    pub(crate) fn configure_and_wait(&self, backend: &AnyBackend) -> Result<()> {
+    pub(crate) fn configure_and_wait(&mut self, backend: &AnyBackend) -> Result<()> {
+        if let Some(role)=self.cast_role.take(){
+            return self.client.configure_development_cast(backend,deadline(),role);
+        }
         self.client.configure_and_wait(backend, deadline())
     }
     pub(crate) fn commit(mut self) {
@@ -397,6 +395,19 @@ impl OwnedLaunch {
         self.client
             .finish_installed_cleanup(false, cleanup, || self.claim.retire(&self.client, false))
     }
+}
+/// With the per-name claim held, restore the initial grant on a pre-boot peer
+/// refusal. If an external writer has replaced it, retain the differing record.
+fn stage_pair_boot(path:&Path,prior:&[u8],bound:&[u8],peer:impl FnOnce()->Result<()>)->Result<()> {
+    mvm_core::atomic_io::write_private_ephemeral(path,bound)?;
+    if let Err(error)=peer(){
+        let mut actual=Vec::new();
+        File::open(path)?.take((bound.len()+1) as u64).read_to_end(&mut actual)?;
+        ensure!(actual==bound,"original boot file changed during cancelled pair publication");
+        mvm_core::atomic_io::write_private_ephemeral(path,prior)?;
+        return Err(error)
+    }
+    Ok(())
 }
 impl Drop for OwnedLaunch {
     fn drop(&mut self) {
@@ -492,6 +503,16 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn failed_pair_publication_restores_only_its_own_boot_grant() {
+        let tmp=tempfile::tempdir().unwrap();let file=tmp.path().join("verb-grant.json");
+        std::fs::write(&file,b"original").unwrap();
+        let result=stage_pair_boot(&file,b"original",b"bound",||{assert_eq!(std::fs::read(&file)?,b"bound");bail!("peer stopped")});
+        assert!(result.is_err());assert_eq!(std::fs::read(&file).unwrap(),b"original");
+        let result=stage_pair_boot(&file,b"original",b"bound",||{std::fs::write(&file,b"replacement")?;bail!("peer stopped")});
+        assert!(result.is_err());assert_eq!(std::fs::read(&file).unwrap(),b"replacement");
+    }
+
     #[test]
     fn original_claim_excludes_same_name_and_allows_another_vm() {
         let home = tempfile::tempdir().unwrap();

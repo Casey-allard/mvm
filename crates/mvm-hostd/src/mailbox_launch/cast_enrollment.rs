@@ -41,7 +41,7 @@ impl PreparedOriginalCastBoot {
         destination: &crate::mailbox_process::owned_client::InstalledMailboxClient,
         config: &mvm_core::vm_backend::VmStartConfig,
         deadline: Instant,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         ensure!(
             destination.owner() == Some(&self.owner)
                 && destination.acquire_request().plan_commitment == self.plan
@@ -69,7 +69,7 @@ impl PreparedOriginalCastBoot {
         );
         let bytes = serde_json::to_vec(&self.boot)?;
         ensure!(bytes.len() <= 16384, "oversized Cast boot grant");
-        Ok(bytes)
+        Ok((serde_json::to_vec(&self.prior)?, bytes))
     }
 }
 

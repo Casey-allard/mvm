@@ -16,6 +16,8 @@ pub mod canonical_linux;
 pub mod detached;
 pub mod grants_report;
 pub mod host_agent_mailbox;
+#[cfg(unix)]
+pub mod cast_rendezvous;
 pub mod machine_start;
 pub mod mailbox_owner;
 pub mod manifest_ref;
