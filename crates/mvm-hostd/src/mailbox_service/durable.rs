@@ -333,7 +333,7 @@ impl DurableMailboxService {
         hold: Duration,
         active: impl Fn() -> bool,
     ) -> std::io::Result<bool> {
-        let mut stream = crate::telemetry_collector::dial_route(
+        let stream = crate::telemetry_collector::dial_route(
             route,
             mvm_contract::protocol::mailbox::MAILBOX_PORT,
         )?;
@@ -341,10 +341,7 @@ impl DurableMailboxService {
             return Ok(false);
         }
         let until = Instant::now() + GUEST_EXCHANGE_TIMEOUT;
-        let mut stream = GuestDeadline {
-            stream: &mut stream,
-            until,
-        };
+        let mut stream = GuestDeadline::new(stream, until)?;
         #[cfg(feature = "durable-guest-io-witness")]
         if let Some(meter) = &self.guest_meter {
             return meter.observe(&mut stream, |io, mark| {
@@ -782,11 +779,9 @@ mod reader_tests {
 
     #[test]
     fn an_expired_guest_exchange_refuses_more_reads_and_writes() {
-        let (mut socket, _peer) = UnixStream::pair().unwrap();
-        let mut expired = GuestDeadline {
-            stream: &mut socket,
-            until: Instant::now() - Duration::from_millis(1),
-        };
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut expired =
+            GuestDeadline::new(socket, Instant::now() - Duration::from_millis(1)).unwrap();
         assert_eq!(
             expired.read(&mut [0; 1]).unwrap_err().kind(),
             std::io::ErrorKind::TimedOut

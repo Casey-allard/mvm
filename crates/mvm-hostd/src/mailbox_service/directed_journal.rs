@@ -190,12 +190,10 @@ impl DirectedJournalSource {
             }),
         )?;
         self.authorize(len)?;
-        let mut stream = connect(deadline)?;
+        let stream = connect(deadline)?;
         self.authorize(len)?;
-        let mut stream = super::durable::GuestDeadline {
-            stream: &mut stream,
-            until: deadline,
-        };
+        let mut stream = super::durable::GuestDeadline::new(stream, deadline)
+            .map_err(|_| Refusal::Unavailable)?;
         let receipt =
             send_local_receipted_frame(&mut stream, &cap, &envelope, &expected, &self.verifier)?;
         if Instant::now() >= deadline

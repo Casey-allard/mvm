@@ -176,7 +176,7 @@ impl OriginalJournalSourceHost {
             Instant::now() < until && self.source.try_wait()?.is_none(),
             "original A helper unavailable"
         );
-        let (mut a, _) = match self.listener.socket.accept() {
+        let (a, _) = match self.listener.socket.accept() {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -189,10 +189,7 @@ impl OriginalJournalSourceHost {
             .destination
             .try_lock()
             .map_err(|_| anyhow::anyhow!("original B helper is busy"))?;
-        let mut a = crate::mailbox_service::durable::GuestDeadline {
-            stream: &mut a,
-            until,
-        };
+        let mut a = crate::mailbox_service::durable::GuestDeadline::new(a, until)?;
         let body = crate::mailbox_service::read_frame(
             crate::mailbox_service::MAX_SOURCE_INTENT_BYTES,
             &mut a,
@@ -205,11 +202,8 @@ impl OriginalJournalSourceHost {
                 && encode_frame(&send, &envelope).ok().as_ref() == Some(&body),
             "A ciphertext did not carry the original canonical Send credential"
         );
-        let mut b = dest.connect_for_proposal(&self.plan, &self.grants, until)?;
-        let mut b = crate::mailbox_service::durable::GuestDeadline {
-            stream: &mut b,
-            until,
-        };
+        let b = dest.connect_for_proposal(&self.plan, &self.grants, until)?;
+        let mut b = crate::mailbox_service::durable::GuestDeadline::new(b, until)?;
         b.write_all(&u32::try_from(body.len())?.to_be_bytes())?;
         b.write_all(&body)?;
         let mut verdict = Vec::new();
