@@ -888,9 +888,7 @@ impl<'a> RunPosture<'a> {
     /// for this paired source admission. Ordinary admission remains unchanged.
     pub fn with_paired_journal(
         mut self,
-        pair: &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission<
-            'a,
-        >,
+        pair: &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission,
     ) -> Self {
         self.paired_journal = Some(pair);
         self
