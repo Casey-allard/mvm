@@ -257,6 +257,17 @@ fn independent_direction_keys_and_original_reader_possession_survive_restart() {
     let root = f.dir.path().join(super::super::ENCRYPTION_ROOT);
     Key::load_or_create(&root).unwrap();
     let first = bind().unwrap();
+    let caller_store = first.caller.custody.storage_paths(f.dir.path()).unwrap();
+    let callee_store = first.callee.custody.storage_paths(f.dir.path()).unwrap();
+    assert_ne!(caller_store.source_intents, callee_store.source_intents);
+    assert_eq!(
+        first.caller.custody.address(),
+        f.credentials.reply.grant.address
+    );
+    assert_eq!(
+        first.callee.custody.address(),
+        f.credentials.call.grant.address
+    );
     assert_eq!(
         first.caller.reader.capability,
         f.credentials.receive_at_caller
@@ -286,6 +297,14 @@ fn independent_direction_keys_and_original_reader_possession_survive_restart() {
     }
     let second = bind().unwrap();
     assert_eq!(
+        second.caller.custody.history_reference(),
+        first.caller.custody.history_reference()
+    );
+    assert_eq!(
+        second.callee.custody.history_reference(),
+        first.callee.custody.history_reference()
+    );
+    assert_eq!(
         first.caller.reader.enrollment,
         second.caller.reader.enrollment
     );
@@ -306,5 +325,309 @@ fn independent_direction_keys_and_original_reader_possession_survive_restart() {
     assert!(
         bind().is_err(),
         "changed retained directional keys must refuse"
+    );
+}
+
+struct History(mvm_core::mailbox::journal::HistoryKeyRef);
+impl mvm_core::mailbox::journal::HistoryKeyCustody for History {
+    fn load_existing(
+        &self,
+        r: &mvm_core::mailbox::journal::HistoryKeyRef,
+    ) -> std::result::Result<Key, mvm_core::mailbox::journal::JournalError> {
+        if r != &self.0 {
+            return Err(mvm_core::mailbox::journal::JournalError::HistoryKeyUnavailable);
+        }
+        Ok(Key::from_bytes([44; 32]))
+    }
+}
+
+#[test]
+fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_lease() {
+    use mvm_core::mailbox::{
+        OpenContext,
+        journal::*,
+        object_pair::role::ObjectParticipantRole::{Callee, Caller},
+        reader::*,
+        reader_wire::ObjectSubmissionV1,
+    };
+    let f = Originals::new();
+    let p = f.prepare(f.credentials.clone()).unwrap();
+    let (ag, bg) = p.selected_grants();
+    let a = BootFixture::new(f.dir.path(), ag, 1, f.now);
+    let b = BootFixture::new(f.dir.path(), bg, 2, f.now);
+    Key::load_or_create(&f.dir.path().join(super::super::ENCRYPTION_ROOT)).unwrap();
+    let material = p
+        .bind_at(f.dir.path(), a.input(), b.input(), f.now)
+        .unwrap();
+    let msg = MessageId::from_bytes([72; 32]);
+    let corr = CorrelationId::from_bytes([73; 32]);
+    let seq = SequenceNumber::new(1).unwrap();
+    let callbody = b"SC\0\x11\0";
+    let replybody = b"reply\0\0";
+    let call = material
+        .seal_turn(Caller, msg, Some(corr), seq, callbody, None, f.now)
+        .unwrap();
+    assert_eq!(call.header().correlation_id, corr);
+    assert!(
+        material
+            .seal_turn(
+                Caller,
+                msg,
+                Some(CorrelationId::from_bytes([0; 32])),
+                seq,
+                callbody,
+                None,
+                f.now
+            )
+            .is_err()
+    );
+    let sub = ObjectSubmissionV1::Call {
+        message_id: msg,
+        correlation_id: corr,
+        payload: callbody.to_vec(),
+    };
+    let restored = material
+        .reopen(
+            Caller,
+            call.capability(),
+            call.envelope().clone(),
+            seq,
+            &sub,
+            None,
+            f.now,
+        )
+        .unwrap();
+    assert_eq!(restored.envelope(), call.envelope());
+    let incorrect = ObjectSubmissionV1::Call {
+        message_id: msg,
+        correlation_id: corr,
+        payload: b"SC\0\x11".to_vec(),
+    };
+    assert!(
+        material
+            .reopen(
+                Caller,
+                call.capability(),
+                call.envelope().clone(),
+                seq,
+                &incorrect,
+                None,
+                f.now
+            )
+            .is_err()
+    );
+
+    let g = &f.credentials.call.grant;
+    let address = g.address;
+    let signer = super::super::derived_keys(f.dir.path(), &bg.mailbox, bg.epoch)
+        .unwrap()
+        .authority;
+    let sender = material.caller.sender.verifying_key();
+    let context = OpenContext {
+        expected_tenant: address.tenant,
+        expected_authorization_domain: address.authorization_domain,
+        expected_mailbox: address.mailbox,
+        expected_sender: g.subject,
+        expected_recipient: address.recipient,
+        acting_principal: g.subject,
+        expected_capability_issuer: g.issuer,
+        current_execution_epoch: bg.epoch,
+        current_policy_epoch: g.policy_epoch,
+        required_operation: MailboxOperation::Send,
+        now_unix_ms: f.now,
+        accepted_content_types: g.content_types.clone(),
+        revoked_capabilities: Vec::new(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let anchor = FileJournalAnchor::open(&dir.path().join("anchor"), address, [29; 32]).unwrap();
+    let history = History(HistoryKeyRef::new(address, bg.epoch, [19; 32], 1).unwrap());
+    let mut journal = MailboxJournal::open_local_with_custody(
+        &dir.path().join("journal"),
+        history.0,
+        signer.verifying_key(),
+        JournalLimits {
+            max_records: 8,
+            max_bytes: 131072,
+        },
+        &history,
+        &anchor,
+        bg.retention.unwrap(),
+    )
+    .unwrap();
+    let receipt = journal
+        .admit_local(
+            JournalAdmission {
+                envelope: call.envelope(),
+                capability: call.capability(),
+                context: &context,
+                encryption_key: &material.callee.inbound_key,
+                sender_key: &sender,
+                signer: &signer,
+            },
+            &anchor,
+        )
+        .unwrap();
+    material.verify_accepted(Caller, &call, &receipt).unwrap();
+    let a_alt_state = tempfile::tempdir().unwrap();
+    a.boot.persist(a_alt_state.path()).unwrap();
+    let b2 = BootFixture::new(f.dir.path(), bg, 2, f.now);
+    assert_ne!(b.boot.boot, b2.boot.boot);
+    let other = p
+        .bind_at(
+            f.dir.path(),
+            BootInput {
+                state: a_alt_state.path(),
+                ..a.input()
+            },
+            b2.input(),
+            f.now,
+        )
+        .unwrap();
+    assert!(
+        other.verify_accepted(Caller, &call, &receipt).is_err(),
+        "another receiver incarnation accepted this original ciphertext"
+    );
+    for t in [
+        call.header().issued_at_unix_ms - 1,
+        call.header().expires_at_unix_ms,
+    ] {
+        let mut replacement = receipt.receipt.clone();
+        replacement.observed_at_unix_ms = t;
+        let replacement = mvm_core::mailbox::sign_receipt(replacement, &signer).unwrap();
+        assert!(
+            material
+                .verify_accepted(Caller, &call, &replacement)
+                .is_err(),
+            "receipt outside original validity"
+        );
+    }
+    assert!(material.verify_accepted(Callee, &call, &receipt).is_err());
+    let reader = &material.callee.reader;
+    let enroll = &reader.enrollment;
+    let session = enroll.enrollment.consumer_session;
+    let challenge = [5; 32];
+    let proof = sign_reader_possession(enroll, &challenge, &b.ack).unwrap();
+    let mut read = context.clone();
+    read.acting_principal = address.recipient;
+    read.required_operation = MailboxOperation::Receive;
+    let (key_a, key_b) = (
+        host_keypair::load_or_init_at(f.dir.path())
+            .unwrap()
+            .verifying,
+        host_keypair::load_or_init_at(f.dir.path())
+            .unwrap()
+            .verifying,
+    );
+    let id = host_keypair::host_signer_id();
+    let trust_a = [(id.as_str(), &key_a)];
+    let trust_b = [(id.as_str(), &key_b)];
+    let live = PairAuthorityState {
+        caller_boot: a.boot.boot,
+        callee_boot: b.boot.boot,
+        caller_epoch: ag.epoch,
+        callee_epoch: bg.epoch,
+        caller_policy: 1,
+        callee_policy: 1,
+        at_caller: &[],
+        at_callee: &[],
+    };
+    let pair = ObjectPairV1::check_originals(
+        &OriginalObjectEndpoint {
+            plan: &a.signed,
+            boot: &a.boot,
+            trusted_signers: &trust_a,
+        },
+        &OriginalObjectEndpoint {
+            plan: &b.signed,
+            boot: &b.boot,
+            trusted_signers: &trust_b,
+        },
+        ObjectPairGrants {
+            call: &f.credentials.call,
+            reply: &f.credentials.reply,
+        },
+        f.now,
+        live,
+    )
+    .unwrap();
+    let read_scope = MailboxGuestReaderScope {
+        plan: &bg,
+        plan_id: &b.boot.plan_id,
+        plan_nonce: &b.boot.plan_nonce,
+        receive: &reader.capability.grant,
+        current_boot: b.boot.boot,
+        current_session: session,
+        now_unix_ms: f.now,
+    };
+    let request = JournalGuestLease {
+        plan: &bg,
+        scope: read_scope,
+        receive: JournalReceive {
+            context: &read,
+            capability: &reader.capability,
+            encryption_key: &material.callee.inbound_key,
+            sender_key: &sender,
+        },
+        enrollment: enroll,
+        challenge: &challenge,
+        possession_signature: &proof,
+        signer: &signer,
+    };
+    let leased = journal
+        .lease_next_object(
+            request,
+            ObjectLeaseScope {
+                pair: &pair,
+                destination: &b.boot,
+                state: live,
+                original_call: None,
+            },
+            |tip| anchor.advance(tip),
+        )
+        .unwrap()
+        .unwrap();
+    let signed = leased.lease().clone();
+    let current = journal.original_object_call(&signed, f.now).unwrap();
+    let reply_id = MessageId::from_bytes([78; 32]);
+    let reply = material
+        .seal_turn(
+            Callee,
+            reply_id,
+            None,
+            seq,
+            replybody,
+            Some(&current),
+            f.now,
+        )
+        .unwrap();
+    let rs = ObjectSubmissionV1::Reply {
+        message_id: reply_id,
+        original_call: Box::new(signed.clone()),
+        payload: replybody.to_vec(),
+    };
+    assert_eq!(
+        material
+            .reopen(
+                Callee,
+                reply.capability(),
+                reply.envelope().clone(),
+                seq,
+                &rs,
+                Some(&current),
+                f.now
+            )
+            .unwrap()
+            .envelope(),
+        reply.envelope()
+    );
+    assert_eq!(reply.header().causation_id.as_bytes(), msg.as_bytes());
+    assert_eq!(reply.header().correlation_id, corr);
+    let mut bad = signed.clone();
+    bad.lease.lease_nonce = DeliveryLeaseNonce::from_bytes([0; 16]);
+    assert!(journal.original_object_call(&bad, f.now).is_err());
+    assert!(
+        journal
+            .original_object_call(&signed, signed.lease.expires_at_unix_ms)
+            .is_err()
     );
 }

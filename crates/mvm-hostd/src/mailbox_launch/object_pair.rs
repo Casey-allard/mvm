@@ -229,6 +229,7 @@ struct PairMaterial {
     callee: EndpointMaterial,
 }
 pub(crate) struct EndpointMaterial {
+    custody: crate::mailbox_custody::RetainedMailboxKeys,
     pub(crate) routing: MailboxRoutingFrame,
     pub(crate) public_role: mvm_core::mailbox::object_pair::role::SignedObjectRoleV1,
     pub(crate) reader: GuestReaderAuthority,
@@ -237,6 +238,28 @@ pub(crate) struct EndpointMaterial {
     pub(crate) sender: ed25519_dalek::SigningKey,
 }
 impl InstalledObjectPair<'_> {
+    pub(crate) fn source_intents(
+        &self,
+        role: mvm_core::mailbox::object_pair::role::ObjectParticipantRole,
+    ) -> Result<std::path::PathBuf> {
+        use mvm_core::mailbox::object_pair::role::ObjectParticipantRole;
+        self.check_current()?;
+        let (local, owner) = match role {
+            ObjectParticipantRole::Caller => (&self.material.caller, &self.caller),
+            ObjectParticipantRole::Callee => (&self.material.callee, &self.callee),
+        };
+        ensure!(
+            local
+                .custody
+                .matches_original(owner.admitted.plan(), local.reader.capability.grant.address),
+            "retained outbound storage belongs to different admitted original"
+        );
+        Ok(local
+            .custody
+            .storage_paths(&mvm_core::config::mvm_keys_dir())?
+            .source_intents)
+    }
+
     /// Only public verifiers and signed reader proofs are observable by the SDK.
     pub fn original_readers(
         &self,
@@ -492,7 +515,21 @@ impl PreparedObjectPair {
                 &d.authority,
                 now,
             )?;
+            let plan = if g.mailbox == self.caller.mailbox {
+                &pa
+            } else {
+                &pb
+            };
+            let custody = crate::mailbox_custody::RetainedMailboxKeys::for_object_role(
+                keys,
+                plan,
+                role.posture,
+                role.boot,
+                &public_role,
+                now,
+            )?;
             Ok(EndpointMaterial {
+                custody,
                 routing: routes[if g.mailbox == self.caller.mailbox {
                     1
                 } else {

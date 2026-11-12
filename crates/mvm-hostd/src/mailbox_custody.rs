@@ -180,7 +180,64 @@ impl RetainedMailboxKeys {
         address: MailboxAddress,
     ) -> Result<Self> {
         posture.verify(plan, vm_name)?;
+        posture
+            .handoff(current_boot)
+            .verify(plan, vm_name, current_boot)?;
         let identity = identity(keys_dir, plan, vm_name, address)?;
+        Self::provision_or_open_identity(keys_dir, plan, identity)
+    }
+
+    /// This entry point is available after both original plans, boots and
+    /// independent direction credentials are bound. The local reciprocal
+    /// credential supplies the destination address for this durable journal.
+    pub(crate) fn for_object_role(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        posture: &MailboxLaunchPosture,
+        boot: &mvm_core::mailbox::reader::MailboxReaderBootBinding,
+        descriptor: &mvm_core::mailbox::object_pair::role::SignedObjectRoleV1,
+        now: i64,
+    ) -> Result<Self> {
+        use mvm_core::mailbox::object_pair::role::ObjectParticipantRole;
+        let vm_name = &plan.image.name;
+        posture.verify(plan, vm_name)?;
+        ensure!(
+            posture.variant() == mvm_core::plan::Variant::Prod,
+            "object custody requires production admission"
+        );
+        boot.check_plan(plan)?;
+        let role = descriptor.verify(boot, now)?;
+        let inbound = match role.role {
+            ObjectParticipantRole::Caller => &role.reply,
+            ObjectParticipantRole::Callee => &role.call,
+        };
+        let address = inbound.grant.address;
+        let grant = plan.mailbox.context("original mailbox grant absent")?;
+        ensure!(
+            grant.durable_object_pair_sha256_v1.is_some()
+                && address.mailbox == grant.mailbox
+                && inbound.grant.issuer.as_bytes() == &grant.authority_key,
+            "retained journal differs from signed pair destination"
+        );
+        let identity = Identity {
+            plan_id: &plan.plan_id,
+            plan_nonce: &plan.nonce,
+            vm_name,
+            address,
+            epoch: grant.epoch,
+            retention_ms: grant
+                .retention
+                .context("signed retention absent")?
+                .retention_ms(),
+        };
+        Self::provision_or_open_identity(keys_dir, plan, identity)
+    }
+
+    fn provision_or_open_identity(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        identity: Identity<'_>,
+    ) -> Result<Self> {
         let (bundle, manifest) = paths(keys_dir, &identity)?;
         let mut existing = false;
         for path in [&bundle, &manifest] {
@@ -191,17 +248,20 @@ impl RetainedMailboxKeys {
             }
         }
         if existing {
-            Self::open_existing(
-                keys_dir,
-                plan,
-                vm_name,
-                &posture.handoff(current_boot),
-                current_boot,
-                address,
-            )
+            Self::open_bound(keys_dir, plan, identity)
         } else {
-            Self::provision(keys_dir, plan, vm_name, posture, address)
+            Self::provision_bound(keys_dir, plan, identity)
         }
+    }
+
+    pub(crate) fn matches_original(&self, plan: &ExecutionPlan, address: MailboxAddress) -> bool {
+        self.binding.plan_id == plan.plan_id
+            && self.binding.plan_nonce == plan.nonce
+            && self.binding.vm_name == plan.image.name
+            && self.binding.address == address
+            && plan.mailbox.is_some_and(|g| {
+                self.binding.epoch == g.epoch && self.binding.authority_key == g.authority_key
+            })
     }
 
     /// Host-local storage remains outside the per-VM state directory so a VM
@@ -235,6 +295,15 @@ impl RetainedMailboxKeys {
     ) -> Result<Self> {
         posture.verify(plan, vm_name)?;
         let identity = identity(keys_dir, plan, vm_name, address)?;
+        Self::provision_bound(keys_dir, plan, identity)
+    }
+    fn provision_bound(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        identity: Identity<'_>,
+    ) -> Result<Self> {
+        let vm_name = identity.vm_name;
+        let address = identity.address;
         let signer = existing_host_signer(keys_dir)?;
         let (bundle_path, manifest_path) = paths(keys_dir, &identity)?;
         mvm_core::private_fs::ensure_private_dir(
@@ -294,6 +363,11 @@ impl RetainedMailboxKeys {
     ) -> Result<Self> {
         posture.verify(plan, vm_name, current_boot)?;
         let identity = identity(keys_dir, plan, vm_name, address)?;
+        Self::open_bound(keys_dir, plan, identity)
+    }
+    fn open_bound(keys_dir: &Path, plan: &ExecutionPlan, identity: Identity<'_>) -> Result<Self> {
+        let vm_name = identity.vm_name;
+        let address = identity.address;
         let signer = existing_host_signer(keys_dir)?;
         let (bundle_path, manifest_path) = paths(keys_dir, &identity)?;
         let directory = bundle_path.parent().context("mailbox custody directory")?;
