@@ -54,7 +54,7 @@ impl InstalledObjectPair<'_> {
             now,
             current,
         )?;
-        let pending = recover(
+        let (pending, validity) = recover(
             &self.material.caller,
             &self.source_intents(ObjectParticipantRole::Caller)?,
             &pair,
@@ -63,7 +63,10 @@ impl InstalledObjectPair<'_> {
             envelope,
             now,
         )?;
-        self.check_current()?;
+        ensure!(
+            validity.contains(&self.check_current()?),
+            "Call or Reply expired during encrypted record lookup"
+        );
         Ok(pending)
     }
 }
@@ -76,7 +79,7 @@ pub(super) fn recover(
     capability: &SignedMailboxCapability,
     reply: &MailboxEnvelope,
     now: i64,
-) -> Result<PendingObjectCall> {
+) -> Result<(PendingObjectCall, std::ops::Range<i64>)> {
     let role = local.public_role.verify(&local.reader.boot, now)?;
     ensure!(
         role.role == ObjectParticipantRole::Caller && capability == &role.reply,
@@ -153,5 +156,9 @@ pub(super) fn recover(
         &local.inbound_key,
         &mut InMemoryReplayProtector::default(),
     )?;
-    Ok(pending)
+    Ok((
+        pending,
+        ch.issued_at_unix_ms.max(h.issued_at_unix_ms)
+            ..ch.expires_at_unix_ms.min(h.expires_at_unix_ms),
+    ))
 }
