@@ -1,6 +1,7 @@
 //! Development-only, one-direction enrollment under two original worker leases.
 //! The launcher uses each worker's once-delegated private config descriptor.
 //! The relay sees only a public direction and fixed-size, separately wrapped keys.
+pub mod control;
 pub(crate) mod destination;
 use super::{InstalledCastParticipant, RoutedCast};
 use crate::mailbox_process::MailboxProcessConfig;
