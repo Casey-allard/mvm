@@ -32,6 +32,7 @@ mod tests;
 mod transient;
 mod unbooted;
 
+use mvm_hostd::mailbox_process::original_journal::PairedBootReservation;
 use unbooted::DefinitionOrigin;
 
 pub use request::{
@@ -396,6 +397,22 @@ pub(crate) fn record_session_stop_failure(
         (Some(plan), Some(emitter)) => record_unsealed_end(Some((&emitter, plan)), end),
         _ => record_unsealed_end(None, end),
     }
+}
+
+pub(crate) fn reserve_named_lifecycle(name: &str) -> Result<PairedBootReservation> {
+    PairedBootReservation::for_lifecycle_mutation(name).map_err(|error| {
+        match error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+        {
+            Some(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists) => {
+                MvmError::Conflict {
+                    reason: error.to_string(),
+                }
+            }
+            _ => crate::local::backend_err(error),
+        }
+    })
 }
 
 impl LocalBackend {
@@ -839,8 +856,9 @@ impl LocalBackend {
             LifecycleMode::Transient => self.launch_transient(request).await,
             LifecycleMode::Persistent => {
                 let name = persistent_name(&request)?;
+                let reservation = reserve_named_lifecycle(&name)?;
                 let (_, origin) = self.create_definition(&request, &name)?;
-                let booted = self.boot_persistent(&name, &request).await;
+                let booted = self.boot_persistent(&name, &request, &reservation).await;
                 let outcome = self.discard_definition_on_failure(&name, origin, booted)?;
                 match self.start_requested_command(outcome, &request) {
                     Ok(outcome) => Ok(outcome),
@@ -872,6 +890,7 @@ impl LocalBackend {
             });
         }
         let name = persistent_name(request)?;
+        let _reservation = reserve_named_lifecycle(&name)?;
         let (spec, _) = self.create_definition(request, &name)?;
         Ok(MachineState {
             id: MachineId(name.clone()),
@@ -914,7 +933,12 @@ impl LocalBackend {
     /// secret references are re-validated fail-closed even when this
     /// request carries none. The request's mailbox is separate one-start
     /// authority, passed into admission without persisting it in the definition.
-    async fn boot_persistent(&self, name: &str, request: &LaunchRequest) -> Result<LaunchOutcome> {
+    async fn boot_persistent(
+        &self,
+        name: &str,
+        request: &LaunchRequest,
+        reservation: &PairedBootReservation,
+    ) -> Result<LaunchOutcome> {
         if self.machine_running(name) {
             return Err(MvmError::Conflict {
                 reason: format!("machine {name:?} is already running"),
@@ -931,6 +955,7 @@ impl LocalBackend {
                 !request.command.is_empty(),
                 request.mailbox,
                 None,
+                reservation,
             )
             .await?;
         if let Some(ttl) = request.ttl_seconds {
@@ -973,15 +998,13 @@ impl LocalBackend {
         has_ad_hoc_argv: bool,
         mailbox: Option<mvm_contract::protocol::mailbox::MailboxGrant>,
         journal: Option<&mut persistent::journal::InstalledJournal<'_>>,
+        reservation: &PairedBootReservation,
     ) -> Result<(machine_start::MachineStart, String)> {
         persistent::journal::validate_slot(journal.as_deref(), mailbox.as_ref())
             .map_err(crate::local::backend_err)?;
         let backend = backend_override
             .map(str::to_string)
             .unwrap_or_else(|| self.backend.name().to_string());
-        if journal.is_none() && !self.machine_running(&spec.name) {
-            remove_vm_runtime_dirs(&spec.name)?;
-        }
         let image = match spec.image.clone() {
             Some(reference) => Some(
                 machine_start::resolve_boot_image(&reference, &spec.name)
@@ -1002,6 +1025,7 @@ impl LocalBackend {
                 mailbox,
             },
             journal,
+            reservation,
         )
         .map_err(|e| crate::local::backend_err(format!("{e:#}")))?;
         Ok((started, backend))
@@ -1241,7 +1265,7 @@ impl LocalBackend {
     ) -> Result<machine_start::MachineStart> {
         persistent::journal::validate_slot(Some(journal), Some(&grant))
             .map_err(crate::local::backend_err)?;
-        mvm_core::naming::validate_vm_name(name).map_err(crate::local::backend_err)?;
+        let reservation = reserve_named_lifecycle(name)?;
         let mut spec = mp::load_machine_spec(name).map_err(|e| MvmError::NotFound {
             id: format!("{name}: {e}"),
         })?;
@@ -1255,7 +1279,14 @@ impl LocalBackend {
         ensure_spec_bootable_in_process(&spec)?;
         self.validate_sidecar_refs(name)?;
         let (started, _) = self
-            .boot_spec(&mut spec, None, false, Some(grant), Some(journal))
+            .boot_spec(
+                &mut spec,
+                None,
+                false,
+                Some(grant),
+                Some(journal),
+                &reservation,
+            )
             .await?;
         Ok(started)
     }
@@ -1265,6 +1296,7 @@ impl LocalBackend {
     /// attachments re-resolved and leased, then the canonical admitted boot.
     /// Starting a machine that is already running returns its state.
     pub async fn start_persistent(&self, name: &str) -> Result<MachineState> {
+        let reservation = reserve_named_lifecycle(name)?;
         let spec = mp::load_machine_spec(name).map_err(|e| MvmError::NotFound {
             id: format!("{name}: {e}"),
         })?;
@@ -1280,7 +1312,9 @@ impl LocalBackend {
         ensure_spec_bootable_in_process(&spec)?;
         self.validate_sidecar_refs(name)?;
         let mut spec = spec;
-        let (_, backend) = self.boot_spec(&mut spec, None, false, None, None).await?;
+        let (_, backend) = self
+            .boot_spec(&mut spec, None, false, None, None, &reservation)
+            .await?;
         let memory_mib = mvm_core::util::parse_human_size(&spec.memory).unwrap_or_default();
         Ok(MachineState {
             id: MachineId(name.to_string()),
@@ -1364,6 +1398,18 @@ impl LocalBackend {
     /// while the receipt still describes the resources; otherwise they are
     /// retained, with the state that records them.
     pub fn cleanup_transient(&self, name: &str) -> Result<()> {
+        let reservation = reserve_named_lifecycle(name)?;
+        self.cleanup_transient_reserved(name, &reservation)
+    }
+
+    pub(crate) fn cleanup_transient_reserved(
+        &self,
+        name: &str,
+        reservation: &PairedBootReservation,
+    ) -> Result<()> {
+        reservation
+            .require_name(name)
+            .map_err(crate::local::backend_err)?;
         if self.machine_running(name) {
             self.stop_for_recreate(name)?;
         }
