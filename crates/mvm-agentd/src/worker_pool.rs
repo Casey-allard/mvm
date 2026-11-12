@@ -28,7 +28,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -103,6 +103,8 @@ enum WorkerSlot {
     /// Slot's worker died and respawn has not yet succeeded. The
     /// recovery thread retries periodically.
     Dead,
+    /// Uncertain exit: reserve the slot and retain the original for shutdown.
+    Unresolved(WorkerHandle),
 }
 
 struct PoolState {
@@ -181,6 +183,7 @@ impl DispatchOutcome {
 
 /// Pool of long-running wrapper workers.
 pub struct WorkerPool {
+    retire_tx: mpsc::SyncSender<(usize, WorkerHandle)>,
     state: Mutex<PoolState>,
     cv: Condvar,
     cfg: WarmProcessConfig,
@@ -253,7 +256,9 @@ impl WorkerPool {
             cfg.effective_queue_depth(),
         );
 
+        let (retire_tx, retire_rx) = mpsc::sync_channel(cfg.pool_size);
         let pool = Arc::new(Self {
+            retire_tx,
             state: Mutex::new(PoolState {
                 slots,
                 pending_waiters: 0,
@@ -280,7 +285,7 @@ impl WorkerPool {
         // sleeps. Holding a `Weak` reference instead of an `Arc`
         // means the thread doesn't keep the pool alive past
         // `shutdown()`.
-        spawn_idle_recycler(Arc::downgrade(&pool));
+        spawn_recycler(Arc::downgrade(&pool), retire_rx)?;
 
         Ok(pool)
     }
@@ -427,17 +432,20 @@ impl WorkerPool {
     pub fn shutdown(&self, grace: Duration) {
         self.shutdown.store(true, Ordering::Release);
         self.cv.notify_all();
-        // Drain idle workers right away. Busy workers tear down
-        // on release.
-        let mut st = self.state.lock().expect("worker pool state mutex poisoned");
-        for slot in st.slots.iter_mut() {
-            if let WorkerSlot::Idle(_) = slot {
-                // Replace with Dead — Drop on the moved handle kills
-                // the worker.
-                *slot = WorkerSlot::Dead;
+        // Pull original handles out of the state lock before any exit wait.
+        let mut draining = Vec::new();
+        {
+            let mut st = self.state.lock().expect("worker pool state poisoned");
+            for slot in &mut st.slots {
+                if matches!(slot, WorkerSlot::Idle(_) | WorkerSlot::Unresolved(_)) {
+                    match std::mem::replace(slot, WorkerSlot::Dead) {
+                        WorkerSlot::Idle(h) | WorkerSlot::Unresolved(h) => draining.push(h),
+                        _ => unreachable!(),
+                    }
+                }
             }
         }
-        drop(st);
+        drop(draining);
         // Give callers a chance to observe in-flight completions.
         thread::sleep(grace.min(Duration::from_secs(30)));
     }
@@ -454,7 +462,7 @@ impl WorkerPool {
                     last_rss_bytes: h.last_rss_bytes,
                 },
                 WorkerSlot::Busy => SlotSnapshot::Busy,
-                WorkerSlot::Dead => SlotSnapshot::Dead,
+                WorkerSlot::Dead | WorkerSlot::Unresolved(_) => SlotSnapshot::Dead,
             })
             .collect()
     }
@@ -479,7 +487,11 @@ impl WorkerPool {
             // No idle. If every slot is Dead, fail fast — there's no
             // hope of waking up unless a recovery thread succeeds,
             // which we don't model in v0.2.
-            if st.slots.iter().all(|s| matches!(s, WorkerSlot::Dead)) {
+            if st
+                .slots
+                .iter()
+                .all(|s| matches!(s, WorkerSlot::Dead | WorkerSlot::Unresolved(_)))
+            {
                 return Err(DispatchError::NoLiveWorkers);
             }
             // Some are Busy; wait for one to be released.
@@ -497,32 +509,62 @@ impl WorkerPool {
         // is fresh. The recycler reads `last_used_at` to decide
         // whether the worker has been idle past the timeout.
         handle.last_used_at = Instant::now();
-        let mut st = self.state.lock().expect("worker pool state mutex poisoned");
-        if recycle {
-            // Drop the handle inside this scope so the old worker is
-            // killed before we attempt to spawn a replacement (their
-            // resource caps may overlap during overshoot).
-            drop(handle);
-            match spawn_worker(&self.entrypoint, &self.worker_env) {
-                Ok(new_handle) => {
-                    eprintln!(
-                        "mvm-guest-agent: warm-process worker {idx} replaced pid={}",
-                        new_handle.pid
-                    );
-                    st.slots[idx] = WorkerSlot::Idle(new_handle);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "mvm-guest-agent: warm-process worker {idx} respawn failed: {e}; \
-                         marking slot dead"
-                    );
-                    st.slots[idx] = WorkerSlot::Dead;
-                }
-            }
-        } else {
+        let mut st = self.state.lock().expect("worker pool state poisoned");
+        if !recycle && !self.shutdown.load(Ordering::Acquire) {
             st.slots[idx] = WorkerSlot::Idle(handle);
+            self.cv.notify_one();
+            return;
         }
-        self.cv.notify_one();
+        // The completed response can now be returned. Busy retains this slot's
+        // capacity until the maintenance thread has collected this exact child.
+        // A single outstanding handle per slot bounds the entire queue.
+        if let Err(error) = self.retire_tx.try_send((idx, handle)) {
+            let (_, original) = match error {
+                mpsc::TrySendError::Disconnected(v) | mpsc::TrySendError::Full(v) => v,
+            };
+            st.slots[idx] = WorkerSlot::Unresolved(original);
+            self.cv.notify_all();
+        }
+    }
+
+    fn retire_and_replace(&self, idx: usize, mut handle: WorkerHandle) {
+        if let Err(err) = handle.retire() {
+            eprintln!("mvm-guest-agent: warm-process worker {idx} could not be collected: {err}");
+            let mut st = self.state.lock().expect("worker pool state poisoned");
+            st.slots[idx] = WorkerSlot::Unresolved(handle);
+            self.cv.notify_all();
+            return;
+        }
+        drop(handle);
+        if self.shutdown.load(Ordering::Acquire) {
+            let mut st = self.state.lock().expect("worker pool state poisoned");
+            st.slots[idx] = WorkerSlot::Dead;
+            self.cv.notify_all();
+            return;
+        }
+        let replacement = spawn_worker(&self.entrypoint, &self.worker_env);
+        let mut st = self.state.lock().expect("worker pool state poisoned");
+        if self.shutdown.load(Ordering::Acquire) {
+            st.slots[idx] = WorkerSlot::Dead;
+            self.cv.notify_all();
+            drop(st);
+            drop(replacement);
+            return;
+        }
+        st.slots[idx] = match replacement {
+            Ok(h) => {
+                eprintln!(
+                    "mvm-guest-agent: warm-process worker {idx} replaced pid={}",
+                    h.pid
+                );
+                WorkerSlot::Idle(h)
+            }
+            Err(err) => {
+                eprintln!("mvm-guest-agent: warm-process worker {idx} respawn failed: {err}");
+                WorkerSlot::Dead
+            }
+        };
+        self.cv.notify_all();
     }
 
     fn should_recycle(
@@ -705,28 +747,34 @@ fn spawn_worker(
 /// Holds a `Weak<WorkerPool>` so the pool can be dropped without
 /// the thread keeping it alive. The thread exits on the first
 /// `Weak::upgrade` failure (pool gone) or when `shutdown` is set.
-fn spawn_idle_recycler(weak_pool: std::sync::Weak<WorkerPool>) -> thread::JoinHandle<()> {
-    /// How often the recycler sweeps. Picked smaller than the host
-    /// reaper's polling cadence so a workload-bound agent isn't
-    /// hostage to host activity for fine-grained reaping. 10 s is
-    /// a reasonable budget for a pool that recycles a worker
-    /// every few minutes — picking the same number as the
-    /// docker/podman default health-check interval, also chosen
-    /// for predictability.
+fn spawn_recycler(
+    weak_pool: std::sync::Weak<WorkerPool>,
+    rx: mpsc::Receiver<(usize, WorkerHandle)>,
+) -> io::Result<()> {
     const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
-
-    thread::spawn(move || {
-        loop {
-            thread::sleep(SWEEP_INTERVAL);
-            let Some(pool) = weak_pool.upgrade() else {
-                return;
-            };
-            if pool.shutdown.load(Ordering::Acquire) {
-                return;
+    thread::Builder::new()
+        .name("mvm-warm-worker-recycler".into())
+        .spawn(move || {
+            let mut next_sweep = Instant::now() + SWEEP_INTERVAL;
+            loop {
+                let event = rx.recv_timeout(next_sweep.saturating_duration_since(Instant::now()));
+                let Some(pool) = weak_pool.upgrade() else {
+                    return;
+                };
+                match event {
+                    Ok((idx, handle)) => pool.retire_and_replace(idx, handle),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => (),
+                }
+                if Instant::now() >= next_sweep {
+                    if !pool.shutdown.load(Ordering::Acquire) {
+                        pool.sweep_idle();
+                    }
+                    next_sweep = Instant::now() + SWEEP_INTERVAL;
+                }
             }
-            pool.sweep_idle();
-        }
-    })
+        })?;
+    Ok(())
 }
 
 impl WorkerPool {
@@ -790,29 +838,8 @@ impl WorkerPool {
             st.slots[idx] = slot;
             return;
         };
-        let pid = handle.pid;
-        // Drop the old handle inside the lock so its `Drop` runs
-        // (kill_and_reap) before we re-spawn — keeps OS-level fd /
-        // PID pressure consistent.
-        drop(handle);
-        eprintln!("mvm-guest-agent: warm-process worker {idx} idle-recycle pid={pid}");
-        match spawn_worker(&self.entrypoint, &self.worker_env) {
-            Ok(new_handle) => {
-                eprintln!(
-                    "mvm-guest-agent: warm-process worker {idx} replaced pid={}",
-                    new_handle.pid
-                );
-                st.slots[idx] = WorkerSlot::Idle(new_handle);
-            }
-            Err(e) => {
-                eprintln!(
-                    "mvm-guest-agent: warm-process worker {idx} idle-recycle respawn failed: {e}; \
-                     marking slot dead"
-                );
-                st.slots[idx] = WorkerSlot::Dead;
-            }
-        }
-        self.cv.notify_one();
+        drop(st);
+        self.retire_and_replace(idx, handle);
     }
 }
 

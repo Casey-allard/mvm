@@ -351,6 +351,11 @@ fn recycle_on_call_count_exceeded() {
     }
     // After 3 calls, the next call should be served by a fresh
     // worker because release saw call_count >= max.
+    wait_until("original worker replaced", || {
+        pool.snapshot()
+            .iter()
+            .any(|s| matches!(s,SlotSnapshot::Idle {pid,..} if *pid!=first_pid))
+    });
     let second_pid = idle_pid(&pool);
     assert_ne!(second_pid, first_pid, "worker recycled after call cap");
 }
@@ -383,6 +388,11 @@ fn wrapper_crash_returns_error_and_recycles() {
     }
 
     // Recycle should have replaced the worker.
+    wait_until("original worker replaced", || {
+        pool.snapshot()
+            .iter()
+            .any(|s| matches!(s,SlotSnapshot::Idle {pid,..} if *pid!=first_pid))
+    });
     let second_pid = idle_pid(&pool);
     assert_ne!(second_pid, first_pid, "crashed worker replaced");
 }
@@ -486,6 +496,11 @@ fn recycle_on_rss_exceeded() {
 
     let _ = dispatch(&pool, b"call-1");
     // After call 1, RSS should be over 10 MiB → worker recycled.
+    wait_until("original worker replaced", || {
+        pool.snapshot()
+            .iter()
+            .any(|s| matches!(s,SlotSnapshot::Idle {pid,..} if *pid!=first_pid))
+    });
     let second_pid = idle_pid(&pool);
     assert_ne!(
         second_pid, first_pid,
@@ -644,7 +659,7 @@ fn retained_warm_response_survives_original_child_reaped_between_calls() {
                 Err(mvm_agentd::lifecycle_hooks::ReadinessError::ScriptMissing { .. })
             ));
         }
-        mvm_agentd::lifecycle_hooks::poll_readiness(&ReadinessConfig::new("/bin/true")).unwrap();
+        mvm_agentd::lifecycle_hooks::poll_readiness(&ReadinessConfig::new("/usr/bin/true")).unwrap();
         let pool = start_pool_with_behavior(cfg(1, 100, 1024), Some("crash_after_n=1"));
         let original = idle_pid(&pool);
         let body: Vec<u8> = (0u8..=255).chain(std::iter::once(0)).collect();
