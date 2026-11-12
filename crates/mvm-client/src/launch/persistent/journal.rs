@@ -188,7 +188,15 @@ impl crate::LocalBackend {
                 }
                 self.release_stopped_leases(name)?;
                 crate::local::deregister_from_name_registry(name);
-                crate::local::remove_stopped_runtime_state(name)?;
+                let removed = mvm_runtime::vm::reconcile::reap_unowned_state_dir(
+                    &mvm_core::config::vm_state_dir(name),
+                    &mvm_core::config::instance_dir(name),
+                )
+                .map_err(anyhow::Error::msg)?;
+                ensure!(
+                    removed,
+                    "stopped original VM runtime still has a lifecycle owner"
+                );
                 Ok(())
             })
             .map_err(crate::local::backend_err)

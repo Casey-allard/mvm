@@ -191,6 +191,9 @@ impl OriginalJournalDestination {
 
     /// Observe terminal status only by collecting the original Child.
     pub fn try_collect(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.stop.stop_started {
+            return self.child.try_wait();
+        }
         self.marker.collect(&mut self.child)
     }
 
@@ -248,7 +251,7 @@ impl<T> std::fmt::Display for IncompleteJournalStart<T> {
 }
 impl<T> std::error::Error for IncompleteJournalStart<T> {}
 
-fn spawn_claimed(
+pub(super) fn spawn_claimed(
     dir: &std::path::Path,
     mut command: std::process::Command,
 ) -> std::io::Result<(Child, OriginalMarker)> {
@@ -409,7 +412,7 @@ pub(super) const MARKER: &str = mvm_core::config::ORIGINAL_MAILBOX_CLAIM;
 
 /// Kept on disk through either launcher crash or an uncollected Child. The
 /// ordinary Drop of Child/FileLock is never proof that a subprocess exited.
-struct OriginalMarker {
+pub(super) struct OriginalMarker {
     path: PathBuf,
     original: std::fs::File,
     token: [u8; 32],
@@ -442,7 +445,7 @@ impl OriginalMarker {
         })
     }
 
-    fn collect(&mut self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+    pub(super) fn collect(&mut self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
         let Some(status) = child.try_wait()? else {
             return Ok(None);
         };
