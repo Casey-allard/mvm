@@ -454,7 +454,9 @@ fn serve_reader(
                     ReaderRequest::ReceiveObjectPairV1 { pair } => Some(pair),
                     _ => None,
                 };
-                if pair != reader.grant.durable_object_pair_sha256_v1 || pair != reader.boot.durable_object_pair_sha256_v1 {
+                if pair != reader.grant.durable_object_pair_sha256_v1
+                    || pair != reader.boot.durable_object_pair_sha256_v1
+                {
                     return Err(Refusal::NotAuthorized);
                 }
                 {
@@ -546,7 +548,9 @@ fn serve_reader(
     });
     let response = result.unwrap_or_else(|reason| ReaderResponse::Refused { reason });
     match &response {
-        ReaderResponse::Delivery { .. } | ReaderResponse::ObjectDeliveryV1 { .. } => mark("lease_created"),
+        ReaderResponse::Delivery { .. } | ReaderResponse::ObjectDeliveryV1 { .. } => {
+            mark("lease_created")
+        }
         ReaderResponse::Acknowledged { .. } => mark("ack_committed"),
         ReaderResponse::Refused { .. } => mark("reader_refused"),
         ReaderResponse::Empty => mark("reader_empty"),

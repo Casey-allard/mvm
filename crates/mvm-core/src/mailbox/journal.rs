@@ -399,6 +399,15 @@ pub struct JournalGuestAck<'a> {
     pub signed: &'a SignedMailboxDeliveryAck,
 }
 
+/// Original installed authority for one retained object delivery. A Reply also
+/// requires the pending identity of A's original authenticated Call.
+pub struct ObjectLeaseScope<'a> {
+    pub pair: &'a super::object_pair::ObjectPairV1<'a>,
+    pub destination: &'a super::reader::MailboxReaderBootBinding,
+    pub state: super::object_pair::PairAuthorityState<'a>,
+    pub original_call: Option<&'a super::object_pair::PendingObjectCall>,
+}
+
 /// A message whose signed lease was durably committed before payload release.
 pub struct LeasedMailboxMessage {
     message: ReceivedMailboxMessage,
@@ -417,19 +426,36 @@ impl LeasedMailboxMessage {
     }
 
     /// The header and bytes come from the same reopened, canonically verified journal entry.
-    pub fn into_reader_response(self, pair: Option<[u8; 32]>) -> Result<super::reader_wire::ReaderResponse, JournalError> {
+    pub fn into_reader_response(
+        self,
+        pair: Option<[u8; 32]>,
+    ) -> Result<super::reader_wire::ReaderResponse, JournalError> {
         use super::reader_wire::ReaderResponse;
         let header = self.message.opened.header();
         let payload = self.message.payload();
         match pair {
-            Some(pair) if self.lease.lease.object_projection_v1 ==
-                Some(super::reader::object_delivery_commitment(&pair, header, payload)?) =>
-                Ok(ReaderResponse::ObjectDeliveryV1 { header: Box::new(header.clone()),
-                    payload: payload.to_vec(), lease: Box::new(self.lease) }),
-            None if self.lease.lease.object_projection_v1.is_none() =>
-                Ok(ReaderResponse::Delivery { content_type: header.content_type.clone(),
-                    payload: payload.to_vec(), lease: Box::new(self.lease) }),
-            _ => Err(JournalError::Mailbox(super::MailboxError::DeliveryLeaseMismatch)),
+            Some(pair)
+                if self.lease.lease.object_projection_v1
+                    == Some(super::reader::object_delivery_commitment(
+                        &pair, header, payload,
+                    )?) =>
+            {
+                Ok(ReaderResponse::ObjectDeliveryV1 {
+                    header: Box::new(header.clone()),
+                    payload: payload.to_vec(),
+                    lease: Box::new(self.lease),
+                })
+            }
+            None if self.lease.lease.object_projection_v1.is_none() => {
+                Ok(ReaderResponse::Delivery {
+                    content_type: header.content_type.clone(),
+                    payload: payload.to_vec(),
+                    lease: Box::new(self.lease),
+                })
+            }
+            _ => Err(JournalError::Mailbox(
+                super::MailboxError::DeliveryLeaseMismatch,
+            )),
         }
     }
 
@@ -1118,6 +1144,29 @@ impl MailboxJournal {
         request: JournalGuestLease<'_>,
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
+        self.lease_next_inner(request, None, anchor)
+    }
+
+    /// Lease the next original record for the opted-in pair. The independent
+    /// Receive enrollment and possession checks are identical to ordinary delivery.
+    pub fn lease_next_object(
+        &mut self,
+        request: JournalGuestLease<'_>,
+        scope: ObjectLeaseScope<'_>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
+        self.lease_next_inner(request, Some(scope), anchor)
+    }
+
+    fn lease_next_inner(
+        &mut self,
+        request: JournalGuestLease<'_>,
+        paired: Option<ObjectLeaseScope<'_>>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
+        if request.plan.durable_object_pair_sha256_v1.is_some() != paired.is_some() {
+            return Err(JournalError::WrongAuthority);
+        }
         if self.poisoned {
             return Err(JournalError::Uncertain);
         }
@@ -1149,6 +1198,27 @@ impl MailboxJournal {
         };
         let identity = message.identity;
         let entry = self.seen.get(&identity).ok_or(JournalError::Corrupt)?;
+        if let Some(scope) = paired {
+            if scope.destination.boot != request.scope.current_boot
+                || scope.destination.durable_object_pair_sha256_v1
+                    != request.plan.durable_object_pair_sha256_v1
+                || &scope.destination.plan_id != request.scope.plan_id
+                || &scope.destination.plan_nonce != request.scope.plan_nonce
+            {
+                return Err(JournalError::WrongAuthority);
+            }
+            scope
+                .pair
+                .check_retained_envelope(
+                    scope.destination,
+                    &entry.envelope,
+                    request.scope.now_unix_ms,
+                    scope.state,
+                    request.receive.encryption_key,
+                    scope.original_call,
+                )
+                .map_err(|_| JournalError::WrongAuthority)?;
+        }
         let now = request.scope.now_unix_ms;
         if let Some(active) = &entry.lease
             && active.signed.lease.expires_at_unix_ms > now
@@ -1200,8 +1270,12 @@ impl MailboxJournal {
         }
         let signed = sign_delivery_lease(
             MailboxDeliveryLease {
-                object_projection_v1: request.plan.durable_object_pair_sha256_v1
-                    .map(|pair| super::reader::object_delivery_commitment(&pair, header, message.payload()))
+                object_projection_v1: request
+                    .plan
+                    .durable_object_pair_sha256_v1
+                    .map(|pair| {
+                        super::reader::object_delivery_commitment(&pair, header, message.payload())
+                    })
                     .transpose()?,
                 protocol_version: ProtocolVersion::V1,
                 signature_algorithm: SignatureAlgorithm::ED25519,

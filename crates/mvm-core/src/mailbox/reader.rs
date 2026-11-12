@@ -27,9 +27,13 @@ pub fn object_delivery_commitment(
     payload: &[u8],
 ) -> Result<[u8; 32], MailboxError> {
     use mvm_contract::protocol::mailbox::MailboxMessageKind;
-    if header.content_type.name() != "application/spiralcore-object" || header.content_type.version() != 1
-        || !matches!((header.kind, header.reply_to.is_some()),
-            (MailboxMessageKind::Call, true) | (MailboxMessageKind::Reply, false)) {
+    if header.content_type.name() != "application/spiralcore-object"
+        || header.content_type.version() != 1
+        || !matches!(
+            (header.kind, header.reply_to.is_some()),
+            (MailboxMessageKind::Call, true) | (MailboxMessageKind::Reply, false)
+        )
+    {
         return Err(MailboxError::UnsupportedContentType);
     }
     if payload.len() != header.plaintext_len as usize {
@@ -58,10 +62,18 @@ pub fn verify_object_delivery_projection(
     verify_delivery_lease_signature(signed, authority)?;
     let lease = &signed.lease;
     if lease.object_projection_v1 != Some(object_delivery_commitment(pair, header, payload)?)
-        || lease.address != (MailboxAddress { tenant: header.tenant, authorization_domain: header.authorization_domain,
-            mailbox: header.mailbox, recipient: header.recipient })
-        || lease.message_id != header.message_id || lease.sender != header.sender
-        || lease.sender_boot != header.sender_boot || lease.execution_epoch != header.execution_epoch {
+        || lease.address
+            != (MailboxAddress {
+                tenant: header.tenant,
+                authorization_domain: header.authorization_domain,
+                mailbox: header.mailbox,
+                recipient: header.recipient,
+            })
+        || lease.message_id != header.message_id
+        || lease.sender != header.sender
+        || lease.sender_boot != header.sender_boot
+        || lease.execution_epoch != header.execution_epoch
+    {
         return Err(MailboxError::DeliveryLeaseMismatch);
     }
     Ok(())

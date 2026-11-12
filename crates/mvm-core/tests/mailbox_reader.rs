@@ -424,6 +424,14 @@ fn lease_and_ack_signatures_bind_committed_ciphertext_and_consumer() {
         &authority,
     )
     .unwrap();
+    // A legacy Cast never acquires header projection or an object response.
+    assert!(
+        serde_json::to_value(&lease.lease)
+            .unwrap()
+            .get("object_projection_v1")
+            .is_none()
+    );
+    test_object_projection(&header, &lease, &authority);
     let authority_vk = authority.verifying_key();
     let context = ReaderDeliveryContext {
         plan: &plan,
@@ -584,4 +592,47 @@ fn lease_and_ack_signatures_bind_committed_ciphertext_and_consumer() {
         verify_ack(&ack, ConsumerSessionId::from_bytes([47; 32])).is_err(),
         "an inherited or stale reader session must not ACK this lease"
     );
+}
+
+fn test_object_projection(
+    original: &MailboxEnvelopeHeader,
+    legacy: &SignedMailboxDeliveryLease,
+    key: &SigningKey,
+) {
+    use mvm_contract::protocol::mailbox::ReplyRoute;
+    use mvm_core::mailbox::reader::{
+        object_delivery_commitment, verify_object_delivery_projection,
+    };
+    let pair = [0xe5; 32];
+    let mut header = original.clone();
+    header.kind = MailboxMessageKind::Call;
+    header.content_type = ContentType::parse("application/spiralcore-object", 1).unwrap();
+    header.reply_to = Some(ReplyRoute {
+        address: legacy.lease.address,
+        capability_id: CapabilityId::from_bytes([55; 32]),
+    });
+    let mut projected = legacy.lease.clone();
+    projected.object_projection_v1 =
+        Some(object_delivery_commitment(&pair, &header, b"hello").unwrap());
+    let signed = sign_delivery_lease(projected, key).unwrap();
+    let check = |pair: &[u8; 32],
+                 h: &MailboxEnvelopeHeader,
+                 data: &[u8],
+                 lease: &SignedMailboxDeliveryLease| {
+        verify_object_delivery_projection(pair, h, data, lease, &key.verifying_key())
+    };
+    check(&pair, &header, b"hello", &signed).unwrap();
+    assert!(check(&pair, &header, b"hello", legacy).is_err());
+    assert!(check(&pair, &header, b"hell!", &signed).is_err());
+    assert!(check(&[8; 32], &header, b"hello", &signed).is_err());
+    let mut changed = header.clone();
+    changed.correlation_id = CorrelationId::from_bytes([91; 32]);
+    assert!(check(&pair, &changed, b"hello", &signed).is_err());
+    changed = header.clone();
+    changed.reply_to.as_mut().unwrap().capability_id = CapabilityId::from_bytes([93; 32]);
+    assert!(check(&pair, &changed, b"hello", &signed).is_err());
+    let mut forged = signed.clone();
+    forged.lease.object_projection_v1 =
+        Some(object_delivery_commitment(&pair, &changed, b"hello").unwrap());
+    assert!(check(&pair, &changed, b"hello", &forged).is_err());
 }
