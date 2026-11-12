@@ -21,7 +21,7 @@ use mvm_agentd::mailbox_outbox::{
     peer_gone, wait_for_outbox,
 };
 use mvm_agentd::telemetry_capture::session::TimedStream;
-use mvm_contract::protocol::mailbox::MAILBOX_PORT;
+use mvm_contract::protocol::mailbox::{MAILBOX_ORDINAL_CMDLINE_TOKEN, MAILBOX_PORT};
 use mvm_core::mailbox::frame::Refusal;
 use mvm_core::mailbox::reader::MailboxReaderBootBinding;
 use zeroize::Zeroizing;
@@ -80,27 +80,50 @@ fn capture_ordinal_outbox(
         .map_err(|_| denied())
 }
 
-/// Retain the root-only ACK key before PID 1 drops to the workload UID.
-/// A missing or malformed key disables Receive; the existing Send path
-/// remains available, and warm children never inherit reader authority.
+fn boot_projection(
+    dir: &Path,
+    expected_ordinal: bool,
+) -> Result<Option<MailboxReaderBootBinding>, mvm_agentd::guest_mount::MountError> {
+    use mvm_agentd::guest_mount::MountError;
+    use mvm_core::mailbox::reader::MAILBOX_READER_BOOT_FILE;
+    let missing = |name: &str| {
+        dir.join(name)
+            .symlink_metadata()
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    };
+    if !expected_ordinal
+        && missing(MAILBOX_READER_BOOT_FILE)
+        && missing(MAILBOX_ACK_SIGNING_KEY_FILE)
+    {
+        return Ok(None);
+    }
+    let binding = MailboxReaderBootBinding::load(dir).map_err(|_| {
+        MountError::InvalidConfig("original mailbox boot identity unavailable".into())
+    })?;
+    let ordinal = binding
+        .outbound_journal_v1
+        .is_some_and(|direction| direction.sender_settlement.is_some());
+    if ordinal != expected_ordinal {
+        return Err(MountError::InvalidConfig(
+            "mailbox boot identity disagrees with the admitted sender profile".into(),
+        ));
+    }
+    Ok(Some(binding))
+}
+
+/// Capture the original mailbox identity before PID 1 drops to the workload UID.
 pub(crate) fn capture_ack_key_before_privilege_drop()
 -> Result<(), mvm_agentd::guest_mount::MountError> {
     let dir = Path::new(RUN_MVM_DIR);
-    let binding = match MailboxReaderBootBinding::load(dir) {
-        Ok(binding) => binding,
-        Err(error) => {
-            if dir
-                .join(mvm_core::mailbox::reader::MAILBOX_READER_BOOT_FILE)
-                .exists()
-            {
-                eprintln!("mvm-guest-agent: mailbox reader boot unavailable: {error}");
-            }
-            return Ok(());
-        }
+    let cmdline = std::fs::read_to_string("/proc/cmdline").map_err(|_| {
+        mvm_agentd::guest_mount::MountError::InvalidConfig(
+            "cannot read admitted guest command line".into(),
+        )
+    })?;
+    let ordinal = cmdline_asserts(&cmdline, MAILBOX_ORDINAL_CMDLINE_TOKEN);
+    let Some(binding) = boot_projection(dir, ordinal)? else {
+        return Ok(());
     };
-    let ordinal = binding
-        .outbound_journal_v1
-        .is_some_and(|d| d.sender_settlement.is_some());
     match load_ack_seed(&dir.join(MAILBOX_ACK_SIGNING_KEY_FILE), 0) {
         Ok(seed)
             if SigningKey::from_bytes(&seed).verifying_key().to_bytes()
@@ -110,7 +133,9 @@ pub(crate) fn capture_ack_key_before_privilege_drop()
                 capture_ordinal_outbox(&binding)?;
             }
             if ACK_SEED.set(seed).is_err() || READER_BOOT.set(binding).is_err() {
-                eprintln!("mvm-guest-agent: mailbox ACK identity already initialized");
+                return Err(mvm_agentd::guest_mount::MountError::InvalidConfig(
+                    "mailbox ACK identity already initialized".into(),
+                ));
             }
         }
         Ok(_) | Err(_) => {
@@ -454,6 +479,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn original_sender_projection_refuses_missing_or_malformed_identity_before_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(boot_projection(dir.path(), false).unwrap().is_none());
+        assert!(boot_projection(dir.path(), true).is_err());
+        std::fs::write(dir.path().join(MAILBOX_ACK_SIGNING_KEY_FILE), [3; 32]).unwrap();
+        assert!(boot_projection(dir.path(), false).is_err());
+        std::fs::write(
+            dir.path()
+                .join(mvm_core::mailbox::reader::MAILBOX_READER_BOOT_FILE),
+            b"{",
+        )
+        .unwrap();
+        for selected in [true, false] {
+            assert!(boot_projection(dir.path(), selected).is_err());
+        }
+    }
+    #[test]
     fn an_idle_guest_logs_a_bounded_number_of_refusals() {
         assert_eq!((0..1000).filter(|&n| logs_refusal(n)).count(), 3 + 10 - 1);
     }
@@ -590,6 +632,12 @@ mod tests {
             guest_identity_key: [54; 32],
             ack_public_key: [55; 32],
         };
+        boot.persist(dir.path()).unwrap();
+        assert_eq!(
+            boot_projection(dir.path(), false).unwrap().as_ref(),
+            Some(&boot)
+        );
+        assert!(boot_projection(dir.path(), true).is_err());
         let (mut guest, mut host) = std::os::unix::net::UnixStream::pair().expect("socket");
         let responder = std::thread::spawn(move || {
             let mut length = [0; 4];

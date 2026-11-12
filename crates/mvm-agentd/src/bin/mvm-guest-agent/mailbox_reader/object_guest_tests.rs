@@ -198,6 +198,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
         signed_enrollment,
         header,
         lease,
+        payload,
         ..
     } = selected_call(|_| {
         (
@@ -258,7 +259,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
                 ReaderResponse::Delivery {
                     lease: Box::new(lease.clone()),
                     content_type: header.content_type.clone(),
-                    payload: b"hello".to_vec(),
+                    payload: payload.clone(),
                 }
             } else {
                 ReaderResponse::ObjectDeliveryV1 {
@@ -267,7 +268,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
                     payload: if variant == 2 {
                         b"HELLO".to_vec()
                     } else {
-                        b"hello".to_vec()
+                        payload.clone()
                     },
                 }
             };

@@ -318,9 +318,8 @@ impl OrdinalOutbox {
         });
         self.publish(next)
     }
-    /// Internal observation only. The agent must reauthorize disclosure with
-    /// the original host on the current connection.
-    pub fn status(
+    #[cfg(test)]
+    fn status(
         &self,
         h: SenderOrdinalV1,
         now: i64,
@@ -345,14 +344,6 @@ impl OrdinalOutbox {
                 payload: p.payload.clone(),
             },
         })
-    }
-    pub fn pending(&self, now: i64) -> Result<Option<SenderRequestV1>, Refusal> {
-        self.check_live(now)?;
-        self.snapshot
-            .current
-            .as_ref()
-            .map(|p| self.request(p.handle, now))
-            .transpose()
     }
     pub fn record_receipt(
         &mut self,

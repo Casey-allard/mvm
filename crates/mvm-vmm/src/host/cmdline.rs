@@ -23,7 +23,7 @@ use mvm_core::vm_backend::VmStartConfig;
 use crate::host::boot_config::booted_with_universal_initramfs;
 use crate::host::boot_config::non_verity_overlay_ext4;
 use crate::host::egress_bridge::{
-    host_signer_pub_cmdline_token, mailbox_cmdline_token, profile_cmdline_token,
+    host_signer_pub_cmdline_token, mailbox_cmdline_tokens, profile_cmdline_token,
     require_grant_cmdline_token, seccomp_cmdline_token, telemetry_cmdline_token,
     verb_grant_cmdline_token,
 };
@@ -156,13 +156,15 @@ fn workload_cmdline_for_hostname(
     let egress = vsock_egress_cmdline_token(config, state_dir);
     let gpu = gpu_cmdline_token(config);
     let hostname = guest_hostname.and_then(hostname_cmdline_token);
+    let [mailbox, sender] = mailbox_cmdline_tokens(config);
     let grants: Vec<String> = [
         verb_grant_cmdline_token(&config.name),
         require_grant_cmdline_token(&config.name),
         host_signer_pub_cmdline_token(&config.name),
         telemetry_cmdline_token(&config.name),
         seccomp_cmdline_token(config),
-        mailbox_cmdline_token(config),
+        mailbox,
+        sender,
         profile_cmdline_token(config),
     ]
     .into_iter()
@@ -535,19 +537,21 @@ mod tests {
     /// token, and the seccomp tier is the same either way.
     #[test]
     fn workload_cmdline_asserts_a_mailbox_only_for_a_granted_plan() {
-        use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
+        use mvm_contract::protocol::mailbox::*;
         let dir = tempfile::tempdir().unwrap();
         let build = |grant: Option<MailboxGrant>| {
             let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
             plan.mailbox = grant;
+            let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+            let signed = mvm_core::plan::sign_plan(&plan, &key, "mailbox-test");
             let config = VmStartConfig {
                 name: "vm-test".to_string(),
-                plan_json: Some(serde_json::to_string(&plan).unwrap()),
+                plan_json: Some(serde_json::to_string(&signed).unwrap()),
                 ..Default::default()
             };
             workload_cmdline(&config, dir.path(), hvf_like_workload_bootargs).expect("cmdline")
         };
-        let granted = build(Some(MailboxGrant {
+        let mut grant = MailboxGrant {
             durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
@@ -556,7 +560,8 @@ mod tests {
             epoch: ExecutionEpoch::new(1).unwrap(),
             report: None,
             retention: None,
-        }));
+        };
+        let granted = build(Some(grant));
         let absent = build(None);
         let tokens = |c: &str| c.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
         assert!(tokens(&granted).contains(&"mvm.mailbox=1".to_string()));
@@ -569,6 +574,42 @@ mod tests {
             tokens(&absent),
             "the grant changes the cmdline by exactly one token"
         );
+        grant.outbound_journal_v1 = Some(MailboxJournalDirectionV1 {
+            sender_settlement: Some(SenderSettlementProfile::OrdinalV1),
+            source: PrincipalId::from_bytes([9; 32]),
+            destination_plan_sha256: [3; 32],
+            destination_plan_nonce: [4; 16],
+            destination_boot: BootId::from_bytes([5; 32]),
+            address: MailboxAddress {
+                tenant: TenantId::from_bytes([6; 32]),
+                authorization_domain: AuthorizationDomainId::from_bytes([7; 32]),
+                mailbox: MailboxId::from_bytes([8; 32]),
+                recipient: PrincipalId::from_bytes([10; 32]),
+            },
+            execution_epoch: grant.epoch,
+            policy_epoch: 1,
+            receipt_key: ed25519_dalek::SigningKey::from_bytes(&[12; 32])
+                .verifying_key()
+                .to_bytes(),
+            source_scope_grant_sha256: [13; 32],
+            send_grant_sha256: [14; 32],
+            receive_grant_sha256: [15; 32],
+            not_before_unix_ms: 1,
+            expires_at_unix_ms: 100,
+            max_payload_bytes: 128,
+        });
+        let selected = build(Some(grant));
+        let projected: Vec<_> = selected
+            .split_whitespace()
+            .filter(|token| token.starts_with("mvm.mailbox"))
+            .collect();
+        assert_eq!(projected, ["mvm.mailbox=1", MAILBOX_ORDINAL_CMDLINE_TOKEN]);
+        grant
+            .outbound_journal_v1
+            .as_mut()
+            .unwrap()
+            .sender_settlement = None;
+        assert_eq!(build(Some(grant)), granted);
     }
 
     /// The guest applies the admitted tier to every workload process, and the

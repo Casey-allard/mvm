@@ -57,7 +57,7 @@ builder protocols, raw channels and their availability restrictions.
 
 ### Original mailbox sender settlement
 
-A signed outbound journal direction can select `OrdinalV1` for its original sender. The application talks to `/run/mvm/mailbox/receive.sock` using the versioned application reader frame. The agent forwards the corresponding requests over the admitted mailbox vsock port 5257.
+A signed outbound journal direction can select `OrdinalV1` for its original sender. On cold boot the host projects that choice into the kernel command line as `mvm.mailbox.sender=ordinal-v1`. Before workload activation the agent checks it against the original mailbox identity and requires the matching ACK key. A missing or inconsistent ordinal identity refuses activation. The application talks to `/run/mvm/mailbox/receive.sock` using the versioned application reader frame. The agent forwards the corresponding requests over the admitted mailbox vsock port 5257.
 
 | Local request | Application contract |
 |---|---|

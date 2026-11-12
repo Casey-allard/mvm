@@ -16,6 +16,8 @@ use crate::plan::{Nonce, PlanId};
 /// shares a queue or credit with machine control (5252), `NetworkFlow` (5253),
 /// telemetry (5254), display (5255) or GPU (5256).
 pub const MAILBOX_PORT: u32 = 5257;
+/// Boot assertion for the original sender's signed ordinal settlement direction.
+pub const MAILBOX_ORDINAL_CMDLINE_TOKEN: &str = "mvm.mailbox.sender=ordinal-v1";
 /// Current mailbox protocol version.
 pub const MAILBOX_PROTOCOL_VERSION: u16 = 1;
 /// Receipt-only version for a locally fsynced, trusted-host acceptance.
