@@ -304,11 +304,8 @@ impl PairedJournalAdmission {
                     };
                     config.keys.outbound_source = Some(delegated);
                     let listener = OwnedListener::bind(&config.vm_state_dir)?;
-                    let (mut source, marker) =
-                        super::spawn_claimed(&guard.owner_dir, super::super::serving_command()?)?;
-                    let readiness = super::super::configure_serving(config, &mut source)
-                        .err()
-                        .map(|e| e.to_string());
+                    let (source, marker, readiness) =
+                        stop.spawn_helper(config, &guard.owner_dir)?;
                     Ok(OriginalJournalSourceHost {
                         source,
                         boot: boot.clone(),

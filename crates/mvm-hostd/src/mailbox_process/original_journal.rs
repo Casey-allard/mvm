@@ -160,10 +160,7 @@ impl OriginalJournalDestination {
             None
         };
         let current = &policy.context;
-        let (mut child, marker) = spawn_claimed(&guard.owner_dir, super::serving_command()?)?;
-        let readiness = super::configure_serving(config, &mut child)
-            .err()
-            .map(|e| e.to_string());
+        let (child, marker, readiness) = stop.spawn_helper(config, &guard.owner_dir)?;
         Ok(Self {
             child,
             readiness,

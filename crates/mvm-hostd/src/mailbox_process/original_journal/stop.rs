@@ -86,6 +86,33 @@ impl StopCustody {
             sdk_cleanup: None,
         })
     }
+    pub(super) fn spawn_helper(
+        &self,
+        config: &crate::mailbox_process::MailboxProcessConfig,
+        owner_dir: &std::path::Path,
+    ) -> Result<(Child, OriginalMarker, Option<String>)> {
+        let mut command = super::super::serving_command()?;
+        let original = self
+            .vmm
+            .as_ref()
+            .map(|(id, _)| super::super::lifetime::OriginalVmm::from_held(*id))
+            .transpose()?;
+        if original.is_some() {
+            command.arg(super::super::ORIGINAL_JOURNAL_V1);
+        }
+        let (mut child, marker) = super::spawn_claimed(owner_dir, command)?;
+        let readiness = match original {
+            Some(original_vmm_v1) => super::super::configure_serving(
+                &super::super::OriginalJournalStartup {
+                    config,
+                    original_vmm_v1,
+                },
+                &mut child,
+            ),
+            None => super::super::configure_serving(config, &mut child),
+        };
+        Ok((child, marker, readiness.err().map(|e| e.to_string())))
+    }
     pub(super) fn observe_helper(
         &self,
         marker: &mut OriginalMarker,
@@ -289,7 +316,14 @@ fn collect_after_vm(
         );
         *kernel_exit_observed = true;
     }
-    let natural = Instant::now() + Duration::from_millis(250);
+    // Allow one admitted in-flight exchange to unwind. An idle helper wakes
+    // on kernel exit during backoff or at its next first-byte poll. Reserve a
+    // short collection interval inside the caller's existing total deadline.
+    let now = Instant::now();
+    let remaining = until.saturating_duration_since(now);
+    let reserve = Duration::from_millis(250).min(remaining / 4);
+    let natural =
+        now + (remaining - reserve).min(crate::mailbox_service::durable::GUEST_EXCHANGE_TIMEOUT);
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);

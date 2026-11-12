@@ -213,7 +213,10 @@ fn read_and_ack(
 // fixture process supplies only lifetime, never a VMM or a guest workload.
 fn lifetime_fixture(name: &str) -> Result<std::process::Child> {
     let child = std::process::Command::new("sleep").arg("40").spawn()?;
-    std::fs::write(mvm_core::config::vm_state_dir(name).join("fc.pid"), child.id().to_string())?;
+    std::fs::write(
+        mvm_core::config::vm_state_dir(name).join("fc.pid"),
+        child.id().to_string(),
+    )?;
     Ok(child)
 }
 
@@ -393,11 +396,17 @@ fn run() -> Result<()> {
         if let Some(status) = a.try_collect()? {
             break status;
         }
-        ensure!(Instant::now() < until, "original A did not retire with its VMM");
+        ensure!(
+            Instant::now() < until,
+            "original A did not retire with its VMM"
+        );
         std::thread::sleep(Duration::from_millis(5));
     };
     ensure!(outcome.success() && b.lock().unwrap().try_collect()?.is_none());
-    eprintln!("ORIGINAL_A_UNASSISTED_EXIT_NS={}", before.elapsed().as_nanos());
+    eprintln!(
+        "ORIGINAL_A_UNASSISTED_EXIT_NS={}",
+        before.elapsed().as_nanos()
+    );
     ensure!(b_vm.try_wait()?.is_none());
     let before = Instant::now();
     b_vm.kill()?;
@@ -408,13 +417,23 @@ fn run() -> Result<()> {
             ensure!(status.success());
             break;
         }
-        ensure!(Instant::now() < until, "original B did not retire with its VMM");
+        ensure!(
+            Instant::now() < until,
+            "original B did not retire with its VMM"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
-    eprintln!("ORIGINAL_B_UNASSISTED_EXIT_NS={}", before.elapsed().as_nanos());
+    eprintln!(
+        "ORIGINAL_B_UNASSISTED_EXIT_NS={}",
+        before.elapsed().as_nanos()
+    );
     for name in ["journal-a", "journal-b"] {
         ensure!(mvm_core::config::vm_state_dir(name).is_dir());
-        ensure!(mvm_core::config::vm_mailbox_original_owner_at(&keys,name).join(super::MARKER).exists());
+        ensure!(
+            mvm_core::config::vm_mailbox_original_owner_at(&keys, name)
+                .join(super::MARKER)
+                .exists()
+        );
     }
     Ok(())
 }

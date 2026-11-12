@@ -38,7 +38,7 @@ use super::{
 };
 
 const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
-const GUEST_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
+pub(crate) const GUEST_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_EXPIRY_RECORDS_PER_REQUEST: usize = 8;
 
 pub(crate) struct GuestDeadline<'a> {
