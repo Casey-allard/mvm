@@ -561,6 +561,7 @@ fn serve_reader(
         // A slot report belongs to the guest-local interface, not this host stream.
         ReaderResponse::OutboundJournalAvailableV1 { .. }
         | ReaderResponse::ObjectSealAcceptedV1 { .. }
+        | ReaderResponse::ObjectCallAuthorityV1 { .. }
         | ReaderResponse::ObjectRoleV1 { .. }
         | ReaderResponse::ObjectPendingV1 { .. }
         | ReaderResponse::ObjectAcceptedV1 { .. }
