@@ -197,6 +197,28 @@ impl OriginalJournalDestination {
         authenticated_connect(&mut self.child, &self.socket, deadline)
     }
 
+    /// Only the retained helper for the opposite boot and exact inbound policy
+    /// may see the source credential. Legacy Cast and own-sender helpers refuse.
+    pub(crate) fn connect_object_recipient(
+        &mut self,
+        role: &mvm_core::mailbox::object_pair::role::ObjectRoleV1,
+        deadline: Instant,
+    ) -> Result<UnixStream> {
+        let grant = &role.outbound().grant;
+        ensure!(
+            self.boot == *role.peer()
+                && self.boot.durable_object_pair_sha256_v1.is_some()
+                && self.address == grant.address
+                && self.policy_epoch == grant.policy_epoch
+                && self.issuer == grant.issuer
+                && self.inbound.expected_sender == grant.subject
+                && self.sender_key.as_bytes() == grant.subject.as_bytes()
+                && grant.operations.allows(self.inbound.required_operation),
+            "original destination helper does not own the selected object direction"
+        );
+        self.connect(deadline)
+    }
+
     /// Observe terminal status only by collecting the original Child.
     pub fn try_collect(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.stop.observe_helper(&mut self.marker, &mut self.child)

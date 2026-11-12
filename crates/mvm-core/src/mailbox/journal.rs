@@ -426,6 +426,42 @@ pub struct ObjectLeaseScope<'a> {
     pub original_call: Option<&'a super::object_pair::PendingObjectCall>,
 }
 
+impl ObjectLeaseScope<'_> {
+    fn operation(&self) -> MailboxOperation {
+        if self.original_call.is_some() {
+            MailboxOperation::Reply
+        } else {
+            MailboxOperation::Send
+        }
+    }
+    fn check_original(
+        &self,
+        scope: &MailboxGuestReaderScope<'_>,
+        entry: &Seen,
+        request: &JournalReceive<'_>,
+    ) -> Result<(), JournalError> {
+        if &entry.capability != self.pair.retained_capability(self.original_call)
+            || self.destination.boot != scope.current_boot
+            || self.destination.durable_object_pair_sha256_v1
+                != scope.plan.durable_object_pair_sha256_v1
+            || &self.destination.plan_id != scope.plan_id
+            || &self.destination.plan_nonce != scope.plan_nonce
+        {
+            return Err(JournalError::WrongAuthority);
+        }
+        self.pair
+            .check_retained_envelope(
+                self.destination,
+                &entry.envelope,
+                scope.now_unix_ms,
+                self.state,
+                request.encryption_key,
+                self.original_call,
+            )
+            .map_err(|_| JournalError::WrongAuthority)
+    }
+}
+
 /// A message whose signed lease was durably committed before payload release.
 pub struct LeasedMailboxMessage {
     message: ReceivedMailboxMessage,
@@ -1135,6 +1171,13 @@ impl MailboxJournal {
         &self,
         request: JournalReceive<'_>,
     ) -> Result<Option<ReceivedMailboxMessage>, JournalError> {
+        self.receive_next_for(request, MailboxOperation::Send)
+    }
+    fn receive_next_for(
+        &self,
+        request: JournalReceive<'_>,
+        original_operation: MailboxOperation,
+    ) -> Result<Option<ReceivedMailboxMessage>, JournalError> {
         if self.poisoned {
             return Err(JournalError::Uncertain);
         }
@@ -1146,7 +1189,7 @@ impl MailboxJournal {
             {
                 continue;
             }
-            let opened = self.open_for_reader(*identity, entry, &request)?;
+            let opened = self.open_for_reader(*identity, entry, &request, original_operation)?;
             return Ok(Some(ReceivedMailboxMessage {
                 identity: *identity,
                 opened,
@@ -1247,31 +1290,19 @@ impl MailboxJournal {
             request.possession_signature,
             &key,
         )?;
-        let Some(message) = self.receive_next(request.receive)? else {
+        let Some(message) = self.receive_next_for(
+            request.receive,
+            paired
+                .as_ref()
+                .map_or(MailboxOperation::Send, ObjectLeaseScope::operation),
+        )?
+        else {
             return Ok(None);
         };
         let identity = message.identity;
         let entry = self.seen.get(&identity).ok_or(JournalError::Corrupt)?;
         if let Some(scope) = paired {
-            if scope.destination.boot != request.scope.current_boot
-                || scope.destination.durable_object_pair_sha256_v1
-                    != request.plan.durable_object_pair_sha256_v1
-                || &scope.destination.plan_id != request.scope.plan_id
-                || &scope.destination.plan_nonce != request.scope.plan_nonce
-            {
-                return Err(JournalError::WrongAuthority);
-            }
-            scope
-                .pair
-                .check_retained_envelope(
-                    scope.destination,
-                    &entry.envelope,
-                    request.scope.now_unix_ms,
-                    scope.state,
-                    request.receive.encryption_key,
-                    scope.original_call,
-                )
-                .map_err(|_| JournalError::WrongAuthority)?;
+            scope.check_original(&request.scope, entry, &request.receive)?;
         }
         let now = request.scope.now_unix_ms;
         if let Some(active) = &entry.lease
@@ -1408,7 +1439,7 @@ impl MailboxJournal {
         if entry.expired_at_unix_ms.is_some() {
             return Err(JournalError::Mailbox(MailboxError::Expired));
         }
-        let _opened = self.open_for_reader(identity, entry, &request)?;
+        let _opened = self.open_for_reader(identity, entry, &request, MailboxOperation::Send)?;
         if entry.lease.is_some() {
             return Err(JournalError::GuestAckRequired);
         }
@@ -1436,6 +1467,27 @@ impl MailboxJournal {
         request: JournalGuestAck<'_>,
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<JournalTip, JournalError> {
+        self.acknowledge_signed_inner(request, None, anchor)
+    }
+    /// Record the canonical guest signature only under the same selected
+    /// original Call/Reply route and still-current independent Receive authority.
+    pub fn acknowledge_signed_object(
+        &mut self,
+        request: JournalGuestAck<'_>,
+        scope: ObjectLeaseScope<'_>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<JournalTip, JournalError> {
+        self.acknowledge_signed_inner(request, Some(scope), anchor)
+    }
+    fn acknowledge_signed_inner(
+        &mut self,
+        request: JournalGuestAck<'_>,
+        paired: Option<ObjectLeaseScope<'_>>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<JournalTip, JournalError> {
+        if request.plan.durable_object_pair_sha256_v1.is_some() != paired.is_some() {
+            return Err(JournalError::WrongAuthority);
+        }
         if self.poisoned {
             return Err(JournalError::Uncertain);
         }
@@ -1474,7 +1526,13 @@ impl MailboxJournal {
         {
             return Err(JournalError::Mailbox(MailboxError::CapabilityRevoked));
         }
-        let opened = self.open_for_reader(identity, entry, &request.receive)?;
+        let operation = paired
+            .as_ref()
+            .map_or(MailboxOperation::Send, ObjectLeaseScope::operation);
+        if let Some(scope) = paired {
+            scope.check_original(&request.scope, entry, &request.receive)?;
+        }
+        let opened = self.open_for_reader(identity, entry, &request.receive, operation)?;
         let guest_key = VerifyingKey::from_bytes(&request.enrollment.enrollment.ack_public_key)
             .map_err(|_| JournalError::Mailbox(MailboxError::ReaderKeyInvalid))?;
         verify_delivery_ack(
@@ -1519,6 +1577,7 @@ impl MailboxJournal {
         identity: ReplayIdentity,
         entry: &Seen,
         request: &JournalReceive<'_>,
+        original_operation: MailboxOperation,
     ) -> Result<super::OpenedMailboxMessage, JournalError> {
         if request.context.required_operation != MailboxOperation::Receive
             || request.context.expected_tenant != self.address.tenant
@@ -1531,7 +1590,7 @@ impl MailboxJournal {
         let mut send_context = request.context.clone();
         send_context.acting_principal = entry.capability.grant.subject;
         send_context.expected_capability_issuer = entry.capability.grant.issuer;
-        send_context.required_operation = MailboxOperation::Send;
+        send_context.required_operation = original_operation;
         let opened = open_authenticated_envelope(
             &entry.envelope,
             &entry.capability,

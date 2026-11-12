@@ -386,17 +386,27 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
         correlation_id: corr,
         payload: callbody.to_vec(),
     };
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_start = std::time::Instant::now();
+    let (ordinal, original) = crate::mailbox_service::object_intent_slot_tests::publish_then_reopen(
+        source_dir.path(),
+        mvm_core::mailbox::reader_wire::original_object_intent_digest(&sub).unwrap(),
+        &mvm_core::mailbox::frame::encode_frame(call.capability(), call.envelope()).unwrap(),
+    );
+    let (restored_grant, restored_envelope) =
+        mvm_core::mailbox::frame::decode_frame(&original).unwrap();
     let restored = material
         .reopen(
             Caller,
-            call.capability(),
-            call.envelope().clone(),
-            seq,
+            &restored_grant,
+            restored_envelope,
+            ordinal,
             &sub,
             None,
             f.now,
         )
         .unwrap();
+    let source_time = source_start.elapsed();
     assert_eq!(restored.envelope(), call.envelope());
     let incorrect = ObjectSubmissionV1::Call {
         message_id: msg,
@@ -454,19 +464,61 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
         bg.retention.unwrap(),
     )
     .unwrap();
-    let receipt = journal
-        .admit_local(
-            JournalAdmission {
-                envelope: call.envelope(),
-                capability: call.capability(),
-                context: &context,
-                encryption_key: &material.callee.inbound_key,
-                sender_key: &sender,
-                signer: &signer,
-            },
-            &anchor,
-        )
-        .unwrap();
+    // Run the same immutable source ciphertext twice through a real local socket.
+    // B admits from the received frame, not from the sender's in-memory object.
+    let mut exchange = || {
+        use mvm_core::mailbox::frame::{decode_frame, send_local_receipted_frame};
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let (mut source, mut destination) = UnixStream::pair().unwrap();
+        let start = std::time::Instant::now();
+        let (received, sent, response) = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let body = crate::mailbox_service::read_frame(65536, &mut destination).unwrap();
+                let (capability, envelope) = decode_frame(&body).unwrap();
+                assert_eq!(envelope, *call.envelope());
+                let receipt = journal
+                    .admit_local(
+                        JournalAdmission {
+                            envelope: &envelope,
+                            capability: &capability,
+                            context: &context,
+                            encryption_key: &material.callee.inbound_key,
+                            sender_key: &sender,
+                            signer: &signer,
+                        },
+                        &anchor,
+                    )
+                    .unwrap();
+                let verdict =
+                    serde_json::to_vec(&Ok::<_, crate::mailbox_service::Refusal>(receipt)).unwrap();
+                destination.write_all(&verdict).unwrap();
+                destination.shutdown(std::net::Shutdown::Write).unwrap();
+                (body.len() + 4, verdict.len())
+            });
+            let response = send_local_receipted_frame(
+                &mut source,
+                restored.capability(),
+                restored.envelope(),
+                restored.header(),
+                &signer.verifying_key(),
+            )
+            .unwrap();
+            let (received, sent) = handle.join().unwrap();
+            (received, sent, response)
+        });
+        println!(
+            "original_object_store source_reopen_ns={} socket_forward_bytes={} socket_return_bytes={} through_signed_receipt_ns={}",
+            source_time.as_nanos(),
+            received,
+            sent,
+            start.elapsed().as_nanos()
+        );
+        response
+    };
+    let receipt = exchange();
+    let retry = exchange();
+    assert_eq!(receipt, retry);
     material.verify_accepted(Caller, &call, &receipt).unwrap();
     let a_alt_state = tempfile::tempdir().unwrap();
     a.boot.persist(a_alt_state.path()).unwrap();
@@ -586,6 +638,7 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
         )
         .unwrap()
         .unwrap();
+    assert_eq!(leased.payload(), callbody, "destination journal readback");
     let signed = leased.lease().clone();
     let current = journal.original_object_call(&signed, f.now).unwrap();
     let reply_id = MessageId::from_bytes([78; 32]);

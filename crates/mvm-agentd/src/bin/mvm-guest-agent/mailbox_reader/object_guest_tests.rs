@@ -237,3 +237,237 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
         });
     }
 }
+
+fn signed_source(now: i64) -> (SignedObjectRoleV1, SigningKey, SigningKey) {
+    use mvm_core::mailbox::object_pair::{ObjectPairGrants, role::*};
+    let (b_key, guest, _, _, _, mut forward, _) = fixture(now);
+    let a_key = SigningKey::from_bytes(&[21; 32]);
+    forward.issuer = PrincipalId::from_bytes(b_key.verifying_key().to_bytes());
+    forward.operations = CapabilityOperations::from_operations(&[MailboxOperation::Send]);
+    let mut reverse = forward.clone();
+    reverse.issuer = PrincipalId::from_bytes(a_key.verifying_key().to_bytes());
+    reverse.subject = forward.address.recipient;
+    reverse.address.recipient = forward.subject;
+    reverse.address.mailbox = MailboxId::from_bytes([31; 32]);
+    reverse.capability_id = CapabilityId::from_bytes([32; 32]);
+    reverse.operations = CapabilityOperations::from_operations(&[MailboxOperation::Reply]);
+    reverse.message_kinds = vec![MailboxMessageKind::Reply];
+    let call = sign_capability(forward, &b_key).unwrap();
+    let reply = sign_capability(reverse, &a_key).unwrap();
+    let a = Nonce::from_bytes([17; 16]);
+    let b = Nonce::from_bytes([18; 16]);
+    let pair = ObjectPairGrants {
+        call: &call,
+        reply: &reply,
+    }
+    .commitment(&a, &b)
+    .unwrap();
+    let boot = |n: u8, plan_nonce, cap: &SignedMailboxCapability| MailboxReaderBootBinding {
+        durable_object_pair_sha256_v1: Some(pair),
+        outbound_journal_v1: None,
+        plan_id: PlanId(format!("sha256:{}", format!("{n:02x}").repeat(32))),
+        plan_nonce,
+        mailbox: cap.grant.address.mailbox,
+        authority_key: *cap.grant.issuer.as_bytes(),
+        execution_epoch: cap.grant.minimum_execution_epoch,
+        boot: BootId::from_bytes([n; 32]),
+        guest_identity_key: [n; 32],
+        ack_public_key: guest.verifying_key().to_bytes(),
+    };
+    let caller = boot(50, a, &reply);
+    let callee = boot(51, b, &call);
+    let role = SignedObjectRoleV1::issue(
+        ObjectRoleV1 {
+            role: ObjectParticipantRole::Caller,
+            caller,
+            callee,
+            call,
+            reply,
+            not_before_unix_ms: now - 2000,
+            expires_at_unix_ms: now + 15000,
+        },
+        &a_key,
+        now,
+    )
+    .unwrap();
+    (role, a_key, b_key)
+}
+
+struct Counted {
+    stream: UnixStream,
+    read: u64,
+    wrote: u64,
+}
+impl Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.stream.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+impl Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.stream.write(buf)?;
+        self.wrote += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+#[test]
+fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers() {
+    use mvm_core::mailbox::{reader_wire::ObjectSubmissionV1, sign_receipt};
+    let now = now_unix_ms().unwrap();
+    let (role, a, b) = signed_source(now);
+    let dir = tempfile::tempdir().unwrap();
+    let original = role.role.caller.clone();
+    let pair = original.durable_object_pair_sha256_v1.unwrap();
+    let new_reader = || {
+        Arc::new(GuestReader {
+            boot: original.clone(),
+            ack_seed: Box::leak(Box::new(Zeroizing::new([8; 32]))),
+            active: Mutex::new(None),
+            role: Some(role.clone()),
+            settlement: Default::default(),
+            outbox: dir.path().to_owned(),
+        })
+    };
+    let reader = new_reader();
+    let message_id = MessageId::from_bytes([65; 32]);
+    let submission = ObjectSubmissionV1::Call {
+        message_id,
+        correlation_id: CorrelationId::from_bytes([66; 32]),
+        payload: b"a\0b\0".to_vec(),
+    };
+    let operation = ApplicationReaderRequest::StageObjectV1 {
+        pair,
+        submission: Box::new(submission.clone()),
+    };
+    let local = |state: &Arc<GuestReader>, op: &ApplicationReaderRequest| {
+        let (mut application, mut service) = UnixStream::pair().unwrap();
+        write_application_request(&mut application, op).unwrap();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        application_request(&mut service, &tx, state)
+    };
+    assert_eq!(
+        local(&reader, &operation),
+        Ok(ReaderResponse::ObjectStagedV1 { pair, message_id })
+    );
+    let body = DestinationReceipt {
+        protocol_version: ProtocolVersion::V2,
+        signature_algorithm: SignatureAlgorithm::ED25519,
+        delivery_id: DeliveryId::from_bytes([67; 32]),
+        message_id,
+        address: role.role.call.grant.address,
+        execution_epoch: original.execution_epoch,
+        outcome: DeliveryOutcome::AcceptedLocalDurable,
+        observed_at_unix_ms: now,
+        ciphertext_commitment: [68; 32],
+    };
+    let original_seal = mvm_core::mailbox::reader_wire::OriginalObjectSealV1 {
+        pair,
+        sender_boot: original.boot,
+        intent_sha256: mvm_core::mailbox::reader_wire::original_object_intent_digest(&submission)
+            .unwrap(),
+        delivery_id: DeliveryId::from_bytes([67; 32]),
+        ciphertext_commitment: [68; 32],
+    };
+    let host_reply = |r| ReaderResponse::ObjectSealAcceptedV1 {
+        original: original_seal.clone(),
+        receipt: Box::new(r),
+    };
+    let valid = host_reply(sign_receipt(body.clone(), &b).unwrap());
+    let mut other_seal = body.clone();
+    other_seal.ciphertext_commitment = [72; 32];
+    other_seal.delivery_id = DeliveryId::from_bytes([73; 32]);
+    let other = host_reply(sign_receipt(other_seal, &b).unwrap());
+    let accepted = ReaderResponse::ObjectAcceptedV1 {
+        receipt: Box::new(sign_receipt(body.clone(), &b).unwrap()),
+    };
+    let status = ApplicationReaderRequest::ObjectSubmissionStatusV1 { pair, message_id };
+    let attempt = |name: &str, reader: &Arc<GuestReader>, response: Option<&ReaderResponse>| {
+        std::thread::scope(|s| {
+            let (mut app, mut svc) = UnixStream::pair().unwrap();
+            let (tx, rx) = mpsc::sync_channel(1);
+            let client = s.spawn(move || application_request(&mut svc, &tx, reader));
+            write_application_request(&mut app, &status).unwrap();
+            let pending = rx.recv_timeout(LOCAL_TIMEOUT).unwrap();
+            let (mut host, guest) = UnixStream::pair().unwrap();
+            let start = Instant::now();
+            let guest = s.spawn(move || {
+                let mut counted = Counted {
+                    stream: guest,
+                    read: 0,
+                    wrote: 0,
+                };
+                exchange(&mut counted, pending).unwrap();
+                (counted.wrote, counted.read)
+            });
+            assert_eq!(
+                read_request(&mut host).unwrap(),
+                ReaderRequest::SubmitObjectV1 {
+                    pair,
+                    submission: Box::new(submission.clone())
+                }
+            );
+            if let Some(r) = response {
+                write_response(&mut host, r).unwrap();
+            }
+            drop(host);
+            let (to_host, to_guest) = guest.join().unwrap();
+            let reply = client.join().unwrap().unwrap();
+            eprintln!(
+                "OBJECT_SUBMISSION sample={name} source_to_host={to_host} host_to_source={to_guest} elapsed_ns={}",
+                start.elapsed().as_nanos()
+            );
+            reply
+        })
+    };
+    assert_eq!(
+        attempt("lost", &reader, None),
+        ReaderResponse::ObjectPendingV1 { pair, message_id }
+    );
+    let wrong = host_reply(sign_receipt(body, &a).unwrap());
+    assert_eq!(
+        attempt("different_seal", &reader, Some(&other)),
+        ReaderResponse::Refused {
+            reason: Refusal::NotAuthorized
+        }
+    );
+    assert_eq!(
+        attempt("unbound", &reader, Some(&accepted)),
+        ReaderResponse::Refused {
+            reason: Refusal::NotAuthorized
+        }
+    );
+    assert_eq!(
+        attempt("wrong_signer", &reader, Some(&wrong)),
+        ReaderResponse::Refused {
+            reason: Refusal::NotAuthorized
+        }
+    );
+    let mut next = submission.clone();
+    if let ObjectSubmissionV1::Call { message_id, .. } = &mut next {
+        *message_id = MessageId::from_bytes([69; 32])
+    }
+    let next = ApplicationReaderRequest::StageObjectV1 {
+        pair,
+        submission: Box::new(next),
+    };
+    assert_eq!(local(&reader, &next), Err(Refusal::QueueFull(1)));
+    assert_eq!(attempt("accepted", &reader, Some(&valid)), accepted);
+    assert_eq!(local(&reader, &status), Ok(accepted.clone()));
+    drop(reader);
+    let reopened = new_reader();
+    assert_eq!(local(&reopened, &next), Err(Refusal::QueueFull(1)));
+    assert_eq!(attempt("reopened", &reopened, Some(&valid)), accepted);
+    assert_eq!(
+        local(&reopened, &next),
+        Ok(ReaderResponse::ObjectStagedV1 {
+            pair,
+            message_id: MessageId::from_bytes([69; 32])
+        })
+    );
+}
