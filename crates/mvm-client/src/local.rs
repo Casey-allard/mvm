@@ -2768,6 +2768,37 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "test-support")]
+    async fn ordinary_stop_remove_and_cleanup_cannot_clear_an_original_journal() {
+        let _home = IsolatedDataDir::new();
+        let name = "retained-mailbox";
+        let id = MachineId(name.into());
+        let owner =
+            mvm_core::config::vm_mailbox_original_owner_at(&mvm_core::config::mvm_keys_dir(), name);
+        mvm_core::private_fs::ensure_private_dir(owner.parent().unwrap()).unwrap();
+        mvm_core::private_fs::ensure_private_dir(&owner).unwrap();
+        let marker = owner.join(mvm_core::config::ORIGINAL_MAILBOX_CLAIM);
+        mvm_core::atomic_io::write_private(&marker, &[7; 32]).unwrap();
+        let state = vm_state_dir(name);
+        std::fs::create_dir_all(&state).unwrap();
+        let retained = state.join("readback");
+        std::fs::write(&retained, b"original").unwrap();
+        let client = LocalBackend::with_hypervisor("mock");
+        for result in [
+            client.stop_machine(&id).await,
+            client.remove_machine(&id).await,
+            client.cleanup_transient(name),
+        ] {
+            assert!(
+                matches!(result, Err(MvmError::Conflict { .. })),
+                "{result:?}"
+            );
+            assert_eq!(std::fs::read(&retained).unwrap(), b"original");
+            assert_eq!(std::fs::read(&marker).unwrap(), [7; 32]);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-support")]
     async fn stopping_a_machine_with_no_state_creates_no_lifecycle_lock() {
         let _data = IsolatedDataDir::new();
         let be = LocalBackend::with_hypervisor("mock");
