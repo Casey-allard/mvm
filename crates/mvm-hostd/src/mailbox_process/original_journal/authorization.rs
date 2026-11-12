@@ -251,6 +251,41 @@ impl OriginalJournalDestination {
     }
 }
 
+/// Borrowed only during the pre-sign / pre-dispatch decision. The underlying
+/// original process cannot be replaced or reconstructed from a public ID.
+pub struct PairedJournalAdmission {
+    pub(super) original: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
+    pub(super) grants: std::sync::Arc<JournalCredentials>,
+    pub(super) deadline: Instant,
+}
+
+impl std::fmt::Debug for PairedJournalAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PairedJournalAdmission")
+    }
+}
+
+impl PairedJournalAdmission {
+    pub fn new(
+        original: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
+        grants: std::sync::Arc<JournalCredentials>,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            original,
+            grants,
+            deadline,
+        }
+    }
+
+    pub(crate) fn verify(&self, plan: &ExecutionPlan) -> Result<()> {
+        self.original
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("original destination is busy"))?
+            .check_proposal(plan, &self.grants, self.deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,40 +409,5 @@ mod tests {
         let mut excess = d;
         excess.max_payload_bytes = grants.destination_send.grant.max_payload_bytes + 1;
         assert!(check(&a_policy.context, &inbound, &grants, &excess).is_err());
-    }
-}
-
-/// Borrowed only during the pre-sign / pre-dispatch decision. The underlying
-/// original process cannot be replaced or reconstructed from a public ID.
-pub struct PairedJournalAdmission {
-    pub(super) original: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
-    pub(super) grants: std::sync::Arc<JournalCredentials>,
-    pub(super) deadline: Instant,
-}
-
-impl std::fmt::Debug for PairedJournalAdmission {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PairedJournalAdmission")
-    }
-}
-
-impl PairedJournalAdmission {
-    pub fn new(
-        original: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
-        grants: std::sync::Arc<JournalCredentials>,
-        deadline: Instant,
-    ) -> Self {
-        Self {
-            original,
-            grants,
-            deadline,
-        }
-    }
-
-    pub(crate) fn verify(&self, plan: &ExecutionPlan) -> Result<()> {
-        self.original
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("original destination is busy"))?
-            .check_proposal(plan, &self.grants, self.deadline)
     }
 }

@@ -147,13 +147,13 @@ fn main() -> ExitCode {
                 }
             }
             Behavior::ExitWithPipeHolder => {
-                // An ordinary same-group helper inherits stdout. Its fixed lifetime
-                // bounds this fixture even if supervisor cleanup fails.
+                // The group leader must exit while its descendant holds stdout.
+                // The OS adopts the child; its four-second lifetime bounds the fixture.
                 let _holder = std::process::Command::new("/bin/sleep")
                     .arg("4")
                     .spawn()
                     .unwrap();
-                return ExitCode::from(0);
+                std::process::exit(0);
             }
             Behavior::CrashAfter(after) => {
                 if call_no > *after {

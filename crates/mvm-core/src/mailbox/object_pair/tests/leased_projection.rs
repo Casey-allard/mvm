@@ -123,7 +123,7 @@ fn lease_and_reopen(reply: bool, resolve_reply: bool) {
             FileJournalAnchor::open(&dir.path().join("anchor"), address, [29; 32]).unwrap();
         let journal = MailboxJournal::open_local_with_custody(
             &dir.path().join("journal"),
-            history.0.clone(),
+            history.0,
             auth.verifying_key(),
             JournalLimits {
                 max_records: 8,
