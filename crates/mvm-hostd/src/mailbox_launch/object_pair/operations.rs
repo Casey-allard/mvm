@@ -174,6 +174,81 @@ impl InstalledObjectPair<'_> {
     }
 }
 
+impl InstalledObjectPair<'_> {
+    /// Called only on the committed callee's original reader connection.
+    /// A fresh authority sample precedes the exact journal owner's lease lookup.
+    pub fn authorize_object_call(
+        &self,
+        pair: [u8; 32],
+        boot: BootId,
+        journal: &mvm_core::mailbox::journal::MailboxJournal,
+        lease: &SignedMailboxDeliveryLease,
+    ) -> Result<&SignedObjectRoleV1> {
+        let now = self.check_current()?;
+        let local = &self.material.callee;
+        ensure!(
+            pair == self.prepared.stamp && boot == local.reader.boot.boot,
+            "wrong destination generation"
+        );
+        let d = local.public_role.verify(&local.reader.boot, now)?;
+        let row = journal.original_object_call(lease, now)?;
+        verify_active_call(local, d, &row, now)?;
+        Ok(&local.public_role)
+    }
+}
+
+fn verify_active_call(
+    local: &EndpointMaterial,
+    d: &mvm_core::mailbox::object_pair::role::ObjectRoleV1,
+    call: &OriginalObjectCallLease<'_>,
+    now: i64,
+) -> Result<MailboxEnvelopeHeader> {
+    let g = &d.reply.grant;
+    ensure!(
+        call.capability() == &d.call,
+        "retained row has different Call grant"
+    );
+    let opened = open_original(
+        &d.call,
+        MailboxOperation::Send,
+        call.envelope(),
+        &local.inbound_key,
+        now,
+    )?;
+    let h = opened.header();
+    let lease = &call.lease().lease;
+    verify_object_delivery_projection(
+        &d.local()
+            .durable_object_pair_sha256_v1
+            .context("missing pair selection")?,
+        h,
+        opened.payload(),
+        call.lease(),
+        &ed25519_dalek::VerifyingKey::from_bytes(&local.reader.grant.authority_key)?,
+    )?;
+    ensure!(
+        call.envelope().ciphertext_commitment == lease.ciphertext_commitment
+            && call.envelope().routing.delivery_id == lease.delivery_id
+            && lease.consumer == local.reader.capability.grant.subject
+            && lease.receive_capability_id == local.reader.capability.grant.capability_id
+            && lease.consumer_session == local.reader.enrollment.enrollment.consumer_session
+            && lease.policy_epoch == g.policy_epoch
+            && (lease.issued_at_unix_ms..lease.expires_at_unix_ms).contains(&now)
+            && h.kind == MailboxMessageKind::Call
+            && h.sender_boot == d.caller.boot
+            && h.capability_id == d.call.grant.capability_id
+            && h.sender == d.call.grant.subject
+            && h.reply_to
+                == Some(ReplyRoute {
+                    address: g.address,
+                    capability_id: g.capability_id
+                })
+            && (h.issued_at_unix_ms..h.expires_at_unix_ms).contains(&now),
+        "Reply requires the authenticated retained Call and original current lease"
+    );
+    Ok(h.clone())
+}
+
 impl PairMaterial {
     pub(super) fn seal_turn(
         &self,
@@ -274,50 +349,10 @@ impl PairMaterial {
                 d.expires_at_unix_ms,
             ),
             (ObjectParticipantRole::Callee, Some(call)) => {
+                let h = verify_active_call(local, d, call, now)?;
                 ensure!(
-                    call.capability() == &d.call,
-                    "retained row has different Call grant"
-                );
-                let opened = open_original(
-                    &d.call,
-                    MailboxOperation::Send,
-                    call.envelope(),
-                    &local.inbound_key,
-                    now,
-                )?;
-                let h = opened.header();
-                let lease = &call.lease().lease;
-                verify_object_delivery_projection(
-                    &d.local()
-                        .durable_object_pair_sha256_v1
-                        .context("missing pair selection")?,
-                    h,
-                    opened.payload(),
-                    call.lease(),
-                    &ed25519_dalek::VerifyingKey::from_bytes(&local.reader.grant.authority_key)?,
-                )?;
-                ensure!(
-                    call.envelope().ciphertext_commitment == lease.ciphertext_commitment
-                        && call.envelope().routing.delivery_id == lease.delivery_id
-                        && lease.consumer == local.reader.capability.grant.subject
-                        && lease.receive_capability_id
-                            == local.reader.capability.grant.capability_id
-                        && lease.consumer_session
-                            == local.reader.enrollment.enrollment.consumer_session
-                        && lease.policy_epoch == g.policy_epoch
-                        && (lease.issued_at_unix_ms..lease.expires_at_unix_ms).contains(&now)
-                        && h.kind == MailboxMessageKind::Call
-                        && h.sender_boot == d.caller.boot
-                        && h.capability_id == d.call.grant.capability_id
-                        && h.sender == d.call.grant.subject
-                        && h.reply_to
-                            == Some(ReplyRoute {
-                                address: g.address,
-                                capability_id: g.capability_id
-                            })
-                        && h.message_id != message
-                        && (h.issued_at_unix_ms..h.expires_at_unix_ms).contains(&now),
-                    "Reply requires the authenticated retained Call and original current lease"
+                    h.message_id != message,
+                    "Reply cannot reuse its Call identity"
                 );
                 (
                     MailboxMessageKind::Reply,

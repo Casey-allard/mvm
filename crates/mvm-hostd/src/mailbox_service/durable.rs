@@ -543,7 +543,8 @@ fn serve_reader(
                     .map_err(reader_refusal)?;
                 Ok(ReaderResponse::Acknowledged { ack: signed })
             }
-            ReaderRequest::GetObjectRoleV1 { .. }
+            ReaderRequest::AuthorizeObjectCallV1 { .. }
+            | ReaderRequest::GetObjectRoleV1 { .. }
             | ReaderRequest::SubmitObjectV1 { .. }
             | ReaderRequest::Possession { .. } => Err(Refusal::NotAuthorized),
         }
@@ -560,6 +561,7 @@ fn serve_reader(
         // A slot report belongs to the guest-local interface, not this host stream.
         ReaderResponse::OutboundJournalAvailableV1 { .. }
         | ReaderResponse::ObjectSealAcceptedV1 { .. }
+        | ReaderResponse::ObjectCallAuthorityV1 { .. }
         | ReaderResponse::ObjectRoleV1 { .. }
         | ReaderResponse::ObjectPendingV1 { .. }
         | ReaderResponse::ObjectAcceptedV1 { .. }

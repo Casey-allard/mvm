@@ -154,6 +154,26 @@ impl MailboxReaderBootBinding {
 
     /// Reopen a bounded host record without following a symlink.
     pub fn load(state_dir: &Path) -> AnyResult<Self> {
+        Self::load_binding(state_dir, false)
+    }
+
+    /// The workload reads only the public projection installed by the guest
+    /// agent from its identity drive. The original boot is never supplied in
+    /// application input or learned from the peer that is proving possession.
+    pub fn load_guest_original() -> AnyResult<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = Path::new("/run/mvm");
+        for ancestor in dir.ancestors() {
+            let m = std::fs::symlink_metadata(ancestor)?;
+            anyhow::ensure!(
+                m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0,
+                "untrusted original boot directory"
+            );
+        }
+        Self::load_binding(dir, true)
+    }
+
+    fn load_binding(state_dir: &Path, guest_original: bool) -> AnyResult<Self> {
         use std::io::Read as _;
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
         let path = state_dir.join(MAILBOX_READER_BOOT_FILE);
@@ -165,6 +185,7 @@ impl MailboxReaderBootBinding {
         let metadata = file.metadata()?;
         anyhow::ensure!(
             metadata.is_file()
+                && (!guest_original || (metadata.uid() == 0 && metadata.mode() & 0o222 == 0))
                 && metadata.nlink() == 1
                 && metadata.len() <= MAX_MAILBOX_READER_BOOT_BYTES,
             "mailbox reader boot binding is not a bounded regular file"
@@ -333,6 +354,109 @@ pub fn verify_guest_reader_enrollment(
         .map_err(|_| MailboxError::ReaderEnrollmentSignatureInvalid)?;
     VerifyingKey::from_bytes(&signed.enrollment.ack_public_key)
         .map_err(|_| MailboxError::ReaderKeyInvalid)
+}
+
+/// Bind the existing guest-held possession key to a fresh application nonce and
+/// an exact signed lease. An application challenge can never be passed directly
+/// to the destination's independent Receive possession exchange.
+pub fn object_call_challenge(
+    pair: &[u8; 32],
+    lease: &SignedMailboxDeliveryLease,
+    role: &super::object_pair::role::SignedObjectRoleV1,
+    nonce: &[u8; 32],
+) -> AnyResult<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(
+        *nonce != [0; 32] && lease.lease.object_projection_v1.is_some(),
+        "invalid object authorization challenge"
+    );
+    let mut h = Sha256::new();
+    h.update(b"mvm.mailbox.object-call-application.v1\0");
+    h.update(pair);
+    h.update(nonce);
+    h.update(lease.encode()?);
+    anyhow::ensure!(role.signature.len() == 64, "invalid signed object role");
+    h.update(&role.signature);
+    Ok(h.finalize().into())
+}
+
+/// Authenticate this one sampled application operation. Both original grants
+/// and the independent Receive, possession key, signed header/body projection
+/// and return route must all describe the same still-live original Call.
+pub fn verify_object_call_authority(
+    boot: &MailboxReaderBootBinding,
+    pair: &[u8; 32],
+    lease: &SignedMailboxDeliveryLease,
+    header: &MailboxEnvelopeHeader,
+    payload: &[u8],
+    nonce: &[u8; 32],
+    response: &super::reader_wire::ReaderResponse,
+    now: i64,
+) -> AnyResult<()> {
+    use super::{object_pair::role::ObjectParticipantRole, reader_wire::ReaderResponse};
+    use mvm_contract::protocol::mailbox::*;
+    let ReaderResponse::ObjectCallAuthorityV1 {
+        role,
+        enrollment,
+        capability,
+        signature,
+    } = response
+    else {
+        anyhow::bail!("missing original Call authorization")
+    };
+    let bound_challenge = object_call_challenge(pair, lease, role, nonce)?;
+    let role = role.verify(boot, now)?;
+    let l = &lease.lease;
+    let authority = VerifyingKey::from_bytes(&boot.authority_key)?;
+    anyhow::ensure!(
+        role.role == ObjectParticipantRole::Callee
+            && boot.durable_object_pair_sha256_v1 == Some(*pair)
+            && enrollment.enrollment.ack_public_key == boot.ack_public_key
+            && l.consumer_session == enrollment.enrollment.consumer_session
+            && header.kind == MailboxMessageKind::Call
+            && header.sender_boot == role.caller.boot
+            && header.sender == role.call.grant.subject
+            && header.capability_id == role.call.grant.capability_id
+            && l.address == role.call.grant.address
+            && header.policy_epoch == role.call.grant.policy_epoch
+            && header.content_type == role.call.grant.content_types[0]
+            && header.reply_to
+                == Some(ReplyRoute {
+                    address: role.reply.grant.address,
+                    capability_id: role.reply.grant.capability_id
+                })
+            && (header.issued_at_unix_ms..header.expires_at_unix_ms).contains(&now)
+            && payload.len() <= capability.grant.max_payload_bytes as usize
+            && capability
+                .grant
+                .content_types
+                .contains(&header.content_type),
+        "unexpected original Call authority"
+    );
+    let grant = MailboxGrant {
+        durable_object_pair_sha256_v1: Some(*pair),
+        outbound_journal_v1: None,
+        incoming_journal_policy_sha256_v1: None,
+        mailbox: boot.mailbox,
+        authority_key: boot.authority_key,
+        epoch: boot.execution_epoch,
+        report: None,
+        retention: None,
+    };
+    let scope = MailboxGuestReaderScope {
+        plan: &grant,
+        plan_id: &boot.plan_id,
+        plan_nonce: &boot.plan_nonce,
+        receive: &capability.grant,
+        current_boot: boot.boot,
+        current_session: l.consumer_session,
+        now_unix_ms: now,
+    };
+    let ack = verify_guest_reader_enrollment(enrollment, capability, &scope, &authority, &[])?;
+    l.check_scope(&grant, &capability.grant, l.consumer_session, now)?;
+    verify_object_delivery_projection(pair, header, payload, lease, &authority)?;
+    verify_reader_possession(enrollment, &bound_challenge, signature, &ack)?;
+    Ok(())
 }
 
 fn possession_bytes(

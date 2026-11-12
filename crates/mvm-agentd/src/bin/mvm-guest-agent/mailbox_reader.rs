@@ -34,6 +34,10 @@ const LOCAL_TIMEOUT: Duration = Duration::from_secs(12);
 
 struct ActiveLease {
     object_call: bool,
+    receive: Option<(
+        Box<mvm_contract::protocol::mailbox::SignedMailboxGuestReaderEnrollment>,
+        Box<mvm_contract::protocol::mailbox::SignedMailboxCapability>,
+    )>,
     lease: SignedMailboxDeliveryLease,
     ack: Option<SignedMailboxDeliveryAck>,
 }
@@ -123,6 +127,18 @@ fn application_request(
     reader: &Arc<GuestReader>,
 ) -> Result<ReaderResponse, Refusal> {
     let request = match read_application_request(stream)? {
+        ApplicationReaderRequest::AuthorizeObjectCallV1 {
+            pair,
+            lease,
+            challenge,
+        } => {
+            check_active_call(reader, pair, &lease, &challenge)?;
+            ReaderRequest::AuthorizeObjectCallV1 {
+                pair,
+                lease,
+                challenge,
+            }
+        }
         ApplicationReaderRequest::ObjectSubmissionStatusV1 { pair, message_id } => {
             match object_submit::status(reader, pair, message_id)? {
                 object_submit::Status::Cached(result) => return Ok(result),
@@ -398,10 +414,46 @@ fn perform_exchange(
                 .lock()
                 .expect("mailbox reader lock poisoned") = Some(ActiveLease {
                 object_call: matches!(&response, ReaderResponse::ObjectDeliveryV1 {header,..} if header.kind==mvm_contract::protocol::mailbox::MailboxMessageKind::Call),
+                receive: pair.map(|_| (enrollment, capability)),
                 lease: (**lease).clone(),
                 ack: None,
             });
             Ok(response)
+        }
+        ReaderRequest::AuthorizeObjectCallV1 {
+            pair,
+            lease,
+            challenge,
+        } => {
+            let ReaderResponse::ObjectRoleV1 { signed } = read_response(stream)? else {
+                return Err(Refusal::NotAuthorized);
+            };
+            if pending.reader.role.as_ref() != Some(&*signed)
+                || signed
+                    .verify(&pending.reader.boot, now_unix_ms()?)
+                    .map_err(|_| Refusal::NotAuthorized)?
+                    .role
+                    != mvm_core::mailbox::object_pair::role::ObjectParticipantRole::Callee
+            {
+                return Err(Refusal::NotAuthorized);
+            }
+            let (enrollment, capability) =
+                check_active_call(&pending.reader, *pair, lease, challenge)?;
+            let bound =
+                mvm_core::mailbox::reader::object_call_challenge(pair, lease, &signed, challenge)
+                    .map_err(|_| Refusal::NotAuthorized)?;
+            let signature = sign_reader_possession(
+                &enrollment,
+                &bound,
+                &SigningKey::from_bytes(pending.reader.ack_seed),
+            )
+            .map_err(|_| Refusal::NotAuthorized)?;
+            Ok(ReaderResponse::ObjectCallAuthorityV1 {
+                role: signed,
+                enrollment,
+                capability,
+                signature: signature.to_vec(),
+            })
         }
         ReaderRequest::Ack { signed } => correlate_ack(read_response(stream)?, signed),
         ReaderRequest::SubmitObjectV1 { pair, submission } => {
@@ -411,6 +463,33 @@ fn perform_exchange(
             Err(Refusal::NotAuthorized)
         }
     }
+}
+
+fn check_active_call(
+    reader: &GuestReader,
+    pair: [u8; 32],
+    lease: &SignedMailboxDeliveryLease,
+    challenge: &[u8; 32],
+) -> Result<
+    (
+        Box<mvm_contract::protocol::mailbox::SignedMailboxGuestReaderEnrollment>,
+        Box<mvm_contract::protocol::mailbox::SignedMailboxCapability>,
+    ),
+    Refusal,
+> {
+    let active = reader.active.lock().map_err(|_| Refusal::Unavailable)?;
+    let x = active.as_ref().ok_or(Refusal::NotAuthorized)?;
+    if *challenge == [0; 32]
+        || reader.boot.durable_object_pair_sha256_v1 != Some(pair)
+        || !x.object_call
+        || x.ack.is_some()
+        || x.lease != *lease
+        || !(lease.lease.issued_at_unix_ms..lease.lease.expires_at_unix_ms)
+            .contains(&now_unix_ms()?)
+    {
+        return Err(Refusal::NotAuthorized);
+    }
+    x.receive.clone().ok_or(Refusal::NotAuthorized)
 }
 
 fn correlate_ack(

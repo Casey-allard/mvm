@@ -118,6 +118,12 @@ impl OriginalObjectSealV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderRequest {
+    /// Fresh, read-only sample for the exact retained, unacknowledged Call.
+    AuthorizeObjectCallV1 {
+        pair: [u8; 32],
+        lease: Box<SignedMailboxDeliveryLease>,
+        challenge: [u8; 32],
+    },
     GetObjectRoleV1 {
         pair: [u8; 32],
         boot: mvm_contract::protocol::mailbox::BootId,
@@ -143,6 +149,12 @@ pub enum ReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApplicationReaderRequest {
+    /// Fresh, read-only sample for the exact retained, unacknowledged Call.
+    AuthorizeObjectCallV1 {
+        pair: [u8; 32],
+        lease: Box<SignedMailboxDeliveryLease>,
+        challenge: [u8; 32],
+    },
     ObjectSubmissionStatusV1 {
         pair: [u8; 32],
         message_id: mvm_contract::protocol::mailbox::MessageId,
@@ -170,6 +182,13 @@ pub enum ApplicationReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderResponse {
+    /// Guest proof of a current check against its enrolled original host.
+    ObjectCallAuthorityV1 {
+        role: Box<super::object_pair::role::SignedObjectRoleV1>,
+        enrollment: Box<SignedMailboxGuestReaderEnrollment>,
+        capability: Box<SignedMailboxCapability>,
+        signature: Vec<u8>,
+    },
     /// Original source service -> guest agent only. Applications receive the verified V2.
     ObjectSealAcceptedV1 {
         original: OriginalObjectSealV1,
