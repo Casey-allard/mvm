@@ -54,6 +54,7 @@ pub(crate) struct DirectedJournalSource {
     destination_context: OpenContext,
     sealer: GuestSealer,
     direction: MailboxJournalDirectionV1,
+    original_commitment: [u8; 32],
     grants: JournalCredentials,
     verifier: VerifyingKey,
     source_revocations: PathBuf,
@@ -121,6 +122,7 @@ impl DirectedJournalSource {
             destination_context: destination.clone(),
             sealer,
             direction: d,
+            original_commitment: material.commitment,
             grants,
             verifier: VerifyingKey::from_bytes(&d.receipt_key)?,
             source_revocations: crate::mailbox_process::reader::revocations_path(source_state),
@@ -208,6 +210,7 @@ impl DirectedJournalSource {
 /// and never authorizes a retry through the local journal.
 pub(crate) struct SourceTurn<'a> {
     original_recipient: Option<PrincipalId>,
+    original_commitment: Option<[u8; 32]>,
     transport: Option<(
         &'a mut DirectedJournalSource,
         &'a mut dyn FnMut(Instant) -> Result<UnixStream, Refusal>,
@@ -215,15 +218,21 @@ pub(crate) struct SourceTurn<'a> {
 }
 
 impl<'a> SourceTurn<'a> {
-    pub(crate) fn from_boot(boot: &MailboxReaderBootBinding) -> Self {
-        Self {
+    pub(crate) fn from_boot(boot: &MailboxReaderBootBinding) -> Result<Self> {
+        Ok(Self {
+            original_commitment: boot
+                .outbound_journal_v1
+                .as_ref()
+                .map(|_| journal_direction_commitment(boot))
+                .transpose()?,
             original_recipient: boot.outbound_journal_v1.map(|d| d.address.recipient),
             transport: None,
-        }
+        })
     }
     pub(super) fn own() -> Self {
         Self {
             original_recipient: None,
+            original_commitment: None,
             transport: None,
         }
     }
@@ -232,7 +241,9 @@ impl<'a> SourceTurn<'a> {
         endpoint: &'a mut DirectedJournalSource,
         connect: &'a mut dyn FnMut(Instant) -> Result<UnixStream, Refusal>,
     ) -> Result<Self, Refusal> {
-        if self.original_recipient != Some(endpoint.recipient()) {
+        if self.original_recipient != Some(endpoint.recipient())
+            || self.original_commitment != Some(endpoint.original_commitment)
+        {
             return Err(Refusal::NotAuthorized);
         }
         self.transport = Some((endpoint, connect));
@@ -260,6 +271,7 @@ mod tests {
         let b = PrincipalId::from_bytes([11; 32]);
         let mut routed = SourceTurn {
             original_recipient: Some(b),
+            original_commitment: Some([4; 32]),
             transport: None,
         };
         let mut local = 0;

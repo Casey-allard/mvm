@@ -317,7 +317,8 @@ fn serve_local(
         anchor,
     )?;
     service.install_guest_reader(reader)?;
-    let mut turn = crate::mailbox_service::directed_journal::SourceTurn::from_boot(&binding);
+    let mut turn = crate::mailbox_service::directed_journal::SourceTurn::from_boot(&binding)
+        .map_err(Error::other)?;
     std::io::stdout().write_all(READY_MARKER)?;
     while keep_serving(launcher, &vm_state_dir) {
         if service
