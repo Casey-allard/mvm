@@ -49,8 +49,8 @@ pub struct OriginalObjectEndpoint<'a> {
 pub struct ObjectPairV1<'a> {
     grants: ObjectPairGrants<'a>,
     commitment: [u8; 32],
-    caller_boot: BootId,
-    callee_boot: BootId,
+    caller_binding: MailboxReaderBootBinding,
+    callee_binding: MailboxReaderBootBinding,
     start: i64,
     end: i64,
 }
@@ -134,8 +134,8 @@ impl<'a> ObjectPairV1<'a> {
         let pair = Self {
             grants,
             commitment: digest,
-            caller_boot: caller.boot.boot,
-            callee_boot: callee.boot.boot,
+            caller_binding: caller.boot.clone(),
+            callee_binding: callee.boot.clone(),
             start: a
                 .valid_from
                 .timestamp_millis()
@@ -156,8 +156,8 @@ impl<'a> ObjectPairV1<'a> {
     fn current(&self, now: i64, state: PairAuthorityState<'_>) -> Result<()> {
         ensure!(
             (self.start..self.end).contains(&now)
-                && state.caller_boot == self.caller_boot
-                && state.callee_boot == self.callee_boot
+                && state.caller_boot == self.caller_binding.boot
+                && state.callee_boot == self.callee_binding.boot
                 && state.caller_epoch == self.grants.reply.grant.minimum_execution_epoch
                 && state.callee_epoch == self.grants.call.grant.minimum_execution_epoch
                 && state.caller_policy == self.grants.reply.grant.policy_epoch
@@ -178,7 +178,7 @@ impl<'a> ObjectPairV1<'a> {
     /// scope. Public callers commit replay only after profile correlation.
     fn open_turn(
         &self,
-        envelope: MailboxEnvelope,
+        envelope: &MailboxEnvelope,
         signed: &SignedMailboxCapability,
         operation: MailboxOperation,
         now: i64,
@@ -201,7 +201,7 @@ impl<'a> ObjectPairV1<'a> {
             revoked_capabilities: Vec::new(),
         };
         Ok(super::decrypt_authorized_envelope(
-            &envelope,
+            envelope,
             signed,
             &context,
             key,
@@ -221,22 +221,15 @@ impl<'a> ObjectPairV1<'a> {
         replay: &mut impl super::ReplayProtector,
     ) -> Result<PendingObjectCall> {
         self.current(now, state)?;
-        let opened =
-            self.open_turn(envelope, self.grants.call, MailboxOperation::Send, now, key)?;
+        let opened = self.open_turn(
+            &envelope,
+            self.grants.call,
+            MailboxOperation::Send,
+            now,
+            key,
+        )?;
         let h = opened.header();
-        let r = &self.grants.reply.grant;
-        ensure!(
-            h.sender_boot == self.caller_boot
-                && h.kind == MailboxMessageKind::Call
-                && h.reply_to
-                    == Some(ReplyRoute {
-                        address: r.address,
-                        capability_id: r.capability_id
-                    })
-                && h.issued_at_unix_ms >= self.start
-                && h.expires_at_unix_ms <= self.end,
-            "Call outside original pair or return route"
-        );
+        self.check_call_header(h)?;
         ensure!(
             replay.check_and_record(super::ReplayIdentity::from_header(h)),
             "Call replay"
@@ -247,8 +240,8 @@ impl<'a> ObjectPairV1<'a> {
             issued: h.issued_at_unix_ms,
             expires: h.expires_at_unix_ms,
             commitment: self.commitment,
-            caller_boot: self.caller_boot,
-            callee_boot: self.callee_boot,
+            caller_boot: self.caller_binding.boot,
+            callee_boot: self.callee_binding.boot,
         })
     }
 
@@ -265,23 +258,55 @@ impl<'a> ObjectPairV1<'a> {
         replay: &mut impl super::ReplayProtector,
     ) -> Result<()> {
         self.current(now, state)?;
-        ensure!(
-            pending.commitment == self.commitment
-                && pending.caller_boot == self.caller_boot
-                && pending.callee_boot == self.callee_boot
-                && (pending.issued..pending.expires).contains(&now),
-            "stale original Call"
-        );
+        self.check_pending(pending, now)?;
         let opened = self.open_turn(
-            envelope,
+            &envelope,
             self.grants.reply,
             MailboxOperation::Reply,
             now,
             key,
         )?;
         let h = opened.header();
+        self.check_reply_header(pending, h)?;
         ensure!(
-            h.sender_boot == self.callee_boot
+            replay.check_and_record(super::ReplayIdentity::from_header(h)),
+            "Reply replay"
+        );
+        Ok(())
+    }
+    fn check_call_header(&self, h: &MailboxEnvelopeHeader) -> Result<()> {
+        let r = &self.grants.reply.grant;
+        ensure!(
+            h.sender_boot == self.caller_binding.boot
+                && h.kind == MailboxMessageKind::Call
+                && h.reply_to
+                    == Some(ReplyRoute {
+                        address: r.address,
+                        capability_id: r.capability_id
+                    })
+                && h.issued_at_unix_ms >= self.start
+                && h.expires_at_unix_ms <= self.end,
+            "Call outside original pair or return route"
+        );
+        Ok(())
+    }
+    fn check_pending(&self, pending: &PendingObjectCall, now: i64) -> Result<()> {
+        ensure!(
+            pending.commitment == self.commitment
+                && pending.caller_boot == self.caller_binding.boot
+                && pending.callee_boot == self.callee_binding.boot
+                && (pending.issued..pending.expires).contains(&now),
+            "stale original Call"
+        );
+        Ok(())
+    }
+    fn check_reply_header(
+        &self,
+        pending: &PendingObjectCall,
+        h: &MailboxEnvelopeHeader,
+    ) -> Result<()> {
+        ensure!(
+            h.sender_boot == self.callee_binding.boot
                 && h.kind == MailboxMessageKind::Reply
                 && h.reply_to.is_none()
                 && h.message_id != pending.message
@@ -291,11 +316,45 @@ impl<'a> ObjectPairV1<'a> {
                 && h.expires_at_unix_ms <= pending.expires,
             "Reply does not match original Call"
         );
-        ensure!(
-            replay.check_and_record(super::ReplayIdentity::from_header(h)),
-            "Reply replay"
-        );
         Ok(())
+    }
+
+    /// For the canonical journal's already accepted retained row only, after
+    /// independent current Receive authorization and before lease mutation.
+    /// No new replay entry or receipt. No side effect or plaintext return.
+    pub(crate) fn check_retained_envelope(
+        &self,
+        destination: &MailboxReaderBootBinding,
+        envelope: &MailboxEnvelope,
+        now: i64,
+        state: PairAuthorityState<'_>,
+        key: &crate::crypto::aead::Key,
+        pending: Option<&PendingObjectCall>,
+    ) -> Result<()> {
+        self.current(now, state)?;
+        if let Some(pending) = pending {
+            ensure!(
+                destination == &self.caller_binding,
+                "Reply lease requires original caller binding"
+            );
+            self.check_pending(pending, now)?;
+            let opened = self.open_turn(
+                envelope,
+                self.grants.reply,
+                MailboxOperation::Reply,
+                now,
+                key,
+            )?;
+            self.check_reply_header(pending, opened.header())
+        } else {
+            ensure!(
+                destination == &self.callee_binding,
+                "Call lease requires original callee binding"
+            );
+            let opened =
+                self.open_turn(envelope, self.grants.call, MailboxOperation::Send, now, key)?;
+            self.check_call_header(opened.header())
+        }
     }
 }
 

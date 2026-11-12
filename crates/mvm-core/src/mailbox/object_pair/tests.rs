@@ -351,6 +351,40 @@ fn original_enrollment_and_correlated_verified_envelopes() {
         )
         .is_err()
     );
+    let fresh = live(ab.boot, bb.boot);
+    assert!(
+        pair.check_retained_envelope(&bb, &call(), NOW, fresh, ar, None)
+            .is_ok()
+    );
+    assert!(
+        pair.check_retained_envelope(&ab, &original_reply(), NOW, fresh, br, Some(&pending))
+            .is_ok()
+    );
+    assert!(
+        pair.check_retained_envelope(&ab, &call(), NOW, fresh, ar, None)
+            .is_err()
+    );
+    assert!(
+        pair.check_retained_envelope(&bb, &original_reply(), NOW, fresh, br, Some(&pending))
+            .is_err()
+    );
+    let mut replaced = bb.clone();
+    replaced.ack_public_key = key(91).verifying_key().to_bytes();
+    assert!(
+        pair.check_retained_envelope(&replaced, &call(), NOW, fresh, ar, None)
+            .is_err()
+    );
+    assert!(
+        pair.check_retained_envelope(
+            &ab,
+            &sealed(&r, bb.boot, None, NOW - 1, 91, 60),
+            NOW,
+            fresh,
+            br,
+            Some(&pending)
+        )
+        .is_err()
+    );
     let wrong = ReplyRoute {
         address: c.grant.address,
         ..route
