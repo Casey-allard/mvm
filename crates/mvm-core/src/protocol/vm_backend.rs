@@ -984,6 +984,7 @@ mod tests {
             verbs: vec![VerbId::new("run-entrypoint").unwrap()],
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         grant.sig = k.sign(&grant.signing_bytes()).to_bytes().to_vec();
@@ -1016,6 +1017,7 @@ mod tests {
             ],
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         grant.sig = k.sign(&grant.signing_bytes()).to_bytes().to_vec();

@@ -1675,6 +1675,7 @@ mod tests {
             }),
             volumes: Vec::new(),
             extensions: Vec::new(),
+            cast_delivery_v1: None,
             verb_grant_envelope: None,
         });
         assert_eq!(req.kind_name(), "activate-environment");

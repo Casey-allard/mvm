@@ -534,6 +534,7 @@ mod tests {
             verbs: Vec::new(),
             drive: Some(drive_grant()),
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: Vec::new(),
         }
     }
@@ -686,6 +687,7 @@ mod tests {
             verbs: vec![VerbId::new("run-entrypoint").unwrap()],
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         // listed => allowed
@@ -718,6 +720,7 @@ mod tests {
             verbs: vec![VerbId::new("readiness-status").unwrap()],
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         let request = GuestRequest::RunEntrypoint {
@@ -755,6 +758,7 @@ mod tests {
             verbs: Vec::new(),
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         assert!(enforce_verb_grant(&GuestRequest::Ping, Some(&grant)).is_none());
@@ -779,6 +783,7 @@ mod tests {
                 .collect(),
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         let requests = [
@@ -961,6 +966,7 @@ mod tests {
             verbs: vec![VerbId::new("ping").unwrap()],
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         good.sig = {
@@ -1048,6 +1054,7 @@ mod tests {
             verbs: verbs.iter().map(|v| VerbId::new(v).unwrap()).collect(),
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         grant.sig = {
@@ -1107,6 +1114,7 @@ mod tests {
             verbs: vec![VerbId::new("ping").unwrap()],
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         grant.sig = {
@@ -1700,6 +1708,7 @@ mod tests {
             verbs: verbs.iter().map(|v| VerbId::new(v).unwrap()).collect(),
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         grant.sig = signer.sign(&grant.signing_bytes()).to_bytes().to_vec();

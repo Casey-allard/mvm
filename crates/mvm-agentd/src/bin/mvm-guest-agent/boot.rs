@@ -105,6 +105,13 @@ pub(crate) fn init_entrypoint_validation(boot_state: &Arc<AgentBootState>) {
 /// dependency failure). Process-exit-on-bad-config is preserved —
 /// `runtime.json` is part of the immutable image and a malformed
 /// file is a build bug.
+fn start_admitted_pool(cfg:mvm_agentd::runtime_config::WarmProcessConfig, entry:Arc<mvm_agentd::entrypoint::ValidatedEntrypoint>)->std::io::Result<Arc<WorkerPool>> {
+    #[cfg(target_os="linux")]
+    if let Some(original)=crate::mailbox::take_original()?{
+        return WorkerPool::start_original_cast(cfg,entry,original);
+    }
+    WorkerPool::start(cfg,entry,Vec::new())
+}
 pub(crate) fn init_warm_pool(boot_state: &Arc<AgentBootState>) {
     let result: Option<Arc<WorkerPool>> = match runtime_config::load() {
         Ok(None) => {
@@ -120,7 +127,7 @@ pub(crate) fn init_warm_pool(boot_state: &Arc<AgentBootState>) {
                 boot_state.set_warm_pool(ComponentState::Starting);
                 match VALIDATED_ENTRYPOINT.get() {
                     Some(Ok(entry)) => match entry.try_clone() {
-                        Ok(cloned) => match WorkerPool::start(wp, Arc::new(cloned), Vec::new()) {
+                        Ok(cloned) => match start_admitted_pool(wp, Arc::new(cloned)) {
                             Ok(pool) => {
                                 // Run the baked `after_start.sh`
                                 // readiness probe before

@@ -31,6 +31,10 @@ pub struct ActivateEnvironment {
     /// Exact optional extension identities admitted by the signed plan.
     #[serde(default)]
     pub extensions: Vec<ExtensionConfig>,
+    /// Public Deliver enrollment committed by the original host-signed boot grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+    pub cast_delivery_v1: Option<mvm_core::mailbox::frame::cast::enrollment::DeliverEnrollmentV1>,
     /// Optional verb-grant envelope to pin before serving operational
     /// RPCs.  When present, the activation message itself must be signed
     /// by the host-signer trust anchor.
@@ -231,6 +235,7 @@ mod tests {
                 label: None,
             }],
             extensions: Vec::new(),
+            cast_delivery_v1: None,
             verb_grant_envelope: None,
         };
         let json = serde_json::to_string(&env).expect("serialize");
@@ -273,6 +278,7 @@ mod tests {
             runtime: None,
             volumes: Vec::new(),
             extensions: Vec::new(),
+            cast_delivery_v1: None,
             verb_grant_envelope: None,
         };
         let json = serde_json::to_string(&env).expect("serialize");
@@ -293,6 +299,7 @@ mod tests {
             runtime: None,
             volumes: Vec::new(),
             extensions: Vec::new(),
+            cast_delivery_v1: None,
             verb_grant_envelope: None,
         };
         let json = serde_json::to_string(&env).expect("serialize");
@@ -323,6 +330,7 @@ mod tests {
             runtime: None,
             volumes: Vec::new(),
             extensions: Vec::new(),
+            cast_delivery_v1: None,
             verb_grant_envelope: None,
         };
         let json = serde_json::to_string(&env).expect("serialize");

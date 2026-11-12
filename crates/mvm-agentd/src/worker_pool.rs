@@ -173,6 +173,7 @@ pub struct WorkerPool {
     /// by the agent at boot from a curated set (e.g., `PATH`,
     /// `LANG`); tests use it to drive test-fixture behavior.
     worker_env: Vec<(String, String)>,
+    original_cast_worker: bool,
     shutdown: AtomicBool,
     /// Substrate-side idle-recycle timeout in seconds. `0` disables
     /// idle-based recycling — only `max_calls_per_worker` and
@@ -209,6 +210,21 @@ impl WorkerPool {
         entrypoint: Arc<ValidatedEntrypoint>,
         worker_env: Vec<(String, String)>,
     ) -> io::Result<Arc<Self>> {
+        Self::start_inner(cfg, entrypoint, worker_env, None)
+    }
+
+    /// The original guest launcher transfers one already admitted workload
+    /// endpoint. A retired original is never respawned with its descriptor.
+    #[cfg(target_os = "linux")]
+    pub fn start_original_cast(cfg: WarmProcessConfig, entrypoint: Arc<ValidatedEntrypoint>, fd: std::os::fd::OwnedFd) -> io::Result<Arc<Self>> {
+        if cfg.pool_size != 1 || entrypoint.use_resolved_path || entrypoint.resolved != std::path::Path::new("/usr/lib/mvm/wrappers/oci-entrypoint") {
+            return Err(io::Error::other("Cast requires one original validated OCI worker"));
+        }
+        Self::start_inner(cfg,entrypoint,Vec::new(),Some(fd))
+    }
+
+    fn start_inner(cfg: WarmProcessConfig, entrypoint: Arc<ValidatedEntrypoint>, worker_env:Vec<(String,String)>, mut original:Option<std::os::fd::OwnedFd>) -> io::Result<Arc<Self>> {
+        let original_cast_worker=original.is_some();
         // Set RLIMIT_CORE=0 on the agent so all child workers
         // inherit it. Mirrors the cold-path one-shot in
         // `entrypoint::execute`.
@@ -216,7 +232,7 @@ impl WorkerPool {
 
         let mut slots = Vec::with_capacity(cfg.pool_size);
         for i in 0..cfg.pool_size {
-            let handle = spawn_worker(&entrypoint, &worker_env)
+            let handle = spawn_worker(&entrypoint, &worker_env,original.take())
                 .map_err(|e| io::Error::other(format!("spawn worker {i}: {e}")))?;
             eprintln!(
                 "mvm-guest-agent: warm-process worker {i} spawned pid={}",
@@ -244,6 +260,7 @@ impl WorkerPool {
             cfg,
             entrypoint,
             worker_env,
+            original_cast_worker,
             shutdown: AtomicBool::new(false),
             // Off by default. `mvmctl session set-timeout` →
             // `UpdateIdleTimeout` vsock verb sets this at runtime;
@@ -474,6 +491,11 @@ impl WorkerPool {
         }
     }
 
+    fn replacement(&self)->io::Result<WorkerHandle>{
+        if self.original_cast_worker {return Err(io::Error::other("original Cast worker retired"));}
+        spawn_worker(&self.entrypoint,&self.worker_env,None)
+    }
+
     fn release(self: &Arc<Self>, idx: usize, mut handle: WorkerHandle, recycle: bool) {
         // Bump idle clock — we just finished a call, so this worker
         // is fresh. The recycler reads `last_used_at` to decide
@@ -485,7 +507,7 @@ impl WorkerPool {
             // killed before we attempt to spawn a replacement (their
             // resource caps may overlap during overshoot).
             drop(handle);
-            match spawn_worker(&self.entrypoint, &self.worker_env) {
+            match self.replacement() {
                 Ok(new_handle) => {
                     eprintln!(
                         "mvm-guest-agent: warm-process worker {idx} replaced pid={}",
@@ -596,6 +618,7 @@ fn run_one_call(
 fn spawn_worker(
     entrypoint: &Arc<ValidatedEntrypoint>,
     worker_env: &[(String, String)],
+    original:Option<std::os::fd::OwnedFd>,
 ) -> io::Result<WorkerHandle> {
     let program = entrypoint::spawn_path(entrypoint);
     #[cfg(target_os = "linux")]
@@ -632,6 +655,12 @@ fn spawn_worker(
             crate::fd_hygiene::mark_descriptors_close_on_exec_from(3, Some(program_fd))?;
             Ok(())
         });
+    }
+    if let Some(original) = original {
+        #[cfg(target_os="linux")]
+        crate::mailbox_cast::exec::configure_worker(&mut cmd, original)?;
+        #[cfg(not(target_os="linux"))]
+        { drop(original); return Err(io::Error::new(io::ErrorKind::Unsupported,"guest Cast requires Linux")); }
     }
     crate::workload_seccomp::confine(&mut cmd);
 
@@ -775,7 +804,7 @@ impl WorkerPool {
         // PID pressure consistent.
         drop(handle);
         eprintln!("mvm-guest-agent: warm-process worker {idx} idle-recycle pid={pid}");
-        match spawn_worker(&self.entrypoint, &self.worker_env) {
+        match self.replacement() {
             Ok(new_handle) => {
                 eprintln!(
                     "mvm-guest-agent: warm-process worker {idx} replaced pid={}",

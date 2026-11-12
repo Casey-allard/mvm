@@ -188,6 +188,7 @@ mod tests {
                     .as_ref()
                     .and_then(|grants| grants.application_terminal.as_ref())
                     .map(mvm_contract::grants::ApplicationTerminalBinding::from),
+                cast_delivery_v1: None,
                 sig: vec![3u8; 64],
             },
         }

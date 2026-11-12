@@ -299,6 +299,19 @@ fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEnviro
     let volumes = build_volume_configs(config)?;
     let extensions = build_extension_configs(config)?;
     let verb_grant_envelope = read_verb_grant_envelope(&config.name)?;
+    let cast_delivery_v1 = match verb_grant_envelope.as_ref().and_then(|g|g.grant.cast_delivery_v1) {
+        None => None,
+        Some(digest) => {
+            use std::io::Read;
+            let path=mvm_core::config::vm_state_dir(&config.name).join("cast-deliver-v1.json");
+            let mut bytes=Vec::new();
+            std::fs::File::open(path)?.take(8193).read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes.len()<=8192,"oversized original Cast activation");
+            let enrollment: mvm_core::mailbox::frame::cast::enrollment::DeliverEnrollmentV1=serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(enrollment.commitment()? == digest,"original Cast activation differs from the boot grant");
+            Some(enrollment)
+        }
+    };
     refuse_legacy_tool_authority(config)?;
 
     Ok(ActivateEnvironment {
@@ -306,6 +319,7 @@ fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEnviro
         runtime,
         volumes,
         extensions,
+        cast_delivery_v1,
         verb_grant_envelope,
     })
 }
@@ -454,6 +468,7 @@ mod tests {
                 verbs: Vec::new(),
                 drive: None,
                 application_terminal: None,
+                cast_delivery_v1: None,
                 sig: vec![0u8; 64],
             },
         }
@@ -846,6 +861,7 @@ mod tests {
             verbs: vec![mvm_core::plan::VerbId::new("ping").unwrap()],
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![0u8; 64],
         };
         let envelope = VerbGrantEnvelope {
@@ -971,6 +987,7 @@ mod tests {
                 verbs: vec![mvm_core::plan::VerbId::new("activate-environment").unwrap()],
                 drive: None,
                 application_terminal: None,
+                cast_delivery_v1: None,
                 sig: vec![0u8; 64],
             },
         };

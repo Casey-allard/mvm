@@ -274,7 +274,11 @@ impl ControlOperations for NativeControlOperations {
         environment: &mvm_agentd::vsock::ActivateEnvironment,
         boot: &Arc<AgentBootState>,
     ) -> anyhow::Result<()> {
+        #[cfg(target_os="linux")]
+        let original=mailbox::prepare_delivery(environment,boot)?;
         init::apply_activation(environment, boot)?;
+        #[cfg(target_os="linux")]
+        mailbox::install_delivery(original)?;
         if init::is_pid1() {
             let boot = Arc::clone(boot);
             let _ = mvm_agentd::detached::spawn_named("entrypoint-validation", move || {
@@ -1326,6 +1330,7 @@ mod tests {
             runtime: None,
             volumes: vec![],
             extensions: vec![],
+            cast_delivery_v1: None,
             verb_grant_envelope: None,
         })
     }
@@ -1717,6 +1722,7 @@ mod tests {
                 runtime: None,
                 volumes: vec![],
                 extensions: vec![],
+                cast_delivery_v1: None,
                 verb_grant_envelope: None,
             });
         assert!(ColdContinuation::Exec.next_request(&activation).is_err());

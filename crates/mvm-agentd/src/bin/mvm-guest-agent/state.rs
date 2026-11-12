@@ -476,6 +476,7 @@ mod tests {
             verbs: verbs.iter().map(|v| VerbId::new(v).unwrap()).collect(),
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         g.sig = signer.sign(&g.signing_bytes()).to_bytes().to_vec();
@@ -660,6 +661,7 @@ mod tests {
             verbs: verbs.iter().map(|v| VerbId::new(v).unwrap()).collect(),
             drive: None,
             application_terminal: None,
+            cast_delivery_v1: None,
             sig: vec![],
         };
         g.sig = signer.sign(&g.signing_bytes()).to_bytes().to_vec();

@@ -4,6 +4,9 @@
 //! Closing a physical host stream does not reset the inbox. A different logical
 //! owner must obtain a new enrollment and a fresh endpoint. The legacy boot
 //! path never constructs this service.
+#[cfg(target_os = "linux")]
+pub mod exec;
+
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixDatagram;
@@ -90,6 +93,16 @@ impl GuestCastEndpoint {
                 last: None,
             },
         ))
+    }
+
+    /// Original PID 1 launch path. Queue context on the private socket before a
+    /// Cast can be offered, and give the one workload descriptor to the launcher.
+    #[cfg(target_os = "linux")]
+    pub fn prepare_original_worker(channel: CastChannel, installed: MailboxLocalLimits) -> io::Result<(Self, OwnedFd)> {
+        let (endpoint, reader) = Self::new(channel, installed)?;
+        let (fd, context) = reader.into_launch_fd()?;
+        exec::queue_context(&endpoint.workload,&context)?;
+        Ok((endpoint,fd))
     }
 
     /// The installed listener supplies an accepted descriptor. Verify the
@@ -180,6 +193,8 @@ fn offer(
     // disposition. One extra byte detects silent datagram truncation.
     let mut buf = [0; 4 + 1 + 8 + 32 + 1 + 1];
     let len = socket.recv(&mut buf)?;
+    #[cfg(test)]
+    tests::ACK_READ.with(|count|count.set(count.get()+len));
     let ack = decode_local_frame(
         &buf[..len],
         LocalRole::Deliver,

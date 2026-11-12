@@ -56,6 +56,7 @@ mod tests {
                 verbs: vec![VerbId::new("run-entrypoint").unwrap()],
                 drive: None,
                 application_terminal: None,
+                cast_delivery_v1: None,
                 sig: vec![0u8; 64],
             },
         };

@@ -19,6 +19,7 @@
 //! wipe, and a filesystem may keep the old blocks.
 
 pub mod cast_pair;
+pub mod cast_enrollment;
 
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
