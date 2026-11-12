@@ -153,8 +153,30 @@ impl Claim {
     fn record_name(&self) -> String {
         format!("{}.json", self.name)
     }
+    fn marker_name(&self) -> String {
+        format!("{}.retiring", self.name)
+    }
+    fn read_state(&self) -> Result<(Option<Record>, bool)> {
+        let active = self.read_at(&self.record_name())?;
+        let retired = self.read_at(&self.marker_name())?;
+        ensure!(
+            active.is_none() || retired.is_none(),
+            "conflicting active and retiring mailbox owners"
+        );
+        if let Some(record) = retired {
+            ensure!(
+                matches!(record, Record::Owned { .. }),
+                "retirement marker requires original signed Stop"
+            );
+            return Ok((Some(record), true));
+        }
+        Ok((active, false))
+    }
     fn read(&self) -> Result<Option<Record>> {
-        let f = match at(&self.dir, &self.record_name(), OFlags::RDONLY) {
+        Ok(self.read_state()?.0)
+    }
+    fn read_at(&self, name: &str) -> Result<Option<Record>> {
+        let f = match at(&self.dir, name, OFlags::RDONLY) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -201,9 +223,45 @@ impl Claim {
         self.dir.sync_all()?;
         Ok(())
     }
-    fn remove(&self) -> Result<()> {
-        unlink(&self.dir, &self.record_name())?;
-        self.dir.sync_all()?;
+    fn retire(&self, original: &InstalledMailboxClient, already_renamed: bool) -> Result<()> {
+        let (Some(Record::Owned { stop }), renamed) = self.read_state()? else {
+            bail!("original signed mailbox locator unavailable for retirement");
+        };
+        ensure!(
+            renamed == already_renamed,
+            "original mailbox retirement position changed"
+        );
+        let recorded = InstalledMailboxClient::from_stop_locator(&self.name, &stop)?;
+        ensure!(
+            recorded.owner() == original.owner()
+                && recorded.acquire_request() == original.acquire_request(),
+            "original signed mailbox locator changed before retirement"
+        );
+        self.retire_with(already_renamed, File::sync_all)
+    }
+    fn retire_with(
+        &self,
+        already_renamed: bool,
+        sync_rename: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<()> {
+        let marker = self.marker_name();
+        if !already_renamed {
+            rustix::fs::renameat(
+                &self.dir,
+                self.record_name().as_str(),
+                &self.dir,
+                marker.as_str(),
+            )?;
+        }
+        // Once the rename is durable, the active locator is retired. If marker
+        // deletion then fails, retry only housekeeping with the original proof.
+        sync_rename(&self.dir)?;
+        unlink(&self.dir, &marker)?;
+        if let Err(error) = self.dir.sync_all() {
+            // Only the inert marker can reappear after a crash. Reporting an
+            // uncertain VM stop here would invite destructive replay by name.
+            tracing::warn!(%error, "retired mailbox marker deletion not durably confirmed");
+        }
         Ok(())
     }
 }
@@ -314,10 +372,8 @@ impl OwnedLaunch {
         cleanup: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         self.rollback_on_drop = false;
-        collect(&self.client)?;
-        self.client.remove_companion_services(deadline())?;
-        cleanup()?;
-        self.claim.remove()
+        self.client
+            .finish_installed_cleanup(false, cleanup, || self.claim.retire(&self.client, false))
     }
 }
 impl Drop for OwnedLaunch {
@@ -325,44 +381,30 @@ impl Drop for OwnedLaunch {
         if self.rollback_on_drop && self.client.owner().is_some() {
             // No backend-cleanup receipt on implicit Drop. Keep the durable
             // locator for the fresh client's stop/recovery even after Stop.
-            if let Err(error) = collect(&self.client) {
+            if let Err(error) = self.client.collect_original_worker() {
                 tracing::warn!(%error,"original mailbox stop remains unresolved");
             }
         }
     }
 }
-fn collect(client: &InstalledMailboxClient) -> Result<()> {
-    client.settle_native_start()?;
-    let until = deadline();
-    match client.stop(until)? {
-        MailboxWorkerState::Collected { .. } => Ok(()),
-        MailboxWorkerState::Reserved | MailboxWorkerState::Unresolved => {
-            ensure!(
-                client.release_unstarted(until)? == MailboxWorkerState::ReleasedBeforeSpawn,
-                "original mailbox reservation release is unresolved"
-            );
-            Ok(())
-        }
-        _ => bail!("original mailbox worker collection is unresolved"),
-    }
-}
-pub(crate) fn stop_with<T>(
+pub(crate) fn stop_with(
     name: &str,
     provisioner: Option<&dyn InstalledMailboxProvisioner>,
-    cleanup: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+    cleanup: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let claim = Claim::acquire(&mvm_core::config::mvm_home_strict()?, name, true)?
         .context("mailbox owner store unavailable")?;
     stop_claim(&claim, name, provisioner, cleanup)
 }
 
-fn stop_claim<T>(
+fn stop_claim(
     claim: &Claim,
     name: &str,
     provisioner: Option<&dyn InstalledMailboxProvisioner>,
-    cleanup: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    let client = match claim.read()? {
+    cleanup: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let (record, retiring) = claim.read_state()?;
+    let client = match record {
         None => return cleanup(),
         Some(Record::Pending { .. }) => {
             bail!("unsigned pending mailbox record cannot prove original ownership")
@@ -390,11 +432,7 @@ fn stop_claim<T>(
             client
         }
     };
-    collect(&client)?;
-    client.remove_companion_services(deadline())?;
-    let value = cleanup()?;
-    claim.remove()?;
-    Ok(value)
+    client.finish_installed_cleanup(retiring, cleanup, || claim.retire(&client, retiring))
 }
 pub(crate) fn stop_if_present(
     name: &str,
@@ -560,6 +598,48 @@ mod tests {
         let claim = Claim::acquire(home.path(), "test", false).unwrap().unwrap();
         assert!(matches!(claim.read().unwrap(), Some(Record::Owned { .. })));
     }
+    #[test]
+    fn interrupted_directory_sync_retains_marker_and_prevents_unowned_backend_cleanup() -> Result<()>
+    {
+        use mvm_core::protocol::broker_control::{self, ControlRequest};
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        let home = tempfile::tempdir()?;
+        env.set("MVM_HOME", home.path());
+        let Record::Pending { mut acquire } = pending() else {
+            unreachable!()
+        };
+        let commitment = context_commitment(&acquire)?;
+        acquire.operation = MailboxWorkerOperation::Stop {
+            owner: MailboxWorkerOwner {
+                daemon_boot_nonce: [7; 32],
+                lease: [8; 32],
+                generation: 1,
+                context_commitment: commitment,
+            },
+        };
+        let stored = broker_control::sign(ControlRequest::MailboxWorkerV1(acquire), &[8; 32])?;
+        let claim = Claim::acquire(home.path(), "test", true)?.unwrap();
+        claim.write(&Record::Owned {
+            stop: Box::new(stored),
+        })?;
+        let error = claim
+            .retire_with(false, |_| {
+                Err(io::Error::other("directory fsync unavailable"))
+            })
+            .unwrap_err();
+        ensure!(error.to_string().contains("directory fsync unavailable"));
+        drop(claim);
+        let claim = Claim::acquire(home.path(), "test", false)?.unwrap();
+        let (record, retiring) = claim.read_state()?;
+        ensure!(retiring && matches!(record, Some(Record::Owned { .. })));
+        ensure!(
+            stop_claim(&claim, "test", None, || -> Result<()> {
+                panic!("retirement marker authorized destructive replay")
+            })
+            .is_err()
+        );
+        Ok(())
+    }
     // This peer uses real framed control I/O and deliberately drops its Acquire
     // response. The callback is the fault injector, not a production daemon.
     fn lost_ack_peer() -> Result<()> {
@@ -642,6 +722,14 @@ mod tests {
             };
             send_response(&mut stream, &result, None, deadline())?;
         }
+        if std::env::var_os("MVM_TEST_EXPIRED_HELPER_RECEIPT").is_some() {
+            // Simulate complete removal of every server-side control receipt:
+            // the live original process will accept no further wire operation.
+            drop(listener);
+            let mut release = [0];
+            io::stdin().read_exact(&mut release)?;
+            ensure!(release == [1]);
+        }
         Ok(())
     }
 
@@ -676,6 +764,22 @@ mod tests {
     }
     #[test]
     fn lost_acquire_reply_recovers_only_original_and_persists_stop_before_cleanup() -> Result<()> {
+        run_lost_acquire(false, Duration::ZERO)
+    }
+
+    #[test]
+    fn confirmed_services_resume_after_receipt_eviction_without_new_wire_operations() -> Result<()>
+    {
+        run_lost_acquire(true, Duration::ZERO)
+    }
+
+    #[test]
+    #[ignore = "61-second native terminal-retention qualification"]
+    fn confirmed_services_resume_beyond_sixty_seconds_without_reacquisition() -> Result<()> {
+        run_lost_acquire(true, Duration::from_secs(61))
+    }
+
+    fn run_lost_acquire(retry_after_retirement: bool, delay: Duration) -> Result<()> {
         use crate::admission::{admit_plan_for_boot, admit_plan_tests::pinning_params};
         use mvm_hostd::plan_admission::InMemoryNonceLedger;
         use std::process::Command;
@@ -698,9 +802,21 @@ mod tests {
         };
         params.mailbox = Some(acquire.mailbox_grant);
         let admitted = admit_plan_for_boot(params)?;
-        let mut worker = TestProcess(Command::new(std::env::current_exe()?)
-            .args(["--exact", "launch::mailbox_owner::tests::lost_acquire_reply_recovers_only_original_and_persists_stop_before_cleanup", "--test-threads=1"])
-            .env(WORKER,"1").spawn()?);
+        let selector = if retry_after_retirement {
+            "launch::mailbox_owner::tests::confirmed_services_resume_after_receipt_eviction_without_new_wire_operations"
+        } else {
+            "launch::mailbox_owner::tests::lost_acquire_reply_recovers_only_original_and_persists_stop_before_cleanup"
+        };
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args(["--exact", selector, "--test-threads=1"])
+            .env(WORKER, "1");
+        if retry_after_retirement {
+            command
+                .env("MVM_TEST_EXPIRED_HELPER_RECEIPT", "1")
+                .stdin(std::process::Stdio::piped());
+        }
+        let mut worker = TestProcess(command.spawn()?);
         let original =
             FixtureInstallation(Arc::new(InstalledMailboxPeer::from_child(&mut worker.0)?));
         let socket = mvm_core::config::host_agent_control_socket("local");
@@ -739,14 +855,44 @@ mod tests {
         ensure!(matches!(claim.read()?, Some(Record::PendingV1 { .. })));
         drop(claim);
 
-        let value = stop_with("test", Some(&original), || {
+        if retry_after_retirement {
+            let record = home.path().join("state/mailbox-owners-v1/test.json");
+            let unavailable = home.path().join("temporarily-unavailable-locator");
+            // Complete the local operation, then fault the original removal.
+            // Restoring precisely that same file leaves only the final ack to retry.
+            let failure = stop_with("test", Some(&original), || {
+                std::fs::rename(&record, &unavailable)?;
+                Ok(())
+            });
+            ensure!(
+                failure.is_err(),
+                "injected owner retirement failure was lost"
+            );
+            std::fs::rename(&unavailable, &record)?;
+            let claim = Claim::acquire(home.path(), "test", false)?.unwrap();
+            ensure!(matches!(claim.read()?, Some(Record::Owned { .. })));
+            drop(claim);
+            std::thread::sleep(delay);
+        }
+        stop_with("test", Some(&original), || {
+            ensure!(
+                !retry_after_retirement,
+                "destructive backend cleanup was replayed"
+            );
             ensure!(
                 refuse_existing("test").is_err(),
                 "cleanup ran without original claim"
             );
-            Ok(17)
+            Ok(())
         })?;
-        ensure!(value == 17);
+        if retry_after_retirement {
+            worker
+                .0
+                .stdin
+                .take()
+                .context("missing original fixture pipe")?
+                .write_all(&[1])?;
+        }
         ensure!(
             worker.0.wait()?.success(),
             "fixture refused recovery sequence"
@@ -773,12 +919,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let claim = Claim::acquire(home.path(), "test", true).unwrap().unwrap();
         for _ in 0..2 {
-            let observed = stop_claim(&claim, "test", None, || {
+            stop_claim(&claim, "test", None, || {
                 assert!(Claim::acquire(home.path(), "test", true).is_err());
-                Ok(17)
+                Ok(())
             })
             .unwrap();
-            assert_eq!(observed, 17);
         }
     }
 }
