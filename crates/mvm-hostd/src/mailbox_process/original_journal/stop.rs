@@ -198,7 +198,7 @@ impl StopCustody {
         }
         #[cfg(test)]
         {
-            return marker.collect(child);
+            marker.collect(child)
         }
         #[cfg(not(test))]
         {

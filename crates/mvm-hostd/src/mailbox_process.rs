@@ -1685,18 +1685,10 @@ mod tests {
                 "{name}"
             );
         }
-        for name in ["wasm"] {
-            let backend = backend_named(name);
-            assert!(!backend.capabilities().guest_mailbox, "{name}");
-            assert!(
-                require_servable(&granted, &backend, posture.as_ref()).is_err(),
-                "{name}"
-            );
-            assert!(
-                require_servable(&config_for(None), &backend, None).is_ok(),
-                "{name}"
-            );
-        }
+        let wasm = backend_named("wasm");
+        assert!(!wasm.capabilities().guest_mailbox);
+        assert!(require_servable(&granted, &wasm, posture.as_ref()).is_err());
+        assert!(require_servable(&config_for(None), &wasm, None).is_ok());
     }
 
     #[test]

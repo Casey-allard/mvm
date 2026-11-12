@@ -651,9 +651,9 @@ mod tests {
         let mut selected = grant(keys.path(), [41; 32]);
         selected.durable_object_pair_sha256_v1 = Some([42; 32]);
         let missing = keys.path().join("absent");
-        let err = derive_launch_keys(&missing, &selected, &test_secret())
-            .err()
-            .expect("unsupported");
+        let Err(err) = derive_launch_keys(&missing, &selected, &test_secret()) else {
+            panic!("selected object pair must refuse Cast keys");
+        };
         assert_eq!(err.kind(), ErrorKind::Unsupported);
         assert!(!missing.exists());
     }
