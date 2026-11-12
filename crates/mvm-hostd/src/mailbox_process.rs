@@ -315,6 +315,8 @@ fn serve_local(
         journal,
         anchor,
     )?;
+    #[cfg(feature = "durable-guest-io-witness")]
+    let service = service.with_guest_meter(&vm_state_dir)?;
     service.install_guest_reader(reader)?;
     std::io::stdout().write_all(READY_MARKER)?;
     while keep_serving(launcher, &vm_state_dir) {
