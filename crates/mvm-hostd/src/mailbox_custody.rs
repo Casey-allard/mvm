@@ -397,42 +397,9 @@ impl RetainedMailboxKeys {
         Self::open_bound(keys_dir, plan, identity)
     }
     fn open_bound(keys_dir: &Path, plan: &ExecutionPlan, identity: Identity<'_>) -> Result<Self> {
-        let vm_name = identity.vm_name;
-        let address = identity.address;
         let signer = existing_host_signer(keys_dir)?;
-        let (bundle_path, manifest_path) = paths(keys_dir, &identity)?;
-        let directory = bundle_path.parent().context("mailbox custody directory")?;
-        let directory_meta = std::fs::symlink_metadata(directory)?;
-        ensure!(
-            directory_meta.file_type().is_dir() && directory_meta.permissions().mode() & 0o077 == 0,
-            "retained mailbox custody directory is not private"
-        );
-        let manifest: SignedBinding =
-            serde_json::from_slice(&read_private(&manifest_path, MAX_MANIFEST_BYTES)?)?;
-        let signature: [u8; 64] = manifest.signature.as_slice().try_into().map_err(|_| {
-            Error::new(ErrorKind::InvalidData, "invalid mailbox manifest signature")
-        })?;
-        signer.verifying_key().verify(
-            &signed_bytes(&manifest.binding)?,
-            &Signature::from_bytes(&signature),
-        )?;
-        let binding = manifest.binding;
-        ensure!(
-            binding.plan_id == *identity.plan_id
-                && binding.plan_nonce == *identity.plan_nonce
-                && binding.vm_name == identity.vm_name
-                && binding.address == address
-                && binding.epoch == identity.epoch
-                && binding.retention_ms == identity.retention_ms
-                && binding.authority_key == plan.mailbox.context("mailbox grant")?.authority_key
-                && binding.host_signer == signer.verifying_key().to_bytes()
-                && binding.key_version == KEY_VERSION
-                && binding.history.address() == address
-                && binding.history.execution_epoch() == identity.epoch
-                && binding.history.algorithm() == EncryptionAlgorithm::AES_256_GCM
-                && binding.history.version() == KEY_VERSION,
-            "retained mailbox custody scope or authority changed"
-        );
+        let (binding, bundle_path) =
+            Self::verified_binding(keys_dir, plan, &identity, &signer.verifying_key())?;
         let bytes = read_private(&bundle_path, KEY_BYTES as u64)?;
         ensure!(
             bytes.len() == KEY_BYTES,
@@ -450,6 +417,79 @@ impl RetainedMailboxKeys {
             "retained mailbox purpose key changed"
         );
         Ok(Self { binding, material })
+    }
+
+    fn verified_binding(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        identity: &Identity<'_>,
+        signer: &ed25519_dalek::VerifyingKey,
+    ) -> Result<(Binding, std::path::PathBuf)> {
+        let address = identity.address;
+        let (bundle_path, manifest_path) = paths(keys_dir, identity)?;
+        let directory = bundle_path.parent().context("mailbox custody directory")?;
+        let directory_meta = std::fs::symlink_metadata(directory)?;
+        ensure!(
+            directory_meta.file_type().is_dir() && directory_meta.permissions().mode() & 0o077 == 0,
+            "retained mailbox custody directory is not private"
+        );
+        let manifest: SignedBinding =
+            serde_json::from_slice(&read_private(&manifest_path, MAX_MANIFEST_BYTES)?)?;
+        let signature: [u8; 64] = manifest.signature.as_slice().try_into().map_err(|_| {
+            Error::new(ErrorKind::InvalidData, "invalid mailbox manifest signature")
+        })?;
+        signer.verify(
+            &signed_bytes(&manifest.binding)?,
+            &Signature::from_bytes(&signature),
+        )?;
+        let binding = manifest.binding;
+        ensure!(
+            binding.plan_id == *identity.plan_id
+                && binding.plan_nonce == *identity.plan_nonce
+                && binding.vm_name == identity.vm_name
+                && binding.address == address
+                && binding.epoch == identity.epoch
+                && binding.retention_ms == identity.retention_ms
+                && binding.authority_key == plan.mailbox.context("mailbox grant")?.authority_key
+                && binding.host_signer == signer.to_bytes()
+                && binding.key_version == KEY_VERSION
+                && binding.history.address() == address
+                && binding.history.execution_epoch() == identity.epoch
+                && binding.history.algorithm() == EncryptionAlgorithm::AES_256_GCM
+                && binding.history.version() == KEY_VERSION,
+            "retained mailbox custody scope or authority changed"
+        );
+        Ok((binding, bundle_path))
+    }
+
+    pub(crate) fn verify_object_worker_storage(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        address: MailboxAddress,
+        signer: &ed25519_dalek::VerifyingKey,
+        history: &HistoryKeyRef,
+        anchor: &[u8; 32],
+    ) -> Result<()> {
+        let grant = plan.mailbox.context("missing selected mailbox")?;
+        ensure!(
+            grant.durable_object_pair_sha256_v1.is_some() && grant.mailbox == address.mailbox,
+            "wrong selected original storage"
+        );
+        let identity = Identity {
+            plan_id: &plan.plan_id,
+            plan_nonce: &plan.nonce,
+            vm_name: &plan.image.name,
+            address,
+            epoch: grant.epoch,
+            retention_ms: grant.retention.context("missing retention")?.retention_ms(),
+        };
+        let (binding, _) = Self::verified_binding(keys_dir, plan, &identity, signer)?;
+        ensure!(
+            binding.history == *history
+                && binding.anchor_key_id == <[u8; 32]>::from(Sha256::digest(anchor)),
+            "changed original worker journal custody"
+        );
+        Ok(())
     }
 
     pub(crate) fn history_reference(&self) -> HistoryKeyRef {

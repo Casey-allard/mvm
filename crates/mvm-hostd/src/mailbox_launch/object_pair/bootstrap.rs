@@ -191,7 +191,6 @@ impl ObjectWorkerBootstrapV1 {
     pub(crate) fn validate_current(&self) -> Result<WorkerAuthority<'_>> {
         use ed25519_dalek::{SigningKey, VerifyingKey};
         use mvm_core::mailbox::reader::verify_guest_reader_enrollment;
-        let now = super::super::now_unix_ms();
         ensure!(
             self.home.is_absolute(),
             "worker installation must be absolute"
@@ -211,7 +210,6 @@ impl ObjectWorkerBootstrapV1 {
         let a = verify_plan(&self.caller_plan, &trust)?;
         let b = verify_plan(&self.callee_plan, &trust)?;
         let role = &self.role.role;
-        self.role.verify(role.local(), now)?;
         let ad = mvm_core::config::vm_state_dir_at(&self.home, &a.image.name);
         let bd = mvm_core::config::vm_state_dir_at(&self.home, &b.image.name);
         let ledger = mvm_core::host_interface::workload::WorkloadLedger::load_at(&self.home)?;
@@ -249,6 +247,7 @@ impl ObjectWorkerBootstrapV1 {
         };
         let ar = read_revocations(&ad)?;
         let br = read_revocations(&bd)?;
+        let mut readers = Vec::with_capacity(2);
         for (plan, state, boot, incoming, receive, revoked) in [
             (
                 &a,
@@ -273,6 +272,13 @@ impl ObjectWorkerBootstrapV1 {
             let enrolled = crate::mailbox_process::reader::check_object_worker_record(
                 state, boot, incoming, receive, pin,
             )?;
+            readers.push((g, plan, boot, receive, revoked, enrolled));
+        }
+        // Sample once after loading both originals; the exact instant also
+        // governs the later journal admission and pending-Call window.
+        let now = super::super::now_unix_ms();
+        self.role.verify(role.local(), now)?;
+        for (g, plan, boot, receive, revoked, enrolled) in readers {
             let scope = MailboxGuestReaderScope {
                 plan: &g,
                 plan_id: &plan.plan_id,
@@ -329,6 +335,14 @@ impl ObjectWorkerBootstrapV1 {
             ObjectParticipantRole::Callee => (b, bd, ad, &role.call),
         };
         let address = incoming.grant.address;
+        crate::mailbox_custody::RetainedMailboxKeys::verify_object_worker_storage(
+            &keys,
+            &local_plan,
+            address,
+            &signer,
+            &self.history_ref,
+            &self.secrets.anchor,
+        )?;
         let paths = crate::mailbox_custody::RetainedMailboxKeys::object_storage_paths(
             &keys,
             &local_plan,

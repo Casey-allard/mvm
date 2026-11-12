@@ -87,7 +87,7 @@ impl ObjectWorkerBootstrapV1 {
             self.incoming() == cap,
             "different original recipient credential"
         );
-        match self.role.role.role {
+        let original_window = match self.role.role.role {
             ObjectParticipantRole::Caller => {
                 let (_, validity) = super::super::pending::recover(
                     &local,
@@ -98,10 +98,7 @@ impl ObjectWorkerBootstrapV1 {
                     envelope,
                     a.now,
                 )?;
-                ensure!(
-                    validity.contains(&self.validate_current()?.now),
-                    "original Reply or Call expired before admission"
-                );
+                Some(validity)
             }
             ObjectParticipantRole::Callee => {
                 a.pair.pending_call(
@@ -111,9 +108,14 @@ impl ObjectWorkerBootstrapV1 {
                     &local.inbound_key,
                     &mut mvm_core::mailbox::InMemoryReplayProtector::default(),
                 )?;
+                None
             }
-        }
+        };
         let current = self.validate_current()?;
+        ensure!(
+            original_window.is_none_or(|w| w.contains(&current.now)),
+            "original Call or Reply expired before commit"
+        );
         let ctx = self.context(&current, false);
         Ok(journal.admit_local(
             JournalAdmission {
