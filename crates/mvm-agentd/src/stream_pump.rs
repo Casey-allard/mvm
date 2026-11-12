@@ -1157,7 +1157,7 @@ mod tests {
 
     /// Spawn a shell child shaped like a production wrapper: its own process
     /// group, both streams piped. The group matters for the deadline path —
-    /// `kill_and_reap` signals `-pgid`.
+    /// `signal_process_group` signals `-pgid`.
     fn sh(script: &str) -> Child {
         use std::os::unix::process::CommandExt;
         Command::new("/bin/sh")

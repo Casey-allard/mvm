@@ -461,10 +461,30 @@ fn terminate_exited_group(pid: i32) -> io::Result<()> {
     }
     let e = io::Error::last_os_error();
     if e.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(e)
+        return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if e.raw_os_error() == Some(libc::EPERM) {
+        // Darwin returns EPERM for a group containing only an unreaped
+        // zombie. Accept that case only after the kernel reports exactly
+        // the original leader. A second member or an incomplete result
+        // leaves the group unresolved. No enumeration outside this group.
+        const PROC_PGRP_ONLY: u32 = 2;
+        let mut members = [0i32; 2];
+        // SAFETY: proc_listpids writes at most the supplied byte count.
+        let bytes = unsafe {
+            libc::proc_listpids(
+                PROC_PGRP_ONLY,
+                pid as u32,
+                members.as_mut_ptr().cast(),
+                std::mem::size_of_val(&members) as libc::c_int,
+            )
+        };
+        if bytes == std::mem::size_of_val(&members[0]) as i32 && members[0] == pid {
+            return Ok(());
+        }
+    }
+    Err(e)
 }
 
 fn waitpid_any(reg: &Registry, raw: &mut i32) -> i32 {
