@@ -279,6 +279,11 @@ impl EnrolledIncoming {
                     .contains(&MailboxMessageKind::Cast),
             "B's original boot-bound reader does not admit the incoming Cast"
         );
+        let journal = retained.storage_paths(config_keys)?.journal;
+        pin_generation(
+            &journal.with_extension("original-destination-v1"),
+            *boot.boot.as_bytes(),
+        )?;
         let parent = retained.payload_key();
         let mut h = <Hmac<Sha256> as KeyInit>::new_from_slice(parent.expose_bytes())?;
         h.update(b"mvm.mailbox.retained-directional-payload.v1\0");
@@ -301,35 +306,7 @@ impl EnrolledIncoming {
         }))
     }
     fn bind_original_source(&self, commitment: [u8; 32]) -> Result<()> {
-        // The first final A plan+boot wins for this retained B journal.
-        // A launcher loss does not permit a replacement generation to reuse its DEK.
-        match mvm_core::util::atomic_io::atomic_write_new(&self.source_claim, &commitment) {
-            Ok(()) => (),
-            Err(e) if mvm_core::util::atomic_io::is_already_exists(&e) => (),
-            Err(e) => return Err(e),
-        }
-        let mut f = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&self.source_claim)?;
-        let meta = f.metadata()?;
-        ensure!(
-            meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o077 == 0 && meta.len() == 32,
-            "invalid original A claim"
-        );
-        let mut held = [0; 32];
-        f.read_exact(&mut held)?;
-        ensure!(
-            held == commitment,
-            "this retained journal belongs to a different original A"
-        );
-        File::open(
-            self.source_claim
-                .parent()
-                .context("missing journal directory")?,
-        )?
-        .sync_all()?;
-        Ok(())
+        pin_generation(&self.source_claim, commitment)
     }
 
     pub(super) fn apply(&self, policy: &mut MailboxPolicy) -> Result<()> {
@@ -354,6 +331,33 @@ impl EnrolledIncoming {
             && self.policy.destination_send == grants.destination_send
             && self.original_receive == grants.destination_receive
     }
+}
+
+fn pin_generation(path: &Path, commitment: [u8; 32]) -> Result<()> {
+    // The first final A plan+boot wins for this retained B journal.
+    // A launcher loss does not permit a replacement generation to reuse its DEK.
+    match mvm_core::util::atomic_io::atomic_write_new(path, &commitment) {
+        Ok(()) => (),
+        Err(e) if mvm_core::util::atomic_io::is_already_exists(&e) => (),
+        Err(e) => return Err(e),
+    }
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = f.metadata()?;
+    ensure!(
+        meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o077 == 0 && meta.len() == 32,
+        "invalid retained generation claim"
+    );
+    let mut held = [0; 32];
+    f.read_exact(&mut held)?;
+    ensure!(
+        held == commitment,
+        "this retained journal belongs to a different original generation"
+    );
+    File::open(path.parent().context("missing journal directory")?)?.sync_all()?;
+    Ok(())
 }
 
 impl OriginalJournalDestination {
@@ -487,10 +491,32 @@ mod tests {
         );
     }
 
+    struct Meter {
+        socket: std::os::unix::net::UnixStream,
+        written: usize,
+        read: usize,
+    }
+    impl std::io::Write for Meter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let n = self.socket.write(bytes)?;
+            self.written += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.socket.flush()
+        }
+    }
+    impl std::io::Read for Meter {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.socket.read(bytes)?;
+            self.read += n;
+            Ok(n)
+        }
+    }
     #[test]
     fn retained_original_b_reads_exact_a_bytes_after_helper_reopen() {
         let keys = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir_in("/tmp").unwrap();
         let (grant, policy, a_signer) = setup(keys.path());
         IncomingJournalAdmission::install_at(keys.path(), &grant, &policy).unwrap();
         let mut plan = PlanFixture::new().build();
@@ -544,7 +570,55 @@ mod tests {
             assert_eq!(inbound.sender_key, a_signer.verifying_key());
             (incoming, inbound)
         };
-        let (first, _) = reopen();
+        let socket = state.path().join("original-b.sock");
+        let start_service = |policy: MailboxPolicy, enrolled: &EnrolledIncoming| {
+            let retained = RetainedMailboxKeys::open_existing(
+                keys.path(),
+                &plan,
+                &plan.image.name,
+                &posture.handoff(Some(boot.boot)),
+                Some(boot.boot),
+                address,
+            )
+            .unwrap();
+            let paths = retained.storage_paths(keys.path()).unwrap();
+            let signer = derive_launch_keys(keys.path(), &grant, &Key::random())
+                .unwrap()
+                .durable_material()
+                .0;
+            let anchor = mvm_core::mailbox::journal::FileJournalAnchor::open(
+                &paths.anchor,
+                address,
+                retained.anchor_key(),
+            )
+            .unwrap();
+            let journal = mvm_core::mailbox::journal::MailboxJournal::open_local_with_custody(
+                &paths.journal,
+                retained.history_reference(),
+                signer.verifying_key(),
+                super::super::LOCAL_JOURNAL_LIMITS,
+                &retained,
+                &anchor,
+                grant.retention.unwrap(),
+            )
+            .unwrap();
+            crate::mailbox_service::durable::DurableMailboxService::bind_local_incoming(
+                &socket,
+                crate::mailbox_launch::LAUNCH_LIMITS,
+                policy,
+                signer,
+                journal,
+                anchor,
+                Some(
+                    enrolled
+                        .send_guard(super::super::reader::revocations_path(state.path()))
+                        .unwrap(),
+                ),
+            )
+            .unwrap()
+        };
+        let (first, initial_policy) = reopen();
+        let initial_service = start_service(initial_policy, &first);
         first.bind_original_source([31; 32]).unwrap();
         let mut header = policy.destination_template.header.clone();
         header.sender = policy.source_scope.grant.subject;
@@ -559,9 +633,10 @@ mod tests {
         header.plaintext_len = bytes.len() as u32;
         let mut routing = policy.destination_template.routing.clone();
         routing.expires_at_unix_ms = header.expires_at_unix_ms;
+        let start = Instant::now();
         let sealed = seal_envelope(
             SealRequest {
-                header,
+                header: header.clone(),
                 routing,
                 plaintext: &bytes,
             },
@@ -570,6 +645,32 @@ mod tests {
         )
         .unwrap();
         let original_receive = first.original_receive.clone();
+        let socket_stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        socket_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        socket_stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut meter = Meter {
+            socket: socket_stream,
+            written: 0,
+            read: 0,
+        };
+        let receipt = mvm_core::mailbox::frame::send_local_receipted_frame(
+            &mut meter,
+            &policy.destination_send,
+            &sealed,
+            &header,
+            &VerifyingKey::from_bytes(&grant.authority_key).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.receipt.outcome,
+            DeliveryOutcome::AcceptedLocalDurable
+        );
+        let accepted_ns = start.elapsed().as_nanos();
+        drop(initial_service);
         drop(first);
         let (second, b) = reopen();
         assert_eq!(second.original_receive, original_receive);
@@ -586,5 +687,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered, bytes);
+        let read_context = OpenContext {
+            acting_principal: address.recipient,
+            required_operation: MailboxOperation::Receive,
+            ..b.context.clone()
+        };
+        let restored = start_service(b, &second);
+        let delivered = restored
+            .receive_next(&original_receive, &read_context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.payload(), bytes);
+        let verified_ns = start.elapsed().as_nanos();
+        let revoke = super::super::reader::revocations_path(state.path());
+        std::fs::write(
+            revoke,
+            serde_json::to_vec(&[policy.destination_send.grant.revocation_id]).unwrap(),
+        )
+        .unwrap();
+        let mut denied = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        assert!(
+            mvm_core::mailbox::frame::send_local_receipted_frame(
+                &mut denied,
+                &policy.destination_send,
+                &sealed,
+                &header,
+                &VerifyingKey::from_bytes(&grant.authority_key).unwrap()
+            )
+            .is_err()
+        );
+        let key_dir = keys.path();
+        let held = RetainedMailboxKeys::open_existing(
+            key_dir,
+            &plan,
+            &plan.image.name,
+            &posture.handoff(Some(boot.boot)),
+            Some(boot.boot),
+            address,
+        )
+        .unwrap();
+        let destination_claim = held
+            .storage_paths(key_dir)
+            .unwrap()
+            .journal
+            .with_extension("original-destination-v1");
+        assert!(pin_generation(&destination_claim, [29; 32]).is_err());
+
+        println!(
+            "incoming journal component body={} source_socket_written={} source_socket_read={} seal_through_signed_receipt_ns={} seal_through_reopen_readback_ns={}",
+            bytes.len(),
+            meter.written,
+            meter.read,
+            accepted_ns,
+            verified_ns
+        );
     }
 }
