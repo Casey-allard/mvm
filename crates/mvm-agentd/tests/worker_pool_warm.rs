@@ -644,12 +644,12 @@ fn retained_warm_response_survives_original_child_reaped_between_calls() {
         assert_eq!(first.stdout, body);
         let first_ns = start.elapsed().as_nanos();
         wait_until(
+            "original child collected by the test reaper",
             || {
                 // Signal zero checks disappearance only; no process is signalled.
                 (unsafe { libc::kill(original as i32, 0) }) == -1
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
             },
-            "original child's exit collected by test reaper",
         );
         let second = Instant::now();
         assert!(matches!(
