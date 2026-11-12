@@ -51,11 +51,11 @@ enum Phase<T, U> {
     Failed,
 }
 
-struct Meeting<T, U> {
+struct Meeting<T, U, const PUBLICATION: bool = false> {
     phase: Mutex<Phase<T, U>>,
     changed: Condvar,
 }
-impl<T, U> Meeting<T, U> {
+impl<T, U, const PUBLICATION: bool> Meeting<T, U, PUBLICATION> {
     fn new() -> Self {
         Self {
             phase: Mutex::new(Phase::Empty),
@@ -67,8 +67,12 @@ impl<T, U> Meeting<T, U> {
             .phase
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *phase = Phase::Failed;
-        self.changed.notify_all();
+        // Once both original boot files are staged and the shared deadline
+        // checked, withdrawing a single side would make that decision asymmetric.
+        if !(PUBLICATION && matches!(*phase, Phase::Ready(_))) {
+            *phase = Phase::Failed;
+            self.changed.notify_all();
+        }
     }
     fn meet(
         &self,
@@ -82,6 +86,9 @@ impl<T, U> Meeting<T, U> {
             .phase
             .lock()
             .map_err(|_| anyhow::anyhow!("Cast pair state unavailable"))?;
+        if PUBLICATION && matches!(*phase, Phase::Ready(_)) {
+            bail!("original Cast publication already committed");
+        }
         if Instant::now() >= deadline {
             *phase = Phase::Failed;
             self.changed.notify_all();
@@ -132,8 +139,16 @@ impl<T, U> Meeting<T, U> {
             }
             _ => bail!("Cast pair lane is already occupied or retired"),
         }
+        self.receive(phase, index, deadline)
+    }
+    fn receive<'a>(
+        &'a self,
+        mut phase: std::sync::MutexGuard<'a, Phase<T, U>>,
+        index: usize,
+        deadline: Instant,
+    ) -> Result<U> {
         loop {
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline && !(PUBLICATION && matches!(*phase, Phase::Ready(_))) {
                 *phase = Phase::Failed;
                 self.changed.notify_all();
                 bail!("original Cast admission expired");
@@ -156,11 +171,11 @@ impl<T, U> Meeting<T, U> {
     }
 }
 
-struct FailedPreparation<'a, T, U> {
-    meeting: &'a Meeting<T, U>,
+struct FailedPreparation<'a, T, U, const PUBLICATION: bool> {
+    meeting: &'a Meeting<T, U, PUBLICATION>,
     armed: bool,
 }
-impl<T, U> Drop for FailedPreparation<'_, T, U> {
+impl<T, U, const PUBLICATION: bool> Drop for FailedPreparation<'_, T, U, PUBLICATION> {
     fn drop(&mut self) {
         if self.armed {
             self.meeting.cancel()
@@ -175,7 +190,7 @@ pub struct OriginalCastPair {
     wait: Duration,
     prepare: Arc<PrepareBoth>,
     admitted: Meeting<ReservedLaunch, OriginalCastRole>,
-    published: Meeting<(), ()>,
+    published: Meeting<(), (), true>,
 }
 impl OriginalCastPair {
     pub(crate) fn new(
@@ -270,7 +285,7 @@ mod tests {
     use super::*;
     #[test]
     fn real_arrivals_order_once_and_retire_without_replacement() {
-        let pair = Meeting::new();
+        let pair = Meeting::<i32, i32>::new();
         std::thread::scope(|s| {
             let a = s.spawn(|| {
                 pair.meet(0, 11, Instant::now() + Duration::from_secs(2), |a, b, _| {
@@ -290,6 +305,33 @@ mod tests {
                 [0, 0]
             ))
             .is_err()
+        );
+    }
+    // Park the first SDK immediately after lodging its original input. The
+    // second SDK drives the real commit; the first reads it after its deadline.
+    #[test]
+    fn committed_publication_survives_delayed_original_and_late_cancellation() {
+        let pair = Meeting::<(), u8, true>::new();
+        let deadline = Instant::now() + Duration::from_millis(40);
+        *pair.phase.lock().unwrap() = Phase::Waiting(0, (), deadline);
+        assert_eq!(
+            pair.meet(1, (), deadline, |_, _, _| Ok([11, 22])).unwrap(),
+            22
+        );
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        pair.cancel();
+        assert!(
+            pair.meet(1, (), deadline, |_, _, _| unreachable!())
+                .is_err()
+        );
+        assert_eq!(
+            pair.receive(pair.phase.lock().unwrap(), 0, deadline)
+                .unwrap(),
+            11
+        );
+        assert!(
+            pair.receive(pair.phase.lock().unwrap(), 0, deadline)
+                .is_err()
         );
     }
     #[test]
