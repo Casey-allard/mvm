@@ -110,6 +110,8 @@ pub mod late_volumes;
 pub mod lifecycle_hooks;
 /// Guest side of the mailbox port: forwards the workload's plaintext message.
 pub mod mailbox_outbox;
+/// Original reliable Cast handoff to one enrolled guest workload.
+pub mod mailbox_cast;
 /// Guest-side network defense. The `mvm-guest-netinit`
 /// binary calls into this module at boot to install kernel blackhole
 /// routes for `MANDATORY_DENY_RANGES` before any workload code runs.

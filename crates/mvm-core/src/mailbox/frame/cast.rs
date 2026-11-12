@@ -251,6 +251,37 @@ impl CastChannel {
         )
     }
 
+    /// The original signed pair's intersection. Retained unread plaintext
+    /// is never newly offered to a workload beyond this interval.
+    pub fn guest_validity(&self) -> std::ops::Range<i64> {
+        self.valid_from..self.valid_until
+    }
+
+    /// Limit this endpoint to both the verified destination grant and the
+    /// original installed reservation. Repeated calls can only narrow limits.
+    pub fn narrow_guest_limits(
+        &mut self,
+        installed: MailboxLocalLimits,
+    ) -> Result<MailboxLocalLimits, Refusal> {
+        installed.validate().map_err(|_| deny())?;
+        let prior = self.limits;
+        let limits = MailboxLocalLimits {
+            payload_bytes: prior.payload_bytes.min(installed.payload_bytes),
+            spooled_requests: prior.spooled_requests.min(installed.spooled_requests),
+            retained_guest_bytes: prior
+                .retained_guest_bytes
+                .min(installed.retained_guest_bytes),
+            queued_messages: prior.queued_messages.min(installed.queued_messages),
+            active_calls: prior.active_calls.min(installed.active_calls),
+            max_frame_bytes: prior.max_frame_bytes.min(installed.max_frame_bytes),
+            retained_host_bytes: prior.retained_host_bytes.min(installed.retained_host_bytes),
+            max_connections: prior.max_connections.min(installed.max_connections),
+        };
+        limits.validate().map_err(|_| deny())?;
+        self.limits = limits;
+        Ok(limits)
+    }
+
     /// One guest inbox for this original role. Retain the last accepted value
     /// across a lost ACK; taking it never enqueues it again.
     pub fn inbox(&self) -> CastInbox {
@@ -335,6 +366,20 @@ impl CastInbox {
         }
         self.retained.clone()
     }
+    /// Clear the original unread mark only after a successful workload
+    /// handoff. Failures, including ambiguous acknowledgments, retain it.
+    pub fn consume_with<T, E>(
+        &mut self,
+        deliver: impl FnOnce(&LocalDelivery) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        let Some(item) = self.retained.as_deref().filter(|_| self.unread) else {
+            return Ok(None);
+        };
+        let result = deliver(item)?;
+        self.unread = false;
+        Ok(Some(result))
+    }
+
     fn accept(&mut self, item: LocalDelivery) -> LocalInboxDisposition {
         let last = if let Some(prior) = &self.retained {
             if prior.as_ref() == &item {

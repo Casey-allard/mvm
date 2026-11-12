@@ -378,7 +378,11 @@ mod canonical {
             );
         });
         assert_eq!(fresh.take().unwrap().body, input);
-        let chan = new_channel(recipient()).unwrap();
+        let mut chan = new_channel(recipient()).unwrap();
+        let mut smaller = profile.limits;
+        smaller.payload_bytes = 24;
+        assert_eq!(chan.narrow_guest_limits(smaller).unwrap(), smaller);
+        assert_eq!(chan.narrow_guest_limits(profile.limits).unwrap(), smaller);
         let mut replay = InMemoryReplayProtector::default();
         let proof = chan
             .verify(
@@ -532,7 +536,26 @@ mod canonical {
             ),
             LocalInboxDisposition::Full
         );
-        let first = inbox.take().unwrap();
+        let failed = inbox.consume_with(|delivery| {
+            assert_eq!(delivery.body, input);
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        });
+        assert_eq!(
+            failed.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            ack_kind(
+                &chan
+                    .receive_cast(greeting, &second_packet, 1_500, &mut inbox)
+                    .unwrap()
+            ),
+            LocalInboxDisposition::Full
+        );
+        let first = inbox
+            .consume_with(|delivery| Ok::<_, ()>(delivery.clone()))
+            .unwrap()
+            .unwrap();
         assert_eq!(first.body, input);
         assert_eq!(first.sender, sender());
         assert_eq!(first.recipient, recipient());
