@@ -101,12 +101,29 @@ impl JournalOwner<'_> {
         }
     }
 
-    /// Record the SDK's successful abort on this original. Collection still
-    /// independently requires the kernel observer armed at helper installation.
-    pub fn note_launch_aborted(&mut self, plan: &ExecutionPlan) -> Result<()> {
+    /// Abort a failed launch through its own original backend. Only a positive
+    /// backend return creates this abort record. Collection separately checks
+    /// the kernel observer that was armed while this generation was live.
+    pub fn abort_original_launch(
+        &mut self,
+        plan: &ExecutionPlan,
+        backend: &AnyBackend,
+        id: &VmId,
+    ) -> Result<()> {
         let (name, boot, _, state, _, _) = self.parts();
-        ensure!(name == plan.image.name, "abort belongs to another VM");
+        ensure!(
+            name == plan.image.name && name == id.0,
+            "abort belongs to another VM"
+        );
         boot.check_plan(plan)?;
+        let (original, _) = state.vmm.as_ref().context("original VMM observer absent")?;
+        ensure!(
+            backend.kind() == state.kind
+                && original.is_live_and_ours()
+                && backend.host_process_id(id)? == Some(original.pid as u32),
+            "original VMM changed before abort"
+        );
+        backend.abort_start(id)?;
         state.sdk_abort_confirmed = true;
         Ok(())
     }

@@ -547,9 +547,8 @@ fn finish_legacy_persistent(
     let paired = journal.is_some();
     if let Some(endpoint) = journal.as_deref_mut() {
         if let Err(error) = endpoint.serve(&admission.admitted, &started) {
-            match started.backend().abort_start(started.vm_id()) {
-                Ok(_) => {
-                    endpoint.note_launch_aborted(admission.admitted.plan())?;
+            match endpoint.abort_original(admission.admitted.plan(), &started) {
+                Ok(()) => {
                     crate::local::deregister_from_name_registry(name);
                     emit_failed(&admission, "mailbox-process", &error);
                 }
@@ -587,9 +586,16 @@ fn finish_legacy_persistent(
     // Detached callers must not observe success until the authenticated guest
     // control plane is actually serving; failure rolls the partial start back
     // before any launch acceptance, lease commit, or launched audit record.
-    if let Err(error) =
-        super::detached::require_serving_guest(name, &started, std::time::Duration::from_secs(30))
-    {
+    let timeout = std::time::Duration::from_secs(30);
+    let ready = match journal.as_deref_mut() {
+        Some(endpoint) => {
+            super::detached::require_serving_guest_with_rollback(name, &started, timeout, || {
+                endpoint.abort_original(admission.admitted.plan(), &started)
+            })
+        }
+        None => super::detached::require_serving_guest(name, &started, timeout),
+    };
+    if let Err(error) = ready {
         let abort_is_unresolved = error.abort_is_unresolved();
         if abort_is_unresolved {
             // The VMM may still hold block-device file descriptors. Preserve
@@ -598,9 +604,6 @@ fn finish_legacy_persistent(
             prepared_volumes.commit();
             audit_detached_readiness_failure(&admission, name, &error);
         } else {
-            if let Some(endpoint) = journal.as_deref_mut() {
-                endpoint.note_launch_aborted(admission.admitted.plan())?;
-            }
             audit_detached_readiness_failure(&admission, name, &error);
             // The failure record and session seal live under the runtime
             // state directory, so cleanup must follow audit finalization.
@@ -620,10 +623,7 @@ fn finish_legacy_persistent(
             &admission,
             &started,
             name,
-            || {
-                started.backend().abort_start(started.vm_id())?;
-                endpoint.note_launch_aborted(admission.admitted.plan())
-            },
+            || endpoint.abort_original(admission.admitted.plan(), &started),
             || prepared_volumes.commit(),
         )?;
     } else {

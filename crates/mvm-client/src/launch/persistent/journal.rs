@@ -80,19 +80,20 @@ impl InstalledJournal<'_> {
         }
     }
 
-    pub(super) fn note_launch_aborted(
+    pub(super) fn abort_original(
         &mut self,
         plan: &mvm_core::plan::ExecutionPlan,
+        started: &crate::StartedVm,
     ) -> Result<()> {
         use mvm_hostd::mailbox_process::original_journal::JournalOwner;
         let original = match self {
             Self::Destination { owner, .. } => owner.as_mut().map(JournalOwner::Destination),
             Self::Source { owner, .. } => owner.as_mut().map(JournalOwner::Source),
         };
-        if let Some(mut held) = original {
-            held.note_launch_aborted(plan)?;
+        match original {
+            Some(mut held) => held.abort_original_launch(plan, started.backend(), started.vm_id()),
+            None => started.backend().abort_start(started.vm_id()).map(|_| ()),
         }
-        Ok(())
     }
 
     pub(super) fn serve(

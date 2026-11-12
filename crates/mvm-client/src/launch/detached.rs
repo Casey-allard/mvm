@@ -71,13 +71,20 @@ pub fn require_serving_guest(
     started: &crate::StartedVm,
     timeout: std::time::Duration,
 ) -> std::result::Result<(), DetachedReadinessError> {
-    // The in-memory backend has no guest transport. It is a lifecycle test
-    // double, not a production detached lane.
-    let ready = started.backend().kind() == mvm_core::vm_backend::BackendKind::Mock
-        || crate::readiness::wait_for_guest_agent_for(name, timeout);
-    require_serving_guest_result(name, timeout, ready, || {
+    require_serving_guest_with_rollback(name, started, timeout, || {
         started.backend().abort_start(started.vm_id()).map(|_| ())
     })
+}
+
+pub(super) fn require_serving_guest_with_rollback(
+    name: &str,
+    started: &crate::StartedVm,
+    timeout: std::time::Duration,
+    rollback: impl FnOnce() -> Result<()>,
+) -> std::result::Result<(), DetachedReadinessError> {
+    let ready = started.backend().kind() == mvm_core::vm_backend::BackendKind::Mock
+        || crate::readiness::wait_for_guest_agent_for(name, timeout);
+    require_serving_guest_result(name, timeout, ready, rollback)
 }
 
 fn require_serving_guest_result(
