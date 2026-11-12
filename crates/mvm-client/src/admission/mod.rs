@@ -399,7 +399,15 @@ pub fn admit_plan_for_boot_configured_ingress(
     p: AdmitPlanForBootParams<'_>,
     ingress: Vec<mvm_core::plan::IngressMapping>,
 ) -> Result<AdmissionContext> {
-    let (context, durability) = admit(p, ingress, durability::AdmissionSync::Inline)?;
+    admit_persistent_ingress(p, ingress, None)
+}
+
+pub(crate) fn admit_persistent_ingress(
+    p: AdmitPlanForBootParams<'_>,
+    ingress: Vec<mvm_core::plan::IngressMapping>,
+    journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
+) -> Result<AdmissionContext> {
+    let (context, durability) = admit(p, ingress, durability::AdmissionSync::Inline, journal)?;
     debug_assert!(
         durability.is_settled(),
         "an inline admission is already durable"
@@ -411,6 +419,7 @@ fn admit(
     p: AdmitPlanForBootParams<'_>,
     ingress: Vec<mvm_core::plan::IngressMapping>,
     sync: durability::AdmissionSync,
+    journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
 ) -> Result<(
     AdmissionContext,
     mvm_core::admission_durability::AdmissionDurability,
@@ -784,13 +793,16 @@ fn admit(
         ms = (t_pre_sign - t_sha).as_secs_f64() * 1000.0,
         "admit: synthesis inputs"
     );
+    let posture =
+        crate::admission::run_grants::run_posture(variant, p.backend_kind, p.runtime_config);
+    let posture = journal.map_or(posture, |endpoint| endpoint.authorize(posture));
     let admitted = admit_for_run(
         &input,
         &SystemClock,
         p.ledger,
         p.keys_dir,
         admission_ctx.as_ref(),
-        crate::admission::run_grants::run_posture(variant, p.backend_kind, p.runtime_config),
+        posture,
     )
     .or_else(|err| -> Result<_> {
         if let Some(refused) =

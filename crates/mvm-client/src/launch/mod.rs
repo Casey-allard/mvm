@@ -826,6 +826,10 @@ impl LocalBackend {
     /// requests persist their definition first, then boot from it — both
     /// through the one canonical signed-admission seam.
     pub async fn launch(&self, request: LaunchRequest) -> Result<LaunchOutcome> {
+        if request.mode == LifecycleMode::Persistent {
+            persistent::journal::validate_slot(None, request.mailbox.as_ref())
+                .map_err(crate::local::backend_err)?;
+        }
         if let LaunchSource::RegistryPack { pin } = &request.source {
             let backend = self.launch_backend(request.backend.as_deref())?;
             built_pack::resolve_built_pack_image(pin, backend.name(), &request.profile)
@@ -926,6 +930,7 @@ impl LocalBackend {
                 request.backend.as_deref(),
                 !request.command.is_empty(),
                 request.mailbox,
+                None,
             )
             .await?;
         if let Some(ttl) = request.ttl_seconds {
@@ -967,11 +972,14 @@ impl LocalBackend {
         backend_override: Option<&str>,
         has_ad_hoc_argv: bool,
         mailbox: Option<mvm_contract::protocol::mailbox::MailboxGrant>,
+        journal: Option<&mut persistent::journal::InstalledJournal<'_>>,
     ) -> Result<(machine_start::MachineStart, String)> {
+        persistent::journal::validate_slot(journal.as_deref(), mailbox.as_ref())
+            .map_err(crate::local::backend_err)?;
         let backend = backend_override
             .map(str::to_string)
             .unwrap_or_else(|| self.backend.name().to_string());
-        if !self.machine_running(&spec.name) {
+        if journal.is_none() && !self.machine_running(&spec.name) {
             remove_vm_runtime_dirs(&spec.name)?;
         }
         let image = match spec.image.clone() {
@@ -985,7 +993,7 @@ impl LocalBackend {
         let host = machine_start::EmbedderStartHost::new(image, &spec.profile)
             .with_secret_service(self.secrets()?)
             .with_backend(&self.backend);
-        let started = detached::boot_recorded(
+        let started = detached::boot_recorded_with_journal(
             spec,
             &host,
             machine_start::MachineStartParams {
@@ -993,6 +1001,7 @@ impl LocalBackend {
                 has_ad_hoc_argv,
                 mailbox,
             },
+            journal,
         )
         .map_err(|e| crate::local::backend_err(format!("{e:#}")))?;
         Ok((started, backend))
@@ -1221,6 +1230,36 @@ fn ensure_spec_bootable_in_process(spec: &mp::MachineSpec) -> Result<()> {
 }
 
 impl LocalBackend {
+    /// Boot a stopped, previously defined machine under a one-start journal
+    /// grant. The original helper is returned in the caller's owner slot.
+    /// An already running machine has its own boot and cannot be adopted.
+    pub async fn start_persistent_with_journal(
+        &self,
+        name: &str,
+        grant: mvm_contract::protocol::mailbox::MailboxGrant,
+        journal: &mut persistent::journal::InstalledJournal<'_>,
+    ) -> Result<machine_start::MachineStart> {
+        persistent::journal::validate_slot(Some(journal), Some(&grant))
+            .map_err(crate::local::backend_err)?;
+        mvm_core::naming::validate_vm_name(name).map_err(crate::local::backend_err)?;
+        let mut spec = mp::load_machine_spec(name).map_err(|e| MvmError::NotFound {
+            id: format!("{name}: {e}"),
+        })?;
+        if spec.name != name || self.machine_running(name) {
+            return Err(MvmError::Conflict {
+                reason: format!(
+                    "journal start requires the original stopped definition for {name:?}"
+                ),
+            });
+        }
+        ensure_spec_bootable_in_process(&spec)?;
+        self.validate_sidecar_refs(name)?;
+        let (started, _) = self
+            .boot_spec(&mut spec, None, false, Some(grant), Some(journal))
+            .await?;
+        Ok(started)
+    }
+
     /// Start a stopped persistent machine from its persisted definition:
     /// sidecar secret references re-validated fail-closed, registered
     /// attachments re-resolved and leased, then the canonical admitted boot.
@@ -1241,7 +1280,7 @@ impl LocalBackend {
         ensure_spec_bootable_in_process(&spec)?;
         self.validate_sidecar_refs(name)?;
         let mut spec = spec;
-        let (_, backend) = self.boot_spec(&mut spec, None, false, None).await?;
+        let (_, backend) = self.boot_spec(&mut spec, None, false, None, None).await?;
         let memory_mib = mvm_core::util::parse_human_size(&spec.memory).unwrap_or_default();
         Ok(MachineState {
             id: MachineId(name.to_string()),

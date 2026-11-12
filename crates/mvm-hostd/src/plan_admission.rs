@@ -1930,6 +1930,25 @@ pub fn apply_admitted_grants_or_undo_launch(
     )
 }
 
+/// Use the caller's original VM handle for rollback. Emit terminal grant
+/// failure only after that rollback confirms the VM stopped.
+pub fn apply_grants_with_owned_rollback(
+    backend: &AnyBackend,
+    vm_id: &VmId,
+    admitted: &AdmittedPlan,
+    emitter: Option<&crate::audit::emitter::AuditEmitter>,
+    rollback: impl FnOnce() -> Result<()>,
+) -> Result<EnforcedGrants> {
+    apply_admitted_grants_with_rollback(
+        backend,
+        vm_id,
+        admitted,
+        emitter,
+        rollback,
+        FailureAuditPolicy::OwnedAfterConfirmedRollback,
+    )
+}
+
 fn apply_admitted_grants_with_rollback(
     backend: &AnyBackend,
     vm_id: &VmId,

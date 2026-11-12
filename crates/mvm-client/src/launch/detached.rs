@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use mvm_runtime::machine::persist::{self as mp, MachineSpec, SpecReconcile};
 
-use super::machine_start::{MachineStart, MachineStartParams, StartHost, start_machine_spec};
+use super::machine_start::{
+    MachineStart, MachineStartParams, StartHost, start_machine_spec_with_journal,
+};
 use crate::secret::MachineSecretRef;
 
 /// How long a boot command waits for the guest agent to answer before giving
@@ -225,7 +227,16 @@ pub fn boot_recorded(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
-    let started = start_machine_spec(spec, host, params)?;
+    boot_recorded_with_journal(spec, host, params, None)
+}
+
+pub(super) fn boot_recorded_with_journal(
+    spec: &mut MachineSpec,
+    host: &dyn StartHost,
+    params: MachineStartParams<'_>,
+    journal: Option<&mut super::persistent::journal::InstalledJournal<'_>>,
+) -> Result<MachineStart> {
+    let started = start_machine_spec_with_journal(spec, host, params, journal)?;
     super::machine_start::record_machine_started(spec, started.resolved_digest.clone());
     if let Err(err) = mp::overwrite_machine_spec(spec) {
         tracing::warn!(error = %err, machine = %spec.name, "updating machine start metadata failed (non-fatal)");

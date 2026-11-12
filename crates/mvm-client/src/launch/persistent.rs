@@ -4,6 +4,7 @@
 //! selected backend.
 
 use anyhow::{Context, Result};
+pub mod journal;
 
 use mvm_core::domain::instance::InstanceReadiness;
 use mvm_core::naming::validate_vm_name;
@@ -21,8 +22,8 @@ use super::runtime_source::{
 };
 use crate::admission::policy::shares_from_volume_cfg;
 use crate::admission::{
-    AdmitPlanForBootParams, admit_plan_for_boot_configured_ingress, attach_guest_boot_config,
-    emit_failed, emit_launched, enforce_kernel, enforce_shares, guest_profile_for_boot,
+    AdmitPlanForBootParams, admit_persistent_ingress, attach_guest_boot_config, emit_failed,
+    emit_launched, enforce_kernel, enforce_shares, guest_profile_for_boot,
 };
 
 fn preopen_console_for_profile(profile: &str) -> bool {
@@ -184,13 +185,21 @@ fn register_vm_name(vm_name: &str, network_name: &str) {
 pub fn start_persistent_oci_machine(
     params: PersistentImageStartParams<'_>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    start_persistent(params, None)
+}
+
+pub(super) fn start_persistent(
+    params: PersistentImageStartParams<'_>,
+    journal: Option<&mut journal::InstalledJournal<'_>>,
+) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     let PreparedPersistentBoot {
         backend,
         start_config,
         admission,
         prepared_volumes,
         built_runtime: _built_runtime,
-    } = prepare_persistent_boot(params)?;
+    } = prepare_persistent_boot(params, journal.as_deref())?;
     let name_label = start_config.name.clone();
     let name = name_label.as_str();
     let backend_label = backend.name().to_string();
@@ -202,6 +211,7 @@ pub fn start_persistent_oci_machine(
         prepared_volumes,
         name,
         backend_name,
+        journal,
     )
 }
 
@@ -215,6 +225,7 @@ struct PreparedPersistentBoot {
 
 fn prepare_persistent_boot(
     params: PersistentImageStartParams<'_>,
+    journal: Option<&journal::InstalledJournal<'_>>,
 ) -> Result<PreparedPersistentBoot> {
     let PersistentImageStartParams {
         name,
@@ -330,7 +341,7 @@ fn prepare_persistent_boot(
                     })
                 })
                 .collect::<Vec<_>>();
-            admit_plan_for_boot_configured_ingress(
+            admit_persistent_ingress(
                 AdmitPlanForBootParams {
                     mailbox,
                     // What the backend will arm, so the admitted tier opens
@@ -395,6 +406,7 @@ fn prepare_persistent_boot(
                         ),
                 },
                 ingress,
+                journal,
             )
         },
     )?;
@@ -487,6 +499,7 @@ fn finish_legacy_persistent(
     mut prepared_volumes: crate::volume::LaunchPreparation,
     name: &str,
     backend_name: &str,
+    journal: Option<&mut journal::InstalledJournal<'_>>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
     let mailbox_posture = admission.admitted.mailbox_posture();
     // VMM selection + workload-support check + start move behind the facade; the
@@ -524,7 +537,33 @@ fn finish_legacy_persistent(
     };
     // The guest asserts a mailbox exactly when the plan grants one, so the
     // host side starts here or the launch is rolled back.
-    if let Err(error) = mvm_hostd::mailbox_process::serve_started(
+    let paired = journal.is_some();
+    if let Some(endpoint) = journal {
+        if let Err(error) = endpoint.serve(&admission.admitted, &started) {
+            match started.backend().abort_start(started.vm_id()) {
+                Ok(_) => {
+                    crate::local::deregister_from_name_registry(name);
+                    emit_failed(&admission, "mailbox-process", &error);
+                }
+                Err(abort) => {
+                    prepared_volumes.commit();
+                    crate::launch::record_unsealed_end(
+                        Some((&admission.emitter, admission.admitted.plan())),
+                        crate::launch::UnsealedEnd::new(
+                            name,
+                            crate::launch::UnsealedReason::StopFailed,
+                        )
+                        .error(format!(
+                            "mailbox helper: {error:#}; launch abort: {abort:#}"
+                        )),
+                    );
+                    return Err(error.context(format!("VM launch rollback unresolved: {abort:#}")));
+                }
+            }
+            // Keep the marker and its state available to the original owner.
+            return Err(error);
+        }
+    } else if let Err(error) = mvm_hostd::mailbox_process::serve_started(
         started.backend(),
         started.vm_id(),
         &start_config,
@@ -554,7 +593,8 @@ fn finish_legacy_persistent(
             audit_detached_readiness_failure(&admission, name, &error);
             // The failure record and session seal live under the runtime
             // state directory, so cleanup must follow audit finalization.
-            if let Err(cleanup_error) = crate::local::remove_stopped_runtime_state(name) {
+            if !paired && let Err(cleanup_error) = crate::local::remove_stopped_runtime_state(name)
+            {
                 tracing::warn!(
                     error = %cleanup_error,
                     machine = name,
@@ -564,19 +604,18 @@ fn finish_legacy_persistent(
         }
         return Err(anyhow::Error::new(error));
     }
-    // After the start, because a cgroup quota is read back off a process that
-    // does not exist until then. This is the call that puts the backend's
-    // `apply_grants` on the path `mvmctl` boots: without it the tier is
-    // computed correctly and reported to nobody. A failure here has already
-    // stopped the VM, so the volume leases are released rather than committed.
-    super::grants_report::report_enforced_grants(&admission, &started)?;
-    // File what this boot committed against the host budget before the volume
-    // leases commit: every later admission's committed-total check sums these
-    // per-VM records, and a boot that never wrote one was invisible to it.
-    // Fatal, like the grants step above — the VM stops rather than stay up as
-    // a machine the host's accounting never saw, and the uncommitted leases
-    // release with the rollback.
-    super::budget_charge::record_boot_charge(&admission, name, &started)?;
+    if paired {
+        journal::account_started(
+            &admission,
+            &started,
+            name,
+            || started.backend().abort_start(started.vm_id()).map(|_| ()),
+            || prepared_volumes.commit(),
+        )?;
+    } else {
+        super::grants_report::report_enforced_grants(&admission, &started)?;
+        super::budget_charge::record_boot_charge(&admission, name, &started)?;
+    }
     prepared_volumes.commit();
     emit_launched(&admission, backend_name, true);
     record_vm_readiness(name, InstanceReadiness::LaunchAccepted);

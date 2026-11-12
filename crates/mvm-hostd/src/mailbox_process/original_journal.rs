@@ -235,6 +235,42 @@ pub(super) fn claim_launch(
     }))
 }
 
+/// Serializes paired SDK starts for one machine through admission, helper
+/// installation and readiness. Persistent custody lives outside disposable VM state.
+pub struct PairedBootReservation {
+    _boot: FileLock,
+}
+
+impl PairedBootReservation {
+    pub fn acquire(name: &str) -> Result<Self> {
+        mvm_core::naming::validate_vm_name(name)?;
+        let owner = owner_dir(&mvm_core::config::mvm_keys_dir(), name)?;
+        Self::acquire_at(
+            &owner,
+            &mvm_core::config::vm_state_dir(name),
+            &mvm_core::config::instance_dir(name),
+        )
+    }
+
+    fn acquire_at(
+        owner: &std::path::Path,
+        state: &std::path::Path,
+        instance: &std::path::Path,
+    ) -> Result<Self> {
+        let boot = FileLock::try_acquire(&owner.join("paired-sdk-boot"))?
+            .context("paired persistent machine start is already in progress")?;
+        // Hold the canonical mailbox lock over cleanup; a surviving original
+        // marker, child pidfile or mailbox socket requires its original owner.
+        let _claim = claim_launch(state, owner, true)?;
+        ensure!(
+            mvm_runtime::vm::reconcile::reap_unowned_state_dir(state, instance)
+                .map_err(anyhow::Error::msg)?,
+            "VM runtime is still owned"
+        );
+        Ok(Self { _boot: boot })
+    }
+}
+
 pub(super) const MARKER: &str = "mailbox-paired-original-v1";
 
 /// Kept on disk through either launcher crash or an uncollected Child. The
@@ -322,6 +358,35 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::time::Duration;
+
+    #[test]
+    fn paired_sdk_reap_preserves_owned_state_and_serializes_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = root.path().join("owner");
+        let state = root.path().join("runtime");
+        let instance = root.path().join("instance");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let sample = state.join("preserved");
+        std::fs::write(&sample, b"original").unwrap();
+        let mut marker = OriginalMarker::claim(&owner).unwrap();
+        assert!(PairedBootReservation::acquire_at(&owner, &state, &instance).is_err());
+        assert_eq!(std::fs::read(&sample).unwrap(), b"original");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        assert!(marker.collect(&mut child).unwrap().is_some());
+        let live = mvm_runtime::vm::instance_snapshot::try_lock_resume_in(&instance)
+            .unwrap()
+            .unwrap();
+        assert!(PairedBootReservation::acquire_at(&owner, &state, &instance).is_err());
+        assert!(sample.exists());
+        drop(live);
+        let first = PairedBootReservation::acquire_at(&owner, &state, &instance).unwrap();
+        assert!(!state.exists());
+        assert!(PairedBootReservation::acquire_at(&owner, &state, &instance).is_err());
+        drop(first);
+        PairedBootReservation::acquire_at(&owner, &state, &instance).unwrap();
+    }
 
     #[test]
     fn journal_peer_child() {

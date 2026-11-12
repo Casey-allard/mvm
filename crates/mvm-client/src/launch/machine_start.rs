@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use mvm_runtime::backend::AnyBackend;
 use mvm_runtime::machine::persist as mp;
 
-use super::persistent::{PersistentImageStartParams, start_persistent_oci_machine};
+use super::persistent::{self, PersistentImageStartParams, journal::InstalledJournal};
 use crate::secret::SecretService;
 use crate::volume::LaunchPreparation;
 
@@ -239,8 +239,27 @@ pub fn start_machine_spec(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
+    start_machine_spec_with_journal(spec, host, params, None)
+}
+
+pub(super) fn start_machine_spec_with_journal(
+    spec: &mp::MachineSpec,
+    host: &dyn StartHost,
+    params: MachineStartParams<'_>,
+    journal: Option<&mut InstalledJournal<'_>>,
+) -> Result<MachineStart> {
+    persistent::journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     AnyBackend::require_hypervisor_selectable(params.hypervisor)?;
-    super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
+    let _boot_reservation = if journal.is_some() {
+        Some(
+            mvm_hostd::mailbox_process::original_journal::PairedBootReservation::acquire(
+                &spec.name,
+            )?,
+        )
+    } else {
+        super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
+        None
+    };
     validate_registry_pack_source(spec)?;
     let network_policy = persisted_network_policy(spec)?;
     let (memory_mib, mem_initial_mib) =
@@ -273,32 +292,35 @@ pub fn start_machine_spec(
         .prepare_volumes(&spec.name, &spec.volumes)
         .context("resolving registered local volumes before admission")?;
     let workload_dir = persistent_workload_dir(spec);
-    let admitted = start_persistent_oci_machine(PersistentImageStartParams {
-        name: &spec.name,
-        image_label: &boot.label,
-        resolved_digest: &boot.digest,
-        rootfs_path: &boot.rootfs,
-        profile: &spec.profile,
-        cpus: spec.cpus,
-        memory_mib,
-        mem_initial_mib,
-        prepared_volumes,
-        network_policy,
-        ports: &spec.ports,
-        backend_name: params.hypervisor,
-        kernel_path,
-        agent_verb: spec.agent_verb.clone(),
-        caller_commitment: spec.caller_commitment.clone(),
-        registry_pack_image: spec.registry_pack_image.clone(),
-        has_ad_hoc_argv: params.has_ad_hoc_argv,
-        grants: spec.grants.clone(),
-        mailbox: params.mailbox,
-        gpu: spec.gpu,
-        gpu_device: spec.gpu_device,
-        workload_dir: workload_dir.as_deref(),
-        secrets,
-        backend: host.backend(params.hypervisor),
-    })?;
+    let admitted = persistent::start_persistent(
+        PersistentImageStartParams {
+            name: &spec.name,
+            image_label: &boot.label,
+            resolved_digest: &boot.digest,
+            rootfs_path: &boot.rootfs,
+            profile: &spec.profile,
+            cpus: spec.cpus,
+            memory_mib,
+            mem_initial_mib,
+            prepared_volumes,
+            network_policy,
+            ports: &spec.ports,
+            backend_name: params.hypervisor,
+            kernel_path,
+            agent_verb: spec.agent_verb.clone(),
+            caller_commitment: spec.caller_commitment.clone(),
+            registry_pack_image: spec.registry_pack_image.clone(),
+            has_ad_hoc_argv: params.has_ad_hoc_argv,
+            grants: spec.grants.clone(),
+            mailbox: params.mailbox,
+            gpu: spec.gpu,
+            gpu_device: spec.gpu_device,
+            workload_dir: workload_dir.as_deref(),
+            secrets,
+            backend: host.backend(params.hypervisor),
+        },
+        journal,
+    )?;
     Ok(MachineStart {
         resolved_digest: boot.digest,
         admitted,

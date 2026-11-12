@@ -1537,7 +1537,7 @@ async fn a_restart_re_admits_under_the_persisted_grants_not_deny_all() {
     mp::save_machine_spec(&spec, false).unwrap();
 
     let (started, _) = client
-        .boot_spec(&mut spec, None, false, None)
+        .boot_spec(&mut spec, None, false, None, None)
         .await
         .expect("the start boots");
     let admitted = started
@@ -2067,9 +2067,10 @@ async fn persistent_request_mailbox_reaches_canonical_backend_admission() {
         ..Default::default()
     };
     mvm_core::user_config::save(&host, None).expect("host retention ceiling");
-    let grant = crate::admission::mailbox_grant::resolve(Some(&"ab".repeat(32)), Some(10_000), None)
-        .expect("host-authorized grant")
-        .expect("requested grant");
+    let grant =
+        crate::admission::mailbox_grant::resolve(Some(&"ab".repeat(32)), Some(10_000), None)
+            .expect("host-authorized grant")
+            .expect("requested grant");
     let request = persistent_request(&home.rootfs(), name)
         .mailbox(grant)
         .build()
@@ -2089,6 +2090,25 @@ async fn persistent_request_mailbox_reaches_canonical_backend_admission() {
         !machine_spec_path(name).exists(),
         "remove only the definition this failed launch created"
     );
+}
+
+#[tokio::test]
+async fn persistent_journal_request_without_original_owner_never_creates_a_machine() {
+    let home = Isolated::new();
+    let name = "p-journal-missing-owner";
+    let client = mock_client();
+    let mut grant = crate::admission::mailbox_grant::resolve(Some(&"ab".repeat(32)), None, None)
+        .unwrap()
+        .unwrap();
+    grant.incoming_journal_policy_sha256_v1 = Some([23; 32]);
+    let request = persistent_request(&home.rootfs(), name)
+        .mailbox(grant)
+        .build()
+        .unwrap();
+    let error = client.launch(request).await.unwrap_err();
+    assert!(error.to_string().contains("journal direction"), "{error}");
+    assert!(!client.machine_running(name));
+    assert!(!machine_spec_path(name).exists());
 }
 
 /// Persisting a definition never persists the request's mailbox authority.

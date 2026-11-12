@@ -43,9 +43,6 @@ pub fn report_enforced_grants(
     ctx: &AdmissionContext,
     started: &StartedVm,
 ) -> anyhow::Result<EnforcedGrants> {
-    let undeclared = Grants::default();
-    let requested = ctx.admitted.plan().grants.as_ref().unwrap_or(&undeclared);
-
     let enforced = mvm_hostd::plan_admission::apply_admitted_grants_or_undo_launch(
         started.backend(),
         started.vm_id(),
@@ -53,20 +50,29 @@ pub fn report_enforced_grants(
         Some(&ctx.emitter),
     )?;
 
-    crate::record_enforced_grants(&started.vm_id().0, &enforced);
+    publish_grants(ctx, started, &enforced);
+    Ok(enforced)
+}
+
+pub(super) fn publish_grants(
+    ctx: &AdmissionContext,
+    started: &StartedVm,
+    enforced: &EnforcedGrants,
+) {
+    let undeclared = Grants::default();
+    let requested = ctx.admitted.plan().grants.as_ref().unwrap_or(&undeclared);
+    crate::record_enforced_grants(&started.vm_id().0, enforced);
 
     if let Err(e) = ctx
         .emitter
-        .emit_grants_enforced(ctx.admitted.plan(), &enforced)
+        .emit_grants_enforced(ctx.admitted.plan(), enforced)
     {
         tracing::warn!(error = %e, "audit emit_grants_enforced failed (non-fatal)");
     }
 
-    if let Some(reason) = degradation_warning(requested, &enforced) {
+    if let Some(reason) = degradation_warning(requested, enforced) {
         mvm_runtime::ui::warn(&reason);
     }
-
-    Ok(enforced)
 }
 
 /// The operator-visible sentence for a boot that asked for a bound and did not
