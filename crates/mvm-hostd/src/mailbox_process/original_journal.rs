@@ -20,7 +20,7 @@ use std::time::Instant;
 /// cannot transfer the mailbox keys, change its recipient, or reopen a PID.
 pub struct OriginalJournalDestination {
     child: Child,
-    _original: FileLock,
+    _original: std::sync::Arc<LaunchClaim>,
     marker: OriginalMarker,
     socket: PathBuf,
     boot: MailboxReaderBootBinding,
@@ -54,7 +54,11 @@ impl OriginalJournalDestination {
         .context("destination VM has no admitted mailbox")
     }
 
-    fn spawn(config: &MailboxProcessConfig, plan: &ExecutionPlan, guard: FileLock) -> Result<Self> {
+    fn spawn(
+        config: &MailboxProcessConfig,
+        plan: &ExecutionPlan,
+        guard: std::sync::Arc<LaunchClaim>,
+    ) -> Result<Self> {
         let boot = config
             .reader_boot
             .clone()
@@ -72,7 +76,7 @@ impl OriginalJournalDestination {
             mailbox: config.grant.mailbox,
             recipient: current.expected_recipient,
         };
-        let marker = OriginalMarker::claim(&config.vm_state_dir)?;
+        let marker = OriginalMarker::claim(&guard.owner_dir)?;
         let child = spawn_serving(config, &config.vm_state_dir)?;
         Ok(Self {
             child,
@@ -111,12 +115,32 @@ impl OriginalJournalDestination {
     }
 }
 
-pub(super) fn claim_launch(state: &std::path::Path, exclusive: bool) -> std::io::Result<FileLock> {
+pub(super) struct LaunchClaim {
+    _guard: FileLock,
+    pub(super) owner_dir: PathBuf,
+}
+
+pub(super) fn owner_dir(keys_dir: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let root = keys_dir.join("mailbox-original-owners-v1");
+    mvm_core::private_fs::ensure_private_dir(&root).map_err(std::io::Error::other)?;
+    let dir = root.join(hex::encode(Sha256::digest(name.as_bytes())));
+    mvm_core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::other)?;
+    mvm_core::util::atomic_io::sync_dir(keys_dir).map_err(std::io::Error::other)?;
+    mvm_core::util::atomic_io::sync_dir(&root).map_err(std::io::Error::other)?;
+    Ok(dir)
+}
+
+pub(super) fn claim_launch(
+    state: &std::path::Path,
+    owner_dir: &std::path::Path,
+    exclusive: bool,
+) -> std::io::Result<std::sync::Arc<LaunchClaim>> {
     use std::io::{Error, ErrorKind};
-    let guard = FileLock::try_acquire(&state.join("mailbox-launch"))
+    let guard = FileLock::try_acquire(&owner_dir.join("mailbox-launch"))
         .map_err(Error::other)?
         .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "mailbox launch is owned"))?;
-    let path = state.join(MARKER);
+    let path = owner_dir.join(MARKER);
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => (),
         Err(e) => return Err(e),
@@ -144,10 +168,13 @@ pub(super) fn claim_launch(state: &std::path::Path, exclusive: bool) -> std::io:
             }
         }
     }
-    Ok(guard)
+    Ok(std::sync::Arc::new(LaunchClaim {
+        _guard: guard,
+        owner_dir: owner_dir.to_path_buf(),
+    }))
 }
 
-const MARKER: &str = "mailbox-paired-original-v1";
+pub(super) const MARKER: &str = "mailbox-paired-original-v1";
 
 /// Kept on disk through either launcher crash or an uncollected Child. The
 /// ordinary Drop of Child/FileLock is never proof that a subprocess exited.
@@ -272,20 +299,20 @@ mod tests {
     #[test]
     fn a_second_launcher_cannot_rotate_a_live_original_or_adopt_stale_state() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
-        let original = claim_launch(dir.path(), true).unwrap();
-        assert!(claim_launch(dir.path(), false).is_err());
-        assert!(claim_launch(dir.path(), true).is_err());
+        let original = claim_launch(dir.path(), dir.path(), true).unwrap();
+        assert!(claim_launch(dir.path(), dir.path(), false).is_err());
+        assert!(claim_launch(dir.path(), dir.path(), true).is_err());
         drop(original);
         let path = dir.path().join(super::super::MAILBOX_PID_FILE);
         std::fs::write(&path, "original marker").unwrap();
-        assert!(claim_launch(dir.path(), true).is_err());
+        assert!(claim_launch(dir.path(), dir.path(), true).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"original marker");
     }
 
     #[test]
     fn dropping_original_custody_keeps_both_normal_and_paired_starts_fenced() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
-        let guard = claim_launch(dir.path(), true).unwrap();
+        let guard = claim_launch(dir.path(), dir.path(), true).unwrap();
         let mut marker = OriginalMarker::claim(dir.path()).unwrap();
         let socket = dir.path().join("peer");
         let mut child = listener(&socket);
@@ -293,11 +320,11 @@ mod tests {
         drop(marker);
         drop(guard);
         assert!(child.try_wait().unwrap().is_none());
-        assert!(claim_launch(dir.path(), false).is_err());
-        assert!(claim_launch(dir.path(), true).is_err());
+        assert!(claim_launch(dir.path(), dir.path(), false).is_err());
+        assert!(claim_launch(dir.path(), dir.path(), true).is_err());
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
-        assert!(claim_launch(dir.path(), false).is_err());
+        assert!(claim_launch(dir.path(), dir.path(), false).is_err());
     }
 
     #[test]

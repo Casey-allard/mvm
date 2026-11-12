@@ -560,7 +560,7 @@ fn spawn_with_original<T>(
     start: impl FnOnce(
         &MailboxProcessConfig,
         &ExecutionPlan,
-        mvm_core::util::atomic_io::FileLock,
+        std::sync::Arc<original_journal::LaunchClaim>,
     ) -> Result<T>,
 ) -> Result<Option<T>> {
     let Some(grant) = &plan.mailbox else {
@@ -592,7 +592,8 @@ fn spawn_with_original<T>(
                 ),
             )
         })?;
-    let guard = original_journal::claim_launch(&state_dir, exclusive)?;
+    let owner_dir = original_journal::owner_dir(&mvm_core::config::mvm_keys_dir(), vm_name)?;
+    let guard = original_journal::claim_launch(&state_dir, &owner_dir, exclusive)?;
     let mut config = build_config(&mvm_core::config::mvm_keys_dir(), grant, &state_dir, route)?;
     let started = (|| {
         config.reader_boot = load_reader_boot_for_plan(&state_dir, plan)?;
@@ -622,9 +623,11 @@ fn spawn_with_original<T>(
         }
         config.posture =
             Some(posture.handoff(config.reader_boot.as_ref().map(|binding| binding.boot)));
-        start(&config, plan, guard).map(Some)
+        start(&config, plan, guard.clone()).map(Some)
     })();
-    if started.is_err() {
+    if started.is_err()
+        && matches!(std::fs::symlink_metadata(owner_dir.join(original_journal::MARKER)), Err(ref e) if e.kind() == ErrorKind::NotFound)
+    {
         let _ = shred_epoch_secret(&state_dir);
     }
     started
