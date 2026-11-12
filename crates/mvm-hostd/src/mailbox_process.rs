@@ -97,7 +97,7 @@ pub fn parse(raw: &[u8]) -> serde_json::Result<MailboxProcessConfig> {
     serde_json::from_slice(raw)
 }
 
-fn load_admitted_plan(state_dir: &Path) -> Result<ExecutionPlan> {
+pub(crate) fn load_admitted_plan(state_dir: &Path) -> Result<ExecutionPlan> {
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 

@@ -137,3 +137,234 @@ impl InstalledObjectPair<'_> {
         Ok((config, [afd, bfd]))
     }
 }
+
+pub(crate) struct WorkerAuthority<'a> {
+    pub(crate) pair: ObjectPairV1<'a>,
+    pub(crate) local_plan: mvm_core::plan::ExecutionPlan,
+    pub(crate) local_state: PathBuf,
+    pub(crate) peer_state: PathBuf,
+    pub(crate) now: i64,
+    caller_revoked: Vec<RevocationId>,
+    callee_revoked: Vec<RevocationId>,
+    role: &'a SignedObjectRoleV1,
+}
+impl WorkerAuthority<'_> {
+    pub(crate) fn state(&self) -> PairAuthorityState<'_> {
+        let r = &self.role.role;
+        PairAuthorityState {
+            caller_boot: r.caller.boot,
+            callee_boot: r.callee.boot,
+            caller_epoch: r.caller.execution_epoch,
+            callee_epoch: r.callee.execution_epoch,
+            caller_policy: r.reply.grant.policy_epoch,
+            callee_policy: r.call.grant.policy_epoch,
+            at_caller: &self.caller_revoked,
+            at_callee: &self.callee_revoked,
+        }
+    }
+}
+
+fn read_public(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, Read};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let m = f.metadata()?;
+    mvm_core::private_fs::require_current_owner(&m)?;
+    if !m.is_file() || m.nlink() != 1 || m.mode() & 0o022 != 0 || m.len() > limit as u64 {
+        return Err(Error::other("invalid installed public metadata"));
+    }
+    let mut data = Vec::new();
+    f.take(limit as u64 + 1).read_to_end(&mut data)?;
+    if data.len() > limit {
+        return Err(Error::other("oversized public metadata"));
+    }
+    Ok(data)
+}
+
+impl ObjectWorkerBootstrapV1 {
+    /// Validate the original public admission and both retained reader records
+    /// on the worker's private endpoint. The caller separately holds/checks
+    /// the two transferred original VMM pidfds before service and on each use.
+    pub(crate) fn validate_current(&self) -> Result<WorkerAuthority<'_>> {
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+        use mvm_core::mailbox::reader::verify_guest_reader_enrollment;
+        let now = super::super::now_unix_ms();
+        ensure!(
+            self.home.is_absolute(),
+            "worker installation must be absolute"
+        );
+        let keys = mvm_core::config::mvm_keys_dir_at(&self.home);
+        ensure!(
+            read_public(&keys.join(super::super::SIGNER_PUBLIC), 32)? == self.plan_verifier,
+            "installed plan verifier changed"
+        );
+        let signer = VerifyingKey::from_bytes(&self.plan_verifier)?;
+        let name = self.caller_plan.0.signer_id.as_str();
+        ensure!(
+            name == self.callee_plan.0.signer_id,
+            "plans have different original signer"
+        );
+        let trust = [(name, &signer)];
+        let a = verify_plan(&self.caller_plan, &trust)?;
+        let b = verify_plan(&self.callee_plan, &trust)?;
+        let role = &self.role.role;
+        self.role.verify(role.local(), now)?;
+        let ad = mvm_core::config::vm_state_dir_at(&self.home, &a.image.name);
+        let bd = mvm_core::config::vm_state_dir_at(&self.home, &b.image.name);
+        let ledger = mvm_core::host_interface::workload::WorkloadLedger::load_at(&self.home)?;
+        let template = match read_public(&keys.join(super::super::TEMPLATE_FILE), 64 * 1024) {
+            Ok(body) => {
+                let t: super::super::MailboxTemplate = serde_json::from_slice(&body)?;
+                ensure!(
+                    t.header.policy_epoch == t.capability.policy_epoch,
+                    "inconsistent installed policy epoch"
+                );
+                t.header.policy_epoch
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 1,
+            Err(e) => return Err(e.into()),
+        };
+        let stamp = role
+            .local()
+            .durable_object_pair_sha256_v1
+            .context("missing pair selection")?;
+        let transcript = material_transcript(
+            stamp,
+            &role.caller,
+            &role.callee,
+            &self.caller_receive,
+            &self.callee_receive,
+        )?;
+        let (fk, rk) = match role.role {
+            ObjectParticipantRole::Caller => (&self.secrets.outbound, &self.secrets.inbound),
+            ObjectParticipantRole::Callee => (&self.secrets.inbound, &self.secrets.outbound),
+        };
+        let pin = original_reader_pin(transcript, fk, rk);
+        let read_revocations = |state: &Path| {
+            reader_revocations(&revocations_path(state))
+                .map_err(|_| anyhow::anyhow!("current original revocations unavailable"))
+        };
+        let ar = read_revocations(&ad)?;
+        let br = read_revocations(&bd)?;
+        for (plan, state, boot, incoming, receive, revoked) in [
+            (
+                &a,
+                &ad,
+                &role.caller,
+                &role.reply,
+                &self.caller_receive,
+                &ar,
+            ),
+            (&b, &bd, &role.callee, &role.call, &self.callee_receive, &br),
+        ] {
+            mvm_core::naming::validate_vm_name(&plan.image.name)?;
+            ensure!(
+                crate::mailbox_process::load_admitted_plan(state)? == *plan
+                    && MailboxReaderBootBinding::load(state)? == *boot
+                    && ledger.entry(&plan.image.name).epoch.0 == boot.execution_epoch.get()
+                    && incoming.grant.policy_epoch == template
+                    && !revoked.contains(&incoming.grant.revocation_id),
+                "original installed plan/boot/epoch or direction changed"
+            );
+            let g = plan.mailbox.context("missing admitted mailbox")?;
+            let enrolled = crate::mailbox_process::reader::check_object_worker_record(
+                state, boot, incoming, receive, pin,
+            )?;
+            let scope = MailboxGuestReaderScope {
+                plan: &g,
+                plan_id: &plan.plan_id,
+                plan_nonce: &plan.nonce,
+                receive: &receive.grant,
+                current_boot: boot.boot,
+                current_session: enrolled.enrollment.consumer_session,
+                now_unix_ms: now,
+            };
+            verify_guest_reader_enrollment(
+                &enrolled,
+                receive,
+                &scope,
+                &VerifyingKey::from_bytes(&boot.authority_key)?,
+                revoked,
+            )?;
+            if boot == role.local() {
+                ensure!(
+                    enrolled == self.reader_enrollment,
+                    "different local reader enrollment"
+                );
+            }
+        }
+        let state = PairAuthorityState {
+            caller_boot: role.caller.boot,
+            callee_boot: role.callee.boot,
+            caller_epoch: role.caller.execution_epoch,
+            callee_epoch: role.callee.execution_epoch,
+            caller_policy: template,
+            callee_policy: template,
+            at_caller: &ar,
+            at_callee: &br,
+        };
+        let pair = ObjectPairV1::check_originals(
+            &OriginalObjectEndpoint {
+                plan: &self.caller_plan,
+                trusted_signers: &trust,
+                boot: &role.caller,
+            },
+            &OriginalObjectEndpoint {
+                plan: &self.callee_plan,
+                trusted_signers: &trust,
+                boot: &role.callee,
+            },
+            ObjectPairGrants {
+                call: &role.call,
+                reply: &role.reply,
+            },
+            now,
+            state,
+        )?;
+        let (local_plan, local_state, peer_state, incoming) = match role.role {
+            ObjectParticipantRole::Caller => (a, ad, bd, &role.reply),
+            ObjectParticipantRole::Callee => (b, bd, ad, &role.call),
+        };
+        let address = incoming.grant.address;
+        let paths = crate::mailbox_custody::RetainedMailboxKeys::object_storage_paths(
+            &keys,
+            &local_plan,
+            address,
+        )?;
+        ensure!(
+            self.local_journal == paths.journal
+                && self.local_anchor == paths.anchor
+                && self.local_intents == paths.source_intents
+                && self.route
+                    == HostDialRoute::Mux(PathBuf::from(mvm_agentd::vsock::vsock_uds_path(
+                        &local_state.to_string_lossy()
+                    )))
+                && self.history_ref.address() == address
+                && self.history_ref.execution_epoch() == role.local().execution_epoch
+                && self.history_ref.key_id()
+                    == &<[u8; 32]>::from(Sha256::digest(self.secrets.history))
+                && SigningKey::from_bytes(&self.secrets.local_authority)
+                    .verifying_key()
+                    .to_bytes()
+                    == role.local().authority_key
+                && SigningKey::from_bytes(&self.secrets.local_sender)
+                    .verifying_key()
+                    .as_bytes()
+                    == role.outbound().grant.subject.as_bytes(),
+            "role-local custody, guest route or signer changed"
+        );
+        Ok(WorkerAuthority {
+            pair,
+            local_plan,
+            local_state,
+            peer_state,
+            now,
+            caller_revoked: ar,
+            callee_revoked: br,
+            role: &self.role,
+        })
+    }
+}

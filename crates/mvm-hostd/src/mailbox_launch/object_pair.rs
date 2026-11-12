@@ -27,6 +27,37 @@ pub struct PreparedObjectPair {
     callee_nonce: Nonce,
 }
 
+fn material_transcript(
+    stamp: [u8; 32],
+    caller: &MailboxReaderBootBinding,
+    callee: &MailboxReaderBootBinding,
+    caller_receive: &SignedMailboxCapability,
+    callee_receive: &SignedMailboxCapability,
+) -> Result<[u8; 32]> {
+    let mut h = Sha256::new();
+    h.update(b"mvm.object-pair.original-material.v1\0");
+    h.update(stamp);
+    h.update(caller.boot.as_bytes());
+    h.update(callee.boot.as_bytes());
+    for b in [caller, callee] {
+        h.update(Sha256::digest(b.plan_id.0.as_bytes()));
+    }
+    for recv in [caller_receive, callee_receive] {
+        h.update(mvm_core::mailbox::outbound::journal_capability_digest(
+            recv,
+        )?);
+    }
+    Ok(h.finalize().into())
+}
+fn original_reader_pin(transcript: [u8; 32], call: &[u8; 32], reply: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"mvm.object-pair.original-reader.keys.v1\0");
+    h.update(transcript);
+    h.update(Sha256::digest(call));
+    h.update(Sha256::digest(reply));
+    h.finalize().into()
+}
+
 impl PreparedObjectPair {
     /// Before signing either plan, verify the operator's two original mailbox
     /// identities and all four independently issued credentials using host keys.
@@ -484,23 +515,13 @@ impl PreparedObjectPair {
                 "original Receive expired or revoked"
             );
         }
-        let mut hash = Sha256::new();
-        hash.update(b"mvm.object-pair.original-material.v1\0");
-        hash.update(self.stamp);
-        hash.update(a.boot.boot.as_bytes());
-        hash.update(b.boot.boot.as_bytes());
-        // The plan IDs are content-addressed. Hash their canonical representation
-        // to fixed widths before appending to this purpose-separated transcript.
-        for p in [&pa, &pb] {
-            hash.update(Sha256::digest(p.plan_id.0.as_bytes()));
-        }
-        for r in [
+        let transcript = material_transcript(
+            self.stamp,
+            a.boot,
+            b.boot,
             &credentials.receive_at_caller,
             &credentials.receive_at_callee,
-        ] {
-            hash.update(mvm_core::mailbox::outbound::journal_capability_digest(r)?);
-        }
-        let transcript: [u8; 32] = hash.finalize().into();
+        )?;
         let root = load_private_root(keys)?;
         let fk = super::derive_with(
             root.expose_bytes(),
@@ -516,12 +537,7 @@ impl PreparedObjectPair {
             self.caller.epoch,
             &transcript,
         );
-        let mut pin = Sha256::new();
-        pin.update(b"mvm.object-pair.original-reader.keys.v1\0");
-        pin.update(transcript);
-        pin.update(Sha256::digest(&fk[..]));
-        pin.update(Sha256::digest(&rk[..]));
-        let pin: [u8; 32] = pin.finalize().into();
+        let pin = original_reader_pin(transcript, &fk, &rk);
         let endpoint = |role: &BootInput<'_>,
                         g: &MailboxGrant,
                         flow: &SignedMailboxCapability,
