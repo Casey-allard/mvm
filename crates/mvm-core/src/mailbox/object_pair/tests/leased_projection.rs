@@ -254,4 +254,109 @@ fn lease_and_reopen(reply: bool) {
     drop(anchor);
     let (mut journal, anchor) = start();
     assert_eq!(exercise(&mut journal, &anchor, 47), first);
+    if !reply {
+        return;
+    }
+    let ReaderResponse::ObjectDeliveryV1 { lease, .. } = first else {
+        panic!("unprojected original")
+    };
+    let signed = sign_delivery_ack(
+        MailboxDeliveryAck {
+            protocol_version: ProtocolVersion::V1,
+            signature_algorithm: SignatureAlgorithm::ED25519,
+            lease: *lease,
+            ack_nonce: DeliveryAckNonce::from_bytes([80; 32]),
+            acknowledged_at_unix_ms: NOW,
+        },
+        &guest,
+    )
+    .unwrap();
+    let req = || JournalGuestAck {
+        receive: JournalReceive {
+            capability: &cap,
+            context: &read,
+            encryption_key: &data,
+            sender_key: &sender_key,
+        },
+        plan: &plan,
+        scope: MailboxGuestReaderScope {
+            plan: &plan,
+            plan_id: &vm.plan_id,
+            plan_nonce: &vm.plan_nonce,
+            receive: &cap.grant,
+            current_boot: vm.boot,
+            current_session: session,
+            now_unix_ms: NOW,
+        },
+        enrollment: &enrollment,
+        signed: &signed,
+    };
+    let before = journal.tip();
+    assert!(
+        journal
+            .acknowledge_signed(req(), |_| panic!(
+                "plain ACK cannot consume a selected Reply"
+            ))
+            .is_err()
+    );
+    let wrong = pair
+        .pending_call(
+            sealed(&c, ab.boot, Some(return_route), NOW - 10, 72, 70),
+            NOW,
+            state,
+            &Key::from_bytes([60; 32]),
+            &mut InMemoryReplayProtector::default(),
+        )
+        .unwrap();
+    let revoked = [grant.grant.revocation_id];
+    for (call, live) in [
+        (Some(&wrong), state),
+        (None, state),
+        (
+            Some(&pending),
+            PairAuthorityState {
+                at_caller: &revoked,
+                ..state
+            },
+        ),
+    ] {
+        assert!(
+            journal
+                .acknowledge_signed_object(
+                    req(),
+                    ObjectLeaseScope {
+                        pair: &pair,
+                        destination: vm,
+                        state: live,
+                        original_call: call
+                    },
+                    |_| panic!("not an authorized original ACK")
+                )
+                .is_err()
+        );
+        assert_eq!(journal.tip(), before);
+    }
+    let bound = || ObjectLeaseScope {
+        pair: &pair,
+        destination: vm,
+        state,
+        original_call: Some(&pending),
+    };
+    let after = journal
+        .acknowledge_signed_object(req(), bound(), |tip| anchor.advance(tip))
+        .unwrap();
+    assert_eq!(after.cursor, before.cursor + 1);
+    drop(journal);
+    drop(anchor);
+    let (mut journal, anchor) = start();
+    assert_eq!(journal.tip(), after);
+    assert_eq!(
+        journal
+            .acknowledge_signed_object(req(), bound(), |_| panic!(
+                "identical signed ACK must not append"
+            ))
+            .unwrap(),
+        after
+    );
+    assert_eq!(anchor.tip(), after);
 }
