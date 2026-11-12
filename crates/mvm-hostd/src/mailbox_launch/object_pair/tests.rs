@@ -923,6 +923,12 @@ fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_c
         },
         f.now,
     )?;
+    let reg = crate::mailbox_process::original_journal::object_registration::Registration::claim(
+        &keys,
+        ("vm-1", &ad),
+        ("vm-2", &bd),
+    )?;
+    let pins = reg.directory_pins()?;
     let bootstrap = |local, d: &Path| {
         material.local_bootstrap(
             local,
@@ -932,6 +938,7 @@ fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_c
                 OriginalVmmId { pid: 1, birth: 1 },
                 OriginalVmmId { pid: 2, birth: 2 },
             ],
+            pins,
             mvm_core::vm_backend::HostDialRoute::Mux(
                 mvm_agentd::vsock::vsock_uds_path(&d.to_string_lossy()).into(),
             ),
@@ -1031,6 +1038,10 @@ fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_c
         ca.lease_original(&mut ja, &aa, &challenge, &proof)?,
         ReaderResponse::Empty
     ));
+    let _held = ca.hold_original_directories()?;
+    std::fs::rename(&bd, bd.with_file_name("original-b"))?;
+    mvm_core::private_fs::ensure_private_dir(&bd)?;
+    assert!(ca.validate_current().is_err());
     Ok(())
 }
 

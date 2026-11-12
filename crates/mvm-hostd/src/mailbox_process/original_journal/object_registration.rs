@@ -52,6 +52,64 @@ impl OriginalDirectory {
     }
 }
 
+/// Private original launch witness. Names are always re-derived from the two
+/// verified plans and MVM home. The bootstrap does not supply arbitrary paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OriginalPathPins {
+    state: (u64, u64),
+    owner: (u64, u64),
+    socket: Option<(u64, u64)>,
+}
+/// Keeping these directories open prevents reuse of a retired inode for the
+/// life of a serving helper; path authority is still rechecked on each turn.
+pub(crate) struct OriginalDirectories {
+    _held: Vec<OriginalDirectory>,
+}
+impl OriginalPathPins {
+    fn members(&self, home: &Path, name: &str) -> Result<Vec<(PathBuf, (u64, u64))>> {
+        mvm_core::naming::validate_vm_name(name)?;
+        let state = mvm_core::config::vm_state_dir_at(home, name);
+        let socket = mvm_core::config::vm_socket_dir_at(&state);
+        let owner = mvm_core::config::vm_mailbox_original_owner_at(
+            &mvm_core::config::mvm_keys_dir_at(home),
+            name,
+        );
+        ensure!(
+            (socket != state) == self.socket.is_some(),
+            "changed original socket path"
+        );
+        let mut members = vec![(state, self.state), (owner, self.owner)];
+        if let Some(id) = self.socket {
+            members.push((socket, id));
+        }
+        Ok(members)
+    }
+    pub(crate) fn require_current(&self, home: &Path, name: &str) -> Result<()> {
+        for (path, id) in self.members(home, name)? {
+            let meta = fs::symlink_metadata(path)?;
+            mvm_core::private_fs::require_current_owner(&meta)?;
+            ensure!(
+                meta.is_dir() && meta.mode() & 0o022 == 0 && (meta.dev(), meta.ino()) == id,
+                "original protected mailbox directory changed"
+            );
+        }
+        Ok(())
+    }
+    pub(crate) fn hold(&self, home: &Path, name: &str) -> Result<OriginalDirectories> {
+        let mut held = Vec::with_capacity(3);
+        for (path, id) in self.members(home, name)? {
+            let dir = OriginalDirectory::open(&path)?;
+            ensure!(
+                dir.identity()? == id,
+                "worker bound to replacement directory"
+            );
+            dir.require_current()?;
+            held.push(dir);
+        }
+        Ok(OriginalDirectories { _held: held })
+    }
+}
 struct Participant {
     _claim: Arc<LaunchClaim>,
     state: OriginalDirectory,
@@ -121,6 +179,21 @@ impl Registration {
                 &self.callee._claim
             }
         }))
+    }
+    pub(crate) fn directory_pins(&self) -> Result<[OriginalPathPins; 2]> {
+        self.require_originals()?;
+        let pin = |p: &Participant| -> Result<OriginalPathPins> {
+            Ok(OriginalPathPins {
+                state: p.state.identity()?,
+                owner: p.owner.identity()?,
+                socket: p
+                    .socket_dir
+                    .as_ref()
+                    .map(OriginalDirectory::identity)
+                    .transpose()?,
+            })
+        };
+        Ok([pin(&self.caller)?, pin(&self.callee)?])
     }
     pub(crate) fn require_originals(&self) -> Result<()> {
         for original in [&self.caller, &self.callee] {

@@ -2,6 +2,9 @@
 //! role and enrollment are exposed by the guest reader. The two Linux pidfds
 //! travel separately on the original child's anonymous Unix control channel.
 use super::*;
+use crate::mailbox_process::original_journal::object_registration::{
+    OriginalDirectories, OriginalPathPins,
+};
 use mvm_core::mailbox::journal::{HistoryKeyCustody, HistoryKeyRef};
 use mvm_core::mailbox::object_pair::role::{ObjectParticipantRole, SignedObjectRoleV1};
 use mvm_core::vm_backend::{BackendKind, HostDialRoute};
@@ -27,6 +30,7 @@ pub(crate) struct ObjectWorkerBootstrapV1 {
     pub(crate) caller_receive: SignedMailboxCapability,
     pub(crate) callee_receive: SignedMailboxCapability,
     pub(crate) reader_enrollment: SignedMailboxGuestReaderEnrollment,
+    pub(crate) directories: [OriginalPathPins; 2],
     pub(crate) caller_vmm: OriginalVmmId,
     pub(crate) callee_vmm: OriginalVmmId,
     pub(crate) home: PathBuf,
@@ -98,6 +102,7 @@ impl InstalledObjectPair<'_> {
             &self.prepared.credentials,
             [self.caller.admitted.signed(), self.callee.admitted.signed()],
             [a, b],
+            self.registration.directory_pins()?,
             route,
         )?;
         self.check_current()?;
@@ -112,6 +117,7 @@ impl PairMaterial {
         creds: &ObjectPairCredentials,
         plans: [&SignedExecutionPlan; 2],
         [a, b]: [OriginalVmmId; 2],
+        directories: [OriginalPathPins; 2],
         route: HostDialRoute,
     ) -> Result<ObjectWorkerBootstrapV1> {
         let keys = mvm_core::config::mvm_keys_dir();
@@ -136,6 +142,7 @@ impl PairMaterial {
             caller_receive: creds.receive_at_caller.clone(),
             callee_receive: creds.receive_at_callee.clone(),
             reader_enrollment: local.reader.enrollment.clone(),
+            directories,
             caller_vmm: a,
             callee_vmm: b,
             home: mvm_core::config::mvm_home_strict()?,
@@ -205,6 +212,29 @@ fn read_public(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
 }
 
 impl ObjectWorkerBootstrapV1 {
+    pub(crate) fn hold_original_directories(&self) -> Result<[OriginalDirectories; 2]> {
+        let a = self.validate_current()?;
+        let (caller, callee) = if self.role.role.role == ObjectParticipantRole::Caller {
+            (a.local_state, a.peer_state)
+        } else {
+            (a.peer_state, a.local_state)
+        };
+        let names = [
+            caller
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("original A name")?,
+            callee
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("original B name")?,
+        ];
+        Ok([
+            self.directories[0].hold(&self.home, names[0])?,
+            self.directories[1].hold(&self.home, names[1])?,
+        ])
+    }
+
     /// Validate the original public admission and both retained reader records
     /// on the worker's private endpoint. The caller separately holds/checks
     /// the two transferred original VMM pidfds before service and on each use.
@@ -229,6 +259,8 @@ impl ObjectWorkerBootstrapV1 {
         let trust = [(name, &signer)];
         let a = verify_plan(&self.caller_plan, &trust)?;
         let b = verify_plan(&self.callee_plan, &trust)?;
+        self.directories[0].require_current(&self.home, &a.image.name)?;
+        self.directories[1].require_current(&self.home, &b.image.name)?;
         let role = &self.role.role;
         let ad = mvm_core::config::vm_state_dir_at(&self.home, &a.image.name);
         let bd = mvm_core::config::vm_state_dir_at(&self.home, &b.image.name);
@@ -351,23 +383,21 @@ impl ObjectWorkerBootstrapV1 {
             now,
             state,
         )?;
-        let (local_plan, local_state, peer_state, incoming) = match role.role {
-            ObjectParticipantRole::Caller => (a, ad, bd, &role.reply),
-            ObjectParticipantRole::Callee => (b, bd, ad, &role.call),
+        let (local_plan, local_state, incoming) = match role.role {
+            ObjectParticipantRole::Caller => (&a, &ad, &role.reply),
+            ObjectParticipantRole::Callee => (&b, &bd, &role.call),
         };
         let address = incoming.grant.address;
         crate::mailbox_custody::RetainedMailboxKeys::verify_object_worker_storage(
             &keys,
-            &local_plan,
+            local_plan,
             address,
             &signer,
             &self.history_ref,
             &self.secrets.anchor,
         )?;
         let paths = crate::mailbox_custody::RetainedMailboxKeys::object_storage_paths(
-            &keys,
-            &local_plan,
-            address,
+            &keys, local_plan, address,
         )?;
         ensure!(
             self.local_journal == paths.journal
@@ -391,6 +421,12 @@ impl ObjectWorkerBootstrapV1 {
                     == role.outbound().grant.subject.as_bytes(),
             "role-local custody, guest route or signer changed"
         );
+        self.directories[0].require_current(&self.home, &a.image.name)?;
+        self.directories[1].require_current(&self.home, &b.image.name)?;
+        let (local_plan, local_state, peer_state) = match role.role {
+            ObjectParticipantRole::Caller => (a, ad, bd),
+            ObjectParticipantRole::Callee => (b, bd, ad),
+        };
         Ok(WorkerAuthority {
             pair,
             local_plan,

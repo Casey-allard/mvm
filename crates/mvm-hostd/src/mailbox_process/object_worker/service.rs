@@ -254,6 +254,7 @@ impl Local<'_> {
 }
 
 pub(super) fn run(owner: WorkerLaunch, [out, incoming]: [UnixStream; 2]) -> Result<()> {
+    let _original_dirs = owner.config.hold_original_directories()?;
     let (journal, anchor) = owner.config.open_journal()?;
     let state = owner.config.validate_current()?.local_state;
     let out = carrier::Link::new(out, &state, true)?;
