@@ -208,14 +208,15 @@ impl OriginalChild {
 
 impl Drop for OriginalChild {
     fn drop(&mut self) {
-        if let Ok(mut reg) = registry().lock() {
-            if reg
-                .originals
-                .get(&self.original.pid)
-                .is_some_and(|v| Arc::ptr_eq(v, &self.original.generation))
-            {
-                reg.originals.remove(&self.original.pid);
-            }
+        let Ok(mut reg) = registry().lock() else {
+            return;
+        };
+        if reg
+            .originals
+            .get(&self.original.pid)
+            .is_some_and(|v| Arc::ptr_eq(v, &self.original.generation))
+        {
+            reg.originals.remove(&self.original.pid);
         }
     }
 }
