@@ -30,6 +30,7 @@ pub struct OriginalJournalDestination {
     policy_epoch: u64,
     issuer: PrincipalId,
     keys_dir: PathBuf,
+    revocations_path: PathBuf,
     inbound: mvm_core::mailbox::OpenContext,
     sender_key: ed25519_dalek::VerifyingKey,
 }
@@ -93,6 +94,7 @@ impl OriginalJournalDestination {
             policy_epoch: current.current_policy_epoch,
             issuer: current.expected_capability_issuer,
             keys_dir: config.keys_dir.clone(),
+            revocations_path: super::reader::revocations_path(&config.vm_state_dir),
             inbound: current.clone(),
             sender_key: policy.sender_key,
         })

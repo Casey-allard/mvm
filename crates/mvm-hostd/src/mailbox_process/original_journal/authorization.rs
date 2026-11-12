@@ -81,6 +81,26 @@ pub(crate) fn check_credentials(
             && journal_capability_digest(&grants.destination_receive)? == d.receive_grant_sha256,
         "signed journal credential changed"
     );
+    ensure!(
+        source_context.expected_tenant == destination_context.expected_tenant
+            && source_context.expected_authorization_domain
+                == destination_context.expected_authorization_domain,
+        "journal direction crosses the admitted tenant or authorization domain"
+    );
+    for credential in [
+        &grants.source_scope,
+        &grants.destination_send,
+        &grants.destination_receive,
+    ] {
+        let cap = &credential.grant;
+        ensure!(
+            cap.not_before_unix_ms <= d.not_before_unix_ms
+                && cap.expires_at_unix_ms >= d.expires_at_unix_ms
+                && cap.max_payload_bytes >= d.max_payload_bytes
+                && cap.max_queue_contribution_bytes >= u64::from(d.max_payload_bytes),
+            "direction exceeds an original signed capability limit"
+        );
+    }
     let mut local = source.header.clone();
     local.kind = MailboxMessageKind::Cast;
     local.reply_to = None;
@@ -165,6 +185,14 @@ impl OriginalJournalDestination {
         require_destination(d, &self.boot, self.address, self.policy_epoch)?;
         let now = now_ms()?;
         let source = journal_scope_before_launch(&self.keys_dir, grant, now)?;
+        mvm_core::naming::validate_vm_name(&plan.image.name)?;
+        let read_revocations = |path: &std::path::Path| {
+            crate::mailbox_service::durable::reader_revocations(path)
+                .map_err(|e| anyhow::anyhow!("original mailbox revocation state: {e:?}"))
+        };
+        let source_state = mvm_core::config::vm_state_dir(&plan.image.name);
+        let mut inbound = self.inbound.clone();
+        inbound.revoked_capabilities = read_revocations(&self.revocations_path)?;
         let h = &source.header;
         let local = OpenContext {
             expected_tenant: h.tenant,
@@ -179,7 +207,9 @@ impl OriginalJournalDestination {
             required_operation: MailboxOperation::Send,
             now_unix_ms: now,
             accepted_content_types: vec![h.content_type.clone()],
-            revoked_capabilities: Vec::new(),
+            revoked_capabilities: read_revocations(&super::super::reader::revocations_path(
+                &source_state,
+            ))?,
         };
         ensure!(
             self.sender_key.to_bytes() == *d.source.as_bytes(),
@@ -190,7 +220,7 @@ impl OriginalJournalDestination {
             d,
             grants,
             &local,
-            &self.inbound,
+            &inbound,
             now,
             d.max_payload_bytes,
         )?;

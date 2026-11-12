@@ -531,10 +531,10 @@ fn guest_context(
     Ok(context)
 }
 
-fn reader_revocations(path: &Path) -> Result<Vec<RevocationId>, Refusal> {
+pub(crate) fn reader_revocations(path: &Path) -> Result<Vec<RevocationId>, Refusal> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,

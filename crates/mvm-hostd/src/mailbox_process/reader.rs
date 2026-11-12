@@ -34,6 +34,10 @@ struct ReaderRecord {
     enrollment: SignedMailboxGuestReaderEnrollment,
 }
 
+pub(crate) fn revocations_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("mailbox-reader-revocations.json")
+}
+
 fn invalid(reason: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -195,7 +199,7 @@ pub(super) fn load_or_enroll(
         boot: binding,
         capability: record.receive,
         enrollment: record.enrollment,
-        revocations_path: state_dir.join("mailbox-reader-revocations.json"),
+        revocations_path: revocations_path(state_dir),
     })
 }
 
