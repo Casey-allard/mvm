@@ -48,6 +48,8 @@ use mvm_vmm::host::boot_config::{
 mod config;
 mod dial;
 mod kernel;
+#[cfg(target_os = "linux")]
+pub mod original;
 mod stop;
 pub use config::FcApiPut;
 use config::fc_drive_puts;
@@ -102,11 +104,23 @@ const MAX_VCPUS: u32 = 32;
 /// host-side bridge; the claim-10 gate and substitution live in that bridge,
 /// not here.
 #[derive(Clone)]
-pub struct FcDriver {}
+pub struct FcDriver {
+    #[cfg(target_os = "linux")]
+    original: Option<original::LaunchObservation>,
+}
 
 impl FcDriver {
+    #[cfg(target_os = "linux")]
+    pub fn for_original_config(original: original::LaunchObservation) -> Self {
+        Self {
+            original: Some(original),
+        }
+    }
     pub fn new() -> Self {
-        Self {}
+        Self {
+            #[cfg(target_os = "linux")]
+            original: None,
+        }
     }
 }
 
@@ -789,6 +803,15 @@ impl FcDriver {
         );
         let mut session =
             api_session(&socket).context("opening Firecracker API session for boot config")?;
+        #[cfg(target_os = "linux")]
+        if let Some(held) = self.original.as_ref() {
+            let peer = original::ConfigSessionOwner::capture(session.connected_stream())?;
+            anyhow::ensure!(
+                peer.pid() == read_firecracker_pid(&abs_dir)?,
+                "original Firecracker config peer differs from held launch"
+            );
+            held.bind(peer)?;
+        }
         for put in &puts {
             api_put_session(&mut session, &put.path, &put.body)
                 .with_context(|| format!("Firecracker API PUT {}", put.path))?;

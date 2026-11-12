@@ -181,22 +181,65 @@ use sha2::{Digest, Sha256};
 /// Public SDK input identifies an already admitted original. The SDK retains
 /// the original backend and passes the boot prepared for that precise launch.
 pub struct InstalledParticipant<'a> {
-    pub admitted: &'a AdmittedPlan,
-    pub original: &'a mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch,
-    pub boot: &'a MailboxReaderBootBinding,
+    admitted: &'a AdmittedPlan,
+    original: OriginalNative<'a>,
+    boot: &'a MailboxReaderBootBinding,
+}
+
+enum OriginalNative<'a> {
+    Hvf(&'a mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch),
+    #[cfg(target_os = "linux")]
+    Firecracker(&'a mvm_runtime::backend::OriginalObjectFirecracker),
+}
+impl<'a> InstalledParticipant<'a> {
+    pub fn from_owned_hvf(
+        admitted: &'a AdmittedPlan,
+        original: &'a mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch,
+        boot: &'a MailboxReaderBootBinding,
+    ) -> Result<Self> {
+        let owner = Self {
+            admitted,
+            original: OriginalNative::Hvf(original),
+            boot,
+        };
+        check_original_native(&owner)?;
+        Ok(owner)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn from_original_firecracker(admitted: &'a AdmittedPlan) -> Result<Self> {
+        let original = admitted.object_firecracker()?;
+        let owner = Self {
+            admitted,
+            original: OriginalNative::Firecracker(original),
+            boot: original.boot()?,
+        };
+        check_original_native(&owner)?;
+        Ok(owner)
+    }
 }
 
 fn check_original_native(participant: &InstalledParticipant<'_>) -> Result<()> {
-    participant.original.validate_live()?;
+    let original = match participant.original {
+        #[cfg(target_os = "linux")]
+        OriginalNative::Firecracker(native) => {
+            native.require_live()?;
+            anyhow::ensure!(
+                participant.boot == native.boot()?,
+                "different original Firecracker guest boot"
+            );
+            return participant.boot.check_plan(participant.admitted.plan());
+        }
+        OriginalNative::Hvf(original) => original,
+    };
+    original.validate_live()?;
     let name = &participant.admitted.plan().image.name;
     mvm_core::naming::validate_vm_name(name)?;
     ensure!(
-        &participant.original.vm_id()?.0 == name,
+        &original.vm_id()?.0 == name,
         "original native VM name differs"
     );
     let envelope: SignedExecutionPlan = serde_json::from_str(
-        participant
-            .original
+        original
             .config()?
             .plan_json
             .as_deref()

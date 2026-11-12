@@ -86,6 +86,8 @@ use refusal::{
     require_late_volumes_mounted,
 };
 use sockets::standing_sockets;
+#[cfg(target_os = "linux")]
+pub(crate) use spawner::OriginalObjectSpawner;
 pub use spawner::{
     FlowMuxIdentitySource, NetworkEndpointSpawnRequest, NetworkEndpointSpawner,
     RealNetworkEndpointSpawner, SpawnedEndpoint, TelemetryStart,
@@ -233,6 +235,24 @@ pub struct WorkloadRunner<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegi
     spawner: S,
     broker: B,
     console_streamer: Arc<dyn ConsoleStreamer>,
+}
+
+#[cfg(target_os = "linux")]
+impl
+    WorkloadRunner<mvm_backends::driver::FcDriver, RealNetworkEndpointSpawner, RealBrokerRegistrar>
+{
+    pub(crate) fn with_original_object_observation(
+        &self,
+        observation: mvm_backends::driver::fc::original::LaunchObservation,
+    ) -> WorkloadRunner<mvm_backends::driver::FcDriver, OriginalObjectSpawner, RealBrokerRegistrar>
+    {
+        WorkloadRunner {
+            driver: mvm_backends::driver::FcDriver::for_original_config(observation.clone()),
+            spawner: OriginalObjectSpawner(observation.reader),
+            broker: RealBrokerRegistrar,
+            console_streamer: self.console_streamer.clone(),
+        }
+    }
 }
 
 /// Timings for the shared workload-runner stop sequence.

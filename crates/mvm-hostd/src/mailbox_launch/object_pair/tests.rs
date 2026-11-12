@@ -638,6 +638,7 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
         )
         .unwrap()
         .unwrap();
+    assert_eq!(leased.payload(), callbody, "destination journal readback");
     let signed = leased.lease().clone();
     let current = journal.original_object_call(&signed, f.now).unwrap();
     let reply_id = MessageId::from_bytes([78; 32]);

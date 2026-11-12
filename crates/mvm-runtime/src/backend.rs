@@ -102,6 +102,26 @@ pub(crate) fn fc_runner() -> FcRunner {
     )
 }
 
+/// Public reader binding written to the original identity drive and the
+/// surviving kernel peer of the Firecracker HTTP config/InstanceStart stream.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct OriginalObjectFirecracker {
+    observation: mvm_backends::driver::fc::original::LaunchObservation,
+}
+#[cfg(target_os = "linux")]
+impl OriginalObjectFirecracker {
+    pub fn boot(&self) -> Result<&mvm_core::mailbox::reader::MailboxReaderBootBinding> {
+        self.observation
+            .reader
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("original guest reader absent"))
+    }
+    pub fn require_live(&self) -> Result<()> {
+        self.observation.require_live()
+    }
+}
+
 /// Compatibility wrapper for the retired raw Firecracker configuration.
 ///
 /// Normal workloads use the runner-backed [`AnyBackend::Firecracker`] variant;
@@ -823,6 +843,36 @@ impl AnyBackend {
             config.wait_for_admission_durability()?;
         }
         self.inner().start(config)
+    }
+
+    /// Run the ordinary NIC-less, signed cold workload path with two observation
+    /// slots owned by this invocation. No previously running VM can fill them.
+    #[cfg(target_os = "linux")]
+    pub fn start_original_object_firecracker(
+        &self,
+        config: &VmStartConfig,
+    ) -> Result<(VmId, OriginalObjectFirecracker)> {
+        let Self::Firecracker(runner) = self else {
+            anyhow::bail!("requires Linux Firecracker")
+        };
+        let plan = mvm_core::plan::plan_from_admitted_json(
+            config
+                .plan_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("original signed plan absent"))?,
+        )?;
+        anyhow::ensure!(
+            plan.image.name == config.name
+                && plan
+                    .mailbox
+                    .is_some_and(|g| g.durable_object_pair_sha256_v1.is_some()),
+            "requires original selected object plan"
+        );
+        let observation = mvm_backends::driver::fc::original::LaunchObservation::default();
+        let id = runner
+            .with_original_object_observation(observation.clone())
+            .start(config)?;
+        Ok((id, OriginalObjectFirecracker { observation }))
     }
 
     /// Start with original writable-image custody transferred to the final writer.

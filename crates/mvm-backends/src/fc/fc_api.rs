@@ -208,6 +208,11 @@ pub struct FcSession {
 }
 
 impl FcSession {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn connected_stream(&self) -> &UnixStream {
+        self.reader.get_ref()
+    }
+
     /// Open a session to the Firecracker API socket at `socket`.
     pub fn connect(socket: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket).with_context(|| {

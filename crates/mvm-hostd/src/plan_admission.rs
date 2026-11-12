@@ -169,6 +169,8 @@ pub struct AdmittedPlan {
     /// admission authorizes one launch; the plan is handed back on
     /// `StartedMachine`, and holding it again must not start a second backend.
     dispatched: bool,
+    #[cfg(target_os = "linux")]
+    object_firecracker: Option<mvm_runtime::backend::OriginalObjectFirecracker>,
 }
 
 /// Re-verified host artifact behind one extension binding in the signed plan.
@@ -186,6 +188,14 @@ impl AdmittedPlan {
         &self.plan
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn object_firecracker(
+        &self,
+    ) -> Result<&mvm_runtime::backend::OriginalObjectFirecracker> {
+        self.object_firecracker
+            .as_ref()
+            .context("no original selected Firecracker launch for this admission")
+    }
     /// The plan's content-address, re-derived and checked during admission.
     #[must_use]
     pub fn plan_id(&self) -> &PlanId {
@@ -250,6 +260,8 @@ impl AdmittedPlan {
             canonical_kernel: None,
             backend: None,
             dispatched: false,
+            #[cfg(target_os = "linux")]
+            object_firecracker: None,
         }
     }
 
@@ -650,6 +662,8 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         canonical_kernel,
         backend,
         dispatched: false,
+        #[cfg(target_os = "linux")]
+        object_firecracker: None,
     })
 }
 
@@ -2195,10 +2209,25 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
     // Spent before the backend starts, so an admission that reached dispatch
     // can never authorize another launch, whatever the start's outcome.
     admitted.dispatched = true;
-    match backend
-        .start(&config)
-        .context("backend start after signed-plan admission")
+    #[cfg(target_os = "linux")]
+    let started = if backend.kind() == BackendKind::Firecracker
+        && admitted
+            .plan()
+            .mailbox
+            .is_some_and(|g| g.durable_object_pair_sha256_v1.is_some())
     {
+        backend
+            .start_original_object_firecracker(&config)
+            .map(|(id, original)| {
+                admitted.object_firecracker = Some(original);
+                id
+            })
+    } else {
+        backend.start(&config)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let started = backend.start(&config);
+    match started.context("backend start after signed-plan admission") {
         Ok(vm_id) => {
             // A VM whose grants could not be applied is running without the
             // bounds it was admitted under; the helper stops it rather than

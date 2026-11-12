@@ -94,6 +94,19 @@ pub struct LaunchOutcome {
     pub(crate) launched_at: Option<std::time::Instant>,
 }
 
+#[cfg(target_os = "linux")]
+impl LaunchOutcome {
+    /// The exact cold launch's signed admission and the kernel peer of its
+    /// configuration stream. No process/file-name lookup can construct this.
+    pub fn original_object_participant(
+        &self,
+    ) -> anyhow::Result<mvm_hostd::mailbox_launch::object_pair::InstalledParticipant<'_>> {
+        mvm_hostd::mailbox_launch::object_pair::InstalledParticipant::from_original_firecracker(
+            &self.admitted,
+        )
+    }
+}
+
 /// Exit report for a waited-on transient machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitReport {
