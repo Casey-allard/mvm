@@ -288,10 +288,80 @@ pub enum JournalHelper {
     Destination,
 }
 
+enum RecoveryAction {
+    ReopenCollected,
+    #[cfg(target_os = "linux")]
+    InterruptOwned,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn collect_interrupted_helper(
+    child: &mut Child,
+    readiness: &mut Option<String>,
+    until: Instant,
+) -> Result<ExitStatus> {
+    use mvm_vmm::host::process_exit::{
+        ProcessExitObserver, ProcessExitWait, collect_after_exit_event,
+    };
+    ensure!(
+        Instant::now() < until,
+        "helper interruption deadline elapsed"
+    );
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    let observer = ProcessExitObserver::arm(libc::pid_t::try_from(child.id())?)?;
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    ensure!(
+        Instant::now() < until,
+        "helper interruption deadline elapsed"
+    );
+    *readiness = Some("original helper interruption awaits recovery".into());
+    child.kill()?;
+    ensure!(
+        observer.wait_event(until)? == ProcessExitWait::Exited,
+        "original helper exit is unconfirmed"
+    );
+    collect_after_exit_event(until, || child.try_wait())?
+        .context("original helper status is uncollected")
+}
+
 impl OriginalJournalSourceHost {
     /// Re-exec a definitively collected helper under the same pair of live
     /// boots, current credentials and exclusive SDK launch claims.
     pub fn reconnect_helper(&mut self, which: JournalHelper, until: Instant) -> Result<ExitStatus> {
+        self.recover_helper(which, until, RecoveryAction::ReopenCollected)
+    }
+
+    /// Interrupt and replace one owned Linux helper while both admitted VMs
+    /// remain live. Outstanding operations require their original retry.
+    /// Other platforms refuse before interrupting a helper.
+    pub fn restart_helper(&mut self, which: JournalHelper, until: Instant) -> Result<ExitStatus> {
+        #[cfg(target_os = "linux")]
+        {
+            self.recover_helper(which, until, RecoveryAction::InterruptOwned)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (which, until);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "controlled live helper restart requires pinned socket retirement",
+            )
+            .into())
+        }
+    }
+
+    fn recover_helper(
+        &mut self,
+        which: JournalHelper,
+        until: Instant,
+        action: RecoveryAction,
+    ) -> Result<ExitStatus> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = action;
         self.require_original_relay()?;
         let until = until.min(Instant::now() + super::super::READY_TIMEOUT);
         let shared = self.destination.clone();
@@ -306,6 +376,27 @@ impl OriginalJournalSourceHost {
             .restart
             .current(&b._original, &b.marker, &mut b.stop, until)?;
         b.check_current_credentials(&self.plan, &self.grants)?;
+        #[cfg(target_os = "linux")]
+        if matches!(action, RecoveryAction::InterruptOwned) {
+            match which {
+                JournalHelper::Source => {
+                    collect_interrupted_helper(&mut self.source, &mut self.readiness, until)?;
+                }
+                JournalHelper::Destination => {
+                    let destination = &mut *b;
+                    collect_interrupted_helper(
+                        &mut destination.child,
+                        &mut destination.readiness,
+                        until,
+                    )?;
+                }
+            }
+            self.restart
+                .current(&self._guard, &self.marker, &mut self.stop, until)?;
+            b.restart
+                .current(&b._original, &b.marker, &mut b.stop, until)?;
+            b.check_current_credentials(&self.plan, &self.grants)?;
+        }
         let prior = match which {
             JournalHelper::Source => {
                 self.restart
@@ -338,6 +429,48 @@ impl OriginalJournalSourceHost {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    fn owned_helper() -> Child {
+        std::process::Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start owned helper fixture")
+    }
+
+    #[test]
+    fn controlled_exit_collects_the_owned_child_and_keeps_readiness_fenced() {
+        let mut child = owned_helper();
+        let mut readiness = None;
+        let until = Instant::now() + std::time::Duration::from_secs(3);
+        let status = collect_interrupted_helper(&mut child, &mut readiness, until)
+            .expect("collect original helper through its exit observer");
+        assert!(!status.success());
+        assert_eq!(
+            child.try_wait().expect("original child status"),
+            Some(status)
+        );
+        assert!(readiness.is_some());
+        assert_eq!(
+            collect_interrupted_helper(&mut child, &mut readiness, until)
+                .expect("retry retains original status"),
+            status
+        );
+    }
+
+    #[test]
+    fn expired_interruption_deadline_leaves_the_original_child_running() {
+        let mut child = owned_helper();
+        let mut readiness = None;
+        let result = collect_interrupted_helper(&mut child, &mut readiness, Instant::now());
+        assert!(result.is_err());
+        assert!(child.try_wait().expect("original child status").is_none());
+        assert!(readiness.is_none());
+        child.kill().expect("clean up owned fixture");
+        child.wait().expect("collect owned fixture");
+    }
+
     #[test]
     fn recovered_socket_never_removes_a_substituted_endpoint() {
         let root = tempfile::tempdir().unwrap();

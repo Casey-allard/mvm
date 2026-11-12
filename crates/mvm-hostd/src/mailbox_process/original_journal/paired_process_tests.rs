@@ -467,6 +467,19 @@ fn run(ordinal: bool, reconnect: bool) -> Result<()> {
                 );
             }
             if reconnect && turn == 1 {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let error = a
+                        .restart_helper(super::JournalHelper::Source, deadline)
+                        .expect_err("unsupported controlled restart");
+                    ensure!(error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::Unsupported)
+                    }));
+                    ensure!(a.source.try_wait()?.is_none());
+                    ensure!(b.lock().unwrap().child.try_wait()?.is_none());
+                }
                 // Repeat an already-receipted immutable envelope after each
                 // originally owned helper has exited, leaving both VMs alive.
                 let which = super::JournalHelper::Source;

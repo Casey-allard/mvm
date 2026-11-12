@@ -57,6 +57,8 @@ builder protocols, raw channels and their availability restrictions.
 
 Boot-binding file authority and local journal storage currently require the supported Unix filesystem checks. Portable clients can verify mailbox signatures and receipts on Windows. Loading a host or guest boot-binding file on an unsupported platform returns an explicit unsupported-operation error.
 
+The installed Linux controller can interrupt and replace one of its owned mailbox helpers through `OriginalJournalSourceHost::restart_helper`. It retains the original guest boots, launch claims and signed credentials. Readiness is fenced before interruption, the original child is collected through its exit observer, and replacement revalidates current authority before readiness. Retry an unsettled operation with its original identity. Controlled live restart returns `Unsupported` on other platforms before interrupting a helper. `reconnect_helper` remains available for an already-collected helper whose original socket can be retired safely.
+
 ### Original mailbox sender settlement
 
 A signed outbound journal direction can select `OrdinalV1` for its original sender. On cold boot the host projects that choice into the kernel command line as `mvm.mailbox.sender=ordinal-v1`. Before workload activation the agent checks it against the original mailbox identity and requires the matching ACK key. A missing or inconsistent ordinal identity refuses activation. The application talks to `/run/mvm/mailbox/receive.sock` using the versioned application reader frame. The agent forwards the corresponding requests over the admitted mailbox vsock port 5257.
