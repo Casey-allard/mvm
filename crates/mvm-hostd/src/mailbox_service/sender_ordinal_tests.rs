@@ -140,6 +140,33 @@ fn ordinal_reopens_exact_pending_at_capacity_and_fences_retired_prefix() {
             .reserve(h(ordinal), journal_intent_digest(&message(ordinal)), never)
             .unwrap();
         assert!(matches!(original,Original::Accepted(s,receipt) if s==*bytes && receipt==*r));
+        if ordinal == 1 {
+            let input = dir.path().join("fixture-settlement.json");
+            mvm_core::atomic_io::write_private(&input, &serde_json::to_vec(&statement).unwrap())
+                .unwrap();
+            let interrupt = |point: &str, code: i32| {
+                let status=std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["mailbox_service::sender_ordinal_tests::terminated_original_settlement_writer","--exact","--ignored"])
+                    .env("MVM_ORDINAL_CRASH_FIXTURE",dir.path()).env("MVM_ORDINAL_CRASH_POINT",point)
+                    .status().unwrap();
+                assert_eq!(status.code(), Some(code));
+            };
+            interrupt("before_rename", 81);
+            let recovered = SenderWindow::reopen(dir.path(), id).unwrap();
+            assert!(
+                matches!(recovered.reserve(h(1),journal_intent_digest(&message(1)),never).unwrap(),Original::Accepted(ref s, ref receipt) if s==bytes && receipt==r)
+            );
+            assert!(matches!(
+                recovered.reserve(h(65), [0; 32], never),
+                Err(Refusal::QueueFull(64))
+            ));
+            interrupt("after_directory_sync", 82);
+            let recovered = SenderWindow::reopen(dir.path(), id).unwrap();
+            assert!(matches!(
+                recovered.reserve(h(1), journal_intent_digest(&message(1)), never),
+                Err(Refusal::SenderOrdinalRetired)
+            ));
+        }
         let retired = window.settle(&statement, &key.verifying_key()).unwrap();
         assert_eq!(retired, if ordinal == 1 { 64 } else { 0 });
         if ordinal == 2 {
@@ -188,4 +215,25 @@ fn ordinal_reopens_exact_pending_at_capacity_and_fences_retired_prefix() {
         "ORDINAL_WINDOW opened=65 distinct_payloads=65 unresolved_limit=64 retired=64 retained_exact_retry_bytes={} next_sequence=65",
         retried.len()
     );
+}
+
+#[test]
+#[ignore = "child of the ordinal authenticated settlement crash fixture"]
+fn terminated_original_settlement_writer() {
+    use super::sender_window::CrashPoint;
+    let root = std::path::PathBuf::from(
+        std::env::var_os("MVM_ORDINAL_CRASH_FIXTURE").expect("requires parent fixture"),
+    );
+    let statement: SenderSettlementV1 =
+        serde_json::from_slice(&std::fs::read(root.join("fixture-settlement.json")).unwrap())
+            .unwrap();
+    let mut window = SenderWindow::reopen(&root, statement.handle.direction).unwrap();
+    window.crash_at = Some(match std::env::var("MVM_ORDINAL_CRASH_POINT").as_deref() {
+        Ok("before_rename") => CrashPoint::BeforeRename,
+        Ok("after_directory_sync") => CrashPoint::AfterDirectorySync,
+        _ => panic!("unknown fixture crash point"),
+    });
+    let guest = SigningKey::from_bytes(&[81; 32]).verifying_key();
+    window.settle(&statement, &guest).unwrap();
+    panic!("fixture did not terminate at selected publication boundary");
 }
