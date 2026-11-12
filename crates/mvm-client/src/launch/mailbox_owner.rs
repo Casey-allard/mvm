@@ -312,7 +312,10 @@ pub(crate) fn without_owner<T>(name: &str, action: impl FnOnce() -> Result<T>) -
 pub(crate) struct OwnedLaunch {
     claim: Claim,
     client: Arc<InstalledMailboxClient>,
-    cast_role: Option<mvm_hostd::mailbox_launch::cast_pair::development::PreparedRole>,
+    cast_role: Option<(
+        mvm_hostd::mailbox_launch::cast_pair::development::PreparedRole,
+        std::ops::Range<i64>,
+    )>,
     original_peer: Arc<InstalledMailboxPeer>,
     rollback_on_drop: bool,
 }
@@ -366,6 +369,12 @@ impl OwnedLaunch {
         })?;
         self.client
             .check_prepared_development_role(&prepared.role)?;
+        let validity = prepared.boot.validity();
+        let until = until.min(cast_publication_deadline(
+            &validity,
+            chrono::Utc::now().timestamp_millis(),
+            Instant::now(),
+        )?);
         let (prior, bytes) =
             prepared
                 .boot
@@ -374,7 +383,7 @@ impl OwnedLaunch {
         stage_pair_boot(&path, &prior, &bytes, || {
             pair.published(&self.claim.name, until)
         })?;
-        self.cast_role = Some(prepared.role);
+        self.cast_role = Some((prepared.role, validity));
         cancellation.disarm();
         Ok(())
     }
@@ -390,13 +399,19 @@ impl OwnedLaunch {
         })
     }
     pub(crate) fn start_native<T>(&self, start: impl FnOnce() -> Result<T>) -> Result<T> {
+        if let Some((_, validity)) = &self.cast_role {
+            ensure!(
+                validity.contains(&chrono::Utc::now().timestamp_millis()),
+                "original Cast authorization expired before VMM start"
+            );
+        }
         self.client.start_native(start)
     }
     pub(crate) fn settle_native_start(&self) -> Result<()> {
         self.client.settle_native_start()
     }
     pub(crate) fn configure_and_wait(&mut self, backend: &AnyBackend) -> Result<()> {
-        if let Some(role) = self.cast_role.take() {
+        if let Some((role, _)) = self.cast_role.take() {
             return self
                 .client
                 .configure_development_cast(backend, deadline(), role);
@@ -415,6 +430,19 @@ impl OwnedLaunch {
         self.client
             .finish_installed_cleanup(false, cleanup, || self.claim.retire(&self.client, false))
     }
+}
+fn cast_publication_deadline(
+    validity: &std::ops::Range<i64>,
+    now_ms: i64,
+    now: Instant,
+) -> Result<Instant> {
+    ensure!(
+        validity.contains(&now_ms),
+        "original Cast authorization outside its validity interval"
+    );
+    let available = std::time::Duration::from_millis(validity.end.abs_diff(now_ms));
+    now.checked_add(available)
+        .context("invalid original Cast expiry")
 }
 /// With the per-name claim held, restore the initial grant on a pre-boot peer
 /// refusal. If an external writer has replaced it, retain the differing record.
@@ -533,6 +561,20 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn publication_respects_the_inclusive_start_and_exclusive_capability_expiry() {
+        let now = Instant::now();
+        let valid = 100..120;
+        assert!(cast_publication_deadline(&valid, 99, now).is_err());
+        assert_eq!(
+            cast_publication_deadline(&valid, 100, now)
+                .unwrap()
+                .duration_since(now),
+            Duration::from_millis(20)
+        );
+        assert!(cast_publication_deadline(&valid, 120, now).is_err());
+    }
+
     #[test]
     fn failed_pair_publication_restores_only_its_own_boot_grant() {
         let tmp = tempfile::tempdir().unwrap();
