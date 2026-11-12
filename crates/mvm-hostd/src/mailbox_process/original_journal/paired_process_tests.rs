@@ -268,14 +268,15 @@ fn collect_with_idle_dial(
             && child.try_wait()?.is_none(),
         "idle dial does not belong to the live original"
     );
-    child.kill()?;
-    let status = child.wait()?;
+    // Darwin may reject socket option changes after its peer has closed.
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(
         until
             .checked_duration_since(Instant::now())
             .context("idle dial deadline")?,
     ))?;
+    child.kill()?;
+    let status = child.wait()?;
     let mut bytes = Vec::new();
     stream.take(14).read_to_end(&mut bytes)?;
     ensure!(
