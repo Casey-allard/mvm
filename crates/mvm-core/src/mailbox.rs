@@ -491,6 +491,23 @@ fn verify_capability_scope(
     Ok(())
 }
 
+/// Check an already signed Send credential against current original scope before
+/// sealing or retrying an object. A positive result is scoped authorization;
+/// destination opening still authenticates the actual ciphertext and replay.
+pub fn authorize_send(
+    header: &MailboxEnvelopeHeader,
+    capability: &SignedMailboxCapability,
+    context: &OpenContext,
+    authority_key: &VerifyingKey,
+) -> Result<(), MailboxError> {
+    if context.required_operation != MailboxOperation::Send {
+        return Err(MailboxError::OperationNotAuthorized);
+    }
+    verify_identity_and_time(header, context)?;
+    verify_capability_signature(capability, authority_key)?;
+    verify_capability_scope(header, capability, context, true)
+}
+
 /// Authenticated header and plaintext from one successful canonical open.
 /// This is verification under the supplied context, not a delivery receipt or
 /// permission to skip a later admission check.

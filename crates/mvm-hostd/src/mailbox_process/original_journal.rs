@@ -2,6 +2,8 @@
 //! Only the canonical production launch can give a caller this handle. It
 //! retains the original Child until collection. A pidfile cannot recreate it.
 
+pub mod authorization;
+
 use super::{MailboxLaunchPosture, MailboxProcessConfig, spawn_serving, spawn_with_original};
 use anyhow::{Context, Result, ensure};
 use mvm_agentd::vsock::connect_unix_before;
@@ -27,6 +29,9 @@ pub struct OriginalJournalDestination {
     address: MailboxAddress,
     policy_epoch: u64,
     issuer: PrincipalId,
+    keys_dir: PathBuf,
+    inbound: mvm_core::mailbox::OpenContext,
+    sender_key: ed25519_dalek::VerifyingKey,
 }
 
 impl OriginalJournalDestination {
@@ -87,6 +92,9 @@ impl OriginalJournalDestination {
             address,
             policy_epoch: current.current_policy_epoch,
             issuer: current.expected_capability_issuer,
+            keys_dir: config.keys_dir.clone(),
+            inbound: current.clone(),
+            sender_key: policy.sender_key,
         })
     }
 

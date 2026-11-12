@@ -175,6 +175,30 @@ pub fn authority_key_for(
         .verifying_key())
 }
 
+/// Public identities only, derived by the original host before signing a
+/// prospective A plan. An operator template cannot replace the signing key.
+pub(crate) fn journal_scope_before_launch(
+    keys: &Path,
+    grant: &MailboxGrant,
+    now: i64,
+) -> Result<MailboxTemplate> {
+    let derived = derived_keys(keys, &grant.mailbox, grant.epoch)?;
+    let template = template_for(keys, &derived, grant, now)?;
+    let h = &template.header;
+    if derived.authority.verifying_key().to_bytes() != grant.authority_key
+        || h.sender.as_bytes() != &derived.sender.verifying_key().to_bytes()
+        || template.capability.issuer.as_bytes() != &grant.authority_key
+        || h.mailbox != grant.mailbox
+        || h.execution_epoch != grant.epoch
+    {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "original journal scope does not match local keys and grant",
+        ));
+    }
+    Ok(template)
+}
+
 /// Everything a mailbox host process needs to serve one granted guest, derived
 /// by the launcher from the host key and nothing else: the three derived keys
 /// and the identities and capability they seal under. It never carries the host
