@@ -49,6 +49,7 @@ use crate::mailbox_service::durable::DurableMailboxService;
 use crate::plan_admission::{MailboxLaunchPosture, MailboxPostureHandoff};
 use crate::vm_lifetime::{endpoint_needed, launcher_is_alive};
 
+pub mod original_journal;
 mod reader;
 
 /// The helper binary this module spawns.
@@ -543,6 +544,20 @@ pub fn spawn_for_launch(
     vm_name: &str,
     posture: Option<&MailboxLaunchPosture>,
 ) -> Result<Option<u32>> {
+    spawn_with_original(plan, backend, vm_name, posture, |config, _| {
+        Ok(spawn_serving(config, &config.vm_state_dir)?.id())
+    })
+}
+
+// Both entry points use the canonical backend, actual admitted posture, boot
+// binding and retained-key provisioning before any original child is spawned.
+fn spawn_with_original<T>(
+    plan: &ExecutionPlan,
+    backend: &AnyBackend,
+    vm_name: &str,
+    posture: Option<&MailboxLaunchPosture>,
+    start: impl FnOnce(&MailboxProcessConfig, &ExecutionPlan) -> Result<T>,
+) -> Result<Option<T>> {
     let Some(grant) = &plan.mailbox else {
         return Ok(None);
     };
@@ -601,7 +616,7 @@ pub fn spawn_for_launch(
         }
         config.posture =
             Some(posture.handoff(config.reader_boot.as_ref().map(|binding| binding.boot)));
-        spawn_serving(&config, &state_dir)
+        start(&config, plan).map(Some)
     })();
     if started.is_err() {
         let _ = shred_epoch_secret(&state_dir);
@@ -609,7 +624,7 @@ pub fn spawn_for_launch(
     started
 }
 
-fn spawn_serving(config: &MailboxProcessConfig, state_dir: &Path) -> Result<Option<u32>> {
+fn spawn_serving(config: &MailboxProcessConfig, state_dir: &Path) -> Result<std::process::Child> {
     let bin = mvm_vmm::host::broker_services_spawn::resolve_subprocess_bin_to_spawn(&AuxBin::new(
         MAILBOX_BIN,
         MAILBOX_BIN_ENV,
@@ -642,7 +657,7 @@ fn spawn_serving(config: &MailboxProcessConfig, state_dir: &Path) -> Result<Opti
         let _ = child.wait();
         return Err(error);
     }
-    Ok(Some(child.id()))
+    Ok(child)
 }
 
 #[cfg(test)]
