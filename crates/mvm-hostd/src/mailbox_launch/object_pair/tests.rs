@@ -822,7 +822,7 @@ fn per_role_sender_retries_the_original_seal_after_an_uncertain_carrier_result()
                 &pair.caller.local,
                 &dir,
                 Instant::now() + Duration::from_secs(5),
-                || Ok(super::super::now_unix_ms()),
+                || Ok(f.now),
                 |original, _| {
                     attempts.push(original.envelope().clone());
                     anyhow::bail!("lost peer response");
@@ -833,6 +833,36 @@ fn per_role_sender_retries_the_original_seal_after_an_uncertain_carrier_result()
     }
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0], attempts[1]);
+    let held = tx.retain(&pair.caller.local, &dir, &|| Ok(f.now)).unwrap();
+    let timeout = held
+        .send(
+            &pair.caller.local,
+            Instant::now(),
+            || Ok(f.now),
+            |_, _| panic!("expired IO deadline reached carrier"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        timeout.downcast_ref::<crate::mailbox_service::Refusal>(),
+        Some(&crate::mailbox_service::Refusal::Unavailable)
+    );
+    let owner = mvm_core::util::atomic_io::FileLock::try_acquire(&dir.join("intent"))
+        .unwrap()
+        .unwrap();
+    let error = tx
+        .forward(
+            &pair.caller.local,
+            &dir,
+            Instant::now() + Duration::from_secs(5),
+            || Ok(f.now),
+            |_, _| panic!("busy source reached carrier"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::mailbox_service::Refusal>(),
+        Some(&crate::mailbox_service::Refusal::Unavailable)
+    );
+    drop(owner);
     let wrong = OutboundObject {
         boot: b.boot.boot,
         ..tx

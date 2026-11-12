@@ -91,12 +91,19 @@ pub(crate) struct Recorder(Mutex<Option<Sink>>);
 
 impl Recorder {
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        Self::create_scoped(
+            path,
+            b"mvm/owned-mailbox/guest-5257/post-mux-host-stream/v1\n",
+        )
+    }
+
+    pub(crate) fn create_scoped(path: &Path, header: &[u8]) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)?;
-        file.write_all(b"mvm/owned-mailbox/guest-5257/post-mux-host-stream/v1\n")?;
+        file.write_all(header)?;
         Ok(Self(Mutex::new(Some(Sink { file, exchanges: 0 }))))
     }
 
