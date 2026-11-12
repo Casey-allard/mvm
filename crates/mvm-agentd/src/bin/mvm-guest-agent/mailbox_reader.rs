@@ -1,6 +1,7 @@
 //! Explicit guest-local Receive and ACK-after-processing over the existing
 //! mailbox vsock port. The workload can read the socket, not the ACK key.
 
+#[path = "mailbox_reader/validity.rs"]
 mod validity;
 
 use std::io::{Read, Write};
