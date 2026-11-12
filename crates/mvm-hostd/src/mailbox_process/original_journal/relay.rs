@@ -122,6 +122,13 @@ impl OriginalJournalSourceHost {
         self.marker.collect(&mut self.source)
     }
 
+    /// Request termination through the retained original Child. The caller
+    /// must first confirm VM stop and separately report assisted teardown.
+    /// Only try_collect can clear this helper's persistent ownership record.
+    pub fn request_original_exit_after_vm_stop(&mut self) -> std::io::Result<()> {
+        super::request_original_exit(&mut self.source)
+    }
+
     /// Nonblocking on an idle listener. One shared action deadline for all
     /// socket traffic and revocation sampling once A has connected.
     pub fn forward_once(&mut self, until: Instant) -> Result<bool> {
