@@ -265,7 +265,7 @@ fn signed_source(now: i64) -> (SignedObjectRoleV1, SigningKey, SigningKey) {
     let boot = |n: u8, plan_nonce, cap: &SignedMailboxCapability| MailboxReaderBootBinding {
         durable_object_pair_sha256_v1: Some(pair),
         outbound_journal_v1: None,
-        plan_id: PlanId(format!("sha256:{}", hex::encode([n; 32]))),
+        plan_id: PlanId(format!("sha256:{}", format!("{n:02x}").repeat(32))),
         plan_nonce,
         mailbox: cap.grant.address.mailbox,
         authority_key: *cap.grant.issuer.as_bytes(),
