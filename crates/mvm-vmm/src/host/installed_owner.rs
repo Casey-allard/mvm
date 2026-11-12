@@ -29,7 +29,10 @@ const DOMAIN: &[u8] = b"spiralcore/installed-owner/v1\0";
 
 #[path = "installed_owner/command_lease.rs"]
 mod command_lease;
-pub use command_lease::{receive_resource_lease_at_startup, spawn_with_resource_lease};
+pub use command_lease::{
+    receive_resource_lease_at_startup, spawn_with_resource_lease,
+    spawn_with_resource_lease_and_control,
+};
 
 #[cfg(test)]
 #[path = "installed_owner/binding_tests.rs"]

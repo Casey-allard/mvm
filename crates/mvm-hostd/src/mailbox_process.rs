@@ -19,6 +19,10 @@
 //! declares the capability. A grant on one that does not refuses the launch
 //! rather than boot a guest that asserts a mailbox nobody serves.
 
+pub mod owned;
+pub mod owned_client;
+pub mod owned_wire;
+
 use std::io::{Error, ErrorKind, Result, Write as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -57,6 +61,26 @@ pub struct MailboxProcessConfig {
     pub route: HostDialRoute,
     /// The VM whose lifetime bounds this process.
     pub vm_state_dir: PathBuf,
+}
+
+/// Serialize into bounded, zeroized launcher memory before exposing any bytes
+/// to the child. The host agent receives only the nonsecret control exchange.
+pub fn write_delegated_config(
+    writer: std::os::fd::OwnedFd,
+    config: &MailboxProcessConfig,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    use mvm_vmm::host::mailbox_worker_transport::{MAX_CONFIG_BYTES, write_config};
+    let mut buffer = zeroize::Zeroizing::new(vec![0_u8; MAX_CONFIG_BYTES]);
+    let mut output = std::io::Cursor::new(buffer.as_mut_slice());
+    serde_json::to_writer(&mut output, config).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "mailbox config exceeds encoding limit",
+        )
+    })?;
+    let size = output.position() as usize;
+    write_config(writer, &buffer[..size], deadline)
 }
 
 /// Parse the stdin config.

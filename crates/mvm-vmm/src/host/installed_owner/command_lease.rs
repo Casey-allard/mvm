@@ -53,10 +53,57 @@ fn invalid() -> io::Error {
 /// All fallible handoff preparation precedes spawn; no post-spawn failure loses
 /// the original Child. The consumed Command cannot outlive its descriptor guard.
 pub fn spawn_with_resource_lease(
-    mut command: Command,
+    command: Command,
     lease: HolderLease,
 ) -> io::Result<(Child, HolderLease)> {
-    let handoff = lease.prepare_handoff().map_err(owner_error)?;
+    spawn_with_channel(command, lease, None)
+}
+/// Inherit the original lease and a private FD 3 in one exec.
+pub fn spawn_with_resource_lease_and_control(
+    command: Command,
+    lease: HolderLease,
+    control: &std::os::unix::net::UnixStream,
+) -> io::Result<(Child, HolderLease)> {
+    if control.as_raw_fd() >= 3 {
+        return spawn_with_channel(command, lease, Some(control));
+    }
+    // Command installs child stdio before pre_exec. Preserve a control socket
+    // allocated in a previously vacant parent stdin/out/err slot.
+    let fd = unsafe { libc::fcntl(control.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let retained = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    spawn_with_channel(command, lease, Some(&retained))
+}
+fn spawn_with_channel(
+    mut command: Command,
+    lease: HolderLease,
+    control: Option<&std::os::unix::net::UnixStream>,
+) -> io::Result<(Child, HolderLease)> {
+    let mut handoff = lease.prepare_handoff().map_err(owner_error)?;
+    if let Some(control) = control {
+        use std::os::unix::process::CommandExt;
+        for file in [&mut handoff.directory, &mut handoff.holder] {
+            if file.as_raw_fd() < 4 {
+                let dup = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4) };
+                if dup < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                *file = unsafe { File::from_raw_fd(dup) };
+            }
+        }
+        let fd = control.as_raw_fd();
+        // Only async-signal-safe descriptor operations in the forked child.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, 3) != 3 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let metadata = Metadata {
         version: 1,
         root: lease._storage.root.clone(),

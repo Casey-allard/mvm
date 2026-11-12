@@ -338,3 +338,61 @@ fn new_wire_response_is_canonical_typed_control_variant() {
         ControlResponse::MailboxWorkerV1(Box::new(result))
     );
 }
+
+#[test]
+fn delegated_config_refuses_a_regular_file_before_writing() {
+    let file = tempfile::tempfile().unwrap();
+    let writer = file.try_clone().unwrap().into();
+    assert!(
+        mvm_vmm::host::mailbox_worker_transport::write_config(writer, b"private", deadline())
+            .is_err()
+    );
+    assert_eq!(file.metadata().unwrap().len(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn delegated_config_closes_after_exact_write_and_times_out_on_full_pipe() {
+    use mvm_vmm::host::mailbox_worker_transport::write_config;
+    let payload = vec![0x45; 65536];
+    let (reader, writer) = pipe();
+    let drain = std::thread::spawn(move || {
+        let mut received = Vec::new();
+        std::fs::File::from(reader)
+            .read_to_end(&mut received)
+            .unwrap();
+        received
+    });
+    write_config(writer, &payload, deadline()).unwrap();
+    assert_eq!(drain.join().unwrap(), payload);
+
+    let (_reader, writer) = pipe();
+    // Reduce capacity to one page so this write is guaranteed to stall.
+    let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+    assert!((1..payload.len() as i32).contains(&capacity));
+    assert_eq!(
+        write_config(writer, &payload, Instant::now() + Duration::from_millis(50))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn worker_request_uses_the_daemons_existing_length_and_signed_body() {
+    use mvm_core::protocol::broker_control::{ControlRequest, sign};
+    use mvm_vmm::host::mailbox_worker_transport::send_request;
+    let (sender, mut receiver) = UnixStream::pair().unwrap();
+    let signed = sign(
+        ControlRequest::MailboxWorkerV1(Box::new(fixture().0)),
+        &[9; 32],
+    )
+    .unwrap();
+    send_request(&sender, &signed, deadline()).unwrap();
+    drop(sender);
+    let mut wire = Vec::new();
+    receiver.read_to_end(&mut wire).unwrap();
+    let expected = serde_json::to_vec(&signed).unwrap();
+    assert_eq!(wire[..4], (expected.len() as u32).to_be_bytes());
+    assert_eq!(wire[4..], expected);
+}

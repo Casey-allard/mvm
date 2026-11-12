@@ -37,7 +37,7 @@ impl MailboxWorkerFactory for FixtureHelper {
             .stdout(Stdio::from(std::os::fd::OwnedFd::from(child_control)))
             .stderr(Stdio::null())
             .spawn()?;
-        Ok(SpawnedMailboxWorker { child, control })
+        Ok(SpawnedMailboxWorker { child, control, parent_lease: None })
     }
 }
 
@@ -280,7 +280,7 @@ impl MailboxWorkerFactory for ExitBeforeConfig {
                 .unwrap(),
             mvm_vmm::host::process_exit::ProcessExitWait::Exited
         );
-        Ok(SpawnedMailboxWorker { child, control })
+        Ok(SpawnedMailboxWorker { child, control, parent_lease: None })
     }
 }
 
@@ -335,7 +335,7 @@ impl MailboxWorkerFactory for IgnoreLifetimeUntilReleased {
             .stdout(Stdio::from(std::os::fd::OwnedFd::from(child_control)))
             .stderr(Stdio::from(std::os::fd::OwnedFd::from(child_release)))
             .spawn()?;
-        Ok(SpawnedMailboxWorker { child, control })
+        Ok(SpawnedMailboxWorker { child, control, parent_lease: None })
     }
 }
 

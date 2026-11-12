@@ -479,23 +479,95 @@ fn serve_derived_with(
             }
         };
         let service = thread_service.get_or_init(|| bound);
-        attempt = 0;
-        while !thread_stop.load(Ordering::SeqCst) {
-            // Ok means a frame arrived, delivered or refused; Err means the
-            // guest had nothing yet (or was not up). Neither ends the loop.
-            match service.serve_guest_until(&paths.route, &mut sealer, &thread_stop) {
-                Ok(()) => {
-                    attempt = 0;
-                    sleep_unless_stopped(&thread_stop, POST_FRAME_PAUSE);
-                }
-                Err(_) => {
-                    sleep_unless_stopped(&thread_stop, dial_delay(attempt, fast_attempts));
-                    attempt = attempt.saturating_add(1);
-                }
-            }
-        }
+        dial_guest(
+            service,
+            &paths.route,
+            &mut sealer,
+            &thread_stop,
+            fast_attempts,
+        );
     });
     MailboxLaunch { stop, service }
+}
+
+/// A helper owns the original dial thread until the parent closes FD 3.
+pub struct OwnedMailboxLaunch {
+    stop: Arc<AtomicBool>,
+    dial: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OwnedMailboxLaunch {
+    /// Stop and join the dialer, including the bound service it owns.
+    pub fn shutdown(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.dial
+            .take()
+            .expect("original dial thread")
+            .join()
+            .map_err(|_| Error::other("mailbox dial thread panicked"))
+    }
+}
+
+impl Drop for OwnedMailboxLaunch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(dial) = self.dial.take() {
+            let _ = dial.join();
+        }
+    }
+}
+
+/// Bind a granted mailbox before its owning helper reports readiness. The local
+/// queue is serving on return. Guest availability is independent of this bind.
+pub fn serve_derived_owned(
+    grant: MailboxGrant,
+    keys: DerivedMailboxKeys,
+    paths: ServePaths,
+    limits: MailboxLimits,
+) -> Result<OwnedMailboxLaunch> {
+    let (trust, sealer) = keys.trust();
+    let (bound, mut sealer) = bind_grant(&grant, trust, sealer, limits, &paths.socket)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let dial = std::thread::Builder::new()
+        .name("mvm-mailbox-dial".into())
+        .spawn(move || {
+            dial_guest(
+                &bound,
+                &paths.route,
+                &mut sealer,
+                &thread_stop,
+                FAST_DIAL_ATTEMPTS,
+            );
+        })?;
+    Ok(OwnedMailboxLaunch {
+        stop,
+        dial: Some(dial),
+    })
+}
+
+fn dial_guest(
+    service: &MailboxService,
+    route: &mvm_core::vm_backend::HostDialRoute,
+    sealer: &mut GuestSealer,
+    stop: &AtomicBool,
+    fast_attempts: u32,
+) {
+    let mut attempt = 0u32;
+    while !stop.load(Ordering::SeqCst) {
+        // Ok means a frame arrived, delivered or refused; Err means the
+        // guest had nothing yet (or was not up). Neither ends the loop.
+        match service.serve_guest_until(route, sealer, stop) {
+            Ok(()) => {
+                attempt = 0;
+                sleep_unless_stopped(stop, POST_FRAME_PAUSE);
+            }
+            Err(_) => {
+                sleep_unless_stopped(stop, dial_delay(attempt, fast_attempts));
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
 }
 
 /// Bounds a launch-time mailbox holds and accepts.
@@ -645,6 +717,32 @@ mod tests {
             socket: dir.join("mailbox.sock"),
             route: mvm_core::vm_backend::HostDialRoute::PortSocket(dir.join("port.sock")),
         }
+    }
+
+    #[test]
+    fn owned_launch_reports_bind_failure_before_advertising_readiness() {
+        let dir = keys_dir();
+        let grant = grant(dir.path(), [7; 32]);
+        let keys = derive_launch_keys(dir.path(), &grant, &test_secret()).unwrap();
+        let paths = serve_paths(&dir.path().join("absent"));
+        let result = serve_derived_owned(grant, keys, paths, LAUNCH_LIMITS);
+        assert_eq!(result.err().map(|e| e.kind()), Some(ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn owned_launch_returns_with_the_canonical_host_queue_serving() {
+        let dir = keys_dir();
+        let grant = grant(dir.path(), [7; 32]);
+        let keys = derive_launch_keys(dir.path(), &grant, &test_secret()).unwrap();
+        let paths = serve_paths(dir.path());
+        let socket = paths.socket.clone();
+        let _launch = serve_derived_owned(grant, keys, paths, LAUNCH_LIMITS).unwrap();
+        assert!(
+            crate::mailbox_service::recv(&socket)
+                .unwrap()
+                .message
+                .is_none()
+        );
     }
 
     #[test]
