@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::mailbox_service::durable::GuestReaderAuthority;
 
+const OBJECT_READER_FILE: &str = "mailbox-object-reader-v1.json";
 const READER_FILE: &str = "mailbox-reader-authority.json";
 const MAX_READER_FILE_BYTES: u64 = 64 * 1024;
 
@@ -87,6 +88,30 @@ fn read_record(path: &Path) -> io::Result<Option<ReaderRecord>> {
         return Err(invalid("record exceeds the encoded bound"));
     }
     serde_json::from_slice(&bytes).map(Some).map_err(invalid)
+}
+
+/// Reopen only the exact pre-existing enrollment selected by a private
+/// original worker bootstrap. No repair, new issuance or state mutation.
+pub(crate) fn check_object_worker_record(
+    state: &Path,
+    boot: &MailboxReaderBootBinding,
+    incoming: &SignedMailboxCapability,
+    receive: &SignedMailboxCapability,
+    material: [u8; 32],
+) -> io::Result<SignedMailboxGuestReaderEnrollment> {
+    let r = read_record(&state.join(OBJECT_READER_FILE))?
+        .ok_or_else(|| invalid("missing selected enrollment"))?;
+    if r.version != 2
+        || r.boot != *boot
+        || r.send != *incoming
+        || r.receive != *receive
+        || r.original_object_material_v1 != Some(material)
+    {
+        return Err(invalid(
+            "selected worker differs from retained reader enrollment",
+        ));
+    }
+    Ok(r.enrollment)
 }
 
 pub(super) fn load_or_enroll(
@@ -330,7 +355,7 @@ pub(crate) fn enroll_object_reader(
     {
         return Err(invalid("object reader original or authorization changed"));
     }
-    let path = state.join("mailbox-object-reader-v1.json");
+    let path = state.join(OBJECT_READER_FILE);
     let make = || -> io::Result<ReaderRecord> {
         let enrollment = sign_guest_reader_enrollment(
             MailboxGuestReaderEnrollment {

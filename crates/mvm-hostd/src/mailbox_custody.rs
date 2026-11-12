@@ -106,6 +106,15 @@ fn existing_host_signer(keys_dir: &Path) -> Result<SigningKey> {
     Ok(signer)
 }
 
+fn storage_paths_for(keys_dir: &Path, identity: &Identity<'_>) -> Result<MailboxStoragePaths> {
+    let (bundle, _) = paths(keys_dir, identity)?;
+    Ok(MailboxStoragePaths {
+        journal: bundle.with_extension("journal"),
+        anchor: bundle.with_extension("anchor"),
+        source_intents: bundle.with_extension("intents"),
+    })
+}
+
 fn read_private(path: &Path, maximum: u64) -> Result<Zeroizing<Vec<u8>>> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -276,12 +285,34 @@ impl RetainedMailboxKeys {
             epoch: binding.epoch,
             retention_ms: binding.retention_ms,
         };
-        let (bundle, _) = paths(keys_dir, &identity)?;
-        Ok(MailboxStoragePaths {
-            journal: bundle.with_extension("journal"),
-            anchor: bundle.with_extension("anchor"),
-            source_intents: bundle.with_extension("intents"),
-        })
+        storage_paths_for(keys_dir, &identity)
+    }
+    /// Derive only the three paths of this signed original's local storage.
+    /// No key bundle is opened or minted in the per-VM worker.
+    pub(crate) fn object_storage_paths(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        address: MailboxAddress,
+    ) -> Result<MailboxStoragePaths> {
+        let g = plan.mailbox.context("missing original mailbox")?;
+        ensure!(
+            g.durable_object_pair_sha256_v1.is_some() && g.mailbox == address.mailbox,
+            "different selected mailbox"
+        );
+        storage_paths_for(
+            keys_dir,
+            &Identity {
+                plan_id: &plan.plan_id,
+                plan_nonce: &plan.nonce,
+                vm_name: &plan.image.name,
+                address,
+                epoch: g.epoch,
+                retention_ms: g
+                    .retention
+                    .context("missing original retention")?
+                    .retention_ms(),
+            },
+        )
     }
 
     /// Provision once under a verified launch posture; an interrupted first
