@@ -351,3 +351,38 @@ mod tests {
         assert!(check(&a_policy.context, &inbound, &grants, &excess).is_err());
     }
 }
+
+/// Borrowed only during the pre-sign / pre-dispatch decision. The underlying
+/// original process cannot be replaced or reconstructed from a public ID.
+pub struct PairedJournalAdmission<'a> {
+    original: std::sync::Mutex<&'a mut OriginalJournalDestination>,
+    grants: &'a JournalCredentials,
+    deadline: Instant,
+}
+
+impl std::fmt::Debug for PairedJournalAdmission<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PairedJournalAdmission")
+    }
+}
+
+impl<'a> PairedJournalAdmission<'a> {
+    pub fn new(
+        original: &'a mut OriginalJournalDestination,
+        grants: &'a JournalCredentials,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            original: std::sync::Mutex::new(original),
+            grants,
+            deadline,
+        }
+    }
+
+    pub(crate) fn verify(&self, plan: &ExecutionPlan) -> Result<()> {
+        self.original
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("original destination is busy"))?
+            .check_proposal(plan, self.grants, self.deadline)
+    }
+}

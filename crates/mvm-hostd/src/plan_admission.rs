@@ -388,8 +388,8 @@ pub fn admit_plan_for_run(
     // signed admitted one to anything downstream that only checks the
     // signature.
     admit_grants(plan, &host_grant_ceiling(), posture)?;
-    enforce_mailbox_retention(
-        plan.mailbox.as_ref(),
+    posture.enforce_journal(
+        plan,
         mvm_core::user_config::load(None).max_mailbox_retention_ms,
     )?;
 
@@ -476,8 +476,8 @@ pub fn admit_signed_plan_for_run(
     let extensions = verify_extension_packs(&verified, None)?;
     verify_registry_pack_assets(&verified)?;
     admit_grants(&verified, &host_grant_ceiling(), posture)?;
-    enforce_mailbox_retention(
-        verified.mailbox.as_ref(),
+    posture.enforce_journal(
+        &verified,
         mvm_core::user_config::load(None).max_mailbox_retention_ms,
     )?;
     admit_within_host_budget(&verified)?;
@@ -843,6 +843,9 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
+    paired_journal: Option<
+        &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission<'a>,
+    >,
 }
 
 impl<'a> RunPosture<'a> {
@@ -854,6 +857,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
+            paired_journal: None,
         }
     }
 
@@ -870,6 +874,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
+            paired_journal: None,
         }
     }
 
@@ -878,6 +883,30 @@ impl<'a> RunPosture<'a> {
     pub fn with_runtime(mut self, runtime_config: Option<&'a VmStartConfig>) -> Self {
         self.runtime_config = runtime_config;
         self
+    }
+
+    /// Supply the independent destination's original live authorization only
+    /// for this paired source admission. Ordinary admission remains unchanged.
+    pub fn with_paired_journal(
+        mut self,
+        pair: &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission<
+            'a,
+        >,
+    ) -> Self {
+        self.paired_journal = Some(pair);
+        self
+    }
+
+    fn enforce_journal(&self, plan: &ExecutionPlan, max_ms: Option<u64>) -> Result<()> {
+        let Some(pair) = self.paired_journal else {
+            return enforce_mailbox_retention(plan.mailbox.as_ref(), max_ms);
+        };
+        anyhow::ensure!(
+            self.variant == Variant::Prod && self.backend.is_some(),
+            "paired journal requires an original production backend"
+        );
+        grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(), max_ms)?;
+        pair.verify(plan)
     }
 
     /// The sealed-production / developer posture this run carries.
