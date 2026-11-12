@@ -1566,8 +1566,8 @@ impl WorkerCoordinator {
             HostAgentDaemon::reconcile_for_shutdown(self.daemon.clone(), &self.generation).await?;
             self.services_receipt = Some(self.custody.drain_services().await?);
         }
-        if let Some(owner) = mailbox {
-            self.collect_mailbox_owner(owner).await?;
+        if let Some(owner) = &mailbox {
+            self.collect_mailbox_owner(owner.clone()).await?;
         }
         let pending = self
             .lifecycle
@@ -1586,6 +1586,12 @@ impl WorkerCoordinator {
             control.drain().await?;
         }
         self.accepted.drain().await?;
+        if let Some(owner) = mailbox {
+            let Some(MailboxRetirement::Collected(receipt)) = &self.mailbox_retirement else {
+                anyhow::bail!("missing original provider receipt");
+            };
+            owner.finalize_retirement(receipt)?;
+        }
         if let Some(signer) = self.signer.as_mut() {
             signer.drain().await?;
         }

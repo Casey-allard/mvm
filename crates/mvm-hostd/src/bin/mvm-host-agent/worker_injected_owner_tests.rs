@@ -265,7 +265,7 @@ fn installed_retirement_collects_injected_original_mailbox_child() -> Result<()>
                     matches!(receipt.original_exit(&requested_owner), Some(MailboxWorkerExit::Code { code: 0 })),
                     "original helper exit status was not preserved"
                 );
-                anyhow::ensure!(original_usage == initial_budget, "original worker reservation or control workspace remains charged");
+                anyhow::ensure!(original_usage.workers == initial_budget.workers && original_usage.bytes == initial_budget.bytes + receipt.retained_bytes() && receipt.retained_bytes() > 0, "original worker reservation or control workspace remains charged");
                 // GREEN must come from the REAL collector joining this loop.
                 // No fixture cancellation may manufacture that completion.
                 anyhow::ensure!(worker.control.as_ref().is_some_and(|control|

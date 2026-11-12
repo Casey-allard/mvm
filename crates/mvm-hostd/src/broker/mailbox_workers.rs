@@ -11,7 +11,7 @@ use mvm_vmm::host::process_exit::{
     ProcessExitObserver, ProcessExitWait, collect_after_exit_event, require_owned_child_custody,
     wait_process_exit_events,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -56,7 +56,7 @@ pub struct WorkerUsage {
 struct Ledger {
     host: WorkerUsage,
     tenants: HashMap<String, WorkerUsage>,
-    registrations: HashSet<(String, String)>,
+    registrations: HashMap<(String, String), usize>,
     host_controls: usize,
     tenant_controls: HashMap<String, usize>,
 }
@@ -81,7 +81,7 @@ struct CleanupState {
     ledger: Arc<Mutex<Ledger>>,
     pool: Mutex<Vec<CleanupCell>>,
     emergency: Mutex<Vec<CleanupCell>>,
-    failed: AtomicBool,
+    failed: Arc<AtomicBool>,
     running: AtomicBool,
     limits: WorkerLimits,
     actor_charge: usize,
@@ -132,7 +132,7 @@ impl MailboxWorkerBudget {
                     .collect(),
             ),
             emergency: Mutex::new(Vec::with_capacity(limits.host_workers)),
-            failed: AtomicBool::new(false),
+            failed: Arc::new(AtomicBool::new(false)),
             running: AtomicBool::new(true),
             limits,
             actor_charge,
@@ -207,7 +207,7 @@ impl MailboxWorkerBudget {
         if let Some(vm) = vm
             && ledger
                 .registrations
-                .contains(&(tenant.to_owned(), vm.to_owned()))
+                .contains_key(&(tenant.to_owned(), vm.to_owned()))
         {
             return Err(refused("original budget already owns this tenant/VM"));
         }
@@ -263,7 +263,7 @@ impl MailboxWorkerBudget {
         if let Some(vm) = vm {
             ledger
                 .registrations
-                .insert((tenant.to_owned(), vm.to_owned()));
+                .insert((tenant.to_owned(), vm.to_owned()), bytes);
         } else {
             ledger.host_controls += CONTROL_WORKSPACE_BYTES;
             *ledger.tenant_controls.entry(tenant.to_owned()).or_default() +=
@@ -304,7 +304,7 @@ impl MailboxWorkerBudget {
         release_worker_credit(&self.ledger, tenant)
     }
     fn retire(&self, tenant: &str, vm: &str) -> io::Result<()> {
-        retire_worker_state(&self.ledger, self.limits, tenant, vm)
+        retire_worker_state(&self.ledger, tenant, vm)
     }
     fn return_cell(&self, mut cell: CleanupCell) {
         cell.slot = None;
@@ -421,25 +421,27 @@ fn release_worker_credit(ledger: &Mutex<Ledger>, tenant: &str) -> io::Result<()>
         .workers -= 1;
     Ok(())
 }
-fn retire_worker_state(
-    ledger: &Mutex<Ledger>,
-    limits: WorkerLimits,
-    tenant: &str,
-    vm: &str,
-) -> io::Result<()> {
+fn retire_worker_state(ledger: &Mutex<Ledger>, tenant: &str, vm: &str) -> io::Result<()> {
     let mut ledger = lock(ledger)?;
-    if !ledger
+    let key = (tenant.to_owned(), vm.to_owned());
+    let bytes = *ledger
         .registrations
-        .remove(&(tenant.to_owned(), vm.to_owned()))
-    {
-        return Err(refused("missing original reservation"));
+        .get(&key)
+        .ok_or_else(|| refused("missing original reservation"))?;
+    refund_bytes(&mut ledger, tenant, bytes)?;
+    ledger.registrations.remove(&key);
+    Ok(())
+}
+fn refund_bytes(ledger: &mut Ledger, tenant: &str, bytes: usize) -> io::Result<()> {
+    if ledger.host.bytes < bytes || ledger.tenants.get(tenant).is_none_or(|u| u.bytes < bytes) {
+        return Err(refused("missing original byte credit"));
     }
-    ledger.host.bytes -= limits.bytes_per_worker;
+    ledger.host.bytes -= bytes;
     let usage = ledger
         .tenants
         .get_mut(tenant)
         .ok_or_else(|| refused("missing tenant reservation"))?;
-    usage.bytes -= limits.bytes_per_worker;
+    usage.bytes -= bytes;
     if usage.workers == 0 && usage.bytes == 0 {
         ledger.tenants.remove(tenant);
     }
@@ -539,7 +541,7 @@ fn cleanup_loop(
             if done {
                 let mut cell = pending.swap_remove(index);
                 release_worker_credit(&state.ledger, &tenant)?;
-                retire_worker_state(&state.ledger, state.limits, &tenant, &vm)?;
+                retire_worker_state(&state.ledger, &tenant, &vm)?;
                 cell.slot = None;
                 let mut pool = lock(&state.pool)?;
                 if pool.len() < state.limits.host_workers {
@@ -674,7 +676,20 @@ struct Slot {
     cell: Option<CleanupCell>,
     spawn_attempted: bool,
     reservation_released: bool,
-    reservation_retired: bool,
+    // Last field: release the original metadata charge after the Child and FDs drop.
+    terminal_metadata: Option<TerminalMetadata>,
+}
+struct TerminalMetadata {
+    cleanup: Arc<CleanupState>,
+    tenant: String,
+    vm: String,
+}
+impl Drop for TerminalMetadata {
+    fn drop(&mut self) {
+        if retire_worker_state(&self.cleanup.ledger, &self.tenant, &self.vm).is_err() {
+            self.cleanup.failed.store(true, Ordering::Release);
+        }
+    }
 }
 struct WorkerLoan {
     slot: Arc<Mutex<Slot>>,
@@ -703,31 +718,51 @@ struct ProviderState {
     publications: usize,
     running: bool,
     failed: bool,
-    retired: Option<Arc<RetirementProof>>,
+    retired: Option<MailboxWorkersRetirement>,
 }
 struct ProviderFence {
     state: Mutex<ProviderState>,
     changed: Condvar,
 }
-struct RetirementProof {
+struct ExitProof {
+    exits: Box<[(MailboxWorkerOwner, MailboxWorkerExit)]>,
+    ledger: Arc<Mutex<Ledger>>,
+    failed: Arc<AtomicBool>,
+    tenant: String,
+    bytes: usize,
+}
+impl Drop for ExitProof {
+    fn drop(&mut self) {
+        // Release the exit array before returning its charge.
+        drop(std::mem::take(&mut self.exits));
+        let result = lock(&self.ledger)
+            .and_then(|mut ledger| refund_bytes(&mut ledger, &self.tenant, self.bytes));
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+    }
+}
+/// In-process proof from the original provider. Empty receipts own no heap storage.
+#[derive(Clone)]
+pub struct MailboxWorkersRetirement {
+    boot: [u8; 32],
     deadline: Instant,
-    exits: Vec<(MailboxWorkerOwner, MailboxWorkerExit)>,
+    proof: Option<Arc<ExitProof>>,
     never_spawned: usize,
 }
-/// Actual local original-provider collection, not mailbox delivery authority.
-/// Only this provider can mint a receipt; neither identity nor exits deserialize.
-pub struct MailboxWorkersRetirement {
-    proof: Arc<RetirementProof>,
-}
 impl MailboxWorkersRetirement {
+    pub fn retained_bytes(&self) -> usize {
+        self.proof.as_ref().map_or(0, |p| p.bytes)
+    }
     pub fn deadline(&self) -> Instant {
-        self.proof.deadline
+        self.deadline
     }
     pub fn never_spawned_released(&self) -> usize {
-        self.proof.never_spawned
+        self.never_spawned
     }
     pub fn original_exit(&self, owner: &MailboxWorkerOwner) -> Option<&MailboxWorkerExit> {
         self.proof
+            .as_ref()?
             .exits
             .iter()
             .find(|(original, _)| original == owner)
@@ -795,6 +830,7 @@ pub struct MailboxWorkers {
     tenant: String,
     budget: Arc<MailboxWorkerBudget>,
     factory: Arc<dyn MailboxWorkerFactory>,
+    finalizer: Mutex<()>,
     boot: [u8; 32],
     slots: Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
     generation: Mutex<u64>,
@@ -813,6 +849,7 @@ impl MailboxWorkers {
             tenant: tenant.into(),
             budget,
             factory,
+            finalizer: Mutex::new(()),
             boot: rand::random(),
             slots: Mutex::new(HashMap::new()),
             generation: Mutex::new(0),
@@ -957,10 +994,14 @@ impl MailboxWorkers {
     pub fn validate_retirement(&self, receipt: &MailboxWorkersRetirement) -> io::Result<()> {
         let state = lock(&self.fence.state)?;
         if state.failed
-            || !state
-                .retired
-                .as_ref()
-                .is_some_and(|proof| Arc::ptr_eq(proof, &receipt.proof))
+            || !state.retired.as_ref().is_some_and(|original| {
+                original.boot == receipt.boot
+                    && match (&original.proof, &receipt.proof) {
+                        (None, None) => true,
+                        (Some(first), Some(other)) => Arc::ptr_eq(first, other),
+                        _ => false,
+                    }
+            })
         {
             return Err(refused("retirement is not from this original provider"));
         }
@@ -977,9 +1018,7 @@ impl MailboxWorkers {
             return Err(refused("provider fence uncertain"));
         }
         if let Some(proof) = &state.retired {
-            return Ok(MailboxWorkersRetirement {
-                proof: proof.clone(),
-            });
+            return Ok(proof.clone());
         }
         if state.running {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
@@ -1046,10 +1085,7 @@ impl MailboxWorkers {
                 }
                 // Retirement is a local released reservation, NOT Collected.
                 guard.state = MailboxWorkerState::Unresolved;
-                if !guard.reservation_retired {
-                    self.budget.retire(&self.tenant, &guard.request.vm_id)?;
-                    guard.reservation_retired = true;
-                }
+                self.retain_metadata_until_drop(&mut guard);
                 never_spawned += 1;
                 continue;
             }
@@ -1107,22 +1143,92 @@ impl MailboxWorkers {
             guard.busy = false;
             guard.terminal_at = Some(Instant::now());
             loan.committed = true;
-            if !guard.reservation_retired {
-                self.budget.retire(&self.tenant, &guard.request.vm_id)?;
-                guard.reservation_retired = true;
-            }
+            self.retain_metadata_until_drop(&mut guard);
         }
-        let proof = Arc::new(RetirementProof {
-            deadline,
-            exits,
-            never_spawned,
-        });
         let mut state = lock(&self.fence.state)?;
         if state.failed || state.active != 0 || state.publications != 0 {
             return Err(refused("provider did not quiesce"));
         }
-        state.retired = Some(proof.clone());
-        Ok(MailboxWorkersRetirement { proof })
+        let receipt = MailboxWorkersRetirement {
+            boot: self.boot,
+            deadline,
+            never_spawned,
+            proof: self.reserve_exit_proof(exits)?,
+        };
+        state.retired = Some(receipt.clone());
+        Ok(receipt)
+    }
+    fn retain_metadata_until_drop(&self, slot: &mut Slot) {
+        slot.terminal_metadata
+            .get_or_insert_with(|| TerminalMetadata {
+                cleanup: self.budget.cleanup.clone(),
+                tenant: self.tenant.clone(),
+                vm: slot.request.vm_id.clone(),
+            });
+    }
+    fn reserve_exit_proof(
+        &self,
+        exits: Vec<(MailboxWorkerOwner, MailboxWorkerExit)>,
+    ) -> io::Result<Option<Arc<ExitProof>>> {
+        if exits.is_empty() {
+            return Ok(None);
+        }
+        let exits = exits.into_boxed_slice();
+        let slots = lock(&self.slots)?;
+        let keys: Vec<_> = slots
+            .keys()
+            .map(|vm| (self.tenant.clone(), vm.clone()))
+            .collect();
+        // Move a portion of existing registrations into the receipt. This succeeds
+        // even at the quota limit and never mints an independent byte allowance.
+        let size = std::mem::size_of_val(&*exits)
+            + std::mem::size_of::<ExitProof>()
+            + 2 * std::mem::size_of::<usize>()
+            + self.tenant.len();
+        if keys.is_empty() {
+            return Err(refused("original exit registration missing"));
+        }
+        let share = size.div_ceil(keys.len());
+        let bytes = share * keys.len();
+        let mut ledger = lock(&self.budget.ledger)?;
+        if keys
+            .iter()
+            .any(|key| ledger.registrations.get(key).is_none_or(|b| *b < share))
+        {
+            return Err(refused("original proof registration credit missing"));
+        }
+        for key in keys {
+            *ledger
+                .registrations
+                .get_mut(&key)
+                .expect("verified original registration") -= share;
+        }
+        Ok(Some(Arc::new(ExitProof {
+            exits,
+            ledger: self.budget.ledger.clone(),
+            failed: self.budget.cleanup.failed.clone(),
+            tenant: self.tenant.clone(),
+            bytes,
+        })))
+    }
+    /// Called after admitted control tasks join. The receipt retains the exit
+    /// values and their quota until its last owner drops it.
+    pub fn finalize_retirement(&self, receipt: &MailboxWorkersRetirement) -> io::Result<()> {
+        let _finalizer = lock(&self.finalizer)?;
+        self.validate_retirement(receipt)?;
+        let mut slots = lock(&self.slots)?;
+        for slot in slots.values() {
+            if Arc::strong_count(slot) != 1 || lock(slot)?.terminal_metadata.is_none() {
+                return Err(refused("original slot still borrowed or uncollected"));
+            }
+        }
+        let heavy = std::mem::take(&mut *slots);
+        drop(slots);
+        drop(heavy);
+        if self.budget.cleanup.failed.load(Ordering::Acquire) {
+            return Err(refused("original metadata retirement uncertain"));
+        }
+        Ok(())
     }
     pub fn tenant(&self) -> &str {
         &self.tenant
@@ -1290,7 +1396,7 @@ impl MailboxWorkers {
                     cell: Some(cell),
                     spawn_attempted: false,
                     reservation_released: false,
-                    reservation_retired: false,
+                    terminal_metadata: None,
                 }));
                 slots.insert(request.vm_id.clone(), slot);
                 return Ok((
@@ -1549,7 +1655,7 @@ impl Drop for MailboxWorkers {
             let collected = matches!(guard.state, MailboxWorkerState::Collected { .. });
             let never_spawned = guard.worker.is_none() && !guard.spawn_attempted && !guard.busy;
             if collected || never_spawned {
-                let already_retired = guard.reservation_retired;
+                let metadata_owned = guard.terminal_metadata.is_some();
                 let cell = guard.cell.take();
                 let tenant = guard.request.tenant.clone();
                 let vm = guard.request.vm_id.clone();
@@ -1562,7 +1668,7 @@ impl Drop for MailboxWorkers {
                 };
                 if credit
                     .and_then(|()| {
-                        if already_retired {
+                        if metadata_owned {
                             Ok(())
                         } else {
                             self.budget.retire(&tenant, &vm)
@@ -1684,6 +1790,7 @@ mod tests {
             receipt.original_exit(&acquired.owner).is_none(),
             "never-spawned is not Child collection"
         );
+        provider.finalize_retirement(&receipt).unwrap();
         assert_eq!(budget.usage().unwrap().workers, 0);
         assert_eq!(
             budget.usage().unwrap().bytes,
@@ -1973,6 +2080,67 @@ mod tests {
             Ok(SpawnedMailboxWorker { child, control })
         }
     }
+    #[test]
+    fn finalized_provider_drops_heavy_slots_while_original_status_proof_survives() {
+        let budget = MailboxWorkerBudget::new(limits()).unwrap();
+        let provider = MailboxWorkers::new("tenant", budget.clone(), Arc::new(PipeChild)).unwrap();
+        let mut request = request(&budget, "tenant");
+        let owner = provider.handle(&request).unwrap().0.owner;
+        request.operation = MailboxWorkerOperation::DelegateConfig {
+            owner: owner.clone(),
+        };
+        request.request_nonce = [2; 32];
+        let (_, writer) = provider.handle(&request).unwrap();
+        drop(writer);
+        let original = Arc::downgrade(&lock(&provider.slots).unwrap()["vm-one"]);
+        provider.begin_retirement(Instant::now()).unwrap();
+        let receipt = provider.retire_originals().unwrap();
+        provider.validate_retirement(&receipt).unwrap();
+        assert_eq!(
+            receipt.original_exit(&owner),
+            Some(&MailboxWorkerExit::Code { code: 0 })
+        );
+        let before = budget.usage().unwrap();
+        let held = original.upgrade().unwrap();
+        assert!(provider.finalize_retirement(&receipt).is_err());
+        assert_eq!(budget.usage().unwrap(), before);
+        drop(held);
+        provider.finalize_retirement(&receipt).unwrap();
+        provider.finalize_retirement(&receipt).unwrap();
+        assert!(
+            original.upgrade().is_none(),
+            "reaped original heavy slot remains alive"
+        );
+        assert_eq!(
+            budget.usage().unwrap().bytes,
+            before.bytes - limits().bytes_per_worker + receipt.retained_bytes()
+        );
+        assert!(receipt.retained_bytes() > 0);
+        drop(provider);
+        assert_eq!(
+            receipt.original_exit(&owner),
+            Some(&MailboxWorkerExit::Code { code: 0 })
+        );
+        let lease = receipt.retained_bytes();
+        let ledger = budget.ledger.clone();
+        let cleanup = Arc::downgrade(&budget.cleanup);
+        let actor = lock(&budget.actor).unwrap().take().unwrap();
+        drop(budget);
+        actor.join().unwrap();
+        assert!(
+            cleanup.upgrade().is_none(),
+            "receipt retained original cleanup storage"
+        );
+        assert_eq!(lock(&ledger).unwrap().host.bytes, lease);
+        assert_eq!(
+            receipt.original_exit(&owner),
+            Some(&MailboxWorkerExit::Code { code: 0 })
+        );
+        drop(receipt);
+        assert_eq!(lock(&ledger).unwrap().host.bytes, 0);
+        eprintln!("original_exit=0 retained_proof_bytes={lease} final_ledger_bytes=0");
+    }
+
     #[test]
     fn returned_handoff_cell_keeps_original_child_and_credit_on_queue_failure() {
         let budget = MailboxWorkerBudget::new(limits()).unwrap();
