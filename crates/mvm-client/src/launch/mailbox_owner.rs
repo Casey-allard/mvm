@@ -365,7 +365,7 @@ impl OwnedLaunch {
         config: Arc<mvm_core::vm_backend::VmStartConfig>,
     ) -> Result<()> {
         let mut cancellation = pair.cancel_on_drop(&self.claim.name);
-        let (prepared, until) = pair.admit(super::cast_rendezvous::ReservedLaunch {
+        let ((prepared,publication), until) = pair.admit(super::cast_rendezvous::ReservedLaunch {
             plan: admission,
             worker: self.client.clone(),
             config: config.clone(),
@@ -386,7 +386,7 @@ impl OwnedLaunch {
         stage_pair_boot(&path, &prior, &bytes, || {
             pair.published(&self.claim.name, until)
         })?;
-        self.client.mark_cast_published(&prepared.role)?;
+        self.client.confirm_cast_publication(&prepared.role,publication)?;
         self.cast_role = Some((prepared.role, validity));
         cancellation.disarm();
         Ok(())

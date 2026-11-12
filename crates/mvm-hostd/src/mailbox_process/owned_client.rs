@@ -714,9 +714,11 @@ impl InstalledMailboxClient {
     /// Only the original, once-delegated FD may receive configuration. A retry
     /// that finds the helper starting just queries its state, keeping all
     /// derived bytes and epoch state out of the host-agent control connection.
-    pub fn mark_cast_published(&self, role:&crate::mailbox_launch::cast_pair::development::PreparedRole)->Result<()> {
+    pub fn confirm_cast_publication(&self, role:&crate::mailbox_launch::cast_pair::development::PreparedRole, publication:crate::mailbox_launch::cast_enrollment::publication::ExpectedCastPublication)->Result<()> {
         self.check_prepared_development_role(role)?;
-        let window=role.immutable_window.clone().context("original boot requires fixed-generation Cast")?;
+        let role_window=role.immutable_window.as_ref().context("original boot requires fixed generation")?;
+        let window=publication.verify(self,role)?;
+        ensure!(role_window.start<=window.start && window.end<=role_window.end,"publication outside original direction");
         ensure!(window.contains(&crate::mailbox_launch::now_unix_ms()),"original Cast expired");
         let mut cell=self.development_peer()?.published_cast.try_lock().map_err(|_|anyhow::anyhow!("original publication busy"))?;
         ensure!(cell.is_none(),"original Cast already published");

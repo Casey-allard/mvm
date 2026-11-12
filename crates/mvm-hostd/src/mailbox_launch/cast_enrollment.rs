@@ -35,6 +35,8 @@ pub struct PreparedOriginalCastBoot {
     boot: VerbGrantEnvelope,
 }
 
+pub mod publication;
+
 impl PreparedOriginalCastBoot {
     /// The authenticated interval intersected across the two original plans,
     /// all three capabilities, boot grant and direction.

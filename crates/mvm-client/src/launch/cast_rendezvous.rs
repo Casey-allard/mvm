@@ -189,7 +189,7 @@ pub struct OriginalCastPair {
     names: [String; 2],
     wait: Duration,
     prepare: Arc<PrepareBoth>,
-    admitted: Meeting<ReservedLaunch, OriginalCastRole>,
+    admitted: Meeting<ReservedLaunch, (OriginalCastRole, mvm_hostd::mailbox_launch::cast_enrollment::publication::ExpectedCastPublication)>,
     published: Meeting<(), (), true>,
 }
 impl OriginalCastPair {
@@ -229,7 +229,7 @@ impl OriginalCastPair {
             self.published.cancel();
         }
     }
-    pub(crate) fn admit(&self, launch: ReservedLaunch) -> Result<(OriginalCastRole, Instant)> {
+    pub(crate) fn admit(&self, launch: ReservedLaunch) -> Result<((OriginalCastRole,mvm_hostd::mailbox_launch::cast_enrollment::publication::ExpectedCastPublication), Instant)> {
         let index = self.index(&launch.config.name)?;
         let expiry = launch
             .plan
@@ -240,19 +240,10 @@ impl OriginalCastPair {
             .unwrap_or_default();
         let deadline = Instant::now() + expiry.min(self.wait);
         let role = self.admitted.meet(index, launch, deadline, |a, b, limit| {
-            use mvm_hostd::mailbox_launch::cast_pair::development::EndpointRole;
-            let roles = (self.prepare)(a, b, limit)?;
-            let source = roles[0]
-                .boot
-                .role_commitment(&roles[0].role, EndpointRole::Source)?;
-            let destination = roles[1]
-                .boot
-                .role_commitment(&roles[1].role, EndpointRole::Destination)?;
-            ensure!(
-                source == destination,
-                "original SDK launches have different Cast directions"
-            );
-            Ok(roles)
+            let [source,dest] = (self.prepare)(a,b,limit)?;
+            let publication=mvm_hostd::mailbox_launch::cast_enrollment::publication::ExpectedCastPublication::from_originals(
+                (&source.boot,&source.role,&a.worker),(&dest.boot,&dest.role,&b.worker))?;
+            Ok([(source,publication.clone()),(dest,publication)])
         })?;
         Ok((role, deadline))
     }
