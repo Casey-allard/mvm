@@ -82,8 +82,21 @@ fn fixture(
     )
 }
 
-#[test]
-fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_possession() {
+struct SelectedCall {
+    now: i64,
+    guest: SigningKey,
+    role: SignedObjectRoleV1,
+    boot: MailboxReaderBootBinding,
+    pair: [u8; 32],
+    receive_cap: SignedMailboxCapability,
+    signed_enrollment: SignedMailboxGuestReaderEnrollment,
+    header: MailboxEnvelopeHeader,
+    lease: SignedMailboxDeliveryLease,
+    payload: Vec<u8>,
+}
+fn selected_call(
+    make_call: impl FnOnce([u8; 32]) -> (MessageId, CorrelationId, Vec<u8>),
+) -> SelectedCall {
     let now = now_unix_ms().unwrap();
     let (authority, guest, mut plan, _, _, mut receive, mut enrollment) = fixture(now);
     let (issued, _, b) = signed_source(now);
@@ -100,6 +113,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
     enrollment.receive_capability_id = receive.capability_id;
     let receive_cap = sign_capability(receive.clone(), &authority).unwrap();
     let signed_enrollment = sign_guest_reader_enrollment(enrollment.clone(), &authority).unwrap();
+    let (message_id, correlation_id, payload) = make_call(pair);
     let header = MailboxEnvelopeHeader {
         protocol_version: ProtocolVersion::V1,
         signature_algorithm: SignatureAlgorithm::ED25519,
@@ -110,8 +124,8 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
         mailbox: plan.mailbox,
         sender_boot: role.role.caller.boot,
         execution_epoch: plan.epoch,
-        message_id: MessageId::from_bytes([32; 32]),
-        correlation_id: CorrelationId::from_bytes([33; 32]),
+        message_id,
+        correlation_id,
         causation_id: mvm_contract::protocol::mailbox::CausationId::from_bytes([34; 32]),
         kind: MailboxMessageKind::Call,
         reply_to: Some(ReplyRoute {
@@ -130,12 +144,12 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
             algorithm: EncryptionAlgorithm::AES_256_GCM,
             key_id: [37; 32],
         },
-        plaintext_len: 5,
+        plaintext_len: payload.len().try_into().unwrap(),
     };
     let lease = sign_delivery_lease(
         MailboxDeliveryLease {
             object_projection_v1: Some(
-                object_delivery_commitment(&pair, &header, b"hello").unwrap(),
+                object_delivery_commitment(&pair, &header, &payload).unwrap(),
             ),
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
@@ -158,6 +172,40 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
     )
     .unwrap();
 
+    SelectedCall {
+        now,
+        guest,
+        role,
+        boot,
+        pair,
+        receive_cap,
+        signed_enrollment,
+        header,
+        lease,
+        payload,
+    }
+}
+
+#[test]
+fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_possession() {
+    let SelectedCall {
+        now,
+        guest,
+        role,
+        boot,
+        pair,
+        receive_cap,
+        signed_enrollment,
+        header,
+        lease,
+        ..
+    } = selected_call(|_| {
+        (
+            MessageId::from_bytes([32; 32]),
+            CorrelationId::from_bytes([33; 32]),
+            b"hello".to_vec(),
+        )
+    });
     let seed = Box::leak(Box::new(Zeroizing::new(guest.to_bytes())));
     let reader = Arc::new(GuestReader {
         role: Some(role.clone()),
@@ -513,3 +561,7 @@ fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers(
         })
     );
 }
+
+#[cfg(target_os = "linux")]
+#[path = "worker_component.rs"]
+mod worker_component;
