@@ -627,3 +627,64 @@ fn wait_for_ready_timeout_leaves_pool_not_ready() {
         Err(DispatchError::NotReady)
     ));
 }
+
+/// A private test process runs the real PID-1 reaper so it cannot collect
+/// the Rust test harness's other children. The runner exits voluntarily
+/// after writing one complete response, and the reaper wins the wait.
+#[test]
+fn retained_warm_response_survives_original_child_reaped_between_calls() {
+    const INNER: &str = "MVM_TEST_ORIGINAL_WORKER_REAPER";
+    if std::env::var_os(INNER).is_some() {
+        mvm_agentd::child_wait::install_orphan_reaper();
+        let pool = start_pool_with_behavior(cfg(1, 100, 1024), Some("crash_after_n=1"));
+        let original = idle_pid(&pool);
+        let body: Vec<u8> = (0u8..=255).chain(std::iter::once(0)).collect();
+        let start = Instant::now();
+        let first = dispatch(&pool, &body);
+        assert_eq!(first.stdout, body);
+        let first_ns = start.elapsed().as_nanos();
+        wait_until(
+            || {
+                // Signal zero checks disappearance only; no process is signalled.
+                (unsafe { libc::kill(original as i32, 0) }) == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            },
+            "original child's exit collected by test reaper",
+        );
+        let second = Instant::now();
+        assert!(matches!(
+            dispatch(&pool, b"observe transport closure").outcome,
+            WorkerOutcome::Error { .. }
+        ));
+        let second_ns = second.elapsed().as_nanos();
+        let third = dispatch(&pool, &body);
+        assert_eq!(third.stdout, body);
+        println!(
+            "original_worker body=257 first_response_ns={first_ns} stale_pipe_response_ns={second_ns} through_replacement_response_ns={}",
+            start.elapsed().as_nanos()
+        );
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "retained_warm_response_survives_original_child_reaped_between_calls",
+            "--nocapture",
+        ])
+        .env(INNER, "1")
+        .spawn()
+        .unwrap();
+    let limit = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= limit {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("original warm slot failed to return a response/replacement inside 8 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
