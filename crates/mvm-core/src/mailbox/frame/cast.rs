@@ -1,6 +1,8 @@
 //! The Deliver-role handoff for one Cast. The destination owner presents the
 //! original verified admission and its current policy while holding admission.
 //! This path never submits ciphertext to a relay, signs receipts, or activates a guest.
+pub mod route;
+
 use super::Refusal;
 use super::local::{decode_local_frame, encode_local_frame, encode_local_greeting};
 use crate::mailbox::{OpenContext, VerifiedMailboxAdmission};
@@ -44,7 +46,7 @@ pub struct CastChannel {
     grant: MailboxGrant,
     valid_from: i64,
     valid_until: i64,
-    source_epoch: mvm_contract::protocol::mailbox::ExecutionEpoch,
+    source: MailboxGrant,
 }
 
 impl CastChannel {
@@ -100,15 +102,20 @@ impl CastChannel {
         {
             return Err(deny());
         }
+        let source_limits = origin.local_service.ok_or_else(deny)?.limits;
+        let mut limits = profile.limits;
+        limits.payload_bytes = limits.payload_bytes.min(source_limits.payload_bytes);
+        limits.max_frame_bytes = limits.max_frame_bytes.min(source_limits.max_frame_bytes);
+        limits.validate().map_err(|_| deny())?;
         Ok(Self {
             greeting,
             recipient,
             sender,
-            limits: profile.limits,
+            limits,
             grant: destination,
             valid_from: start,
             valid_until: until,
-            source_epoch: origin.epoch,
+            source: origin,
         })
     }
 
@@ -127,7 +134,7 @@ impl CastChannel {
     ) -> Result<VerifiedCast, Refusal> {
         if current.now_unix_ms < self.valid_from
             || current.now_unix_ms >= self.valid_until
-            || current.current_execution_epoch != self.source_epoch
+            || current.current_execution_epoch != self.source.epoch
             || current.expected_sender != self.sender
             || current.acting_principal != self.sender
             || current.expected_recipient != self.recipient

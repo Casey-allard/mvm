@@ -131,7 +131,10 @@ fn config_input(
 pub fn run(lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()> {
     run_profile(lease, false)
 }
-pub fn run_profile(_lease: mvm_vmm::host::installed_owner::HolderLease, paired: bool) -> io::Result<()> {
+pub fn run_profile(
+    _lease: mvm_vmm::host::installed_owner::HolderLease,
+    paired: bool,
+) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut control = inherited_control()?;
     let prepare = read_prepare(&control, deadline)?;
@@ -141,8 +144,10 @@ pub fn run_profile(_lease: mvm_vmm::host::installed_owner::HolderLease, paired: 
         let config = super::parse(&raw)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid mailbox config"))?;
         drop(raw);
-        // SAFETY: getppid has no preconditions.
-        prepare.validate(&config, unsafe { libc::getppid() } as u32)?;
+        // Acquire only from the original helper's inherited Prepare and the
+        // approved, delegated configuration. Legacy launch consumes its keys.
+        let original = BoundCastEndpoint::from_original(&prepare, config, &_lease)?;
+        let config = original.config;
         serve_owned_with_counts(
             config.grant,
             config.keys,
@@ -150,7 +155,11 @@ pub fn run_profile(_lease: mvm_vmm::host::installed_owner::HolderLease, paired: 
                 socket: config.socket,
                 route: config.route,
             },
-            if paired { super::installed_profile::pair_queue_limits() } else { LAUNCH_LIMITS },
+            if paired {
+                super::installed_profile::pair_queue_limits()
+            } else {
+                LAUNCH_LIMITS
+            },
             report.is_some(),
             paired.then_some(super::installed_profile::PAIR_REPLAY_ENTRIES),
         )
@@ -247,5 +256,113 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+}
+
+/// This endpoint token can only be constructed within the worker process's
+/// validated inherited-control launch path. It cannot be manufactured by the
+/// control-plane router, and its plaintext never leaves this endpoint module.
+pub struct BoundCastEndpoint<'lease> {
+    owner: mvm_contract::protocol::mailbox_worker::MailboxWorkerOwner,
+    config: super::MailboxProcessConfig,
+    _lease: &'lease mvm_vmm::host::installed_owner::HolderLease,
+}
+impl<'lease> BoundCastEndpoint<'lease> {
+    fn from_original(
+        prepare: &super::owned_wire::PrepareOwnedV1,
+        config: super::MailboxProcessConfig,
+        lease: &'lease mvm_vmm::host::installed_owner::HolderLease,
+    ) -> io::Result<Self> {
+        // SAFETY: getppid has no preconditions.
+        prepare.validate(&config, unsafe { libc::getppid() } as u32)?;
+        Ok(Self {
+            owner: prepare.owner.clone(),
+            config,
+            _lease: lease,
+        })
+    }
+
+    /// Open only under the receiver's retained original keys. This is a
+    /// destination operation; the worker's approved ingress must authenticate
+    /// the routed request and supply both current policy views, sequence and
+    /// original replay owner. ReliableV1 activation still uses the canonical
+    /// installation gate in PrepareOwnedV1::validate.
+    pub fn open_addressed<'turn>(
+        &'turn self,
+        routed: &'turn crate::mailbox_launch::cast_pair::RoutedCast<'turn>,
+        source: &mvm_core::mailbox::OpenContext,
+        destination: &mvm_core::mailbox::OpenContext,
+        replay: &mut impl mvm_core::mailbox::ReplayProtector,
+        sequence: std::num::NonZeroU64,
+    ) -> io::Result<BoundOpenedCast<'turn>> {
+        let channel = routed.channel();
+        if self.config.grant.local_service.is_none()
+            || !channel.is_bounded_destination(
+                &self.config.grant,
+                crate::broker::mailbox_workers::cast_credit::CAST_BODY_LIMIT,
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "wrong original addressed Cast endpoint",
+            ));
+        }
+        let input = routed
+            .for_original_destination(&self.owner, source, destination)
+            .map_err(io::Error::other)?;
+        let (a, b) = routed
+            .policies(source, destination)
+            .map_err(io::Error::other)?;
+        let proof = self.config.keys.open_original_cast(
+            channel,
+            input.envelope.clone(),
+            input.grants,
+            &a,
+            &b,
+            replay,
+            sequence,
+        )?;
+        Ok(BoundOpenedCast {
+            proof,
+            routed,
+            endpoint: self,
+        })
+    }
+}
+
+/// Rust ownership keeps the coordinator credit AND original holder lease alive
+/// alongside the verified plaintext until actual handoff or explicit discard.
+/// Crossing processes requires a protected original-credit protocol; one
+/// cannot serialize this in-process object or release its credit early.
+pub struct BoundOpenedCast<'turn> {
+    proof: mvm_core::mailbox::frame::cast::route::AddressedVerifiedCast,
+    routed: &'turn crate::mailbox_launch::cast_pair::RoutedCast<'turn>,
+    endpoint: &'turn BoundCastEndpoint<'turn>,
+}
+impl BoundOpenedCast<'_> {
+    /// Private until the original worker's authenticated backend role stream is
+    /// wired. The public coordinator cannot substitute an arbitrary writer.
+    #[allow(dead_code)]
+    fn deliver_on_original_stream<'a>(
+        &'a self,
+        stream: &mut (impl std::io::Read + std::io::Write),
+        policy: impl FnOnce() -> io::Result<(
+            &'a mvm_core::mailbox::OpenContext,
+            &'a mvm_core::mailbox::OpenContext,
+        )>,
+    ) -> io::Result<mvm_contract::protocol::mailbox::local::LocalDeliveryAck> {
+        let sample = std::cell::OnceCell::new();
+        self.proof.dispatch_on(self.routed.channel(), stream, || {
+            let (source, dest) = policy()?;
+            self.routed
+                .for_original_destination(&self.endpoint.owner, source, dest)
+                .map_err(io::Error::other)?;
+            let (a, b) = self
+                .routed
+                .policies(source, dest)
+                .map_err(io::Error::other)?;
+            let current = sample.get_or_init(|| (a, b));
+            Ok((&current.0, &current.1))
+        })
     }
 }

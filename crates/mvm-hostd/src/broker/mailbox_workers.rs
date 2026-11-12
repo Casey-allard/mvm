@@ -6,6 +6,7 @@
 //! is asynchronous. A collected child receipt requires original custody and
 //! a checked exit status.
 mod owned_factory;
+pub(crate) mod cast_credit;
 use mvm_core::protocol::mailbox_worker_control::*;
 use mvm_vmm::host::process_exit::{
     ProcessExitObserver, ProcessExitWait, collect_after_exit_event, require_owned_child_custody,
@@ -870,6 +871,7 @@ impl Drop for RetirementJob {
 /// Long-lived tenant owner injected into the actual daemon. All state is bounded
 /// by the shared ledger. Default daemon construction never enables this path.
 pub struct MailboxWorkers {
+    cast_lane: Mutex<cast_credit::CastLane>,
     tenant: String,
     budget: Arc<MailboxWorkerBudget>,
     factory: Arc<dyn MailboxWorkerFactory>,
@@ -894,6 +896,7 @@ impl MailboxWorkers {
             factory,
             finalizer: Mutex::new(()),
             boot: rand::random(),
+            cast_lane: Mutex::default(),
             slots: Mutex::new(HashMap::new()),
             generation: Mutex::new(0),
             fence: Arc::new(ProviderFence {

@@ -755,7 +755,29 @@ pub fn open_verified_admission(
     authority_key: &VerifyingKey,
     replay: &mut impl ReplayProtector,
 ) -> Result<VerifiedMailboxAdmission, MailboxError> {
-    let opened = open_verified_envelope(
+    open_verified_admission_if(
+        envelope,
+        capability,
+        context,
+        encryption_key,
+        sender_key,
+        authority_key,
+        replay,
+        |_| Ok(()),
+    )
+}
+
+fn open_verified_admission_if(
+    envelope: MailboxEnvelope,
+    capability: &SignedMailboxCapability,
+    context: &OpenContext,
+    encryption_key: &Key,
+    sender_key: &VerifyingKey,
+    authority_key: &VerifyingKey,
+    replay: &mut impl ReplayProtector,
+    before_replay: impl FnOnce(&MailboxEnvelopeHeader) -> Result<(), MailboxError>,
+) -> Result<VerifiedMailboxAdmission, MailboxError> {
+    let opened = open_verified_envelope_if(
         &envelope,
         capability,
         context,
@@ -763,6 +785,7 @@ pub fn open_verified_admission(
         sender_key,
         authority_key,
         replay,
+        before_replay,
     )?;
     let header = opened.header();
     let scope = VerifiedMailboxScope {
@@ -825,6 +848,28 @@ pub fn open_verified_envelope(
     authority_key: &VerifyingKey,
     replay: &mut impl ReplayProtector,
 ) -> Result<OpenedMailboxEnvelope, MailboxError> {
+    open_verified_envelope_if(
+        envelope,
+        capability,
+        context,
+        encryption_key,
+        sender_key,
+        authority_key,
+        replay,
+        |_| Ok(()),
+    )
+}
+
+fn open_verified_envelope_if(
+    envelope: &MailboxEnvelope,
+    capability: &SignedMailboxCapability,
+    context: &OpenContext,
+    encryption_key: &Key,
+    sender_key: &VerifyingKey,
+    authority_key: &VerifyingKey,
+    replay: &mut impl ReplayProtector,
+    before_replay: impl FnOnce(&MailboxEnvelopeHeader) -> Result<(), MailboxError>,
+) -> Result<OpenedMailboxEnvelope, MailboxError> {
     envelope.validate_bounds()?;
     validate_outer_versions(envelope)?;
     let actual_commitment: [u8; 32] = Sha256::digest(&envelope.ciphertext).into();
@@ -863,6 +908,7 @@ pub fn open_verified_envelope(
     verify_capability_signature(capability, authority_key)?;
     verify_capability_scope(&message.header, capability, context)?;
 
+    before_replay(&message.header)?;
     if !replay.check_and_record(ReplayIdentity::from_header(&message.header)) {
         return Err(MailboxError::Replay);
     }

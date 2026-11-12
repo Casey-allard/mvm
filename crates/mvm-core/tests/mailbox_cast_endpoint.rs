@@ -145,6 +145,239 @@ mod canonical {
             )
             .is_err()
         );
+        // Bind two independently attested canonical domains before opening.
+        // A's original own-address Call is only a membership credential. Its
+        // operations are never applied to the addressed Cast.
+        let src_authority = SigningKey::from_bytes(&[111; 32]);
+        let mut src_plan = src.clone();
+        let mut src_grant = src_plan.mailbox.unwrap();
+        src_grant.authority_key = src_authority.verifying_key().to_bytes();
+        src_plan.mailbox = Some(src_grant);
+        let a = sign_plan(&src_plan, &plan_key, "pinned");
+        let aid = verify_plan(&a, &trusted).unwrap().plan_id;
+        let mut addressed = CastChannel::from_signed_pair(
+            &a,
+            &signed_dst,
+            &trusted,
+            (&aid, &did),
+            greeting,
+            sender(),
+            recipient(),
+            1500,
+        )
+        .unwrap();
+        addressed.restrict_frame_budget(4096).unwrap();
+        let mut a_policy = live.clone();
+        a_policy.expected_mailbox = src_grant.mailbox;
+        let mut member = cap.grant.clone();
+        member.address.mailbox = src_grant.mailbox;
+        member.message_kinds = vec![MailboxMessageKind::Call];
+        let a_witness = sign_capability(member.clone(), &src_authority).unwrap();
+        use mvm_core::mailbox::frame::cast::route::AddressedCastGrants;
+        let grants = AddressedCastGrants {
+            source_scope: &a_witness,
+            send: &cap,
+            receive: &recv_cap,
+        };
+        let mut unbounded = a_policy.clone();
+        unbounded.revoked_capabilities = vec![a_witness.grant.revocation_id; 33];
+        assert!(grants.check_compact_policy(&unbounded, &live).is_err());
+        assert!(grants.admits_encoded_contribution(4096));
+        assert!(!grants.admits_encoded_contribution(4097));
+        // Same textual local tenant can have unrelated signed binary domains.
+        member.address.authorization_domain =
+            mvm_contract::protocol::mailbox::AuthorizationDomainId::from_bytes([244; 32]);
+        let own_domain = sign_capability(member, &src_authority).unwrap();
+        let mut default_policy = a_policy.clone();
+        default_policy.expected_authorization_domain =
+            own_domain.grant.address.authorization_domain;
+        assert!(
+            addressed
+                .authorize_addressed(
+                    AddressedCastGrants {
+                        source_scope: &own_domain,
+                        ..grants
+                    },
+                    &default_policy,
+                    &live
+                )
+                .is_err()
+        );
+        assert!(
+            addressed
+                .authorize_addressed(
+                    AddressedCastGrants {
+                        source_scope: &recv_cap,
+                        ..grants
+                    },
+                    &a_policy,
+                    &live
+                )
+                .is_err()
+        );
+        assert!(
+            addressed
+                .authorize_addressed(
+                    AddressedCastGrants {
+                        receive: &cap,
+                        ..grants
+                    },
+                    &a_policy,
+                    &live
+                )
+                .is_err()
+        );
+        let mut revoked_a = a_policy.clone();
+        revoked_a
+            .revoked_capabilities
+            .push(a_witness.grant.revocation_id);
+        assert!(
+            addressed
+                .authorize_addressed(grants, &revoked_a, &live)
+                .is_err()
+        );
+        // The authenticated message must also fit the destination Receive grant.
+        // A refused Receive must not consume its canonical replay tuple.
+        let mut small = recv_cap.grant.clone();
+        small.max_payload_bytes = 1;
+        let small = sign_capability(small, &authority_key).unwrap();
+        let mut rows = InMemoryReplayProtector::default();
+        let seq = 1.try_into().unwrap();
+        assert!(
+            addressed
+                .open_addressed(
+                    envelope.clone(),
+                    AddressedCastGrants {
+                        receive: &small,
+                        ..grants
+                    },
+                    &a_policy,
+                    &live,
+                    &encryption_key,
+                    &mut rows,
+                    seq
+                )
+                .is_err()
+        );
+        let admitted = addressed
+            .open_addressed(
+                envelope.clone(),
+                grants,
+                &a_policy,
+                &live,
+                &encryption_key,
+                &mut rows,
+                seq,
+            )
+            .unwrap();
+        use std::io::{Read as _, Write as _};
+        // A valid callback cannot change either signed credential after open.
+        // A denied retry transmits only the greeting and no delivery or body.
+        let mut revoked_b = live.clone();
+        revoked_b
+            .revoked_capabilities
+            .push(recv_cap.grant.revocation_id);
+        for (left, right) in [(&revoked_a, &live), (&a_policy, &revoked_b)] {
+            let (mut host, mut guest) = std::os::unix::net::UnixStream::pair().unwrap();
+            std::thread::scope(|scope| {
+                let other = scope.spawn(|| {
+                    let mut hello = [0; 52];
+                    guest.read_exact(&mut hello).unwrap();
+                    guest.write_all(&hello).unwrap();
+                    let mut body = Vec::new();
+                    guest.read_to_end(&mut body).unwrap();
+                    body
+                });
+                assert!(
+                    admitted
+                        .dispatch_on(&addressed, &mut host, || Ok((left, right)))
+                        .is_err()
+                );
+                drop(host);
+                assert!(other.join().unwrap().is_empty());
+            });
+        }
+        let mut inbox = addressed.inbox();
+        let (mut host, mut guest) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| addressed.receive_on(&mut guest, || 1500, &mut inbox));
+            admitted
+                .dispatch_on(&addressed, &mut host, || Ok((&a_policy, &live)))
+                .unwrap();
+            reader.join().unwrap().unwrap();
+        });
+        assert_eq!(inbox.take().unwrap().body, input);
+        assert!(
+            addressed
+                .open_addressed(
+                    envelope.clone(),
+                    grants,
+                    &a_policy,
+                    &live,
+                    &encryption_key,
+                    &mut rows,
+                    seq
+                )
+                .is_err()
+        );
+        // Independent fresh synthetic destination. Time one contiguous open,
+        // signed-scope recheck, local Deliver and correlated guest ACK. Count
+        // successful bytes at both actual socket ends, excluding fixture setup.
+        let canonical_size = mvm_core::mailbox::encode_envelope(&envelope).unwrap().len();
+        let (host, guest) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut host = Meter {
+            io: host,
+            read: 0,
+            written: 0,
+        };
+        let mut guest = Meter {
+            io: guest,
+            read: 0,
+            written: 0,
+        };
+        let mut fresh = addressed.inbox();
+        let mut once = InMemoryReplayProtector::default();
+        std::thread::scope(|scope| {
+            let rx = scope.spawn(|| {
+                let t = thread_cpu_ns();
+                addressed
+                    .receive_on(&mut guest, || 1500, &mut fresh)
+                    .unwrap();
+                (thread_cpu_ns() - t, guest.read, guest.written)
+            });
+            let wall = std::time::Instant::now();
+            let cpu = thread_cpu_ns();
+            let verified = addressed
+                .open_addressed(
+                    envelope.clone(),
+                    grants,
+                    &a_policy,
+                    &live,
+                    &encryption_key,
+                    &mut once,
+                    seq,
+                )
+                .unwrap();
+            let ack = verified
+                .dispatch_on(&addressed, &mut host, || Ok((&a_policy, &live)))
+                .unwrap();
+            let elapsed = wall.elapsed().as_nanos();
+            let tx_cpu = thread_cpu_ns() - cpu;
+            let (rx_cpu, read, written) = rx.join().unwrap();
+            assert_eq!((host.written, host.read), (read, written));
+            assert_eq!(ack.delivery_sequence, 1);
+            println!(
+                "addressed_cast_component payload={} encoded_envelope_not_sent={} host_to_guest={} guest_to_host={} open_through_ack_ns={} destination_host_thread_cpu_ns={} guest_thread_cpu_ns={}",
+                input.len(),
+                canonical_size,
+                host.written,
+                host.read,
+                elapsed,
+                tx_cpu,
+                rx_cpu
+            );
+        });
+        assert_eq!(fresh.take().unwrap().body, input);
         let chan = new_channel(recipient()).unwrap();
         let mut replay = InMemoryReplayProtector::default();
         let proof = chan
