@@ -20,6 +20,7 @@ use crate::audit::host_keypair::{PUBLIC_FILENAME, SECRET_FILENAME};
 use crate::plan_admission::AdmittedPlan;
 
 mod native_start;
+mod terminal_acceptance;
 
 /// Kernel identity anchored while the installation controller holds its original Child.
 pub struct InstalledMailboxPeer {
@@ -27,6 +28,7 @@ pub struct InstalledMailboxPeer {
     pid: u32,
     issuer: [u8; 16],
     native_start: native_start::NativeStartCustody,
+    terminal_acceptance: terminal_acceptance::TerminalAcceptance,
 }
 
 impl InstalledMailboxPeer {
@@ -54,6 +56,7 @@ impl InstalledMailboxPeer {
             pid,
             issuer: rand::random(),
             native_start: Default::default(),
+            terminal_acceptance: Default::default(),
         })
     }
 
@@ -68,6 +71,10 @@ impl InstalledMailboxPeer {
             peer == self.pid,
             "mailbox control socket differs from original daemon"
         );
+        self.check_original_alive()
+    }
+
+    fn check_original_alive(&self) -> Result<()> {
         let mut original = self
             .observer
             .lock()
@@ -110,6 +117,10 @@ pub struct InstalledMailboxClient {
     owner: Option<MailboxWorkerOwner>,
     authority: Authority,
     peer: Option<Arc<InstalledMailboxPeer>>,
+}
+
+fn worker_deadline() -> Instant {
+    Instant::now() + Duration::from_millis(MAX_WORKER_OPERATION_MS)
 }
 
 fn now_ms() -> Result<u64> {
@@ -224,6 +235,7 @@ impl InstalledMailboxClient {
             self.authority == Authority::Fresh && self.peer.is_none(),
             "initial acquisition already bound"
         );
+        peer.terminal_acceptance.while_vacant(|| Ok(()))?;
         self.acquire.request_nonce[..16].copy_from_slice(&peer.issuer);
         self.authority = Authority::Admitted;
         self.bind_peer(peer)
@@ -441,14 +453,52 @@ impl InstalledMailboxClient {
     /// mailbox locator. Capture the original typed error for stop/recovery.
     pub fn start_native<T>(&self, start: impl FnOnce() -> Result<T>) -> Result<T> {
         ensure!(self.authority == Authority::Admitted, "cleanup locator cannot start a VM");
-        self.peer.as_ref().context("missing original mailbox peer")?
-            .native_start.run(&self.original()?, start)
+        let peer = self.peer.as_ref().context("missing original mailbox peer")?;
+        peer.terminal_acceptance.while_vacant(|| peer.native_start.run(&self.original()?, start))
     }
 
     /// Resolve any retained *native* start before allowing mailbox/VM cleanup.
     pub fn settle_native_start(&self) -> Result<()> {
         self.peer.as_ref().context("missing original mailbox peer")?
             .native_start.settle(&self.original()?)
+    }
+
+    /// Recover the same terminal helper and paired broker while the original
+    /// installed controller survives. Retain one fixed-size acceptance token
+    /// until the caller durably commits its local cleanup under the VM claim.
+    pub fn finish_installed_cleanup(&self, retiring: bool, cleanup: impl FnOnce() -> Result<()>, acknowledge: impl FnOnce() -> Result<()>) -> Result<()> {
+        let peer = self.peer.as_ref().context("missing original mailbox peer")?;
+        ensure!(peer.issued_nonce(&self.acquire.request_nonce), "original cleanup issuer differs");
+        peer.terminal_acceptance.finish(
+            self.original()?, self.acquire.request_nonce, retiring,
+            || {
+                peer.check_original_alive()?;
+                self.settle_native_start()
+            },
+            || {
+                self.collect_worker_terminal(worker_deadline())?;
+                self.remove_companion_services(worker_deadline())
+            },
+            cleanup,
+            acknowledge,
+        )
+    }
+
+    pub fn collect_original_worker(&self) -> Result<()> {
+        self.settle_native_start()?;
+        self.collect_worker_terminal(worker_deadline())
+    }
+
+    fn collect_worker_terminal(&self, until: Instant) -> Result<()> {
+        match self.stop(until)? {
+            MailboxWorkerState::Collected { .. } => Ok(()),
+            MailboxWorkerState::Reserved | MailboxWorkerState::Unresolved => {
+                ensure!(self.release_unstarted(until)? == MailboxWorkerState::ReleasedBeforeSpawn,
+                    "original mailbox reservation release is unresolved");
+                Ok(())
+            }
+            _ => bail!("original mailbox worker collection is unresolved"),
+        }
     }
 
     fn original(&self) -> Result<MailboxWorkerOwner> {
