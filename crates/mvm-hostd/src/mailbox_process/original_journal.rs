@@ -184,7 +184,7 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let output = std::io::BufReader::new(child.stdout.as_mut().unwrap());
         assert!(
             output
                 .lines()
