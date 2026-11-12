@@ -113,6 +113,12 @@ pub(crate) struct PrivateLaunch {
     wrapping: [u8; 32],
     scope: SignedMailboxCapability,
 }
+impl PrivateLaunch {
+    pub(crate) fn original_bundle(&self)->bool {
+        self.direction.is_some() && matches!((self.end.role,self.source.is_some(),self.destination.is_some()),
+            (EndpointRole::Source,true,false)|(EndpointRole::Destination,false,true))
+    }
+}
 impl Drop for PrivateLaunch {
     fn drop(&mut self) {
         self.wrapping.zeroize();

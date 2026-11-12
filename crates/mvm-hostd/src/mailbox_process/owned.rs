@@ -135,6 +135,14 @@ pub fn run_profile(
     _lease: mvm_vmm::host::installed_owner::HolderLease,
     paired: bool,
 ) -> io::Result<()> {
+    run_installed_profile(_lease,paired,false)
+}
+
+pub fn run_original_cast(lease:mvm_vmm::host::installed_owner::HolderLease)->io::Result<()> {
+    run_installed_profile(lease,true,true)
+}
+
+fn run_installed_profile(_lease:mvm_vmm::host::installed_owner::HolderLease,paired:bool,cast:bool)->io::Result<()>{
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut control = inherited_control()?;
     let prepare = read_prepare(&control, deadline)?;
@@ -146,7 +154,7 @@ pub fn run_profile(
         drop(raw);
         // Acquire only from the original helper's inherited Prepare and the
         // approved, delegated configuration. Legacy launch consumes its keys.
-        BoundCastEndpoint::from_original(&prepare, config, &_lease)
+        BoundCastEndpoint::from_original(&prepare, config, &_lease,cast)
     };
     let mut original = match prepare_original() {
         Ok(o) => o,
@@ -333,9 +341,17 @@ impl<'lease> BoundCastEndpoint<'lease> {
         prepare: &super::owned_wire::PrepareOwnedV1,
         mut config: super::MailboxProcessConfig,
         lease: &'lease mvm_vmm::host::installed_owner::HolderLease,
+        cast:bool,
     ) -> io::Result<Self> {
         // SAFETY: getppid has no preconditions.
-        prepare.validate(&config, unsafe { libc::getppid() } as u32)?;
+        let parent=unsafe {libc::getppid()} as u32;
+        if cast {
+            prepare.validate_binding(&config,parent)?;
+            if prepare.grant.local_service!=Some(mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant::original_cast_v1())
+               || !config.keys.development_cast.as_ref().is_some_and(|s|s.original_bundle()) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied,"complete original Cast bundle required"));
+            }
+        } else {prepare.validate(&config,parent)?;}
         let direction = crate::mailbox_launch::cast_pair::development::PrivateSlot::new(
             &mut config,
             &prepare.owner,
