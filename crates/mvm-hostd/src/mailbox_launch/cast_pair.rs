@@ -57,6 +57,13 @@ impl InstalledCastParticipant<'_> {
 /// shared reservation and matching session greeting when calling dispatch_on.
 /// Candidate discovery alone consequently has no I/O or durable receipt effect.
 pub struct InstalledCastMapping {
+    pub channel: CastChannel,
+    pub destination_route: HostDialRoute,
+}
+
+/// A routing handle only the original live coordinator's checked provisioning
+/// path can construct. A passive diagnostic map cannot route an envelope.
+pub struct ServingCastMapping {
     channel: CastChannel,
     destination_route: HostDialRoute,
     source_vm: String,
@@ -101,7 +108,7 @@ pub fn map_installed_cast_pair(
     );
     let now = now_unix_ms();
     let template = template_for(&keys, &target, dst, now)?;
-    let mut channel = CastChannel::from_signed_pair(
+    let channel = CastChannel::from_signed_pair(
         source.plan.signed(),
         destination.plan.signed(),
         trusted_plan_signers,
@@ -111,9 +118,6 @@ pub fn map_installed_cast_pair(
         template.header.recipient,
         now,
     )?;
-    channel.restrict_frame_budget(
-        crate::broker::mailbox_workers::cast_credit::CAST_BODY_LIMIT as u32,
-    )?;
     let state = mvm_core::config::vm_state_dir(&destination.worker.acquire_request().vm_id);
     let destination_route = backend
         .host_dial_route(&state, MAILBOX_PORT)
@@ -121,12 +125,6 @@ pub fn map_installed_cast_pair(
     Ok(InstalledCastMapping {
         channel,
         destination_route,
-        source_vm: source.worker.acquire_request().vm_id.clone(),
-        destination_vm: destination.worker.acquire_request().vm_id.clone(),
-        source_owner: left.clone(),
-        destination_owner: right.clone(),
-        destination_sender: PrincipalId::from_bytes(target.sender.verifying_key().to_bytes()),
-        destination_epoch: dst.epoch,
     })
 }
 
@@ -159,7 +157,7 @@ pub fn map_serving_cast_pair(
     trusted_plan_signers: &[(&str, &VerifyingKey)],
     destination_greeting: LocalGreeting,
     grants: AddressedCastGrants<'_>,
-) -> Result<InstalledCastMapping> {
+) -> Result<ServingCastMapping> {
     use mvm_core::protocol::mailbox_worker_control::context_commitment;
     use mvm_runtime::catalog::BackendKind;
     let kind = match backend.kind() {
@@ -207,7 +205,7 @@ pub fn map_serving_cast_pair(
     let route = backend
         .host_dial_route(&state, MAILBOX_PORT)
         .context("missing installed mailbox route")?;
-    let mapping = InstalledCastMapping {
+    let mapping = ServingCastMapping {
         channel,
         destination_route: route,
         source_vm: a.to_owned(),
@@ -229,11 +227,11 @@ pub struct RoutedCast<'a> {
     canonical: Vec<u8>,
     envelope: MailboxEnvelope,
     grants: AddressedCastGrants<'a>,
-    mapping: &'a InstalledCastMapping,
+    mapping: &'a ServingCastMapping,
     credit: CastCredit<'a>,
 }
 
-impl InstalledCastMapping {
+impl ServingCastMapping {
     pub fn destination_route(&self) -> &HostDialRoute {
         &self.destination_route
     }
