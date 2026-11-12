@@ -11,8 +11,8 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use mvm_agentd::mailbox_outbox::{
-    MAILBOX_HOLD, MAILBOX_IO_TIMEOUT, OUTBOX_PATH, bound_socket_io,
-    forward_outbox, peer_gone, wait_for_outbox,
+    MAILBOX_HOLD, MAILBOX_IO_TIMEOUT, OUTBOX_PATH, bound_socket_io, forward_outbox, peer_gone,
+    wait_for_outbox,
 };
 use mvm_contract::protocol::mailbox::MAILBOX_PORT;
 use mvm_contract::protocol::mailbox::local_service::{
@@ -124,6 +124,14 @@ pub(crate) fn install_delivery(
         anyhow::ensure!(
             matches!(runtime.concurrency,Some(ConcurrencyConfig::WarmProcess(cfg)) if cfg.pool_size==1),
             "one original OCI worker required"
+        );
+        let entry = mvm_agentd::entrypoint::EntrypointPolicy::production()
+            .validate()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        anyhow::ensure!(
+            !entry.use_resolved_path
+                && entry.resolved == std::path::Path::new("/usr/lib/mvm/wrappers/oci-entrypoint"),
+            "original Cast requires the validated OCI entrypoint"
         );
         ORIGINAL
             .set(OriginalDelivery {

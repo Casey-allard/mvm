@@ -135,9 +135,17 @@ pub(crate) fn apply_activation(
 ) -> Result<(), guest_mount::MountError> {
     admit_workload_seccomp()?;
     if !is_pid1() {
+        if env.cast_delivery_v1.is_some() {
+            return Err(guest_mount::MountError::InvalidConfig(
+                "original Cast requires PID 1".into(),
+            ));
+        }
         return Ok(());
     }
 
+    #[cfg(target_os = "linux")]
+    let original = crate::mailbox::prepare_delivery(env, boot_state)
+        .map_err(|e| guest_mount::MountError::InvalidConfig(e.to_string()))?;
     boot_state.set_activation(ActivationState::Activating);
 
     let new_root = guest_mount::mount_rootfs(&env.rootfs)?;
@@ -186,6 +194,9 @@ pub(crate) fn apply_activation(
     crate::telemetry::capture_session_keys_before_privilege_drop();
     guest_mount::drop_guest_agent_privilege(guest_mount::WORKLOAD_UID, guest_mount::WORKLOAD_GID)?;
 
+    #[cfg(target_os = "linux")]
+    crate::mailbox::install_delivery(original)
+        .map_err(|e| guest_mount::MountError::InvalidConfig(e.to_string()))?;
     boot_state.set_activation(ActivationState::Activated);
     Ok(())
 }

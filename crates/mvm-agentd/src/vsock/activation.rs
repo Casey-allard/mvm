@@ -46,8 +46,11 @@ impl ActivateEnvironment {
     /// The canonical host mount projection checked again by PID 1 before
     /// mounting it. The boot grant and enrollment do not hash themselves.
     pub fn cast_mount_commitment(&self) -> serde_json::Result<[u8; 32]> {
-        Ok(mvm_core::mailbox::frame::cast::enrollment::mount_context(
-            &serde_json::to_vec(&(&self.rootfs, &self.runtime, &self.volumes, &self.extensions))?,
+        mvm_core::mailbox::frame::cast::enrollment::mount_context(&(
+            &self.rootfs,
+            &self.runtime,
+            &self.volumes,
+            &self.extensions,
         ))
     }
 }
@@ -220,6 +223,26 @@ pub struct VolumeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cast_mount_commitment_tracks_the_canonical_selected_boot_devices() {
+        let original: ActivateEnvironment =
+            serde_json::from_value(serde_json::json!({"rootfs":{"data_dev":"/dev/vda"}})).unwrap();
+        let digest = original.cast_mount_commitment().unwrap();
+        let mut redirected = original.clone();
+        redirected.rootfs.data_dev = "/dev/vdc".into();
+        assert_ne!(redirected.cast_mount_commitment().unwrap(), digest);
+        let with_hash:ActivateEnvironment=serde_json::from_value(serde_json::json!({"rootfs":{"data_dev":"/dev/vda","hash_dev":"/dev/vdb","roothash":"ab".repeat(32)}})).unwrap();
+        assert_ne!(with_hash.cast_mount_commitment().unwrap(), digest);
+        let mounted_volume:ActivateEnvironment=serde_json::from_value(serde_json::json!({"rootfs":{"data_dev":"/dev/vda"},"volumes":[{"tag":"uvol0","mountpoint":"/data","read_only":true}]})).unwrap();
+        assert_ne!(mounted_volume.cast_mount_commitment().unwrap(), digest);
+        assert!(
+            serde_json::to_value(original)
+                .unwrap()
+                .get("cast_delivery_v1")
+                .is_none()
+        );
+    }
 
     #[test]
     fn activate_environment_roundtrips() {

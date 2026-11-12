@@ -156,9 +156,9 @@ impl DeliverEnrollmentV1 {
 
 /// Hash the fixed-order canonical activation tuple supplied by the shared guest
 /// configuration module. No application data or secret is included.
-pub fn mount_context(bytes: &[u8]) -> [u8; 32] {
+pub fn mount_context<T: serde::Serialize>(configuration: &T) -> serde_json::Result<[u8; 32]> {
     let mut h = Sha256::new();
     h.update(b"mvm-original-cast-mount-config-v1\0");
-    h.update(bytes);
-    h.finalize().into()
+    h.update(serde_jcs::to_vec(configuration)?);
+    Ok(h.finalize().into())
 }
