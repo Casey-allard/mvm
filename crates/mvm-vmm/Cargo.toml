@@ -29,7 +29,7 @@ mvm-fs = { workspace = true }
 # Structured logging used by host helpers.
 tracing = { workspace = true }
 # JSON serialization for host-service configs.
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde = { workspace = true }
 # The per-VM egress CA key is held and serialized here; `Zeroizing` keeps the
 # in-memory copies from outliving their use. Already in this crate's closure
@@ -51,9 +51,13 @@ rand.workspace = true
 libc.workspace = true
 socket2.workspace = true
 ed25519-dalek.workspace = true
+sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
 flate2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["event", "fs", "net", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mvm-macho-sign = { path = "../deps/mvm-macho-sign" }

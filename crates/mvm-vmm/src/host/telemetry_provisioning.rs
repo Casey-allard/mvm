@@ -118,6 +118,239 @@ pub fn load_records_key(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+
+
+#[cfg(unix)]
+pub(crate) fn provision_records_key_owned_with_file(
+    state: &std::fs::File,
+    keys_dir: &Path,
+) -> std::io::Result<(mvm_core::crypto::aead::Key, std::fs::File)> {
+    use mvm_core::crypto::aead::{KEY_SIZE, Key};
+    use std::io;
+
+    owned_private_directory(state)?;
+    let keys = crate::host::restore_image::open_trusted_dir(keys_dir)
+        .map_err(|_| owned_key_storage_error())?;
+    owned_private_directory(&keys)?;
+    let kek_name = mvm_core::transcript::TRANSCRIPT_KEK_FILENAME;
+    match owned_read_private(state, TELEMETRY_RECORDS_KEY_FILE, 1024) {
+        Ok((wrapped, file)) => {
+            let (kek, _) = owned_read_private(&keys, kek_name, KEY_SIZE)?;
+            let kek = Key::from_slice(&kek).map_err(|_| owned_key_storage_error())?;
+            return owned_unwrap(&kek, &wrapped).map(|key| (key, file));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // A missing key cannot authorize dropping or replacing retained records.
+    match open_owned_private_file(state, TELEMETRY_RECORDS_FILE) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        _ => return Err(owned_key_storage_error()),
+    }
+    let (kek, _) = match owned_read_private(&keys, kek_name, KEY_SIZE) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            publish_owned_key(&keys, kek_name, Key::random().expose_bytes())?;
+            owned_read_private(&keys, kek_name, KEY_SIZE)?
+        }
+        result => result?,
+    };
+    let kek = Key::from_slice(&kek).map_err(|_| owned_key_storage_error())?;
+    let wrapped = mvm_core::transcript::wrap_data_key(&kek, &Key::random());
+    publish_owned_key(state, TELEMETRY_RECORDS_KEY_FILE, wrapped.as_bytes())?;
+    let (wrapped, file) = owned_read_private(state, TELEMETRY_RECORDS_KEY_FILE, 1024)?;
+    owned_unwrap(&kek, &wrapped).map(|key| (key, file))
+}
+
+#[cfg(unix)]
+fn owned_key_storage_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid owned telemetry key storage",
+    )
+}
+
+#[cfg(unix)]
+fn owned_private_directory(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::{fd::AsFd, unix::fs::MetadataExt};
+    let metadata = file.metadata()?;
+    mvm_core::private_fs::require_current_owner(&metadata)?;
+    if !metadata.is_dir()
+        || metadata.mode() & 0o7777 != 0o700
+        || crate::host::restore_image::fd_acl_grants_access(file.as_fd())?
+    {
+        return Err(owned_key_storage_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn owned_private_file(file: &std::fs::File) -> std::io::Result<std::fs::Metadata> {
+    use std::os::{fd::AsFd, unix::fs::MetadataExt};
+    let metadata = file.metadata()?;
+    mvm_core::private_fs::require_current_owner(&metadata)?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o600
+        || crate::host::restore_image::fd_acl_grants_access(file.as_fd())?
+    {
+        return Err(owned_key_storage_error());
+    }
+    Ok(metadata)
+}
+
+#[cfg(unix)]
+fn open_owned_private_file(
+    directory: &std::fs::File,
+    name: &str,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    let file = std::fs::File::from(openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    owned_private_file(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn owned_read_private(
+    directory: &std::fs::File,
+    name: &str,
+    limit: usize,
+) -> std::io::Result<(zeroize::Zeroizing<Vec<u8>>, std::fs::File)> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let mut file = open_owned_private_file(directory, name)?;
+    let before = owned_private_file(&file)?;
+    let mut scratch = zeroize::Zeroizing::new([0_u8; 1025]);
+    if limit >= scratch.len() || before.len() > limit as u64 {
+        return Err(owned_key_storage_error());
+    }
+    let mut used = 0;
+    while used <= limit {
+        match file.read(&mut scratch[used..=limit]) {
+            Ok(0) => break,
+            Ok(bytes) => used += bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let after = owned_private_file(&file)?;
+    let named = open_owned_private_file(directory, name)?.metadata()?;
+    if used > limit
+        || (before.dev(), before.ino(), before.len()) != (after.dev(), after.ino(), after.len())
+        || (after.dev(), after.ino(), after.len()) != (named.dev(), named.ino(), named.len())
+        || used as u64 != after.len()
+    {
+        return Err(owned_key_storage_error());
+    }
+    Ok((zeroize::Zeroizing::new(scratch[..used].to_vec()), file))
+}
+
+/// Publish a durable private key relative to the retained directory. The
+/// exclusive rename publishes a complete single-link file or leaves the winner.
+#[cfg(unix)]
+fn publish_owned_key(directory: &std::fs::File, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use rand::Rng;
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
+    use std::io::Write;
+
+    let mut token = [0_u8; 16];
+    rand::rng().fill_bytes(&mut token);
+    let temp = format!(".mvm-telemetry-key-{}", hex::encode(token));
+    let mut file = std::fs::File::from(openat(
+        directory,
+        temp.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )?);
+    let check_staging_name = |file: &std::fs::File| -> std::io::Result<()> {
+        let named = rustix::fs::statat(directory, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+        let held = rustix::fs::fstat(file)?;
+        if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino) {
+            return Err(owned_key_storage_error());
+        }
+        Ok(())
+    };
+    let result = (|| -> std::io::Result<bool> {
+        owned_private_file(&file)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        check_staging_name(&file)?;
+        match rename_owned_key(directory, &temp, name) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
+    })();
+    if !matches!(&result, Ok(true)) {
+        let removed = check_staging_name(&file).and_then(|()| {
+            unlinkat(directory, temp.as_str(), AtFlags::empty()).map_err(Into::into)
+        });
+        result?;
+        removed?;
+    }
+    directory.sync_all()
+}
+
+#[cfg(target_os = "linux")]
+fn rename_owned_key(
+    directory: &std::fs::File,
+    source: &str,
+    destination: &str,
+) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        directory,
+        source,
+        directory,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(target_os = "macos")]
+fn rename_owned_key(
+    directory: &std::fs::File,
+    source: &str,
+    destination: &str,
+) -> std::io::Result<()> {
+    use std::{ffi::CString, os::fd::AsRawFd};
+    let source = CString::new(source).map_err(|_| owned_key_storage_error())?;
+    let destination = CString::new(destination).map_err(|_| owned_key_storage_error())?;
+    // SAFETY: the directory is held and both path components are NUL-terminated.
+    if unsafe {
+        libc::renameatx_np(
+            directory.as_raw_fd(),
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn rename_owned_key(_: &std::fs::File, _: &str, _: &str) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+#[cfg(unix)]
+fn owned_unwrap(
+    kek: &mvm_core::crypto::aead::Key,
+    wrapped: &[u8],
+) -> std::io::Result<mvm_core::crypto::aead::Key> {
+    let encoded = std::str::from_utf8(wrapped).map_err(|_| owned_key_storage_error())?;
+    mvm_core::transcript::unwrap_data_key(kek, encoded.trim())
+        .map_err(|_| owned_key_storage_error())
+}
+
 /// The pure decision, split from the environment so it is testable without
 /// process-global state: only an explicit off value disables collection.
 pub fn collection_enabled_from(explicit_collect: Option<&str>) -> bool {
@@ -132,6 +365,25 @@ pub fn collection_enabled_from(explicit_collect: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_key_publication_stays_in_the_captured_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let original = root.path().join("original");
+        mvm_core::config::create_private_dir(&state).unwrap();
+        let held = std::fs::File::open(&state).unwrap();
+        std::fs::rename(&state, &original).unwrap();
+        mvm_core::config::create_private_dir(&state).unwrap();
+        publish_owned_key(&held, "key", b"original bytes").unwrap();
+        publish_owned_key(&held, "key", b"must not replace").unwrap();
+        assert!(!state.join("key").exists());
+        assert_eq!(
+            std::fs::read(original.join("key")).unwrap(),
+            b"original bytes"
+        );
+        assert_eq!(std::fs::read_dir(original).unwrap().count(), 1);
+    }
 
     #[test]
     fn collection_is_on_unless_explicitly_turned_off() {

@@ -26,6 +26,8 @@ pub mod runtime_catalog;
 /// The denylist for environment variables that change what a process loads or
 /// runs, applied to guest env passthrough and to every host helper spawn.
 pub mod bounded_run;
+pub mod bounded_owned_json;
+pub mod runtime_state_protection;
 #[cfg(feature = "client")]
 pub mod client;
 pub mod cold_build;
