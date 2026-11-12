@@ -13,6 +13,9 @@ pub const ENABLE_ENV: &str = "MVM_WITNESS_OWNED_MAILBOX_IO_V1";
 pub const SCOPE: &str = "mvm/owned-mailbox/guest-5257/post-mux-host-stream/v1";
 const MAX_REPORT: usize = 1024;
 
+#[cfg(target_os = "linux")]
+pub mod private_channel;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuestStreamCounts {
@@ -141,6 +144,10 @@ pub(crate) fn inherited_report_socket() -> io::Result<Option<UnixDatagram>> {
         return Ok(None);
     }
     let fd: OwnedFd = std::io::stdout().as_fd().try_clone_to_owned()?;
+    anonymous_datagram(fd).map(Some)
+}
+
+fn anonymous_datagram(fd: OwnedFd) -> io::Result<UnixDatagram> {
     if rustix::net::sockopt::socket_type(&fd)? != rustix::net::SocketType::DGRAM {
         return Err(invalid("expected private witness datagram"));
     }
@@ -149,7 +156,19 @@ pub(crate) fn inherited_report_socket() -> io::Result<Option<UnixDatagram>> {
         return Err(invalid("expected anonymous witness socketpair"));
     }
     socket.set_nonblocking(true)?;
-    Ok(Some(socket))
+    Ok(socket)
+}
+pub(crate) fn worker_report_socket(owner: &MailboxWorkerOwner) -> io::Result<Option<UnixDatagram>> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os(ENABLE_ENV).as_deref()
+        == Some(std::ffi::OsStr::new(private_channel::ISOLATED_HELPER_MODE))
+    {
+        let fd = std::io::stdout().as_fd().try_clone_to_owned()?;
+        let control = anonymous_datagram(fd)?;
+        return private_channel::prepare_writer(&control, owner).map(Some);
+    }
+    let _ = owner;
+    inherited_report_socket()
 }
 pub(crate) fn send_original(
     socket: &UnixDatagram,
@@ -167,7 +186,9 @@ pub(crate) fn send_original(
     Ok(())
 }
 
-/// Called after signed collection of the expected helper and coordinator drain.
+/// Read after signed original helper collection. Shared v1 channels also
+/// require coordinator drain. A dedicated private reader has only that helper
+/// as its reporter and can be collected before tenant shutdown.
 pub fn receive_original(
     socket: &UnixDatagram,
     owner: &MailboxWorkerOwner,
@@ -224,7 +245,7 @@ mod tests {
             Ok(())
         }
     }
-    fn owner(n: u8) -> MailboxWorkerOwner {
+    pub(super) fn owner(n: u8) -> MailboxWorkerOwner {
         MailboxWorkerOwner {
             generation: 1,
             daemon_boot_nonce: [1; 32],
