@@ -247,8 +247,11 @@ pub fn start_machine_spec(
 ) -> Result<MachineStart> {
     AnyBackend::require_hypervisor_selectable(params.hypervisor)?;
     let vacant = super::mailbox_owner::VacantOwner::claim(&spec.name)?;
-    let discard = || super::discard_stopped_runtime_state(params.hypervisor, &spec.name);
-    if let Some(pair) = host.installed_mailbox().and_then(|p|p.original_cast_pair()) {
+    let discard = || -> Result<()> {
+        super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
+        Ok(())
+    };
+    if let Some(pair) = host.installed_mailbox().and_then(|p| p.original_cast_pair()) {
         pair.index(&spec.name)?;
         #[cfg(unix)]
         super::cast_state::prepare(&mvm_core::config::mvm_home_strict()?, &spec.name, discard)?;
