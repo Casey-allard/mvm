@@ -76,7 +76,7 @@ pub(crate) fn prepare_delivery(
         selected == MailboxGuestService::ReliableV1,
         "missing signed reliable service selection"
     );
-    selected.require_implemented()?;
+    // Only the signed, original role checked below can activate this subset.
     let held = held.context("missing original boot grant")?;
     let anchor = boot
         .host_signer_key()
@@ -201,6 +201,17 @@ pub(crate) fn retire_for_restore() -> bool {
 pub(crate) fn init_mailbox() {
     let selected = std::fs::read_to_string("/proc/cmdline").and_then(|cmdline| {
         let service = parse_mailbox_service_cmdline(&cmdline).map_err(std::io::Error::other)?;
+        #[cfg(target_os = "linux")]
+        if service == MailboxGuestService::ReliableV1 {
+            let live = ORIGINAL
+                .get()
+                .and_then(|o| o.endpoint.lock().ok())
+                .is_some_and(|slot| slot.is_some());
+            if !live {
+                return Err(std::io::Error::other("no verified original mailbox role"));
+            }
+            return Ok(service);
+        }
         service
             .require_implemented()
             .map_err(std::io::Error::other)?;

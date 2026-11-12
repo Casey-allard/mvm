@@ -203,11 +203,12 @@ fn original_submit_oci_dispatch_reads_binary_body_from_the_ordinary_call() {
     let output = app.join().unwrap();
     assert_eq!(output.outcome, WorkerOutcome::Exit { code: 0 });
     assert_eq!(output.stdout, [15; 32]);
+    let app_times: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert!(e.pending.is_some());
     println!(
         "ORIGINAL_OCI_SUBMIT {}",
         serde_json::json!({"payload_bytes":257,"guest_to_host_bytes":direction,"host_to_guest_bytes":reverse,
-        "application_result_bytes":output.stdout.len(),"dispatch_through_result_wall_ns":start.elapsed().as_nanos() as u64,"agent_thread_cpu_ns":cpu_time()-cpu})
+        "application_result_bytes":output.stdout.len(),"dispatch_through_result_wall_ns":start.elapsed().as_nanos() as u64,"source_workload":app_times,"agent_thread_cpu_ns":cpu_time()-cpu})
     );
 }
 fn cpu_time() -> u64 {
