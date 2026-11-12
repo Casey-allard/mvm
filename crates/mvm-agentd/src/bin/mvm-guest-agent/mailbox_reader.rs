@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(12);
 
 struct ActiveLease {
+    object_call: bool,
     lease: SignedMailboxDeliveryLease,
     ack: Option<SignedMailboxDeliveryAck>,
 }
@@ -110,6 +111,38 @@ fn application_request(
     reader: &Arc<GuestReader>,
 ) -> Result<ReaderResponse, Refusal> {
     let request = match read_application_request(stream)? {
+        ApplicationReaderRequest::StageObjectV1 { pair, submission } => {
+            use mvm_core::mailbox::reader_wire::ObjectSubmissionV1;
+            let message_id = submission.message_id();
+            if reader.boot.durable_object_pair_sha256_v1 != Some(pair) {
+                return Err(Refusal::NotAuthorized);
+            }
+            match &*submission {
+                ObjectSubmissionV1::Call { correlation_id, .. }
+                    if correlation_id.as_bytes() != &[0; 32] => {}
+                ObjectSubmissionV1::Reply { original_call, .. } => {
+                    let active = reader.active.lock().map_err(|_| Refusal::Unavailable)?;
+                    let current = active.as_ref().ok_or(Refusal::NotAuthorized)?;
+                    let now = now_unix_ms()?;
+                    if !current.object_call
+                        || current.ack.is_some()
+                        || current.lease != **original_call
+                        || message_id == current.lease.lease.message_id
+                        || !(current.lease.lease.issued_at_unix_ms
+                            ..current.lease.lease.expires_at_unix_ms)
+                            .contains(&now)
+                    {
+                        return Err(Refusal::NotAuthorized);
+                    }
+                }
+                _ => return Err(Refusal::NotAuthorized),
+            }
+            let dir = Path::new(mvm_agentd::mailbox_outbox::LOCAL_OUTBOX_PATH)
+                .parent()
+                .ok_or(Refusal::Unavailable)?;
+            mvm_agentd::mailbox_outbox::object_pair::stage(dir, &reader.boot, pair, &submission)?;
+            return Ok(ReaderResponse::ObjectStagedV1 { pair, message_id });
+        }
         ApplicationReaderRequest::CheckOutboundJournalV1 {
             commitment,
             recipient,
@@ -124,7 +157,20 @@ fn application_request(
             )?;
             return Ok(ReaderResponse::OutboundJournalAvailableV1 { commitment });
         }
-        ApplicationReaderRequest::Receive => ReaderRequest::Receive,
+        ApplicationReaderRequest::Receive
+            if reader.boot.durable_object_pair_sha256_v1.is_none() =>
+        {
+            ReaderRequest::Receive
+        }
+        ApplicationReaderRequest::ReceiveObjectPairV1 { pair }
+            if reader.boot.durable_object_pair_sha256_v1 == Some(pair) =>
+        {
+            ReaderRequest::ReceiveObjectPairV1 { pair }
+        }
+        ApplicationReaderRequest::Receive
+        | ApplicationReaderRequest::ReceiveObjectPairV1 { .. } => {
+            return Err(Refusal::NotAuthorized);
+        }
         ApplicationReaderRequest::Ack { lease } => {
             let mut active = reader.active.lock().expect("mailbox reader lock poisoned");
             let active = active.as_mut().ok_or(Refusal::NotAuthorized)?;
@@ -192,7 +238,14 @@ fn perform_exchange(
 ) -> Result<ReaderResponse, Refusal> {
     write_request(stream, &pending.request)?;
     match &pending.request {
-        ReaderRequest::Receive => {
+        ReaderRequest::Receive | ReaderRequest::ReceiveObjectPairV1 { .. } => {
+            let pair = match pending.request {
+                ReaderRequest::ReceiveObjectPairV1 { pair } => Some(pair),
+                _ => None,
+            };
+            if pair != pending.reader.boot.durable_object_pair_sha256_v1 {
+                return Err(Refusal::NotAuthorized);
+            }
             let ReaderResponse::Challenge {
                 enrollment,
                 capability,
@@ -203,7 +256,7 @@ fn perform_exchange(
             };
             let boot = &pending.reader.boot;
             let grant = MailboxGrant {
-                durable_object_pair_sha256_v1: None,
+                durable_object_pair_sha256_v1: boot.durable_object_pair_sha256_v1,
                 incoming_journal_policy_sha256_v1: None,
                 outbound_journal_v1: None,
                 mailbox: boot.mailbox,
@@ -253,34 +306,55 @@ fn perform_exchange(
                 },
             )?;
             let response = read_response(stream)?;
-            if let ReaderResponse::Delivery {
-                lease,
-                content_type,
-                payload,
-            } = &response
-            {
-                verify_delivery_lease_signature(lease, &authority)
+            let (lease, content_type, payload) = match (&response, pair) {
+                (
+                    ReaderResponse::Delivery {
+                        lease,
+                        content_type,
+                        payload,
+                    },
+                    None,
+                ) if lease.lease.object_projection_v1.is_none() => {
+                    verify_delivery_lease_signature(lease, &authority)
+                        .map_err(|_| Refusal::NotAuthorized)?;
+                    (lease, content_type, payload)
+                }
+                (
+                    ReaderResponse::ObjectDeliveryV1 {
+                        lease,
+                        header,
+                        payload,
+                    },
+                    Some(pair),
+                ) => {
+                    mvm_core::mailbox::reader::verify_object_delivery_projection(
+                        &pair, header, payload, lease, &authority,
+                    )
                     .map_err(|_| Refusal::NotAuthorized)?;
-                validity::verify(lease.lease.issued_at_unix_ms, pending.wait_until, |now| {
-                    lease
-                        .check_scope(&grant, &capability.grant, current_session, now)
-                        .map_err(Into::into)
-                })?;
-                if payload.len() > capability.grant.max_payload_bytes as usize {
-                    return Err(Refusal::NotAuthorized);
+                    (lease, &header.content_type, payload)
                 }
-                if !capability.grant.content_types.contains(content_type) {
-                    return Err(Refusal::NotAuthorized);
-                }
-                *pending
-                    .reader
-                    .active
-                    .lock()
-                    .expect("mailbox reader lock poisoned") = Some(ActiveLease {
-                    lease: (**lease).clone(),
-                    ack: None,
-                });
+                (ReaderResponse::Empty | ReaderResponse::Refused { .. }, _) => return Ok(response),
+                _ => return Err(Refusal::NotAuthorized),
+            };
+            validity::verify(lease.lease.issued_at_unix_ms, pending.wait_until, |now| {
+                lease
+                    .check_scope(&grant, &capability.grant, current_session, now)
+                    .map_err(Into::into)
+            })?;
+            if payload.len() > capability.grant.max_payload_bytes as usize
+                || !capability.grant.content_types.contains(content_type)
+            {
+                return Err(Refusal::NotAuthorized);
             }
+            *pending
+                .reader
+                .active
+                .lock()
+                .expect("mailbox reader lock poisoned") = Some(ActiveLease {
+                object_call: matches!(&response, ReaderResponse::ObjectDeliveryV1 {header,..} if header.kind==mvm_contract::protocol::mailbox::MailboxMessageKind::Call),
+                lease: (**lease).clone(),
+                ack: None,
+            });
             Ok(response)
         }
         ReaderRequest::Ack { signed } => correlate_ack(read_response(stream)?, signed),
@@ -353,6 +427,7 @@ mod tests {
         let guest = SigningKey::from_bytes(&[10; 32]);
         let lease = sign_delivery_lease(
             MailboxDeliveryLease {
+                object_projection_v1: None,
                 protocol_version: ProtocolVersion::V1,
                 signature_algorithm: SignatureAlgorithm::ED25519,
                 address: MailboxAddress {
@@ -415,3 +490,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "mailbox_reader/object_guest_tests.rs"]
+mod object_guest_tests;

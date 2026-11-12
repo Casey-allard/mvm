@@ -139,6 +139,7 @@ fn current_session() -> ConsumerSessionId {
 
 fn lease() -> MailboxDeliveryLease {
     MailboxDeliveryLease {
+        object_projection_v1: None,
         protocol_version: ProtocolVersion::V1,
         signature_algorithm: SignatureAlgorithm::ED25519,
         address: address(),

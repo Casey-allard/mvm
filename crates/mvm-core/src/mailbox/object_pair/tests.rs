@@ -447,3 +447,6 @@ fn grants_and_both_original_signed_plans_are_required() {
         false
     ));
 }
+
+#[path = "tests/leased_projection.rs"]
+mod leased_projection;

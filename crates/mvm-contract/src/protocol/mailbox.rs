@@ -1092,6 +1092,9 @@ pub struct MailboxDeliveryLease {
     pub consumer_session: ConsumerSessionId,
     pub receive_capability_id: CapabilityId,
     pub policy_epoch: u64,
+    /// Present only for the separately admitted durable object service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_projection_v1: Option<[u8; 32]>,
     pub ciphertext_commitment: [u8; 32],
     pub issued_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
