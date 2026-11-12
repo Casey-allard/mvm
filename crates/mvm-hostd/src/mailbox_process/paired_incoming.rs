@@ -616,6 +616,7 @@ pub(super) mod tests {
                         .send_guard(super::super::reader::revocations_path(state.path()))
                         .unwrap(),
                 ),
+                false,
             )
             .unwrap()
         };

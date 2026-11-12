@@ -114,12 +114,31 @@ pub(crate) fn check_object_worker_record(
     Ok(r.enrollment)
 }
 
+fn enrollment_digest(record: &ReaderRecord) -> io::Result<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(record).map_err(invalid)?).into())
+}
+pub(super) fn original_enrollment_digest(state: &Path) -> io::Result<[u8; 32]> {
+    enrollment_digest(
+        &read_record(&state.join(READER_FILE))?
+            .ok_or_else(|| invalid("original reader enrollment missing"))?,
+    )
+}
 pub(super) fn load_or_enroll(
     state_dir: &Path,
     grant: &MailboxGrant,
     binding: MailboxReaderBootBinding,
     send_grant: &MailboxCapabilityGrant,
     signer: &SigningKey,
+) -> io::Result<GuestReaderAuthority> {
+    load_reader(state_dir, grant, binding, send_grant, signer, None)
+}
+pub(super) fn load_reader(
+    state_dir: &Path,
+    grant: &MailboxGrant,
+    binding: MailboxReaderBootBinding,
+    send_grant: &MailboxCapabilityGrant,
+    signer: &SigningKey,
+    required_original: Option<[u8; 32]>,
 ) -> io::Result<GuestReaderAuthority> {
     // Re-read the host's persisted boot identity: stdin alone cannot change
     // which cold guest this per-VM helper is authorized to serve.
@@ -140,7 +159,17 @@ pub(super) fn load_or_enroll(
     let now = now_unix_ms()?;
     let path = state_dir.join(READER_FILE);
     let record = match read_record(&path)? {
-        Some(record) => record,
+        Some(record) => {
+            if let Some(digest) = required_original
+                && enrollment_digest(&record)? != digest
+            {
+                return Err(invalid("original reader enrollment changed"));
+            }
+            record
+        }
+        None if required_original.is_some() => {
+            return Err(invalid("original reader enrollment missing"));
+        }
         None => {
             let send = sign_capability(send_grant.clone(), signer).map_err(invalid)?;
             let receive =
@@ -301,7 +330,44 @@ mod tests {
             first_send.capability_id
         );
 
+        let digest = original_enrollment_digest(state.path()).unwrap();
         let path = state.path().join(READER_FILE);
+        let record = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            load_reader(
+                state.path(),
+                &grant,
+                binding.clone(),
+                &second_send,
+                &second_keys.durable_material().0,
+                Some(digest)
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+        std::fs::write(&path, &record).unwrap();
+        assert!(
+            load_reader(
+                state.path(),
+                &grant,
+                binding.clone(),
+                &second_send,
+                &second_keys.durable_material().0,
+                Some([0; 32])
+            )
+            .is_err()
+        );
+        let recovered = load_reader(
+            state.path(),
+            &grant,
+            binding.clone(),
+            &second_send,
+            &second_keys.durable_material().0,
+            Some(digest),
+        )
+        .unwrap();
+        assert_eq!(recovered.capability, first.capability);
         let mut forged: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         forged["receive"]["signature"] = serde_json::json!("AAAAAAAA");

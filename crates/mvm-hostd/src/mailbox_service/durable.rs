@@ -106,6 +106,7 @@ pub struct DurableMailboxService {
     aggregate_meter: Option<witness_io::aggregate::Aggregate>,
     shared: Arc<Shared>,
     path: PathBuf,
+    original_socket: Option<(u64, u64)>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -173,6 +174,7 @@ impl DurableMailboxService {
             Box::new(anchor),
             None,
             None,
+            false,
         )
     }
 
@@ -187,7 +189,7 @@ impl DurableMailboxService {
         journal: MailboxJournal,
         anchor: FileJournalAnchor,
     ) -> std::io::Result<Self> {
-        Self::bind_local_incoming(path, limits, policy, signer, journal, anchor, None)
+        Self::bind_local_incoming(path, limits, policy, signer, journal, anchor, None, false)
     }
 
     pub(crate) fn bind_local_incoming(
@@ -198,6 +200,7 @@ impl DurableMailboxService {
         journal: MailboxJournal,
         anchor: FileJournalAnchor,
         incoming: Option<IncomingSendGuard>,
+        exclusive_bind: bool,
     ) -> std::io::Result<Self> {
         journal
             .local_ready(&anchor, &signer.verifying_key())
@@ -215,6 +218,7 @@ impl DurableMailboxService {
             Box::new(commit),
             Some(anchor),
             incoming,
+            exclusive_bind,
         )
     }
 
@@ -226,6 +230,7 @@ impl DurableMailboxService {
         anchor: Box<dyn JournalAnchor>,
         local_anchor: Option<Arc<FileJournalAnchor>>,
         incoming: Option<IncomingSendGuard>,
+        exclusive_bind: bool,
     ) -> std::io::Result<Self> {
         if signer.verifying_key() != state.policy.authority_key {
             return Err(std::io::Error::new(
@@ -239,8 +244,16 @@ impl DurableMailboxService {
                 "mailbox limits must be nonzero",
             ));
         }
-        let _ = std::fs::remove_file(path);
+        if !exclusive_bind {
+            let _ = std::fs::remove_file(path);
+        }
         let listener = UnixListener::bind(path)?;
+        let original_socket = if exclusive_bind {
+            let m = std::fs::symlink_metadata(path)?;
+            Some((m.dev(), m.ino()))
+        } else {
+            None
+        };
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
             limits,
@@ -282,6 +295,7 @@ impl DurableMailboxService {
             aggregate_meter: None,
             shared,
             path: path.to_owned(),
+            original_socket,
             stop,
             worker: Some(worker),
         })
@@ -727,7 +741,11 @@ impl Drop for DurableMailboxService {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        if self.original_socket.is_none_or(|original| {
+            std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == original)
+        }) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

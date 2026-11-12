@@ -75,7 +75,7 @@ const LOCAL_JOURNAL_LIMITS: JournalLimits = JournalLimits {
 
 /// What the process reads on stdin. `deny_unknown_fields`, so a field a newer
 /// launcher adds fails closed here.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxProcessConfig {
     pub grant: MailboxGrant,
@@ -141,7 +141,7 @@ pub fn serve(config: MailboxProcessConfig) -> i32 {
 }
 
 fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
-    serve_with_lifetime(config, None)
+    serve_with_lifetime(config, None, None)
 }
 
 pub const ORIGINAL_JOURNAL_V1: &str = "--original-journal-v1";
@@ -152,16 +152,23 @@ pub const ORIGINAL_JOURNAL_V1: &str = "--original-journal-v1";
 struct OriginalJournalStartup<C> {
     config: C,
     original_vmm_v1: lifetime::OriginalVmm,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_reader_sha256: Option<[u8; 32]>,
 }
 
 pub fn serve_original_launch(raw: &[u8]) -> Result<()> {
     let launch: OriginalJournalStartup<MailboxProcessConfig> = serde_json::from_slice(raw)?;
-    serve_with_lifetime(launch.config, Some(launch.original_vmm_v1))
+    serve_with_lifetime(
+        launch.config,
+        Some(launch.original_vmm_v1),
+        launch.required_reader_sha256,
+    )
 }
 
 fn serve_with_lifetime(
     config: MailboxProcessConfig,
     lifetime: Option<lifetime::OriginalVmm>,
+    required_reader: Option<[u8; 32]>,
 ) -> Result<()> {
     // SAFETY: `getppid` is async-signal-safe and infallible.
     let launcher = unsafe { libc::getppid() };
@@ -209,6 +216,7 @@ fn serve_with_lifetime(
         return serve_local(
             launcher,
             lifetime,
+            required_reader,
             &plan,
             MailboxProcessConfig {
                 grant,
@@ -249,6 +257,7 @@ fn serve_with_lifetime(
 fn serve_local(
     launcher: libc::pid_t,
     lifetime: Option<lifetime::OriginalVmm>,
+    required_reader: Option<[u8; 32]>,
     plan: &ExecutionPlan,
     config: MailboxProcessConfig,
 ) -> Result<()> {
@@ -338,12 +347,13 @@ fn serve_local(
         retention,
     )
     .map_err(Error::other)?;
-    let reader = reader::load_or_enroll(
+    let reader = reader::load_reader(
         &vm_state_dir,
         &grant,
         binding.clone(),
         &sealer.capability,
         &signer,
+        required_reader,
     )?;
     let mut directed = if let Some(private) = delegated.as_ref() {
         let d = binding.outbound_journal_v1.ok_or_else(|| {
@@ -406,6 +416,7 @@ fn serve_local(
         journal,
         anchor,
         inbound,
+        original.is_some(),
     )?;
     #[cfg(feature = "durable-guest-io-witness")]
     let service = service.with_guest_meter(&vm_state_dir)?;

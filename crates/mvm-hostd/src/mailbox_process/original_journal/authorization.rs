@@ -183,6 +183,15 @@ impl OriginalJournalDestination {
         grants: &JournalCredentials,
         deadline: Instant,
     ) -> Result<std::os::unix::net::UnixStream> {
+        self.check_current_credentials(plan, grants)?;
+        self.connect(deadline)
+    }
+
+    pub(super) fn check_current_credentials(
+        &self,
+        plan: &ExecutionPlan,
+        grants: &JournalCredentials,
+    ) -> Result<()> {
         let grant = plan.mailbox.as_ref().context("source has no mailbox")?;
         let d = grant
             .outbound_journal_v1
@@ -238,8 +247,7 @@ impl OriginalJournalDestination {
             &inbound,
             now,
             d.max_payload_bytes,
-        )?;
-        self.connect(deadline)
+        )
     }
 }
 

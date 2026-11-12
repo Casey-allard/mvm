@@ -67,6 +67,24 @@ A signed outbound journal direction can select `OrdinalV1` for its original send
 
 The versioned application request carries no signing keys. B's durable mailbox admission, B's application ACK and A's retirement are distinct events. This profile disables the arbitrary-ID sender path on A. Original guest state belongs to the admitted boot. Restarting a mailbox helper leaves the guest running. A new guest boot requires fresh admission.
 
+For a local directed journal pair, the installed SDK controller can call
+`OriginalJournalSourceHost::reconnect_helper(JournalHelper::Source, deadline)`
+or select `JournalHelper::Destination`. It first collects that helper's exit
+status and checks both retained VM process identities, boot records, signed
+credentials, revocations and original reader enrollments. The successor opens
+the same journal and returns through the existing mailbox service. The caller
+keeps the same owner for cleanup if startup or readiness fails. A disconnected
+guest operation can still report a transport failure. Its caller retries with
+the original message identity and checks the signed destination receipt.
+
+A vacant service socket can be rebound. On Linux the controller also holds the
+original socket inode and can retire its stale pathname after helper exit.
+The host operator and root are trusted. The executable and its ancestors must be
+protected against modification by other users, including any extended ACLs.
+The SDK checks owner and POSIX mode along the canonical executable path.
+On macOS an occupied pathname refuses recovery. A controller restart loses the
+original process handles and requires separate recovery.
+
 ### Guest telemetry
 
 Every workload boot carries telemetry from the guest to the host by default.

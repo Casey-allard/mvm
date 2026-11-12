@@ -5,7 +5,7 @@ use super::{
 };
 use crate::mailbox_process::paired_incoming::{IncomingJournalAdmission, tests::setup};
 use crate::plan_admission::MailboxLaunchPosture;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use mvm_contract::protocol::mailbox::{MailboxGrant, MailboxJournalDirectionV1};
@@ -60,6 +60,9 @@ fn guest_stream(listener: &UnixListener, until: Instant) -> Result<UnixStream> {
             Err(e) => return Err(e.into()),
         }
     };
+    // Darwin accepts a socket with its listener's O_NONBLOCK flag. The
+    // fixture uses bounded blocking I/O on each individual guest stream.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(4)))?;
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
     let mut command = [0u8; 13];
@@ -211,16 +214,82 @@ fn read_and_ack(
 
 // The helper receives a real, originally observed process generation; this
 // fixture process supplies only lifetime, never a VMM or a guest workload.
-fn lifetime_fixture(name: &str) -> Result<std::process::Child> {
+struct LifetimeFixture(std::process::Child);
+impl std::ops::Deref for LifetimeFixture {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for LifetimeFixture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for LifetimeFixture {
+    fn drop(&mut self) {
+        if self.0.try_wait().is_ok_and(|s| s.is_none()) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+fn lifetime_fixture(name: &str) -> Result<LifetimeFixture> {
     let child = std::process::Command::new("sleep").arg("40").spawn()?;
     std::fs::write(
         mvm_core::config::vm_state_dir(name).join("fc.pid"),
         child.id().to_string(),
     )?;
-    Ok(child)
+    Ok(LifetimeFixture(child))
 }
 
-fn run(ordinal: bool) -> Result<()> {
+// Unlike a running guest agent, the stream fixture only calls accept when
+// the test asks it for one exchange. Hold each original idle connection
+// across its own child exit and check the terminal bytes before replay.
+fn collect_with_idle_dial(
+    listener: &UnixListener,
+    child: &mut std::process::Child,
+    until: Instant,
+) -> Result<std::process::ExitStatus> {
+    // Capture the connected original while its kernel peer identity is
+    // available. Darwin clears LOCAL_PEERPID when a peer has exited.
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                ensure!(Instant::now() < until, "missing original idle dial");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    ensure!(
+        mvm_vmm::host::uds_peer::connected_peer_pid(&stream)? as u32 == child.id()
+            && child.try_wait()?.is_none(),
+        "idle dial does not belong to the live original"
+    );
+    child.kill()?;
+    let status = child.wait()?;
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(
+        until
+            .checked_duration_since(Instant::now())
+            .context("idle dial deadline")?,
+    ))?;
+    let mut bytes = Vec::new();
+    stream.take(14).read_to_end(&mut bytes)?;
+    ensure!(
+        b"CONNECT 5257\n".starts_with(&bytes),
+        "application data on collected dial"
+    );
+    ensure!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "unexpected further dial after original collection"
+    );
+    Ok(status)
+}
+
+fn run(ordinal: bool, reconnect: bool) -> Result<()> {
     let keys = mvm_core::config::mvm_keys_dir();
     mvm_core::private_fs::ensure_private_dir(&keys)?;
     let (b_grant, incoming, _) = setup(&keys);
@@ -316,6 +385,7 @@ fn run(ordinal: bool) -> Result<()> {
         let message =
             OutboxMessage::new(direction.address.recipient, (0..=255).chain([0]).collect());
         let mut receipt = None;
+        let mut original_wire = None;
         let transaction = Instant::now();
         for turn in 0..3 {
             let mut socket = guest_stream(&guest, deadline)?;
@@ -324,20 +394,37 @@ fn run(ordinal: bool) -> Result<()> {
             socket.write_all(&u32::try_from(encoded.len())?.to_be_bytes())?;
             socket.write_all(&encoded)?;
             let mut socket = Some(socket);
-            if turn == 0 {
+            if turn == 0 && !reconnect {
                 drop(socket.take());
             }
+            let mut observed = None;
             let relay = loop {
-                if let Some(value) = a.forward_once_with_counts(deadline)? {
+                if let Some(value) = a.forward_once_observed(deadline, |envelope, reply| {
+                    observed = Some((envelope.clone(), reply.to_vec()));
+                })? {
                     break value;
                 }
                 ensure!(Instant::now() < deadline, "A helper did not request relay");
                 std::thread::sleep(Duration::from_millis(2));
             };
+            let wire = observed.context("missing original sealed turn")?;
+            if let Some(prior) = &original_wire {
+                ensure!(
+                    prior == &wire,
+                    "canonical envelope or raw signed B verdict changed"
+                );
+            } else {
+                original_wire = Some(wire);
+            }
             eprintln!(
                 "ORIGINAL_PAIRED_RELAY turn={turn} sealed_to_b={} b_reply_to_a={}",
                 relay.sealed_to_destination, relay.reply_to_source
             );
+            if reconnect && turn == 0 {
+                // The check discards the original reply only after A sent
+                // the exact request to B, before the application reads it.
+                drop(socket.take());
+            }
             if let Some(socket) = socket {
                 let mut raw = Vec::new();
                 socket.take(4097).read_to_end(&mut raw)?;
@@ -376,6 +463,88 @@ fn run(ordinal: bool) -> Result<()> {
                     message.body.len(),
                     encoded.len() + 4,
                     raw.len()
+                );
+            }
+            if reconnect && turn == 1 {
+                // Repeat an already-receipted immutable envelope after each
+                // originally owned helper has exited, leaving both VMs alive.
+                let which = super::JournalHelper::Source;
+                ensure!(a.reconnect_helper(which, deadline).is_err());
+                let old_a = collect_with_idle_dial(&guest, &mut a.source, deadline)
+                    .context("collecting original A with idle dial")?;
+                let old_b =
+                    collect_with_idle_dial(&b_guest, &mut b.lock().unwrap().child, deadline)
+                        .context("collecting original B with idle dial")?;
+                eprintln!("COLLECTED_DIALS source=1 destination=1");
+                let fresh = OriginalJournalDestination::start_custodied(
+                    &bp,
+                    &backend,
+                    "journal-b",
+                    &posture_b,
+                );
+                ensure!(
+                    fresh.is_err_and(|e| e
+                        .chain()
+                        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                        .any(|cause| cause.kind() == std::io::ErrorKind::WouldBlock)),
+                    "fresh launch unexpectedly bypassed the original ownership fence"
+                );
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // This backend cannot pin a stale socket vnode. The
+                    // fixture models a clean original release only after
+                    // witnessing the conservative refusal on both paths.
+                    ensure!(a.reconnect_helper(which, deadline).is_err());
+                    ensure!(
+                        a.reconnect_helper(super::JournalHelper::Destination, deadline)
+                            .is_err()
+                    );
+                    std::fs::remove_file(mvm_core::config::vm_mailbox_socket_at(&a_state))?;
+                    std::fs::remove_file(mvm_core::config::vm_mailbox_socket_at(
+                        &mvm_core::config::vm_state_dir("journal-b"),
+                    ))?;
+                }
+                let denied = crate::mailbox_process::reader::revocations_path(&a_state);
+                mvm_core::atomic_io::write_private(
+                    &denied,
+                    &serde_json::to_vec(&[incoming.source_scope.grant.revocation_id])?,
+                )?;
+                ensure!(a.reconnect_helper(which, deadline).is_err());
+                std::fs::remove_file(denied)?;
+                let (anchor, original_pid) = {
+                    let b = b.lock().unwrap();
+                    let retained = crate::mailbox_custody::RetainedMailboxKeys::open_existing(
+                        &keys,
+                        &bp,
+                        "journal-b",
+                        &posture_b.handoff(Some(boot_b.boot)),
+                        Some(boot_b.boot),
+                        b.address(),
+                    )?;
+                    (retained.storage_paths(&keys)?.anchor, b.child.id())
+                };
+                let anchor_bytes = std::fs::read(&anchor)?;
+                std::fs::write(&anchor, b"invalid test anchor")?;
+                ensure!(
+                    a.reconnect_helper(super::JournalHelper::Destination, deadline)
+                        .is_err()
+                );
+                let failed_status = {
+                    let mut b = b.lock().unwrap();
+                    ensure!(b.child.id() != original_pid && b.require_ready().is_err());
+                    b.marker.require_original()?;
+                    b.child.wait()?
+                };
+                ensure!(!old_b.success() && !failed_status.success());
+                std::fs::write(&anchor, &anchor_bytes)?;
+                ensure!(
+                    a.reconnect_helper(super::JournalHelper::Destination, deadline)?
+                        == failed_status
+                );
+                ensure!(a.reconnect_helper(which, deadline)? == old_a);
+                ensure!(a_vm.try_wait()?.is_none() && b_vm.try_wait()?.is_none());
+                eprintln!(
+                    "ORIGINAL_RECONNECT both_predecessors_collected=true both_original_vms_live=true current_revocation_refused=true"
                 );
             }
         }
@@ -448,27 +617,43 @@ fn run(ordinal: bool) -> Result<()> {
     Ok(())
 }
 
+// Install this exact test binary in an owner-only directory, just as the
+// production operator does. Cargo's group-writable target is a build output.
+fn run_private_fixture(test_name: &str, guard_env: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let build = exe.parent().unwrap().parent().unwrap().join("mvm-mailbox");
+    let helper = temp.path().join("mvm-mailbox");
+    std::fs::copy(build, &helper).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let selector = format!("mailbox_process::original_journal::paired_process_tests::{test_name}");
+    let status = std::process::Command::new(exe)
+        .arg(selector)
+        .args(["--exact", "--ignored", "--nocapture"])
+        .env(guard_env, "1")
+        .env("MVM_HOME", temp.path())
+        .env("MVM_MAILBOX_PATH", helper)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 #[test]
 #[ignore = "requires the separately compiled mvm-mailbox binary from this exact tree"]
 fn original_a_and_b_helpers_relay_same_sealed_intent_after_lost_guest_reply() {
     const IDENT: &str = "MVM_ORIGINAL_JOURNAL_HOST_COMPONENT";
     if std::env::var_os(IDENT).is_some() {
-        run(false).unwrap();
+        run(false, false).unwrap();
         return;
     }
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
-    let helper = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("mvm-mailbox");
-    assert!(helper.is_file(), "build same-source mvm-mailbox first");
-    let child=std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["mailbox_process::original_journal::paired_process_tests::original_a_and_b_helpers_relay_same_sealed_intent_after_lost_guest_reply","--exact","--ignored","--nocapture"])
-        .env(IDENT,"1").env("MVM_HOME",temp.path()).env("MVM_MAILBOX_PATH",helper).status().unwrap();
-    assert!(child.success());
+    run_private_fixture(
+        "original_a_and_b_helpers_relay_same_sealed_intent_after_lost_guest_reply",
+        IDENT,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -560,15 +745,25 @@ fn ordinal_exchange(
 fn original_helpers_settle_ordinal_only_on_signed_receipt() {
     const IDENT: &str = "MVM_ORIGINAL_ORDINAL_COMPONENT";
     if std::env::var_os(IDENT).is_some() {
-        run(true).unwrap();
+        run(true, false).unwrap();
         return;
     }
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
-    let exe = std::env::current_exe().unwrap();
-    let helper = exe.parent().unwrap().parent().unwrap().join("mvm-mailbox");
-    assert!(helper.is_file());
-    let status=std::process::Command::new(&exe).args([
-        "mailbox_process::original_journal::paired_process_tests::original_helpers_settle_ordinal_only_on_signed_receipt","--exact","--ignored","--nocapture"
-    ]).env(IDENT,"1").env("MVM_HOME",temp.path()).env("MVM_MAILBOX_PATH",helper).status().unwrap();
-    assert!(status.success());
+    run_private_fixture(
+        "original_helpers_settle_ordinal_only_on_signed_receipt",
+        IDENT,
+    );
+}
+
+#[test]
+#[ignore = "requires the separately compiled mvm-mailbox binary from this exact tree"]
+fn original_helper_reconnect_preserves_receipt_under_both_live_vms() {
+    const IDENT: &str = "MVM_ORIGINAL_HELPER_RECONNECT_COMPONENT";
+    if std::env::var_os(IDENT).is_some() {
+        run(false, true).unwrap();
+        return;
+    }
+    run_private_fixture(
+        "original_helper_reconnect_preserves_receipt_under_both_live_vms",
+        IDENT,
+    );
 }
