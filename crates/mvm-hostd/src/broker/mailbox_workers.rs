@@ -2241,6 +2241,63 @@ mod tests {
         }
     }
     #[test]
+    fn paired_installed_budget_preserves_two_particular_admissions_and_one_shared_workspace() {
+        use crate::mailbox_process::installed_profile::{InstalledMailboxProfile, MailboxPair};
+        use std::os::unix::fs::PermissionsExt;
+        use mvm_vmm::host::installed_owner::{InstallationBinding, InstallationKey};
+        let home = tempfile::tempdir().unwrap();
+        let binary = home.path().join("mvm-mailbox");
+        std::fs::write(&binary, b"no children started in this test").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binding = Arc::new(InstallationBinding {
+            root: home.path().join("unused"), generation: 2,
+            key: InstallationKey { installation: [1; 32], profile: [2; 32] },
+        });
+        let pair = MailboxPair::new(["alpha", "beta"]).unwrap();
+        let profile = InstalledMailboxProfile::Pair(pair);
+        let limits = profile.worker_limits();
+        let budget = MailboxWorkerBudget::new(limits).unwrap();
+        let factory = InstalledMailboxWorkerFactory::with_profile(&binary, binding, home.path(), profile).unwrap();
+        let workers = MailboxWorkers::new("local", budget.clone(), Arc::new(factory)).unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let call = |request: &MailboxWorkerRequest| {
+            let envelope = broker_control::sign(ControlRequest::MailboxWorkerV1(Box::new(request.clone())), &key.to_bytes()).unwrap();
+            verify_request(&envelope, &key.verifying_key(), budget.now_unix_ms().unwrap()).unwrap();
+            workers.handle(request)
+        };
+        let request_for = |vm: &str, nonce: u8| {
+            let mut r = request(&budget, "local");
+            r.vm_id = vm.to_owned();
+            r.workload_id = vm.to_owned();
+            r.request_nonce = [nonce; 32];
+            r.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: 2 };
+            r
+        };
+        let baseline = budget.usage().unwrap();
+        assert!(call(&request_for("foreign", 9)).is_err());
+        let mut a = request_for("alpha", 4);
+        let mut b = request_for("beta", 5);
+        let oa = call(&a).unwrap().0.owner;
+        let ob = call(&b).unwrap().0.owner;
+        assert_ne!(oa, ob);
+        assert_eq!(budget.usage().unwrap().bytes, baseline.bytes + 2 * limits.bytes_per_worker);
+        assert_eq!(budget.usage().unwrap().workers, 2);
+        let workspace = workers.reserve_control().unwrap();
+        assert!(budget.usage().unwrap().bytes <= limits.host_bytes);
+        assert!(workers.reserve_control().is_err());
+        drop(workspace);
+        assert!(call(&request_for("alpha", 8)).is_err());
+        b.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: oa.clone() };
+        assert!(call(&b).is_err());
+        a.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: oa };
+        assert_eq!(call(&a).unwrap().0.state, MailboxWorkerState::ReleasedBeforeSpawn);
+        assert_eq!(budget.usage().unwrap().workers, 1);
+        assert!(call(&request_for("foreign", 9)).is_err());
+        b.operation = MailboxWorkerOperation::Query { owner: ob };
+        assert_eq!(call(&b).unwrap().0.state, MailboxWorkerState::Reserved);
+    }
+
+    #[test]
     fn missing_vm_state_before_spawn_allows_signed_release_and_joined_retirement() {
         use std::os::unix::fs::PermissionsExt;
         use mvm_vmm::host::installed_owner::{InstallationBinding, InstallationKey};
