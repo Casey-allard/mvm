@@ -823,7 +823,14 @@ impl MailboxJournal {
                 signer,
             )?);
         }
-        if self.tip.cursor >= self.limits.max_records as u64 {
+        // Local checkpoints advance the authenticated cursor even when they
+        // retire old records. Charge every retained replay identity; append
+        // separately enforces the resident record and byte limits.
+        let at_capacity = match tier {
+            AcceptanceTier::Local => self.seen.len() >= self.limits.max_records,
+            AcceptanceTier::Independent => self.tip.cursor >= self.limits.max_records as u64,
+        };
+        if at_capacity {
             return Err(JournalError::Full);
         }
         let accepted = receipt(match tier {
