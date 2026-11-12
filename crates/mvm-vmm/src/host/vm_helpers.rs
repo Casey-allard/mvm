@@ -61,6 +61,23 @@ mod tests {
     }
 
     #[test]
+    fn paired_original_keeps_epoch_custody_until_owner_collection() {
+        use sha2::{Digest, Sha256};
+        let home = tempfile::tempdir().unwrap();
+        let name = "original";
+        let state = mvm_core::config::vm_state_dir_at(home.path(), name);
+        std::fs::create_dir_all(&state).unwrap();
+        let owner = mvm_core::config::mvm_keys_dir_at(home.path())
+            .join("mailbox-original-owners-v1").join(hex::encode(Sha256::digest(name.as_bytes())));
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(owner.join("mailbox-paired-original-v1"), [1u8; 32]).unwrap();
+        let secret = mvm_core::config::vm_mailbox_secret_at(&state);
+        mvm_core::atomic_io::write_private(&secret, &[8; 32]).unwrap();
+        reap_vm_host_helpers(&state, name);
+        assert_eq!(std::fs::read(secret).unwrap(), [8; 32]);
+    }
+
+    #[test]
     fn the_mailbox_epoch_secret_is_shredded_when_the_vm_is_reaped() {
         let dir = tempfile::tempdir().expect("tempdir");
         let secret = mvm_core::config::vm_mailbox_secret_at(dir.path());
