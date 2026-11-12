@@ -161,6 +161,19 @@ pub fn run_profile(
             return Err(e);
         }
     };
+    if let Some(role) = original.direction.open_immutable_role(
+        &original.owner, &original.config.grant,
+        crate::mailbox_launch::cast_pair::development::EndpointRole::Source,
+    ).map_err(io::Error::other)? {
+        if !paired {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "source Cast requires an installed pair"));
+        }
+        let counts = super::source_ingress::run(original, role, &control, prepare.expected_parent, deadline)?;
+        if let Some(socket) = report {
+            crate::mailbox_service::guest_io::send_original(&socket, &prepare.owner, counts)?;
+        }
+        return Ok(());
+    }
     let role = original
         .direction
         .open_immutable_destination(&original.owner, &original.config.grant)

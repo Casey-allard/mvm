@@ -30,11 +30,18 @@ pub struct OriginalCastBoot<'a> {
 pub struct PreparedOriginalCastBoot {
     owner: MailboxWorkerOwner,
     plan: [u8; 32],
+    validity: std::ops::Range<i64>,
     prior: VerbGrantEnvelope,
     boot: VerbGrantEnvelope,
 }
 
 impl PreparedOriginalCastBoot {
+    /// The authenticated interval intersected across the two original plans,
+    /// all three capabilities, boot grant and direction.
+    pub fn validity(&self) -> std::ops::Range<i64> {
+        self.validity.clone()
+    }
+
     /// Check the signed public projection against the actual private role which
     /// will be delegated to this original helper. Return only the public digest.
     pub fn role_commitment(
@@ -345,6 +352,7 @@ impl OriginalCastBoot<'_> {
         Ok(PreparedOriginalCastBoot {
             owner,
             plan: participant.worker.acquire_request().plan_commitment,
+            validity: bounds,
             prior: original_grant.clone(),
             boot,
         })

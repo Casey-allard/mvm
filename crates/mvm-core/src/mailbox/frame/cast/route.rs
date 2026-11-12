@@ -63,6 +63,13 @@ impl CastChannel {
                 .local_service
                 .is_some_and(|p| p.limits.retained_host_bytes >= bytes)
     }
+    pub fn is_bounded_source(
+        &self,
+        grant: &mvm_contract::protocol::mailbox::MailboxGrant,
+        frame_limit: usize,
+    ) -> bool {
+        &self.source == grant && self.limits.max_frame_bytes as usize <= frame_limit
+    }
     pub fn is_bounded_destination(
         &self,
         grant: &mvm_contract::protocol::mailbox::MailboxGrant,

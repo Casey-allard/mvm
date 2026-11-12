@@ -106,6 +106,8 @@ fn credentials(g: AddressedCastGrants<'_>) -> Result<[u8; 32]> {
 pub(crate) struct PrivateLaunch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     destination: Option<Box<destination::PrivateDestination>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<Box<destination::PrivateDestination>>,
     direction: Option<[u8; 32]>,
     end: End,
     wrapping: [u8; 32],
@@ -141,6 +143,7 @@ impl LaunchCustody {
         let end = End::new(owner, role, scope_hash(scope)?)?;
         let wrapping = Key::random();
         let setup = PrivateLaunch {
+            source: None,
             destination: None,
             direction: None,
             end: end.clone(),
@@ -570,7 +573,7 @@ fn prepare_profile(
             .transpose()?,
     )?;
     if immutable {
-        destination_setup.setup.destination = Some(Box::new(destination::PrivateDestination::new(
+        let bundle = destination::PrivateDestination::new(
             &delivery,
             source.installed.plan.signed(),
             destination.installed.plan.signed(),
@@ -578,7 +581,9 @@ fn prepare_profile(
             grants,
             source.current,
             destination.current,
-        )?));
+        )?;
+        source_setup.setup.source = Some(Box::new(bundle.for_source(&delivery.source)));
+        destination_setup.setup.destination = Some(Box::new(bundle));
     }
     source
         .installed
@@ -598,7 +603,7 @@ fn prepare_profile(
         destination: destination_setup,
     })
 }
-fn issue_scoped(
+fn issue_with_policy(
     channel: &CastChannel,
     source: LaunchCustody,
     destination: LaunchCustody,
@@ -606,6 +611,7 @@ fn issue_scoped(
     source_policy: &OpenContext,
     destination_policy: &OpenContext,
     now: i64,
+    immutable_policy: Option<[u8; 32]>,
 ) -> Result<DirectionDelivery> {
     issue_with_policy(
         channel,

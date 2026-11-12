@@ -50,9 +50,17 @@ fn original_socket_helper_process() {
     let mut owner = String::new();
     input.read_line(&mut owner).unwrap();
     let original = serde_json::from_str(&owner).unwrap();
-    let status = crate::mailbox_process::owned_wire::OwnedStatusV1::ReadyCastDestinationV1 {
-        owner: original,
-        direction_commitment: [42; 32],
+    use crate::mailbox_process::owned_wire::OwnedStatusV1;
+    let status = if std::path::Path::new(&path).ends_with("a") {
+        OwnedStatusV1::ReadyCastSourceV1 {
+            owner: original,
+            direction_commitment: [42; 32],
+        }
+    } else {
+        OwnedStatusV1::ReadyCastDestinationV1 {
+            owner: original,
+            direction_commitment: [42; 32],
+        }
     };
     // Only this child has the write half of the private status socket.
     let body = serde_json::to_vec(&status).unwrap();
@@ -163,6 +171,39 @@ fn lost_peer_reply_keeps_cast_workspace_until_the_original_child_exits() {
     let (a, a_input) = make("a", 1);
     let (b, b_input) = make("b", 2);
     let base = budget.usage().unwrap();
+    let participants = (("a", &a), ("b", &b));
+    let wrong_source = UnixStream::connect(dir.path().join("b")).unwrap();
+    assert!(
+        registry
+            .retain_original_source(participants.0, participants.1, &wrong_source, [42; 32])
+            .is_err()
+    );
+    drop(wrong_source);
+    let first_source = UnixStream::connect(dir.path().join("a")).unwrap();
+    assert!(
+        registry
+            .retain_original_source(participants.0, participants.1, &first_source, [43; 32])
+            .is_err()
+    );
+    assert_eq!(budget.usage().unwrap(), base);
+    registry
+        .retain_original_source(participants.0, participants.1, &first_source, [42; 32])
+        .unwrap();
+    drop(first_source);
+    let reopened = UnixStream::connect(dir.path().join("a")).unwrap();
+    registry
+        .retain_original_source(participants.0, participants.1, &reopened, [42; 32])
+        .unwrap();
+    drop(reopened);
+    assert!(
+        registry
+            .reserve_cast_source(participants.0, participants.1)
+            .is_err()
+    );
+    assert_eq!(
+        budget.usage().unwrap().bytes,
+        base.bytes + cast_credit::CAST_WORK_BYTES
+    );
     let route = registry.reserve_cast(("a", &a), ("b", &b)).unwrap();
     let bytes = (0..=255).chain([0]).collect::<Vec<u8>>();
     let deadline = || Instant::now() + Duration::from_secs(3);
@@ -213,7 +254,7 @@ fn lost_peer_reply_keeps_cast_workspace_until_the_original_child_exits() {
     drop(route);
     assert_eq!(
         budget.usage().unwrap().bytes,
-        base.bytes + cast_credit::CAST_WORK_BYTES,
+        base.bytes + 2 * cast_credit::CAST_WORK_BYTES,
         "lost peer reply prematurely refunded the live original's workspace"
     );
     assert!(registry.reserve_cast(("a", &a), ("b", &b)).is_err());
@@ -243,10 +284,29 @@ fn lost_peer_reply_keeps_cast_workspace_until_the_original_child_exits() {
         assert!(Instant::now() < until);
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(budget.usage().unwrap().bytes, base.bytes);
+    assert_eq!(
+        budget.usage().unwrap().bytes,
+        base.bytes + cast_credit::CAST_WORK_BYTES
+    );
     let mut peer = UnixStream::connect(dir.path().join("a")).unwrap();
     peer.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
     peer.write_all(&bytes).unwrap();
     drop(a_input);
     drop(peer);
+    let until = deadline();
+    loop {
+        let slots = lock(&registry.slots).unwrap();
+        let mut slot = lock(&slots["a"]).unwrap();
+        if collect_child(slot.worker.as_mut().unwrap())
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        drop(slot);
+        drop(slots);
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(budget.usage().unwrap(), base);
 }
