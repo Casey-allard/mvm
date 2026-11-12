@@ -82,6 +82,32 @@ impl OwnedClientBoot {
         }
     }
 
+    /// Borrow both the signed admission and the original activated native owner.
+    /// This accessor never reattaches to a process or looks one up by VM name.
+    pub fn object_participant<'a>(
+        &'a self,
+        boot: &'a mvm_core::mailbox::reader::MailboxReaderBootBinding,
+    ) -> Result<mvm_hostd::mailbox_launch::object_pair::InstalledParticipant<'a>> {
+        let group = self
+            .custody
+            .as_ref()
+            .context("original client custody released")?;
+        let resources = group
+            .resources
+            .as_ref()
+            .context("original admission released")?;
+        Ok(
+            mvm_hostd::mailbox_launch::object_pair::InstalledParticipant {
+                admitted: &resources.admission.admitted,
+                original: group
+                    .runtime
+                    .as_ref()
+                    .context("original runtime not present")?,
+                boot,
+            },
+        )
+    }
+
     pub(crate) fn resources(&self) -> &ClientBootResources {
         self.custody
             .as_ref()

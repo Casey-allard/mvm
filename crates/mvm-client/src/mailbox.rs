@@ -10,6 +10,12 @@
 //! returned, so a read whose entry cannot be written is refused and the
 //! message it took is not delivered.
 
+/// Explicit same-installation object profile inputs for the host SDK. The
+/// ordinary mailbox reader and persistent machine launch retain their own gates.
+pub use mvm_hostd::mailbox_launch::object_pair::{
+    InstalledObjectPair, InstalledParticipant, ObjectPairCredentials, PreparedObjectPair,
+};
+
 use std::path::Path;
 
 use anyhow::{Context, Result};

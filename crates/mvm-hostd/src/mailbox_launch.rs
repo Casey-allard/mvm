@@ -18,6 +18,8 @@
 //! exists. The shred overwrites and unlinks the file; it is not a physical
 //! wipe, and a filesystem may keep the old blocks.
 
+pub mod object_pair;
+
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
