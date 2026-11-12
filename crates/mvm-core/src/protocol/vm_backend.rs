@@ -103,6 +103,9 @@ pub struct BundleBootAssetsPin {
 
 #[derive(Debug, Clone, Default)]
 pub struct VmStartConfig {
+    /// Original in-process installed lifetime retained across this launch.
+    #[cfg(unix)]
+    pub host_lifetime: Option<std::sync::Arc<crate::host_lifetime::HostLifetimeAnchor>>,
     /// VM name (user-provided or auto-generated).
     pub name: String,
     /// Stable registered-template identity for warm-parent compatibility.
