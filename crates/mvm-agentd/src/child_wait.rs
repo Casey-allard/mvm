@@ -28,18 +28,18 @@
 //! each run under the same mutex. So an owner either wins the race and
 //! reads the status from the kernel, or loses it and finds the status
 //! already in the table — there is no interleaving where the status is
-//! observable by neither, and therefore no retry loop. The lock is held
-//! only across non-blocking calls, so a long-lived child never blocks
-//! orphan reaping.
+//! observable by neither, and therefore no retry loop. Original worker and hook launches also hold the mutex across spawn
+//! so a failed exec can be collected by the standard library before a sweep.
+//! Waiting for a live child never holds that mutex.
 //!
 //! Everything degrades to the plain `Child` methods when no reaper is
 //! installed, which is every unit test and every non-PID-1 process.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::process::{Child, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// How often the orphan reaper sweeps. Zombie orphans are harmless while
@@ -69,6 +69,9 @@ static REAPER_RUNNING: AtomicBool = AtomicBool::new(false);
 /// status" are a single atomic step against an owner's own wait.
 #[derive(Default)]
 struct Registry {
+    // This form registers at spawn, before another thread can reap. Each
+    // generation owns its own status even after the kernel reuses the PID.
+    originals: HashMap<i32, Arc<Generation>>,
     owned: HashSet<i32>,
     reaped: HashMap<i32, i32>,
 }
@@ -76,6 +79,145 @@ struct Registry {
 fn registry() -> &'static Mutex<Registry> {
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
     REGISTRY.get_or_init(Mutex::default)
+}
+
+struct Generation {
+    status: OnceLock<ExitStatus>,
+    // Only set for a worker launched as the leader of a fresh process group.
+    process_group: bool,
+}
+
+/// Original status and signal authority for one supervised process.
+#[derive(Clone)]
+pub(crate) struct OriginalProcess {
+    pid: i32,
+    generation: Arc<Generation>,
+}
+
+impl OriginalProcess {
+    /// Check the original generation while holding the reaper lock. An exit
+    /// between this check and kill remains a zombie, so the PID cannot have
+    /// been recycled under our feet.
+    pub(crate) fn signal(&self, signal: i32) -> io::Result<()> {
+        let reg = registry()
+            .lock()
+            .map_err(|_| io::Error::other("child registry poisoned"))?;
+        if self.generation.status.get().is_some() {
+            return Ok(());
+        }
+        if !reg
+            .originals
+            .get(&self.pid)
+            .is_some_and(|v| Arc::ptr_eq(v, &self.generation))
+        {
+            return Err(io::Error::other("original child identity unavailable"));
+        }
+        let target = if self.generation.process_group {
+            -self.pid
+        } else {
+            self.pid
+        };
+        // SAFETY: kill has no pointer arguments. Only the still-held original
+        // child (or its group created at spawn) can be targeted.
+        if unsafe { libc::kill(target, signal) } < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct OriginalChild {
+    pub(crate) child: Child,
+    pub(crate) original: OriginalProcess,
+}
+
+impl OriginalChild {
+    /// std may wait for its own failed-exec child *inside* Command::spawn.
+    /// Cover that interval too, then publish the successful original before
+    /// the PID-1 reaper can consume its exit. Waiting for a running child is
+    /// always outside this critical section.
+    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_registered(command, false)
+    }
+
+    pub(crate) fn spawn_group(command: &mut Command) -> io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        Self::spawn_registered(command, true)
+    }
+
+    fn spawn_registered(command: &mut Command, process_group: bool) -> io::Result<Self> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| io::Error::other("child registry poisoned"))?;
+        let child = command.spawn()?;
+        let original = OriginalProcess {
+            pid: child.id() as i32,
+            generation: Arc::new(Generation {
+                status: OnceLock::new(),
+                process_group,
+            }),
+        };
+        reg.originals
+            .insert(original.pid, original.generation.clone());
+        Ok(Self { child, original })
+    }
+
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| io::Error::other("child registry poisoned"))?;
+        if let Some(status) = self.original.generation.status.get() {
+            return Ok(Some(*status));
+        }
+        if !reg
+            .originals
+            .get(&self.original.pid)
+            .is_some_and(|v| Arc::ptr_eq(v, &self.original.generation))
+        {
+            return Err(io::Error::other("original child status unavailable"));
+        }
+        if self.original.generation.process_group {
+            if peek_exit(libc::P_PID, self.original.pid as libc::id_t)?.is_none() {
+                return Ok(None);
+            }
+            terminate_exited_group(self.original.pid)?;
+        }
+        if let Some(status) = self.child.try_wait()? {
+            let _ = self.original.generation.status.set(status);
+            reg.originals.remove(&self.original.pid);
+            return Ok(Some(status));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        let mut gap = WAIT_POLL_MIN;
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(gap);
+            gap = (gap * 2).min(WAIT_POLL_MAX);
+        }
+    }
+}
+
+impl Drop for OriginalChild {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = registry().lock() {
+            if reg
+                .originals
+                .get(&self.original.pid)
+                .is_some_and(|v| Arc::ptr_eq(v, &self.original.generation))
+            {
+                reg.originals.remove(&self.original.pid);
+            }
+        }
+    }
 }
 
 /// Registration token for a child this process spawned and will wait on.
@@ -179,7 +321,7 @@ pub fn install_orphan_reaper() {
         .name("mvm-orphan-reaper".to_string())
         .spawn(|| {
             loop {
-                reap_in(registry(), waitpid_any);
+                reap_with(registry(), waitpid_any);
                 std::thread::sleep(REAP_INTERVAL);
             }
         });
@@ -257,27 +399,105 @@ fn try_wait_pid_in(
 /// `waitpid` writes the raw status through its out-param and returns the
 /// reaped pid, `0` when children exist but none have exited, or a negative
 /// value when there are none at all — i.e. `waitpid(-1, …, WNOHANG)`.
+#[cfg(test)]
 fn reap_in(reg: &Mutex<Registry>, mut waitpid: impl FnMut(&mut i32) -> i32) {
+    reap_with(reg, |_, raw| waitpid(raw))
+}
+
+fn reap_with(reg: &Mutex<Registry>, mut waitpid: impl FnMut(&Registry, &mut i32) -> i32) {
     let Ok(mut reg) = reg.lock() else {
         return;
     };
     loop {
         let mut raw = 0;
-        let pid = waitpid(&mut raw);
+        let pid = waitpid(&reg, &mut raw);
         if pid <= 0 {
             return;
         }
-        if reg.owned.contains(&pid) {
+        if let Some(exit) = reg.originals.remove(&pid) {
+            let _ = exit.status.set(exit_status_from_raw(raw));
+        } else if reg.owned.contains(&pid) {
             reg.reaped.insert(pid, raw);
         }
     }
 }
 
-fn waitpid_any(raw: &mut i32) -> i32 {
-    // SAFETY: `waitpid` writes only through `raw`, a live caller-owned
-    // `i32`. `WNOHANG` means it never blocks, so the registry lock the
-    // caller holds is held for a bounded, non-blocking span.
-    unsafe { libc::waitpid(-1, raw, libc::WNOHANG) }
+/// WNOWAIT leaves an exited leader in the kernel until we collect its status.
+/// While holding the registry lock its PID (and therefore its original group
+/// ID) cannot be reused by another managed worker.
+fn peek_exit(kind: libc::idtype_t, id: libc::id_t) -> io::Result<Option<i32>> {
+    // SAFETY: zero is valid for siginfo_t. POSIX permits the no-event case
+    // to leave this struct unchanged; a zero si_pid means no pending exit.
+    let mut event: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: event is a writable siginfo_t. All wait options are valid
+        // for this selector; WNOHANG makes the operation nonblocking.
+        let rc = unsafe {
+            libc::waitid(
+                kind,
+                id,
+                &mut event,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: waitid supplies the child PID on an exit notification.
+            let pid = unsafe { event.si_pid() };
+            return Ok((pid > 0).then_some(pid));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn terminate_exited_group(pid: i32) -> io::Result<()> {
+    // SAFETY: this function is called only under the original registry lock
+    // after WNOWAIT identified its unreaped group leader. A same-group
+    // descendant can keep the pipes open even though the leader exited.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if e.raw_os_error() == Some(libc::EPERM) {
+        // Darwin returns EPERM for a group containing only an unreaped
+        // zombie. Accept that case only after the kernel reports exactly
+        // the original leader. A second member or an incomplete result
+        // leaves the group unresolved. No enumeration outside this group.
+        const PROC_PGRP_ONLY: u32 = 2;
+        let mut members = [0i32; 2];
+        // SAFETY: proc_listpids writes at most the supplied byte count.
+        let bytes = unsafe {
+            libc::proc_listpids(
+                PROC_PGRP_ONLY,
+                pid as u32,
+                members.as_mut_ptr().cast(),
+                std::mem::size_of_val(&members) as libc::c_int,
+            )
+        };
+        if bytes == std::mem::size_of_val(&members[0]) as i32 && members[0] == pid {
+            return Ok(());
+        }
+    }
+    Err(e)
+}
+
+fn waitpid_any(reg: &Registry, raw: &mut i32) -> i32 {
+    let Ok(Some(pid)) = peek_exit(libc::P_ALL, 0) else {
+        return 0;
+    };
+    if reg.originals.get(&pid).is_some_and(|g| g.process_group)
+        && terminate_exited_group(pid).is_err()
+    {
+        return 0;
+    }
+    // SAFETY: raw is a writable i32, targeted at the child we just observed.
+    unsafe { libc::waitpid(pid, raw, libc::WNOHANG) }
 }
 
 fn exit_status_from_raw(raw: i32) -> ExitStatus {
@@ -326,6 +546,52 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("child {pid} was never collected");
+    }
+
+    /// The standard library waits for a child that cannot exec, inside
+    /// Command::spawn. Open that interval deterministically on a real fork.
+    #[test]
+    fn original_failed_exec_owns_reaping_until_std_returns_its_error() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::{net::UnixStream, process::CommandExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing_hook = directory.path().join("absent-after_start.sh");
+        let (mut observer, child_barrier) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let launch = std::thread::spawn(move || {
+            let fd = child_barrier.as_raw_fd();
+            let mut command = Command::new(missing_hook);
+            // SAFETY: only the two async-signal-safe I/O syscalls run after
+            // fork. The parent owns both endpoints through spawn completion.
+            unsafe {
+                command.pre_exec(move || {
+                    let mut byte = 1u8;
+                    if libc::write(fd, (&byte as *const u8).cast(), 1) != 1
+                        || libc::read(fd, (&mut byte as *mut u8).cast(), 1) != 1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            OriginalChild::spawn(&mut command).err().map(|e| e.kind())
+        });
+        let mut ready = [0];
+        observer.read_exact(&mut ready).unwrap();
+        // Always release the child before asserting a failure.
+        let excluded = matches!(
+            registry().try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        observer.write_all(&[1]).unwrap();
+        assert_eq!(launch.join().unwrap(), Some(io::ErrorKind::NotFound));
+        assert!(excluded, "the reaper could enter during original exec");
+        let mut later = OriginalChild::spawn(&mut Command::new("/usr/bin/true")).unwrap();
+        assert_eq!(later.wait().unwrap().code(), Some(0));
     }
 
     #[test]

@@ -351,6 +351,11 @@ fn recycle_on_call_count_exceeded() {
     }
     // After 3 calls, the next call should be served by a fresh
     // worker because release saw call_count >= max.
+    wait_until("original worker replaced", || {
+        pool.snapshot()
+            .iter()
+            .any(|s| matches!(s,SlotSnapshot::Idle {pid,..} if *pid!=first_pid))
+    });
     let second_pid = idle_pid(&pool);
     assert_ne!(second_pid, first_pid, "worker recycled after call cap");
 }
@@ -383,6 +388,11 @@ fn wrapper_crash_returns_error_and_recycles() {
     }
 
     // Recycle should have replaced the worker.
+    wait_until("original worker replaced", || {
+        pool.snapshot()
+            .iter()
+            .any(|s| matches!(s,SlotSnapshot::Idle {pid,..} if *pid!=first_pid))
+    });
     let second_pid = idle_pid(&pool);
     assert_ne!(second_pid, first_pid, "crashed worker replaced");
 }
@@ -486,6 +496,11 @@ fn recycle_on_rss_exceeded() {
 
     let _ = dispatch(&pool, b"call-1");
     // After call 1, RSS should be over 10 MiB → worker recycled.
+    wait_until("original worker replaced", || {
+        pool.snapshot()
+            .iter()
+            .any(|s| matches!(s,SlotSnapshot::Idle {pid,..} if *pid!=first_pid))
+    });
     let second_pid = idle_pid(&pool);
     assert_ne!(
         second_pid, first_pid,
@@ -626,4 +641,109 @@ fn wait_for_ready_timeout_leaves_pool_not_ready() {
         pool.dispatch(b"x".to_vec(), CALL_HANG_GUARD_SECS, Vec::new()),
         Err(DispatchError::NotReady)
     ));
+}
+
+/// A private test process runs the real PID-1 reaper so it cannot collect
+/// the Rust test harness's other children. The runner exits voluntarily
+/// after writing one complete response, and the reaper wins the wait.
+#[test]
+fn retained_warm_response_survives_original_child_reaped_between_calls() {
+    const INNER: &str = "MVM_TEST_ORIGINAL_WORKER_REAPER";
+    if std::env::var_os(INNER).is_some() {
+        mvm_agentd::child_wait::install_orphan_reaper();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent-after_start.sh");
+        for _ in 0..4 {
+            assert!(matches!(
+                mvm_agentd::lifecycle_hooks::poll_readiness(&ReadinessConfig::new(&missing)),
+                Err(mvm_agentd::lifecycle_hooks::ReadinessError::ScriptMissing { .. })
+            ));
+        }
+        mvm_agentd::lifecycle_hooks::poll_readiness(&ReadinessConfig::new("/usr/bin/true"))
+            .unwrap();
+        let holder = start_pool_with_behavior(cfg(1, 100, 1024), Some("exit_with_pipe_holder"));
+        let began = Instant::now();
+        let failed = holder.dispatch(b"call".to_vec(), 1, Vec::new()).unwrap();
+        let elapsed = began.elapsed();
+        println!("inherited_output_pipe call_ns={}", elapsed.as_nanos());
+        assert!(matches!(failed.outcome, WorkerOutcome::Error { .. }));
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "same-group holder retained pipe for {elapsed:?}"
+        );
+        holder.shutdown(Duration::ZERO);
+        let pool = start_pool_with_behavior(cfg(1, 100, 1024), Some("crash_after_n=1"));
+        let original = idle_pid(&pool);
+        let body: Vec<u8> = (0u8..=255).chain(std::iter::once(0)).collect();
+        let start = Instant::now();
+        let first = dispatch(&pool, &body);
+        assert_eq!(first.stdout, body);
+        let first_ns = start.elapsed().as_nanos();
+        wait_until("original child collected by the test reaper", || {
+            // Signal zero checks disappearance only; no process is signalled.
+            (unsafe { libc::kill(original as i32, 0) }) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        });
+        let second = Instant::now();
+        assert!(matches!(
+            dispatch(&pool, b"observe transport closure").outcome,
+            WorkerOutcome::Error { .. }
+        ));
+        let second_ns = second.elapsed().as_nanos();
+        let third = dispatch(&pool, &body);
+        assert_eq!(third.stdout, body);
+        println!(
+            "original_worker body=257 first_response_ns={first_ns} stale_pipe_response_ns={second_ns} through_replacement_response_ns={}",
+            start.elapsed().as_nanos()
+        );
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "retained_warm_response_survives_original_child_reaped_between_calls",
+            "--nocapture",
+        ])
+        .env(INNER, "1")
+        .spawn()
+        .unwrap();
+    let limit = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= limit {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("original warm slot failed to return a response/replacement inside 8 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+#[test]
+fn completed_single_call_returns_while_original_drains() {
+    let pool = start_pool_with_behavior(cfg(1, 1, 1024), Some("graceful_retirement"));
+    let original = idle_pid(&pool);
+    let body: Vec<u8> = (0u8..=255).chain(std::iter::once(0)).collect();
+    let started = Instant::now();
+    let response = dispatch(&pool, &body);
+    let response_ns = started.elapsed().as_nanos();
+    assert_eq!(response.stdout, body);
+    // The complete response is available before the old worker's grace
+    // ends, and the slot remains unavailable until it is actually collected.
+    let before = pool.snapshot();
+    println!("completed_response body=257 elapsed_ns={response_ns} slot={before:?}");
+    assert!(matches!(before.as_slice(), [SlotSnapshot::Busy]));
+    wait_until("replacement after original collection", || {
+        pool.snapshot()
+            .iter()
+            .any(|slot| matches!(slot,SlotSnapshot::Idle{pid,..} if *pid!=original))
+    });
+    println!(
+        "completed_response through_replacement_ns={}",
+        started.elapsed().as_nanos()
+    );
+    pool.shutdown(Duration::ZERO);
 }

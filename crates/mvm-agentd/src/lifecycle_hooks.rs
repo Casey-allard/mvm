@@ -25,7 +25,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 const EXECUTABLE_BUSY_RETRIES: usize = 3;
@@ -86,42 +86,27 @@ impl HookRunner for RealHookRunner {
     type Child = RealHookChild;
 
     fn status(&self, script_path: &Path) -> io::Result<HookExit> {
-        let mut command = Command::new(script_path);
-        crate::fd_hygiene::configure_close_fds(&mut command, 3, None);
-        crate::workload_seccomp::confine(&mut command);
-        command.status().map(HookExit::from)
+        self.spawn(script_path)?.wait()
     }
 
     fn spawn(&self, script_path: &Path) -> io::Result<Self::Child> {
         let mut command = Command::new(script_path);
         crate::fd_hygiene::configure_close_fds(&mut command, 3, None);
         crate::workload_seccomp::confine(&mut command);
-        command.spawn().map(|child| RealHookChild {
-            _owned: crate::child_wait::OwnedChild::new(child.id()),
-            child,
-        })
+        crate::child_wait::OriginalChild::spawn(&mut command).map(RealHookChild)
     }
 }
 
-/// The hook's child plus the token that keeps PID 1's orphan reaper
-/// publishing its exit status rather than discarding it. The token is
-/// never read — dropping it alongside the child is the whole contract.
-struct RealHookChild {
-    child: Child,
-    _owned: crate::child_wait::OwnedChild,
-}
-
+struct RealHookChild(crate::child_wait::OriginalChild);
 impl HookChild for RealHookChild {
     fn try_wait(&mut self) -> io::Result<Option<HookExit>> {
-        crate::child_wait::try_wait(&mut self.child).map(|status| status.map(HookExit::from))
+        self.0.try_wait().map(|status| status.map(HookExit::from))
     }
-
     fn kill(&mut self) -> io::Result<()> {
-        self.child.kill()
+        self.0.original.signal(libc::SIGKILL)
     }
-
     fn wait(&mut self) -> io::Result<HookExit> {
-        crate::child_wait::wait(&mut self.child).map(HookExit::from)
+        self.0.wait().map(HookExit::from)
     }
 }
 
