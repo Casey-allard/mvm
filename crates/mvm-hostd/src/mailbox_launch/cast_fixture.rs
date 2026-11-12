@@ -22,6 +22,18 @@ use mvm_core::{
 };
 use std::{path::Path, time::Instant};
 
+/// Explicit grant requested by this fixture before the plan is signed.
+pub fn local_service() -> local_service::MailboxLocalServiceGrant {
+    let mut service = local_service::MailboxLocalServiceGrant::reliable_v1();
+    service.limits.payload_bytes = 1024;
+    service.limits.max_frame_bytes = 4096;
+    service.limits.spooled_requests = 1;
+    service.limits.queued_messages = 1;
+    service.limits.active_calls = 1;
+    service.limits.retained_guest_bytes = 8192;
+    service.limits.retained_host_bytes = 16 * 1024;
+    service
+}
 pub struct ReservedFixture<'a> {
     pub original: InstalledCastParticipant<'a>,
     pub config: &'a VmStartConfig,
@@ -138,7 +150,7 @@ pub fn prepare(
             "fixture must own original reservation"
         );
         ensure!(
-            r.mailbox_grant.local_service.is_some(),
+            r.mailbox_grant.local_service == Some(local_service()),
             "actual signed local mailbox service absent"
         );
     }
