@@ -209,6 +209,17 @@ fn read_and_ack(
     Ok(())
 }
 
+// The helper receives a real, originally observed process generation; this
+// fixture process supplies only lifetime, never a VMM or a guest workload.
+fn lifetime_fixture(name: &str) -> Result<std::process::Child> {
+    let child = std::process::Command::new("sleep").arg("40").spawn()?;
+    std::fs::write(
+        mvm_core::config::vm_state_dir(name).join("fc.pid"),
+        child.id().to_string(),
+    )?;
+    Ok(child)
+}
+
 fn run() -> Result<()> {
     let keys = mvm_core::config::mvm_keys_dir();
     mvm_core::private_fs::ensure_private_dir(&keys)?;
@@ -217,7 +228,15 @@ fn run() -> Result<()> {
     let backend = AnyBackend::from_hypervisor("firecracker");
     let (bp, boot_b, posture_b, ack_b) = original_plan("journal-b", b_grant)?;
     let b_guest = fixture_listener(&mvm_core::config::vm_state_dir("journal-b"))?;
-    let b = OriginalJournalDestination::start(&bp, &backend, "journal-b", &posture_b)?;
+    // An installed SDK B refuses before creating a helper when the original
+    // VMM cannot be observed. Only this explicit test fixture may omit it.
+    ensure!(
+        OriginalJournalDestination::start_custodied(&bp, &backend, "journal-b", &posture_b)
+            .is_err()
+    );
+    let mut b_vm = lifetime_fixture("journal-b")?;
+    let b = OriginalJournalDestination::start_custodied(&bp, &backend, "journal-b", &posture_b)?;
+    b.require_ready()?;
     let signed_recv = b.original_receive()?.clone();
     let grants = Arc::new(JournalCredentials {
         source_scope: incoming.source_scope.clone(),
@@ -278,7 +297,14 @@ fn run() -> Result<()> {
     let guest = fixture_listener(&a_state)?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let admission = PairedJournalAdmission::new(b.clone(), grants, deadline);
-    let mut a = admission.launch_original_source(&ap, &backend, "journal-a", &posture_a)?;
+    ensure!(
+        admission
+            .launch_custodied_source(&ap, &backend, "journal-a", &posture_a)
+            .is_err()
+    );
+    let mut a_vm = lifetime_fixture("journal-a")?;
+    let mut a = admission.launch_custodied_source(&ap, &backend, "journal-a", &posture_a)?;
+    a.require_ready()?;
     let message = OutboxMessage::new(direction.address.recipient, (0..=255).chain([0]).collect());
     let mut receipt = None;
     let transaction = Instant::now();
@@ -357,25 +383,57 @@ fn run() -> Result<()> {
         "ORIGINAL_TRANSACTION first_connection_through_b_ack_ns={}",
         transaction.elapsed().as_nanos()
     );
-    drop(guest);
+    // A holds a real mux connection waiting for the next guest frame. B has
+    // no listener and may be in reconnect backoff. The SDK and both original
+    // state directories stay alive throughout. Stop only A first.
+    let _a_idle = guest_stream(&guest, deadline)?;
     drop(b_guest);
-
-    // Withdraw only the synthetic runtime state from this fixture. The helpers
-    // observe this normally and the caller waits on the real original handles.
-    for name in ["journal-a", "journal-b"] {
-        let state = mvm_core::config::vm_state_dir(name);
-        std::fs::rename(&state, state.with_file_name(format!("{name}-retired")))?;
-    }
-    let until = Instant::now() + Duration::from_secs(9);
+    let before = Instant::now();
+    a_vm.kill()?;
+    a_vm.wait()?;
+    let until = Instant::now() + Duration::from_secs(2);
+    let outcome = loop {
+        if let Some(status) = a.try_collect()? {
+            break status;
+        }
+        ensure!(
+            Instant::now() < until,
+            "original A did not retire with its VMM"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    ensure!(outcome.success() && b.lock().unwrap().try_collect()?.is_none());
+    eprintln!(
+        "ORIGINAL_A_UNASSISTED_EXIT_NS={}",
+        before.elapsed().as_nanos()
+    );
+    ensure!(b_vm.try_wait()?.is_none());
+    let before = Instant::now();
+    b_vm.kill()?;
+    b_vm.wait()?;
+    let until = Instant::now() + Duration::from_secs(2);
     loop {
-        let ea = a.try_collect()?;
-        let eb = b.lock().unwrap().try_collect()?;
-        if let (Some(a), Some(b)) = (ea, eb) {
-            ensure!(a.success() && b.success());
+        if let Some(status) = b.lock().unwrap().try_collect()? {
+            ensure!(status.success());
             break;
         }
-        ensure!(Instant::now() < until, "original helpers did not retire");
-        std::thread::sleep(Duration::from_millis(20));
+        ensure!(
+            Instant::now() < until,
+            "original B did not retire with its VMM"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    eprintln!(
+        "ORIGINAL_B_UNASSISTED_EXIT_NS={}",
+        before.elapsed().as_nanos()
+    );
+    for name in ["journal-a", "journal-b"] {
+        ensure!(mvm_core::config::vm_state_dir(name).is_dir());
+        ensure!(
+            mvm_core::config::vm_mailbox_original_owner_at(&keys, name)
+                .join(super::MARKER)
+                .exists()
+        );
     }
     Ok(())
 }

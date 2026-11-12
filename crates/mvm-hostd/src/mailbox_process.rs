@@ -49,6 +49,7 @@ use crate::mailbox_service::durable::DurableMailboxService;
 use crate::plan_admission::{MailboxLaunchPosture, MailboxPostureHandoff};
 use crate::vm_lifetime::{endpoint_needed, launcher_is_alive};
 
+mod lifetime;
 pub mod original_journal;
 pub mod paired_incoming;
 pub(crate) mod reader;
@@ -136,6 +137,28 @@ pub fn serve(config: MailboxProcessConfig) -> i32 {
 }
 
 fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
+    serve_with_lifetime(config, None)
+}
+
+pub const ORIGINAL_JOURNAL_V1: &str = "--original-journal-v1";
+
+/// This private original-launch message is never a guest or relay frame.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalJournalStartup<C> {
+    config: C,
+    original_vmm_v1: lifetime::OriginalVmm,
+}
+
+pub fn serve_original_launch(raw: &[u8]) -> Result<()> {
+    let launch: OriginalJournalStartup<MailboxProcessConfig> = serde_json::from_slice(raw)?;
+    serve_with_lifetime(launch.config, Some(launch.original_vmm_v1))
+}
+
+fn serve_with_lifetime(
+    config: MailboxProcessConfig,
+    lifetime: Option<lifetime::OriginalVmm>,
+) -> Result<()> {
     // SAFETY: `getppid` is async-signal-safe and infallible.
     let launcher = unsafe { libc::getppid() };
     let MailboxProcessConfig {
@@ -181,6 +204,7 @@ fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
     if posture.variant() == Variant::Prod {
         return serve_local(
             launcher,
+            lifetime,
             &plan,
             MailboxProcessConfig {
                 grant,
@@ -194,7 +218,7 @@ fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
             },
         );
     }
-    if posture.variant() != Variant::Dev {
+    if posture.variant() != Variant::Dev || lifetime.is_some() {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             "invalid mailbox posture",
@@ -220,6 +244,7 @@ fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
 
 fn serve_local(
     launcher: libc::pid_t,
+    lifetime: Option<lifetime::OriginalVmm>,
     plan: &ExecutionPlan,
     config: MailboxProcessConfig,
 ) -> Result<()> {
@@ -233,6 +258,12 @@ fn serve_local(
         reader_boot,
         vm_state_dir,
     } = config;
+    let original = lifetime.map(lifetime::OriginalVmm::observe).transpose()?;
+    let active = || match &original {
+        Some(lifetime) => vm_state_dir.exists() && lifetime.alive_until(std::time::Instant::now()),
+        None => keep_serving(launcher, &vm_state_dir),
+    };
+
     let posture = posture.ok_or_else(|| {
         Error::new(
             ErrorKind::PermissionDenied,
@@ -388,20 +419,26 @@ fn serve_local(
         ));
     }
     std::io::stdout().write_all(READY_MARKER)?;
-    while keep_serving(launcher, &vm_state_dir) {
+    while active() {
         if service
-            .serve_guest_while(&route, &mut sealer, &mut turn, || {
-                keep_serving(launcher, &vm_state_dir)
-            })
+            .serve_guest_while(&route, &mut sealer, &mut turn, active)
             .is_err()
         {
-            std::thread::sleep(POLL_INTERVAL);
+            if let Some(lifetime) = &original {
+                lifetime.alive_until(std::time::Instant::now() + POLL_INTERVAL);
+            } else {
+                std::thread::sleep(POLL_INTERVAL);
+            }
         }
         match service.maintain_local() {
             Ok(()) | Err(JournalError::MaintenancePending) => {}
             Err(error) => return Err(Error::other(error)),
         }
     }
+    if let Some(lifetime) = original {
+        lifetime.finish()?;
+    }
+
     Ok(())
 }
 
@@ -721,7 +758,10 @@ fn serving_command() -> Result<Command> {
 
 // Keep this handshake separate from exec: a rejected configuration can have
 // a real Child while a failed executable lookup or failed exec has none.
-fn configure_serving(config: &MailboxProcessConfig, child: &mut std::process::Child) -> Result<()> {
+fn configure_serving(
+    config: &impl serde::Serialize,
+    child: &mut std::process::Child,
+) -> Result<()> {
     let mut stdin = child
         .stdin
         .take()

@@ -15,8 +15,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone, Copy)]
+pub(super) enum VmmMode {
+    Installed,
+    #[cfg(test)]
+    HelperFixture,
+}
+
 pub(super) struct StopCustody {
     state: File,
+    split_socket: Option<(std::path::PathBuf, File)>,
     kind: BackendKind,
     // Component-only helper fixtures need no VMM. A real typed stop always
     // requires the originally observed kernel identity before touching a VMM.
@@ -26,7 +34,6 @@ pub(super) struct StopCustody {
     kernel_exit_observed: bool,
     assisted: bool,
     sdk_cleanup: Option<ExitStatus>,
-    pub(super) stop_started: bool,
 }
 
 impl StopCustody {
@@ -34,23 +41,42 @@ impl StopCustody {
         config: &crate::mailbox_process::MailboxProcessConfig,
         backend: &AnyBackend,
         name: &str,
+        mode: VmmMode,
     ) -> Result<Self> {
         let state = File::options()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
             .open(&config.vm_state_dir)?;
-        let vmm = backend
-            .host_process_id(&VmId(name.into()))
-            .ok()
-            .flatten()
-            .map(EndpointPid::of_child)
-            .filter(EndpointPid::is_live_and_ours)
-            .and_then(|original| {
-                let observer = ProcessExitObserver::arm(original.pid).ok()?;
-                original.is_live_and_ours().then_some((original, observer))
-            });
+        let socket_dir = mvm_core::config::vm_socket_dir_at(&config.vm_state_dir);
+        let split_socket = if socket_dir != config.vm_state_dir {
+            let fd = File::options()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(&socket_dir)?;
+            Some((socket_dir, fd))
+        } else {
+            None
+        };
+        let vmm = match mode {
+            VmmMode::Installed => {
+                let pid = backend
+                    .host_process_id(&VmId(name.into()))?
+                    .context("no installed VMM process to observe")?;
+                let original = EndpointPid::of_child(pid);
+                ensure!(original.is_live_and_ours(), "no live original VMM identity");
+                let observer = ProcessExitObserver::arm(original.pid)?;
+                ensure!(
+                    original.is_live_and_ours(),
+                    "original VMM changed while arming observer"
+                );
+                Some((original, observer))
+            }
+            #[cfg(test)]
+            VmmMode::HelperFixture => None,
+        };
         Ok(Self {
             state,
+            split_socket,
             kind: backend.kind(),
             vmm,
             sdk_abort_confirmed: false,
@@ -58,8 +84,52 @@ impl StopCustody {
             kernel_exit_observed: false,
             assisted: false,
             sdk_cleanup: None,
-            stop_started: false,
         })
+    }
+    pub(super) fn spawn_helper(
+        &self,
+        config: &crate::mailbox_process::MailboxProcessConfig,
+        owner_dir: &std::path::Path,
+    ) -> Result<(Child, OriginalMarker, Option<String>)> {
+        let mut command = super::super::serving_command()?;
+        let original = self
+            .vmm
+            .as_ref()
+            .map(|(id, _)| super::super::lifetime::OriginalVmm::from_held(*id))
+            .transpose()?;
+        if original.is_some() {
+            command.arg(super::super::ORIGINAL_JOURNAL_V1);
+        }
+        let (mut child, marker) = super::spawn_claimed(owner_dir, command)?;
+        let readiness = match original {
+            Some(original_vmm_v1) => super::super::configure_serving(
+                &super::super::OriginalJournalStartup {
+                    config,
+                    original_vmm_v1,
+                },
+                &mut child,
+            ),
+            None => super::super::configure_serving(config, &mut child),
+        };
+        Ok((child, marker, readiness.err().map(|e| e.to_string())))
+    }
+    pub(super) fn observe_helper(
+        &self,
+        marker: &mut OriginalMarker,
+        child: &mut Child,
+    ) -> std::io::Result<Option<ExitStatus>> {
+        if self.vmm.is_some() {
+            return child.try_wait(); // Durable original claim survives through typed SDK cleanup.
+        }
+        #[cfg(test)]
+        {
+            return marker.collect(child);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = marker;
+            Err(std::io::Error::other("missing installed VMM custody"))
+        }
     }
 }
 
@@ -158,12 +228,10 @@ impl JournalOwner<'_> {
             });
         }
         let same_state = || -> Result<()> {
-            let held = state.state.metadata()?;
-            let current = std::fs::symlink_metadata(&dir)?;
-            ensure!(
-                current.is_dir() && (held.dev(), held.ino()) == (current.dev(), current.ino()),
-                "VM runtime directory changed since original launch"
-            );
+            require_directory(&state.state, &dir)?;
+            if let Some((path, fd)) = &state.split_socket {
+                require_directory(fd, path)?;
+            }
             Ok(())
         };
         same_state()?;
@@ -190,7 +258,6 @@ impl JournalOwner<'_> {
             .vmm
             .as_ref()
             .context("no original kernel process identity")?;
-        state.stop_started = true;
         if !state.vm_stopped && !state.sdk_abort_confirmed {
             let backend =
                 AnyBackend::for_started_vm(name).context("original VMM backend is unavailable")?;
@@ -225,6 +292,16 @@ impl JournalOwner<'_> {
     }
 }
 
+fn require_directory(original: &File, path: &std::path::Path) -> Result<()> {
+    let held = original.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    ensure!(
+        current.is_dir() && (held.dev(), held.ino()) == (current.dev(), current.ino()),
+        "VM runtime or socket directory changed since original launch"
+    );
+    Ok(())
+}
+
 fn collect_after_vm(
     observer: &ProcessExitObserver,
     kernel_exit_observed: &mut bool,
@@ -239,7 +316,14 @@ fn collect_after_vm(
         );
         *kernel_exit_observed = true;
     }
-    let natural = Instant::now() + Duration::from_millis(250);
+    // Allow one admitted in-flight exchange to unwind. An idle helper wakes
+    // on kernel exit during backoff or at its next first-byte poll. Reserve a
+    // short collection interval inside the caller's existing total deadline.
+    let now = Instant::now();
+    let remaining = until.saturating_duration_since(now);
+    let reserve = Duration::from_millis(250).min(remaining / 4);
+    let natural =
+        now + (remaining - reserve).min(crate::mailbox_service::durable::GUEST_EXCHANGE_TIMEOUT);
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
@@ -258,6 +342,52 @@ fn collect_after_vm(
 mod tests {
     use super::*;
     use std::process::Command;
+    #[test]
+    fn observed_helper_exit_keeps_the_original_claim_while_its_vm_lives() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut marker = OriginalMarker::claim(directory.path()).unwrap();
+        let mut vm = Command::new("sleep").arg("15").spawn().unwrap();
+        let pid = EndpointPid::of_child(vm.id());
+        let original = StopCustody {
+            state: File::open(directory.path()).unwrap(),
+            split_socket: None,
+            kind: BackendKind::Firecracker,
+            vmm: Some((pid, ProcessExitObserver::arm(pid.pid).unwrap())),
+            sdk_abort_confirmed: false,
+            vm_stopped: false,
+            kernel_exit_observed: false,
+            assisted: false,
+            sdk_cleanup: None,
+        };
+        let mut helper = Command::new("true").spawn().unwrap();
+        helper.wait().unwrap();
+        assert!(
+            original
+                .observe_helper(&mut marker, &mut helper)
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert!(marker.path.exists());
+        assert!(vm.try_wait().unwrap().is_none());
+        vm.kill().unwrap();
+        vm.wait().unwrap();
+    }
+
+    #[test]
+    fn replaced_socket_directory_cannot_be_cleaned_as_the_original() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("socket");
+        std::fs::create_dir(&path).unwrap();
+        let original = File::open(&path).unwrap();
+        require_directory(&original, &path).unwrap();
+        std::fs::rename(&path, root.path().join("old")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"replacement").unwrap();
+        assert!(require_directory(&original, &path).is_err());
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"replacement");
+    }
+
     #[test]
     fn unresolved_vmm_keeps_actual_helper_until_original_kernel_exit() {
         let directory = tempfile::tempdir().unwrap();
