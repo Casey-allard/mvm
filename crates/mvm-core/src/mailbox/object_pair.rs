@@ -156,6 +156,8 @@ impl<'a> ObjectPairV1<'a> {
     fn current(&self, now: i64, state: PairAuthorityState<'_>) -> Result<()> {
         ensure!(
             (self.start..self.end).contains(&now)
+                && state.caller_boot == self.caller_boot
+                && state.callee_boot == self.callee_boot
                 && state.caller_epoch == self.grants.reply.grant.minimum_execution_epoch
                 && state.callee_epoch == self.grants.call.grant.minimum_execution_epoch
                 && state.caller_policy == self.grants.reply.grant.policy_epoch
@@ -297,9 +299,11 @@ impl<'a> ObjectPairV1<'a> {
     }
 }
 
-/// Current epochs and revocations supplied independently by the two original authorities.
+/// Live boots, current epochs and revocations supplied by the two trusted original owners on this turn.
 #[derive(Clone, Copy)]
 pub struct PairAuthorityState<'a> {
+    pub caller_boot: BootId,
+    pub callee_boot: BootId,
     pub caller_epoch: ExecutionEpoch,
     pub callee_epoch: ExecutionEpoch,
     pub caller_policy: u64,

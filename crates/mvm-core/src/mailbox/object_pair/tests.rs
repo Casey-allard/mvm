@@ -5,8 +5,10 @@ use crate::plan::{sign_plan, test_support::PlanFixture};
 use ed25519_dalek::SigningKey;
 
 const NOW: i64 = 1_800_000_000_000;
-fn current() -> PairAuthorityState<'static> {
+fn live(caller_boot: BootId, callee_boot: BootId) -> PairAuthorityState<'static> {
     PairAuthorityState {
+        caller_boot,
+        callee_boot,
         caller_epoch: ExecutionEpoch::new(1).unwrap(),
         callee_epoch: ExecutionEpoch::new(1).unwrap(),
         caller_policy: 12,
@@ -199,7 +201,8 @@ fn original_enrollment_and_correlated_verified_envelopes() {
         boot: &bb,
         trusted_signers: &[("original", &bk)],
     };
-    let pair = ObjectPairV1::check_originals(&ae, &be, selected, NOW, current()).unwrap();
+    let pair =
+        ObjectPairV1::check_originals(&ae, &be, selected, NOW, live(ab.boot, bb.boot)).unwrap();
     let mut stripped = ab.clone();
     stripped.durable_object_pair_sha256_v1 = None;
     assert!(
@@ -211,7 +214,7 @@ fn original_enrollment_and_correlated_verified_envelopes() {
             &be,
             selected,
             NOW,
-            current()
+            live(ab.boot, bb.boot)
         )
         .is_err()
     );
@@ -224,10 +227,10 @@ fn original_enrollment_and_correlated_verified_envelopes() {
     let br = &Key::from_bytes([61; 32]);
     let mut calls = InMemoryReplayProtector::default();
     let pending = pair
-        .pending_call(call(), NOW, current(), ar, &mut calls)
+        .pending_call(call(), NOW, live(ab.boot, bb.boot), ar, &mut calls)
         .unwrap();
     assert!(
-        pair.pending_call(call(), NOW, current(), ar, &mut calls)
+        pair.pending_call(call(), NOW, live(ab.boot, bb.boot), ar, &mut calls)
             .is_err()
     );
     let revoked = [r.grant.revocation_id];
@@ -241,14 +244,21 @@ fn original_enrollment_and_correlated_verified_envelopes() {
             &mut InMemoryReplayProtector::default(),
         )
     };
-    assert!(check(sealed(&r, bb.boot, None, NOW - 1, 88, 60), NOW, current()).is_ok());
+    assert!(
+        check(
+            sealed(&r, bb.boot, None, NOW - 1, 88, 60),
+            NOW,
+            live(ab.boot, bb.boot)
+        )
+        .is_ok()
+    );
     for msg in [
         sealed(&r, bb.boot, None, NOW - 1, 88, 77),
         sealed(&r, bb.boot, None, NOW - 1, 89, 60),
         sealed(&r, ab.boot, None, NOW - 1, 88, 60),
         sealed(&r, bb.boot, None, NOW - 3, 88, 60),
     ] {
-        assert!(check(msg, NOW, current()).is_err());
+        assert!(check(msg, NOW, live(ab.boot, bb.boot)).is_err());
     }
     assert!(
         check(
@@ -256,7 +266,7 @@ fn original_enrollment_and_correlated_verified_envelopes() {
             NOW,
             PairAuthorityState {
                 at_caller: &revoked,
-                ..current()
+                ..live(ab.boot, bb.boot)
             }
         )
         .is_err()
@@ -265,12 +275,35 @@ fn original_enrollment_and_correlated_verified_envelopes() {
         check(
             sealed(&r, bb.boot, None, NOW - 1, 88, 60),
             NOW + 5_000,
-            current()
+            live(ab.boot, bb.boot)
         )
         .is_err()
     );
     let mut replay = InMemoryReplayProtector::default();
     let original_reply = || sealed(&r, bb.boot, None, NOW - 1, 88, 60);
+    for replacement in [
+        PairAuthorityState {
+            caller_boot: BootId::from_bytes([99; 32]),
+            ..live(ab.boot, bb.boot)
+        },
+        PairAuthorityState {
+            callee_boot: BootId::from_bytes([99; 32]),
+            ..live(ab.boot, bb.boot)
+        },
+    ] {
+        assert!(
+            pair.check_reply(
+                &pending,
+                original_reply(),
+                NOW,
+                replacement,
+                br,
+                &mut replay
+            )
+            .is_err()
+        );
+    }
+
     assert!(
         pair.check_reply(
             &pending,
@@ -278,7 +311,7 @@ fn original_enrollment_and_correlated_verified_envelopes() {
             NOW,
             PairAuthorityState {
                 caller_policy: 13,
-                ..current()
+                ..live(ab.boot, bb.boot)
             },
             br,
             &mut replay
@@ -290,19 +323,33 @@ fn original_enrollment_and_correlated_verified_envelopes() {
             &pending,
             sealed(&r, bb.boot, None, NOW - 1, 88, 99),
             NOW,
-            current(),
+            live(ab.boot, bb.boot),
             br,
             &mut replay
         )
         .is_err()
     );
     assert!(
-        pair.check_reply(&pending, original_reply(), NOW, current(), br, &mut replay)
-            .is_ok()
+        pair.check_reply(
+            &pending,
+            original_reply(),
+            NOW,
+            live(ab.boot, bb.boot),
+            br,
+            &mut replay
+        )
+        .is_ok()
     );
     assert!(
-        pair.check_reply(&pending, original_reply(), NOW, current(), br, &mut replay)
-            .is_err()
+        pair.check_reply(
+            &pending,
+            original_reply(),
+            NOW,
+            live(ab.boot, bb.boot),
+            br,
+            &mut replay
+        )
+        .is_err()
     );
     let wrong = ReplyRoute {
         address: c.grant.address,
@@ -312,7 +359,7 @@ fn original_enrollment_and_correlated_verified_envelopes() {
         pair.pending_call(
             sealed(&c, ab.boot, Some(wrong), NOW - 2, 88, 70),
             NOW,
-            current(),
+            live(ab.boot, bb.boot),
             ar,
             &mut InMemoryReplayProtector::default()
         )
@@ -346,7 +393,7 @@ fn grants_and_both_original_signed_plans_are_required() {
             },
             pair,
             NOW,
-            current(),
+            live(ab.boot, bb.boot),
         )
         .is_ok()
     };
