@@ -293,6 +293,29 @@ fn signed_source(now: i64) -> (SignedObjectRoleV1, SigningKey, SigningKey) {
     (role, a_key, b_key)
 }
 
+struct Counted {
+    stream: UnixStream,
+    read: u64,
+    wrote: u64,
+}
+impl Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.stream.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+impl Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.stream.write(buf)?;
+        self.wrote += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 #[test]
 fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers() {
     use mvm_core::mailbox::{reader_wire::ObjectSubmissionV1, sign_receipt};
@@ -364,15 +387,24 @@ fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers(
         receipt: Box::new(sign_receipt(body.clone(), &b).unwrap()),
     };
     let status = ApplicationReaderRequest::ObjectSubmissionStatusV1 { pair, message_id };
-    let attempt = |reader: &Arc<GuestReader>, response: Option<&ReaderResponse>| {
+    let attempt = |name: &str, reader: &Arc<GuestReader>, response: Option<&ReaderResponse>| {
         std::thread::scope(|s| {
             let (mut app, mut svc) = UnixStream::pair().unwrap();
             let (tx, rx) = mpsc::sync_channel(1);
             let client = s.spawn(move || application_request(&mut svc, &tx, reader));
             write_application_request(&mut app, &status).unwrap();
             let pending = rx.recv_timeout(LOCAL_TIMEOUT).unwrap();
-            let (mut host, mut guest) = UnixStream::pair().unwrap();
-            let guest = s.spawn(move || exchange(&mut guest, pending));
+            let (mut host, guest) = UnixStream::pair().unwrap();
+            let start = Instant::now();
+            let guest = s.spawn(move || {
+                let mut counted = Counted {
+                    stream: guest,
+                    read: 0,
+                    wrote: 0,
+                };
+                exchange(&mut counted, pending).unwrap();
+                (counted.wrote, counted.read)
+            });
             assert_eq!(
                 read_request(&mut host).unwrap(),
                 ReaderRequest::SubmitObjectV1 {
@@ -384,29 +416,34 @@ fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers(
                 write_response(&mut host, r).unwrap();
             }
             drop(host);
-            guest.join().unwrap().unwrap();
-            client.join().unwrap().unwrap()
+            let (to_host, to_guest) = guest.join().unwrap();
+            let reply = client.join().unwrap().unwrap();
+            eprintln!(
+                "OBJECT_SUBMISSION sample={name} source_to_host={to_host} host_to_source={to_guest} elapsed_ns={}",
+                start.elapsed().as_nanos()
+            );
+            reply
         })
     };
     assert_eq!(
-        attempt(&reader, None),
+        attempt("lost", &reader, None),
         ReaderResponse::ObjectPendingV1 { pair, message_id }
     );
     let wrong = host_reply(sign_receipt(body, &a).unwrap());
     assert_eq!(
-        attempt(&reader, Some(&other)),
+        attempt("different_seal", &reader, Some(&other)),
         ReaderResponse::Refused {
             reason: Refusal::NotAuthorized
         }
     );
     assert_eq!(
-        attempt(&reader, Some(&accepted)),
+        attempt("unbound", &reader, Some(&accepted)),
         ReaderResponse::Refused {
             reason: Refusal::NotAuthorized
         }
     );
     assert_eq!(
-        attempt(&reader, Some(&wrong)),
+        attempt("wrong_signer", &reader, Some(&wrong)),
         ReaderResponse::Refused {
             reason: Refusal::NotAuthorized
         }
@@ -420,12 +457,12 @@ fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers(
         submission: Box::new(next),
     };
     assert_eq!(local(&reader, &next), Err(Refusal::QueueFull(1)));
-    assert_eq!(attempt(&reader, Some(&valid)), accepted);
+    assert_eq!(attempt("accepted", &reader, Some(&valid)), accepted);
     assert_eq!(local(&reader, &status), Ok(accepted.clone()));
     drop(reader);
     let reopened = new_reader();
     assert_eq!(local(&reopened, &next), Err(Refusal::QueueFull(1)));
-    assert_eq!(attempt(&reopened, Some(&valid)), accepted);
+    assert_eq!(attempt("reopened", &reopened, Some(&valid)), accepted);
     assert_eq!(
         local(&reopened, &next),
         Ok(ReaderResponse::ObjectStagedV1 {
