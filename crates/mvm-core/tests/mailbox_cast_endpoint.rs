@@ -2,6 +2,10 @@
 // explicitly and exercise the production local frame codecs in both directions.
 mod canonical {
     include!("mailbox_crypto.rs");
+    #[cfg(all(unix, feature = "test-support"))]
+    mod source_transfer {
+        include!("mailbox_cast_source/check.rs");
+    }
 
     #[cfg(all(unix, feature = "test-support"))]
     struct Meter<S> {
@@ -179,6 +183,19 @@ mod canonical {
             send: &cap,
             receive: &recv_cap,
         };
+        assert!(addressed.matches_original_source(
+            src_grant.mailbox, src_grant.epoch, &src_grant.authority_key
+        ));
+        assert!(!addressed.matches_original_source(
+            dest.mailbox, src_grant.epoch, &src_grant.authority_key
+        ));
+        assert!(!addressed.matches_original_source(
+            src_grant.mailbox, src_grant.epoch, &dest.authority_key
+        ));
+        source_transfer::check(
+            &addressed, grants, &a_policy, &live, &h, &sender_key, &authority_key,
+            &encryption_key, input,
+        );
         let mut unbounded = a_policy.clone();
         unbounded.revoked_capabilities = vec![a_witness.grant.revocation_id; 33];
         assert!(grants.check_compact_policy(&unbounded, &live).is_err());

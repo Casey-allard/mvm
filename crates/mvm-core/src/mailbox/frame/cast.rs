@@ -2,6 +2,7 @@
 //! original verified admission and its current policy while holding admission.
 //! This path never submits ciphertext to a relay, signs receipts, or activates a guest.
 pub mod route;
+pub mod source;
 
 use super::Refusal;
 use super::local::{decode_local_frame, encode_local_frame, encode_local_greeting};

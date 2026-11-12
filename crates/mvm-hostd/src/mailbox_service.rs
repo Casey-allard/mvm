@@ -40,6 +40,7 @@ use mvm_core::mailbox::{
     sign_capability,
 };
 
+pub(crate) mod cast_source;
 pub mod guest_io;
 use guest_io::{GuestStreamCounts, Measured};
 
@@ -128,7 +129,7 @@ impl GuestSealer {
         message: OutboxMessage,
     ) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal> {
         let gate = |e: mvm_core::mailbox::MailboxError| Refusal::Mailbox(e.to_string());
-        self.sent += 1;
+        self.sent = self.sent.checked_add(1).ok_or(Refusal::Malformed)?;
         let n = self.sent;
         let mut header = self.header.clone();
         header.recipient = self.resolve_recipient(message.recipient);
@@ -688,6 +689,34 @@ mod accept_loop_tests {
         mvm_core::crypto::aead::Key::from_bytes([5; 32])
     }
     use std::time::Instant;
+
+    #[test]
+    fn exhausted_original_sequence_cannot_wrap_or_seal_another_message() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::audit::host_keypair::load_or_init_at(dir.path()).unwrap();
+        let mailbox = mvm_contract::protocol::mailbox::MailboxId::from_bytes([5; 32]);
+        let epoch = ExecutionEpoch::new(1).unwrap();
+        let grant = MailboxGrant {
+            local_service: None,
+            mailbox,
+            epoch,
+            authority_key: crate::mailbox_launch::authority_key_for(dir.path(), &mailbox, epoch)
+                .unwrap()
+                .to_bytes(),
+        };
+        let (_, mut sealer) =
+            crate::mailbox_launch::host_trust(dir.path(), &grant, &test_secret()).unwrap();
+        sealer.sent = u64::MAX;
+        assert!(
+            sealer
+                .seal(OutboxMessage {
+                    recipient: sealer.header.recipient,
+                    body: vec![1]
+                })
+                .is_err()
+        );
+        assert_eq!(sealer.sent, u64::MAX);
+    }
 
     fn service(dir: &Path) -> MailboxService {
         crate::audit::host_keypair::load_or_init_at(dir).unwrap();
