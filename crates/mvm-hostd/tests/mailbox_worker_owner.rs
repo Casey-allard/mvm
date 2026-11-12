@@ -1003,3 +1003,40 @@ async fn signed_initial_worker_waits_for_held_mutation_lane_and_rechecks_expiry(
     assert_eq!(budget.usage().unwrap().workers,2);
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_pair_reuses_single_control_workspace_for_signed_query() {
+    use mvm_hostd::mailbox_process::installed_profile::{InstalledMailboxProfile, MailboxPair};
+    let profile=InstalledMailboxProfile::OriginalCast(MailboxPair::new(["alpha","beta"]).unwrap());
+    let budget=MailboxWorkerBudget::new(profile.worker_limits()).unwrap();
+    let (_dir,path,server)=serve("tenant",budget.clone()).await;
+    let alpha=request("tenant","alpha");
+    let beta=request("tenant","beta");
+    let invoke=|r:MailboxWorkerRequest| {
+        let socket=path.clone();
+        tokio::task::spawn_blocking(move ||call(&socket,&r).map(|v|v.0))
+    };
+    let owner=invoke(alpha.clone()).await.unwrap().unwrap().owner;
+    assert_eq!(invoke(beta).await.unwrap().unwrap().state,MailboxWorkerState::Reserved);
+    let baseline=budget.usage().unwrap();
+    let idle=UnixStream::connect(&path).unwrap();
+    let until=Instant::now()+Duration::from_secs(2);
+    loop {
+        if budget.usage().unwrap().bytes == baseline.bytes+5*MAX_WORKER_CONTROL_BYTES {break}
+        assert!(Instant::now()<until,"original workspace was not reserved");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let peak=budget.usage().unwrap();
+    let mut query=alpha;
+    query.operation=MailboxWorkerOperation::Query {owner:owner.clone()};
+    let mut pending=invoke(query);
+    let early=tokio::time::timeout(Duration::from_millis(100),&mut pending).await;
+    assert!(early.is_err(),"full-pair signed Query returned before workspace release: {early:?}");
+    assert_eq!(budget.usage().unwrap(),peak);
+    drop(idle);
+    let reply=pending.await.unwrap().unwrap();
+    assert_eq!(reply.owner,owner);
+    assert_eq!(reply.state,MailboxWorkerState::Reserved);
+    assert!(peak.bytes<=1_048_576);
+    server.abort();
+}
