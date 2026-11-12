@@ -31,7 +31,8 @@ pub struct SourceCastEnrollment<'a> {
 
 struct PendingCast {
     request: Zeroizing<Vec<u8>>,
-    request_id: u64,
+    result: local::LocalSubmitResult,
+    peer_accepted: bool,
     issued_at_ms: i64,
     content_type: ContentType,
     envelope: MailboxEnvelope,
@@ -163,8 +164,14 @@ impl<'a, C> CastSource<'a, C> {
     ) -> Result<&MailboxEnvelope, Refusal> {
         self.channel
             .authorize_addressed(self.grants, source, destination)?;
-        if self.slot.pending.is_none() {
-            let pending = self.seal_new(encoded, source, destination)?;
+        let old = self.slot.pending.as_ref();
+        if old.is_none() || old.is_some_and(|p| p.request.as_slice() != encoded && p.peer_accepted)
+        {
+            let floor = old.map_or(self.slot.retired, |p| p.result.request_id);
+            // Authenticate and prepare the successor before replacing the prior
+            // result. Invalid or stale submissions cannot evict the only receipt.
+            let pending = self.seal_new(encoded, source, destination, floor)?;
+            self.slot.retired = floor;
             self.slot.pending = Some(pending);
             self.slot.scope = Some(self.scope);
         }
@@ -189,6 +196,7 @@ impl<'a, C> CastSource<'a, C> {
         encoded: &[u8],
         source: &OpenContext,
         destination: &OpenContext,
+        floor: u64,
     ) -> Result<PendingCast, Refusal> {
         let src_limits = self.channel.source.local_service.ok_or_else(deny)?.limits;
         let limit = self
@@ -199,7 +207,7 @@ impl<'a, C> CastSource<'a, C> {
         if encoded.len() > limit + 4 {
             return Err(Refusal::Oversized(limit));
         }
-        let (request, _) = decode_submit_with_digest(encoded, &src_limits)?;
+        let (request, digest) = decode_submit_with_digest(encoded, &src_limits)?;
         let send = &self.grants.send.grant;
         let receive = &self.grants.receive.grant;
         let max_payload = send
@@ -208,7 +216,7 @@ impl<'a, C> CastSource<'a, C> {
             .min(self.channel.limits.payload_bytes);
         let expires = request.expires_at_unix_ms;
         if request.kind != MailboxMessageKind::Cast
-            || request.request_id <= self.slot.retired
+            || request.request_id <= floor
             || request.originating_binding != self.enrollment.source_binding
             || request.recipient != self.channel.recipient
             || request.body.len() > max_payload as usize
@@ -277,6 +285,14 @@ impl<'a, C> CastSource<'a, C> {
         let mut routing = self.enrollment.routing.clone();
         routing.delivery_id = DeliveryId::from_bytes(identity(b"delivery"));
         routing.expires_at_unix_ms = expires;
+        let result = local::LocalSubmitResult {
+            request_id: request.request_id,
+            semantic_digest: digest,
+            disposition: local::LocalDisposition::Unavailable,
+            message_id: header.message_id,
+            correlation: header.correlation_id,
+            service_generation: *self.enrollment.sender_boot.as_bytes(),
+        };
         let envelope = seal_envelope(
             SealRequest {
                 routing,
@@ -295,11 +311,36 @@ impl<'a, C> CastSource<'a, C> {
         self.slot.last_sequence = n;
         Ok(PendingCast {
             request: Zeroizing::new(encoded.to_vec()),
-            request_id: request.request_id,
+            result,
+            peer_accepted: false,
             issued_at_ms: source.now_unix_ms,
             content_type: request.content_type,
             envelope,
         })
+    }
+
+    /// Translate a complete original-peer verdict for one already sealed
+    /// source claim. A lost reply to the guest keeps this exact claim and ID.
+    /// Callers supply acceptance only after the peer's complete bounded verdict.
+    pub fn record_peer_disposition(
+        &mut self,
+        encoded: &[u8],
+        disposition: local::LocalDisposition,
+    ) -> Result<local::LocalSubmitResult, Refusal> {
+        let pending = self.slot.pending.as_mut().ok_or_else(deny)?;
+        if pending.request.as_slice() != encoded {
+            return Err(deny());
+        }
+        if matches!(
+            disposition,
+            local::LocalDisposition::AcceptedEphemeral
+                | local::LocalDisposition::DuplicateEphemeral
+        ) {
+            pending.peer_accepted = true;
+        }
+        let mut result = pending.result.clone();
+        result.disposition = disposition;
+        Ok(result)
     }
 
     /// Local owner action after its disposition is recorded. This never
@@ -318,7 +359,7 @@ impl<'a, C> CastSource<'a, C> {
             return Err(std::io::Error::other(deny()));
         }
         record_disposition()?;
-        self.slot.retired = pending.request_id;
+        self.slot.retired = pending.result.request_id;
         self.slot.pending = None;
         Ok(())
     }

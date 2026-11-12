@@ -180,8 +180,38 @@ pub(super) fn check(
         .unwrap();
     assert_ne!(first.routing.delivery_id, second.routing.delivery_id);
     assert_ne!(first.ciphertext, second.ciphertext);
+    use mvm_contract::protocol::mailbox::local::LocalDisposition;
+    let encoded = source_request(8, input);
+    let next = source_request(9, input);
+    let second = second.clone();
+    assert!(
+        lane.record_peer_disposition(&next, LocalDisposition::AcceptedEphemeral)
+            .is_err()
+    );
+    let full = lane
+        .record_peer_disposition(&encoded, LocalDisposition::Full)
+        .unwrap();
+    assert!(lane.prepare(&next, a_policy, live).is_err());
+    let accepted = lane
+        .record_peer_disposition(&encoded, LocalDisposition::AcceptedEphemeral)
+        .unwrap();
+    assert_eq!(accepted.message_id, full.message_id);
+    assert_eq!(accepted.request_id, 8);
+    assert_eq!(accepted.service_generation, *h.sender_boot.as_bytes());
+    assert_ne!(accepted.message_id.as_bytes(), &[0; 32]);
+    assert!(
+        lane.prepare(&source_request(8, b"conflict"), a_policy, live)
+            .is_err()
+    );
+    assert!(lane.prepare(&first_request, a_policy, live).is_err());
+    assert_eq!(lane.prepare(&encoded, a_policy, live).unwrap(), &second);
+    assert_ne!(
+        lane.prepare(&next, a_policy, live).unwrap().ciphertext,
+        second.ciphertext
+    );
+    assert!(lane.prepare(&encoded, a_policy, live).is_err());
     drop(lane);
-    assert_eq!(counter, 2);
+    assert_eq!(counter, 3);
 }
 
 fn measured_transfer<C>(
