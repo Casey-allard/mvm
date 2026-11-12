@@ -394,7 +394,7 @@ async fn stop_timeout_retains_original_owner_and_credit_until_later_collection()
         r.deadline_unix_ms = now() + 100;
         assert!(call(&path, &r).is_err());
         r.request_nonce = [4; 32];
-        r.operation = MailboxWorkerOperation::Query { owner };
+        r.operation = MailboxWorkerOperation::Query { owner: owner.clone() };
         r.deadline_unix_ms = now() + 4_000;
         assert_eq!(
             call(&path, &r).unwrap().0.state,
@@ -405,18 +405,22 @@ async fn stop_timeout_retains_original_owner_and_credit_until_later_collection()
         // Release only the fixture's injected fault; the daemon remains the
         // sole process reaper. No external kill/waitpid/Child wait is used.
         drop(factory.0.lock().unwrap().take());
-        let mut collected = false;
+        let mut collected = None;
         for _ in 0..100 {
-            if matches!(
-                call(&path, &r).unwrap().0.state,
-                MailboxWorkerState::Collected { .. }
-            ) {
-                collected = true;
+            let reply = call(&path, &r).unwrap().0;
+            if matches!(reply.state, MailboxWorkerState::Collected { .. }) {
+                collected = Some(reply);
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(collected);
+        let original = collected.expect("original child exit collection");
+        assert_eq!(original.owner, owner);
+        assert_eq!(budget.usage().unwrap().workers, 0);
+        r.request_nonce = [5; 32];
+        let replay = call(&path, &r).unwrap().0;
+        assert_eq!(replay.owner, original.owner);
+        assert_eq!(replay.state, original.state);
         assert_eq!(budget.usage().unwrap().workers, 0);
     })
     .await

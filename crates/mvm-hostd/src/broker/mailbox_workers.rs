@@ -1450,7 +1450,7 @@ impl MailboxWorkers {
             return Err(refused("installed mailbox provisioning disabled"));
         }
         self.factory.admit(request)?;
-        let _operation = self.operation_permit(request)?;
+        let operation_turn = self.operation_permit(request)?;
         if request.tenant != self.tenant {
             return Err(refused("foreign worker tenant"));
         }
@@ -1598,7 +1598,14 @@ impl MailboxWorkers {
             }
             if matches!(request.operation, MailboxWorkerOperation::Query { .. })
                 && slot.stop_requested
+                && (!operation_turn.counted
+                    || slot.busy
+                    || slot.worker.is_none()
+                    || slot.state != MailboxWorkerState::Unresolved)
             {
+                // The retirement owner or an in-flight loan retains collection.
+                // A pre-fence query of an idle unresolved original with its
+                // Child present instead uses the normal nonblocking try_wait below.
                 let state = if matches!(slot.state, MailboxWorkerState::Collected { .. }) {
                     slot.state.clone()
                 } else {
