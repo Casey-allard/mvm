@@ -838,6 +838,70 @@ mod accept_loop_tests {
     }
 
     #[test]
+    fn paired_installed_unknown_verdict_keeps_original_and_reports_failed_removal() {
+        use mvm_agentd::mailbox_outbox::{forward_outbox, write_outbox};
+        use std::io::Cursor;
+        struct Verdict {
+            bytes: Cursor<Vec<u8>>,
+            read_error: bool,
+            write_error: bool,
+        }
+        impl Read for Verdict {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.read_error && self.bytes.position() >= self.bytes.get_ref().len() as u64 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                self.bytes.read(buf)
+            }
+        }
+        impl Write for Verdict {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.write_error {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let original = OutboxMessage {
+            recipient: PrincipalId::from_bytes(OWN_MAILBOX_RECIPIENT), body: vec![0, 5, 0],
+        };
+        write_outbox(dir.path(), &original).unwrap();
+        let original_file = std::fs::read_dir(dir.path()).unwrap().next().unwrap().unwrap().path();
+        let expected = original.encode();
+        let accepted = br#"{"Ok":null}"#.to_vec();
+        for (wire, read_error, write_error) in [
+            (Vec::new(), false, false), (br#"{"Ok":n"#.to_vec(), false, false),
+            (accepted.clone(), true, false), (accepted.clone(), false, true),
+            (vec![b' '; 4_097], false, false),
+        ] {
+            let mut stream = Verdict { bytes: Cursor::new(wire), read_error, write_error };
+            assert!(forward_outbox(&mut stream, dir.path()).is_err());
+            assert_eq!(std::fs::read(&original_file).unwrap(), expected);
+        }
+        // A *complete* terminal refusal from the host retains legacy semantics.
+        let mut refused = Verdict { bytes: Cursor::new(br#"{"Err":"Malformed"}"#.to_vec()), read_error: false, write_error: false };
+        assert_eq!(forward_outbox(&mut refused, dir.path()), Err(Refusal::Malformed));
+        assert!(!original_file.exists());
+        write_outbox(dir.path(), &original).unwrap();
+        let path = std::fs::read_dir(dir.path()).unwrap().next().unwrap().unwrap().path();
+        let saved = dir.path().join(".saved-original");
+        let (mut guest, mut host) = UnixStream::pair().unwrap();
+        arm(&guest); arm(&host);
+        std::thread::scope(|scope| {
+            let report = scope.spawn(|| forward_outbox(&mut guest, dir.path()));
+            let mut sent = vec![0; 4 + expected.len()];
+            host.read_exact(&mut sent).unwrap();
+            assert_eq!(&sent[4..], expected);
+            std::fs::rename(&path, &saved).unwrap();
+            host.write_all(&accepted).unwrap(); drop(host);
+            assert!(matches!(report.join().unwrap(), Err(Refusal::Mailbox(_))));
+        });
+        assert_eq!(std::fs::read(saved).unwrap(), expected);
+    }
+
+    #[test]
     fn an_idle_service_blocks_instead_of_polling() {
         let dir = tempfile::tempdir().unwrap();
         let service = service(dir.path());
