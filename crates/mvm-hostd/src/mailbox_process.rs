@@ -126,8 +126,19 @@ pub fn build_config(
     grant
         .require_implemented_local_service()
         .map_err(|error| Error::new(ErrorKind::Unsupported, error))?;
+    build_admitted_config(keys_dir,grant,state_dir,route)
+}
+
+fn build_cast_config(keys_dir:&Path,grant:&MailboxGrant,state_dir:&Path,route:HostDialRoute)->Result<MailboxProcessConfig>{
+    if grant.local_service!=Some(mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant::original_cast_v1()) {
+        return Err(Error::new(ErrorKind::Unsupported,"invalid original service"));
+    }
+    build_admitted_config(keys_dir,grant,state_dir,route)
+}
+
+fn build_admitted_config(keys_dir:&Path,grant:&MailboxGrant,state_dir:&Path,route:HostDialRoute)->Result<MailboxProcessConfig>{
     let secret = mint_epoch_secret(state_dir)?;
-    let keys = derive_launch_keys(keys_dir, grant, &secret).inspect_err(|_| {
+    let keys = crate::mailbox_launch::derive_admitted_keys(keys_dir, grant, &secret).inspect_err(|_| {
         let _ = shred_epoch_secret(state_dir);
     })?;
     Ok(MailboxProcessConfig {
@@ -186,6 +197,7 @@ fn granted_plan(config: &VmStartConfig) -> Option<ExecutionPlan> {
 pub fn require_servable(config: &VmStartConfig, backend: &AnyBackend) -> anyhow::Result<()> {
     if let Some(json) = config.plan_json.as_deref() {
         let plan = mvm_core::plan::plan_from_admitted_json(json)?;
+        if config.original_cast_grant(&plan) && backend.kind()==mvm_core::vm_backend::BackendKind::Firecracker && backend.capabilities().guest_mailbox {return Ok(());}
         require_wired(&plan, backend)?;
     }
     Ok(())

@@ -166,13 +166,12 @@ impl HostAgentMailboxProvisioner {
             request.tenant == "local",
             "installed mailbox requires local SDK admission"
         );
-        let client = InstalledMailboxClient::reconnect(
-            plan,
-            backend,
-            &request.vm_id,
-            request.request_nonce,
-            None,
-        )?;
+        let client=if let Some(pair)=&self.cast {
+            pair.index(&request.vm_id)?;
+            InstalledMailboxClient::reconnect_cast_reservation(plan,backend,&request.vm_id,request.request_nonce)?
+        } else {
+            InstalledMailboxClient::reconnect(plan,backend,&request.vm_id,request.request_nonce,None)?
+        };
         ensure!(
             client.acquire_request() == request,
             "mailbox reservation differs from admission"

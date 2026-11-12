@@ -195,7 +195,7 @@ impl OriginalCastPair {
             published: Meeting::new(),
         })
     }
-    fn index(&self, name: &str) -> Result<usize> {
+    pub(crate) fn index(&self, name: &str) -> Result<usize> {
         self.names
             .iter()
             .position(|n| n == name)

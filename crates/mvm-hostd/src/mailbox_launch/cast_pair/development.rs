@@ -155,7 +155,7 @@ impl LaunchCustody {
                 original,
                 routing,
             },
-            PreparedRole { setup, grant },
+            PreparedRole { setup, grant, immutable: false },
         ))
     }
     pub fn greeting(&self) -> LocalGreeting {
@@ -376,6 +376,7 @@ pub struct DirectionDelivery {
 /// Only the original SDK holds this nonclone secret. Its exclusive config
 /// descriptor is consumed once, later, without a second key mint or rebind.
 pub struct PreparedRole {
+    pub(crate) immutable: bool,
     setup: PrivateLaunch,
     grant: MailboxGrant,
 }
@@ -390,6 +391,7 @@ impl PreparedRole {
             "cannot change original role direction"
         );
         self.setup.direction = Some(d.commitment());
+        self.immutable = d.fields.immutable_policy.is_some();
         Ok(())
     }
     pub(crate) fn check_recipient(

@@ -31,8 +31,11 @@ impl MailboxPair {
 pub enum InstalledMailboxProfile {
     Single,
     Pair(MailboxPair),
+    OriginalCast(MailboxPair),
 }
 
+pub const CAST_QUALIFIER: &str = "--immutable-cast-v1";
+pub const CAST_HELPER_FLAG: &str = "--owned-original-cast-v1";
 pub const PAIR_HELPER_FLAG: &str = "--owned-pair-slot-v1";
 const SINGLE_FLAG: &str = "--owned-mailbox-v1";
 const PAIR_FLAG: &str = "--owned-mailbox-pair-v1";
@@ -55,6 +58,11 @@ impl InstalledMailboxProfile {
         match args {
             [] => Ok(None),
             [mode] if mode == SINGLE_FLAG => Ok(Some(Self::Single)),
+            [mode,a,b,profile] if mode == PAIR_FLAG && profile==CAST_QUALIFIER => {
+                let a=a.to_str().ok_or_else(||io::Error::other("invalid VM name"))?;
+                let b=b.to_str().ok_or_else(||io::Error::other("invalid VM name"))?;
+                Ok(Some(Self::OriginalCast(MailboxPair::new([a,b])?)))
+            }
             [mode, a, b] if mode == PAIR_FLAG => {
                 let a = a
                     .to_str()
@@ -72,12 +80,28 @@ impl InstalledMailboxProfile {
         match self {
             Self::Single => vec![SINGLE_FLAG],
             Self::Pair(pair) => vec![PAIR_FLAG, &pair.0[0], &pair.0[1]],
+            Self::OriginalCast(pair) => vec![PAIR_FLAG, &pair.0[0], &pair.0[1],CAST_QUALIFIER],
         }
     }
 
+    pub(crate) fn check_grant(&self, request:&mvm_contract::protocol::mailbox_worker::MailboxWorkerRequest)->io::Result<()> {
+        use mvm_contract::protocol::{mailbox::local_service::MailboxLocalServiceGrant,mailbox_worker::MailboxWorkerBackend};
+        match self {
+            Self::OriginalCast(pair)=>{
+                pair.index(&request.vm_id)?;
+                if request.backend!=MailboxWorkerBackend::Firecracker || request.mailbox_grant.local_service!=Some(MailboxLocalServiceGrant::original_cast_v1()) {
+                    return Err(io::Error::other("signed compact Firecracker original grant required"));
+                }
+                Ok(())
+            }
+            Self::Pair(pair)=>{pair.index(&request.vm_id)?;request.mailbox_grant.require_implemented_local_service().map_err(io::Error::other)}
+            Self::Single=>request.mailbox_grant.require_implemented_local_service().map_err(io::Error::other),
+        }
+    }
     pub fn worker_limits(&self) -> WorkerLimits {
         let (workers, bytes_per_worker) = match self {
             Self::Single => (1, WORKER_CONTROL_BYTES),
+            Self::OriginalCast(p) => return development_cast_capacity(p).worker,
             Self::Pair(_) => (
                 2,
                 WORKER_CONTROL_BYTES
@@ -99,7 +123,7 @@ impl InstalledMailboxProfile {
 /// Development-only A→B capacity proposal. The full 8 KiB worker frame still
 /// covers a capped envelope plus the peer's signed credential and prefix.
 /// A two-entry queue per worker frees one 32 KiB source generation reservation
-/// inside the same 1 MiB aggregate. No installed CLI selects this profile.
+/// inside the same 1 MiB aggregate. The explicit immutable Cast qualifier selects this capacity.
 pub struct DevelopmentCastCapacity {
     pub worker: WorkerLimits,
     pub queue: MailboxLimits,
