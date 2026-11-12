@@ -252,16 +252,28 @@ pub fn start_machine_spec(
         Ok(())
     };
     #[cfg(unix)]
-    let fresh_state = if let Some(pair) = host.installed_mailbox().and_then(|p| p.original_cast_pair()) {
+    let fresh_state = if let Some(pair) = host
+        .installed_mailbox()
+        .and_then(|p| p.original_cast_pair())
+    {
         pair.index(&spec.name)?;
-        Some(super::cast_state::prepare(&mvm_core::config::mvm_home_strict()?, &spec.name, discard)?)
+        Some(super::cast_state::prepare(
+            &mvm_core::config::mvm_home_strict()?,
+            &spec.name,
+            discard,
+        )?)
     } else {
         discard()?;
         None
     };
     #[cfg(not(unix))]
     {
-        anyhow::ensure!(host.installed_mailbox().and_then(|p|p.original_cast_pair()).is_none(),"original Cast requires a Unix host");
+        anyhow::ensure!(
+            host.installed_mailbox()
+                .and_then(|p| p.original_cast_pair())
+                .is_none(),
+            "original Cast requires a Unix host"
+        );
         discard()?;
     }
     validate_registry_pack_source(spec)?;
@@ -296,6 +308,11 @@ pub fn start_machine_spec(
         .prepare_volumes(&spec.name, &spec.volumes)
         .context("resolving registered local volumes before admission")?;
     let workload_dir = persistent_workload_dir(spec);
+    // Native startup owns state recovery from this point, including ambiguous exits.
+    #[cfg(unix)]
+    if let Some(fresh) = fresh_state {
+        fresh.commit();
+    }
     let admitted = start_persistent_with_mailbox(
         PersistentImageStartParams {
             name: &spec.name,
@@ -326,8 +343,6 @@ pub fn start_machine_spec(
         host.installed_mailbox(),
         vacant,
     )?;
-    #[cfg(unix)]
-    if let Some(fresh)=fresh_state {fresh.commit();}
     Ok(MachineStart {
         resolved_digest: boot.digest,
         admitted,
