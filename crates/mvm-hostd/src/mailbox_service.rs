@@ -104,6 +104,13 @@ pub struct GuestSealer {
     pub intent_dir: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+struct OriginalSend<'a> {
+    signed: &'a SignedMailboxCapability,
+    verifier: &'a VerifyingKey,
+    commitment: [u8; 32],
+}
+
 impl GuestSealer {
     /// Bind to a plan's grant: its mailbox and epoch apply, and its authority
     /// key must be the verifying half of the host's own authority key.
@@ -147,9 +154,10 @@ impl GuestSealer {
     fn seal_using(
         &mut self,
         message: OutboxMessage,
-        external: Option<(&SignedMailboxCapability, &VerifyingKey)>,
+        external: Option<OriginalSend<'_>>,
     ) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal> {
-        if let Some((send, key)) = external {
+        if let Some(role) = external {
+            let (send, key) = (role.signed, role.verifier);
             if self.intent_dir.is_none()
                 || send.grant != self.capability
                 || message.recipient != self.header.recipient
@@ -161,7 +169,7 @@ impl GuestSealer {
         }
         let Some(dir) = self.intent_dir.clone() else {
             let (capability, envelope, n) =
-                self.seal_new(&message, external.map(|(send, _)| send))?;
+                self.seal_new(&message, external.map(|role| role.signed))?;
             self.sent = n;
             return Ok((capability, envelope));
         };
@@ -170,10 +178,15 @@ impl GuestSealer {
         let _lock = FileLock::try_acquire(&dir.join("intent"))
             .map_err(|_| Refusal::Unavailable)?
             .ok_or(Refusal::Unavailable)?;
-        let path = dir.join(hex::encode(message.message_id.as_bytes()));
+        let id = hex::encode(message.message_id.as_bytes());
+        let name = external.map_or_else(
+            || id.clone(),
+            |role| format!("directed-{}-{id}", hex::encode(role.commitment)),
+        );
+        let path = dir.join(&name);
         if path.exists() {
             let reused = self.read_intent(&path, &message, external)?;
-            charge_source_attempt(&dir, &message)?;
+            charge_source_attempt(&dir, &name)?;
             return Ok(reused);
         }
         let mut count = 0;
@@ -188,14 +201,20 @@ impl GuestSealer {
                 return Err(Refusal::QueueFull(MAX_SOURCE_INTENTS));
             }
         }
-        let (capability, envelope, n) = self.seal_new(&message, external.map(|(send, _)| send))?;
+        // Directed records and local records share one cursor, lock and cap.
+        // Existing immutable records recover the lower bound after restart.
+        if external.is_some() {
+            self.sent = self.sent.max(count as u64);
+        }
+        let (capability, envelope, n) =
+            self.seal_new(&message, external.map(|role| role.signed))?;
         let bytes = encode_frame(&capability, &envelope)?;
         if bytes.len() > MAX_SOURCE_INTENT_BYTES {
             return Err(Refusal::Oversized(MAX_SOURCE_INTENT_BYTES));
         }
         atomic_write_new(&path, &bytes).map_err(|_| Refusal::Unavailable)?;
         sync_dir(&dir).map_err(|_| Refusal::Unavailable)?;
-        charge_source_attempt(&dir, &message)?;
+        charge_source_attempt(&dir, &name)?;
         self.sent = n;
         Ok((capability, envelope))
     }
@@ -204,7 +223,7 @@ impl GuestSealer {
         &self,
         path: &Path,
         message: &OutboxMessage,
-        external: Option<(&SignedMailboxCapability, &VerifyingKey)>,
+        external: Option<OriginalSend<'_>>,
     ) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal> {
         let meta = std::fs::symlink_metadata(path).map_err(|_| Refusal::Unavailable)?;
         if !meta.file_type().is_file()
@@ -223,11 +242,11 @@ impl GuestSealer {
             return Err(Refusal::Oversized(MAX_SOURCE_INTENT_BYTES));
         }
         let (capability, envelope) = decode_frame(&bytes)?;
-        if external.is_some_and(|(send, _)| send != &capability) {
+        if external.is_some_and(|role| role.signed != &capability) {
             return Err(Refusal::NotAuthorized);
         }
         let own_verifier = self.authority_key.verifying_key();
-        let verifier = external.map_or(&own_verifier, |(_, key)| key);
+        let verifier = external.map_or(&own_verifier, |role| role.verifier);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Refusal::Unavailable)?
@@ -314,11 +333,8 @@ impl GuestSealer {
     }
 }
 
-fn charge_source_attempt(dir: &Path, message: &OutboxMessage) -> Result<(), Refusal> {
-    let path = dir.join(format!(
-        "{}.attempts",
-        hex::encode(message.message_id.as_bytes())
-    ));
+fn charge_source_attempt(dir: &Path, name: &str) -> Result<(), Refusal> {
+    let path = dir.join(format!("{name}.attempts"));
     let count = match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_file() && meta.len() <= 3 => {
             let raw = std::fs::read(&path).map_err(|_| Refusal::Unavailable)?;
@@ -1065,15 +1081,36 @@ mod tests {
         let wrong = sign_capability(send.grant.clone(), &sealer.authority_key).unwrap();
         assert!(
             sealer
-                .seal_using(message.clone(), Some((&wrong, &verifier)))
+                .seal_using(
+                    message.clone(),
+                    Some(OriginalSend {
+                        signed: &wrong,
+                        verifier: &verifier,
+                        commitment: [29; 32]
+                    })
+                )
                 .is_err()
         );
         assert!(!sealer.intent_dir.as_ref().unwrap().exists());
         let first = sealer
-            .seal_using(message.clone(), Some((&send, &verifier)))
+            .seal_using(
+                message.clone(),
+                Some(OriginalSend {
+                    signed: &send,
+                    verifier: &verifier,
+                    commitment: [29; 32],
+                }),
+            )
             .unwrap();
         let again = sealer
-            .seal_using(message.clone(), Some((&send, &verifier)))
+            .seal_using(
+                message.clone(),
+                Some(OriginalSend {
+                    signed: &send,
+                    verifier: &verifier,
+                    commitment: [29; 32],
+                }),
+            )
             .unwrap();
         assert_eq!(first.0, send);
         assert_eq!(
@@ -1084,13 +1121,27 @@ mod tests {
         changed.body.push(0);
         assert!(
             sealer
-                .seal_using(changed, Some((&send, &verifier)))
+                .seal_using(
+                    changed,
+                    Some(OriginalSend {
+                        signed: &send,
+                        verifier: &verifier,
+                        commitment: [29; 32]
+                    })
+                )
                 .is_err()
         );
         sealer.header.sender_boot = BootId::from_bytes([67; 32]);
         assert!(
             sealer
-                .seal_using(message, Some((&send, &verifier)))
+                .seal_using(
+                    message,
+                    Some(OriginalSend {
+                        signed: &send,
+                        verifier: &verifier,
+                        commitment: [29; 32]
+                    })
+                )
                 .is_err()
         );
     }

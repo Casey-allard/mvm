@@ -113,7 +113,7 @@ impl DirectedJournalSource {
                     .intent_dir
                     .as_ref()
                     .context("A lacks durable source intents")?
-                    .join(hex::encode(material.commitment)),
+                    .clone(),
             ),
         };
         let mut result = Self {
@@ -183,7 +183,11 @@ impl DirectedJournalSource {
         expected.message_id = message.message_id;
         let (cap, envelope) = self.sealer.seal_using(
             message,
-            Some((&self.grants.destination_send, &self.verifier)),
+            Some(super::OriginalSend {
+                signed: &self.grants.destination_send,
+                verifier: &self.verifier,
+                commitment: self.original_commitment,
+            }),
         )?;
         self.authorize(len)?;
         let mut stream = connect(deadline)?;

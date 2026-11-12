@@ -209,7 +209,7 @@ impl PairedJournalAdmission {
                         .try_lock()
                         .map_err(|_| anyhow::anyhow!("original B busy"))?;
                     dest.check_proposal(plan, &self.grants, self.deadline)?;
-                    let mut config = config.clone();
+
                     let delegated = SourceConfiguration {
                         parent: std::process::id(),
                         destination_name: dest.name.clone(),
@@ -222,7 +222,7 @@ impl PairedJournalAdmission {
                     config.keys.outbound_source = Some(delegated);
                     let listener = OwnedListener::bind(&config.vm_state_dir)?;
                     let marker = super::OriginalMarker::claim(&guard.owner_dir)?;
-                    let source = super::super::spawn_serving(&config, &config.vm_state_dir)?;
+                    let source = super::super::spawn_serving(config, &config.vm_state_dir)?;
                     Ok(OriginalJournalSourceHost {
                         source,
                         _guard: guard,

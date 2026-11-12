@@ -626,7 +626,7 @@ fn spawn_with_original<T>(
     posture: Option<&MailboxLaunchPosture>,
     exclusive: bool,
     start: impl FnOnce(
-        &MailboxProcessConfig,
+        &mut MailboxProcessConfig,
         &ExecutionPlan,
         std::sync::Arc<original_journal::LaunchClaim>,
     ) -> Result<T>,
@@ -697,7 +697,7 @@ fn spawn_with_original<T>(
         }
         config.posture =
             Some(posture.handoff(config.reader_boot.as_ref().map(|binding| binding.boot)));
-        start(&config, plan, guard.clone()).map(Some)
+        start(&mut config, plan, guard.clone()).map(Some)
     })();
     if started.is_err()
         && matches!(std::fs::symlink_metadata(owner_dir.join(original_journal::MARKER)), Err(ref e) if e.kind() == ErrorKind::NotFound)
@@ -719,7 +719,9 @@ fn spawn_serving(config: &MailboxProcessConfig, state_dir: &Path) -> Result<std:
         .stdin
         .take()
         .ok_or_else(|| Error::other("mvm-mailbox stdin was not piped"))
-        .and_then(|mut stdin| stdin.write_all(&serde_json::to_vec(config)?));
+        .and_then(|mut stdin| {
+            stdin.write_all(&zeroize::Zeroizing::new(serde_json::to_vec(config)?))
+        });
     if let Err(error) = written {
         let _ = child.kill();
         let _ = child.wait();
