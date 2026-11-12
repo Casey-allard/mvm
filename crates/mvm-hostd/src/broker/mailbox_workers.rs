@@ -2253,6 +2253,29 @@ mod tests {
             root: home.path().join("unused"), generation: 2,
             key: InstallationKey { installation: [1; 32], profile: [2; 32] },
         });
+        // Run the pre-existing installed mode against the same canonical
+        // reservations before choosing the explicitly paired capacity.
+        {
+            let budget = MailboxWorkerBudget::new(InstalledMailboxProfile::Single.worker_limits()).unwrap();
+            let factory = InstalledMailboxWorkerFactory::new(&binary, binding.clone(), home.path()).unwrap();
+            let workers = MailboxWorkers::new("local", budget.clone(), Arc::new(factory)).unwrap();
+            let key = SigningKey::from_bytes(&[7; 32]);
+            let reserve = |vm: &str, nonce| {
+                let mut r = request(&budget, "local");
+                r.vm_id = vm.into();
+                r.workload_id = vm.into();
+                r.request_nonce = [nonce; 32];
+                r.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: 2 };
+                let envelope = broker_control::sign(ControlRequest::MailboxWorkerV1(Box::new(r.clone())), &key.to_bytes()).unwrap();
+                verify_request(&envelope, &key.verifying_key(), budget.now_unix_ms().unwrap()).unwrap();
+                workers.handle(&r)
+            };
+            reserve("alpha", 4).unwrap();
+            let before = budget.usage().unwrap();
+            assert!(reserve("beta", 5).is_err());
+            assert_eq!(budget.usage().unwrap(), before);
+            assert_eq!(before.workers, 1);
+        }
         let pair = MailboxPair::new(["alpha", "beta"]).unwrap();
         let profile = InstalledMailboxProfile::Pair(pair);
         let limits = profile.worker_limits();
