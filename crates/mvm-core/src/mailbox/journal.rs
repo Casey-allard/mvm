@@ -2260,6 +2260,82 @@ mod anchor_tests {
     }
 
     #[test]
+    fn local_checkpoints_keep_retained_identity_and_physical_quotas_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let b = SigningKey::from_bytes(&[6; 32]);
+        let anchor = FileJournalAnchor::open(
+            &dir.path().join("anchor").join("tip.json"),
+            address(),
+            [22; 32],
+        )
+        .unwrap();
+        let quota = JournalLimits {
+            max_records: 3,
+            max_bytes: 512 * 1024,
+        };
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                b.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
+                local_retention(),
+            )
+        };
+        let mut journal = open(quota).unwrap();
+        let now = 1_800_000_000_000;
+        let mut receipts = Vec::new();
+        for id in 1..=3 {
+            let (e, c, x, k, a, b) = message_at(id, id.into(), now);
+            receipts.push(
+                journal
+                    .admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor)
+                    .unwrap(),
+            );
+            if id < 3 {
+                journal.compact_local(now, &b, &anchor).unwrap();
+            }
+        }
+        // The checkpoint retains two identities, and one more was appended. A lower
+        // recovery quota must reject this combination even though its two files fit.
+        drop(journal);
+        let lower = JournalLimits {
+            max_records: 2,
+            ..quota
+        };
+        assert!(matches!(open(lower), Err(JournalError::Full)));
+        let mut journal = open(quota).unwrap();
+        journal.compact_local(now, &b, &anchor).unwrap();
+        drop(journal);
+        assert!(matches!(open(lower), Err(JournalError::Full)));
+        let mut journal = open(quota).unwrap();
+        assert_eq!(journal.records, 1);
+        assert_eq!(journal.seen.len(), 3);
+        let tip = anchor.tip();
+        let (e, c, x, k, a, b) = message_at(4, 4, now);
+        assert!(matches!(
+            journal.admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor),
+            Err(JournalError::Full)
+        ));
+        assert_eq!(anchor.tip(), tip);
+        // Fresh sealing under a prior identity conflicts; the old proof remains intact.
+        let (e, c, x, k, a, b) = message_at(1, 4, now);
+        assert!(matches!(
+            journal.admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor),
+            Err(JournalError::ConflictingRetry)
+        ));
+        assert_eq!(anchor.tip(), tip);
+        assert_eq!(
+            receipts[0].receipt.message_id,
+            MessageId::from_bytes([1; 32])
+        );
+    }
+
+    #[test]
     fn interrupted_terminal_expiry_reconciles_without_an_early_receipt() {
         let dir = tempfile::tempdir().expect("journal root");
         let root = dir.path().join("journal");
