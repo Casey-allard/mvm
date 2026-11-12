@@ -645,6 +645,7 @@ fn load_private_root(keys: &Path) -> Result<Key> {
 }
 
 mod operations;
+mod pending;
 pub use operations::{OriginalObjectCallLease, SealedObjectTurn};
 
 #[cfg(test)]

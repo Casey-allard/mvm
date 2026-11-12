@@ -483,7 +483,7 @@ impl PairMaterial {
 /// Verification of a previously retained immutable row. The source intent or
 /// active journal lease owns durable replay accounting. This local inspection
 /// is never used to admit a new delivery.
-fn open_original(
+pub(super) fn open_original(
     cap: &SignedMailboxCapability,
     op: MailboxOperation,
     envelope: &MailboxEnvelope,

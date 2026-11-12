@@ -48,7 +48,7 @@ use mvm_core::util::atomic_io::{FileLock, atomic_write_durable, atomic_write_new
 pub(crate) mod directed_journal;
 /// Separate destination path that returns a signed, journal-backed verdict.
 pub mod durable;
-mod object_intent;
+pub(crate) mod object_intent;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SOURCE_INTENTS: usize = 64;
@@ -1353,10 +1353,10 @@ pub(crate) mod object_intent_slot_tests {
     /// Exercise exactly the disk format opened by the installed owner.
     pub(crate) fn publish_then_reopen(
         dir: &Path,
+        name: &str,
         digest: [u8; 32],
         frame: &[u8],
     ) -> (SequenceNumber, Vec<u8>) {
-        let name = "object-test";
         let slot = ObjectIntentSlot::open(dir, name, digest).unwrap();
         slot.publish(frame).unwrap();
         charge_source_attempt(dir, name).unwrap();

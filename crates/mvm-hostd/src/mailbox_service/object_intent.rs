@@ -5,6 +5,7 @@ use crate::mailbox_launch::object_pair::{
 };
 use crate::mailbox_process::original_journal::authorization::now_ms;
 use anyhow::{Context, Result, ensure};
+use mvm_contract::protocol::mailbox::MessageId;
 use mvm_core::mailbox::frame::send_local_receipted_frame;
 use mvm_core::mailbox::{
     object_pair::role::ObjectParticipantRole,
@@ -24,6 +25,54 @@ pub(super) struct ObjectIntentSlot {
     pub(super) original: Option<Vec<u8>>,
 }
 
+/// A reader opens only the already atomically published original. A lookup does
+/// not allocate an ID, change the attempt count, create a store or repair state.
+pub(crate) fn read_original_object(
+    path: &Path,
+) -> Result<Option<(SequenceNumber, [u8; 32], Vec<u8>)>> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => {
+            let meta = file.metadata()?;
+            private_fs::require_current_owner(&meta)?;
+            ensure!(
+                meta.is_file()
+                    && meta.nlink() == 1
+                    && meta.mode() & 0o077 == 0
+                    && meta.len() <= MAX_SOURCE_INTENT_BYTES as u64,
+                "invalid original object intent"
+            );
+            let mut bytes = Vec::with_capacity(meta.len() as usize);
+            file.take(MAX_SOURCE_INTENT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() <= MAX_SOURCE_INTENT_BYTES && bytes.len() > 40,
+                "invalid original intent size"
+            );
+            let ordinal = u64::from_be_bytes(bytes[..8].try_into()?);
+            let digest = bytes[8..40].try_into()?;
+            Ok(Some((
+                SequenceNumber::new(ordinal)?,
+                digest,
+                bytes.split_off(40),
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+pub(crate) fn original_record_name(pair: [u8; 32], boot: BootId, id: MessageId) -> String {
+    format!(
+        "object-v1-{}-{}-{}",
+        hex::encode(pair),
+        hex::encode(boot.as_bytes()),
+        hex::encode(id.as_bytes())
+    )
+}
+
 impl ObjectIntentSlot {
     // dir and name are constructed by the original holder. No guest pathname.
     pub(super) fn open(dir: &Path, name: &str, intent: [u8; 32]) -> Result<Self> {
@@ -31,36 +80,15 @@ impl ObjectIntentSlot {
         sync_dir(dir.parent().context("missing mailbox custody parent")?)?;
         let owner =
             FileLock::try_acquire(&dir.join("intent"))?.context("original source writer busy")?;
-        let (sequence, original) = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(dir.join(name))
-        {
-            Ok(file) => {
-                let meta = file.metadata()?;
-                private_fs::require_current_owner(&meta)?;
+        let (sequence, original) = match read_original_object(&dir.join(name))? {
+            Some((ordinal, digest, frame)) => {
                 ensure!(
-                    meta.is_file()
-                        && meta.nlink() == 1
-                        && meta.mode() & 0o077 == 0
-                        && meta.len() <= MAX_SOURCE_INTENT_BYTES as u64,
-                    "invalid original object intent"
-                );
-                let mut bytes = Vec::with_capacity(meta.len() as usize);
-                file.take(MAX_SOURCE_INTENT_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)?;
-                ensure!(
-                    bytes.len() <= MAX_SOURCE_INTENT_BYTES && bytes.len() > 40,
-                    "invalid original intent size"
-                );
-                ensure!(
-                    bytes[8..40] == intent,
+                    digest == intent,
                     "stable ID reused with a different original submission"
                 );
-                let ordinal = u64::from_be_bytes(bytes[..8].try_into()?);
-                (SequenceNumber::new(ordinal)?, Some(bytes.split_off(40)))
+                (ordinal, Some(frame))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            None => {
                 // A durable attempt means this ID already had a published seal.
                 // A missing original must never mint a second ciphertext for it.
                 match std::fs::symlink_metadata(dir.join(format!("{name}.attempts"))) {
@@ -73,7 +101,6 @@ impl ObjectIntentSlot {
                     None,
                 )
             }
-            Err(e) => return Err(e.into()),
         };
         Ok(Self {
             dir: dir.into(),
@@ -130,12 +157,7 @@ impl InstalledObjectPair<'_> {
             _ => anyhow::bail!("submission does not match the original role and active Call lease"),
         }
         let dir = self.source_intents(role)?;
-        let name = format!(
-            "object-v1-{}-{}-{}",
-            hex::encode(pair),
-            hex::encode(boot.as_bytes()),
-            hex::encode(submission.message_id().as_bytes())
-        );
+        let name = original_record_name(pair, boot, submission.message_id());
         let slot = ObjectIntentSlot::open(&dir, &name, original_object_intent_digest(submission)?)?;
         let turn = if let Some(record) = &slot.original {
             let (cap, envelope) = decode_frame(record)?;

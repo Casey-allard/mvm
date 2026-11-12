@@ -388,8 +388,11 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
     };
     let source_dir = tempfile::tempdir().unwrap();
     let source_start = std::time::Instant::now();
+    let record_name =
+        crate::mailbox_service::object_intent::original_record_name(p.stamp, a.boot.boot, msg);
     let (ordinal, original) = crate::mailbox_service::object_intent_slot_tests::publish_then_reopen(
         source_dir.path(),
+        &record_name,
         mvm_core::mailbox::reader_wire::original_object_intent_digest(&sub).unwrap(),
         &mvm_core::mailbox::frame::encode_frame(call.capability(), call.envelope()).unwrap(),
     );
@@ -653,6 +656,46 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
             f.now,
         )
         .unwrap();
+    let recover = |dir: &std::path::Path, envelope: &MailboxEnvelope| {
+        super::pending::recover(
+            &material.caller,
+            dir,
+            &pair,
+            live,
+            reply.capability(),
+            envelope,
+            f.now,
+        )
+    };
+    recover(source_dir.path(), reply.envelope()).unwrap();
+    let absent = tempfile::tempdir().unwrap();
+    assert!(recover(absent.path(), reply.envelope()).is_err());
+    assert_eq!(std::fs::read_dir(absent.path()).unwrap().count(), 0);
+    let bad_reply = {
+        let mut h = reply.header().clone();
+        h.correlation_id = CorrelationId::from_bytes([164; 32]);
+        mvm_core::mailbox::seal_envelope(
+            mvm_core::mailbox::SealRequest {
+                header: h,
+                routing: reply.envelope().routing.clone(),
+                plaintext: replybody,
+            },
+            &material.callee.outbound_key,
+            &material.callee.sender,
+        )
+        .unwrap()
+    };
+    assert!(recover(source_dir.path(), &bad_reply).is_err());
+    let record_path = source_dir.path().join(&record_name);
+    let saved = std::fs::read(&record_path).unwrap();
+    for byte in [7, 8] {
+        let mut changed = saved.clone();
+        changed[byte] ^= 2;
+        std::fs::write(&record_path, &changed).unwrap();
+        assert!(recover(source_dir.path(), reply.envelope()).is_err());
+    }
+    std::fs::write(&record_path, saved).unwrap();
+    recover(source_dir.path(), reply.envelope()).unwrap();
     let rs = ObjectSubmissionV1::Reply {
         message_id: reply_id,
         original_call: Box::new(signed.clone()),
