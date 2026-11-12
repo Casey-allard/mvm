@@ -172,10 +172,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        options.open_with_mode(0o600, dir.path().join("a")).unwrap();
-        options.open_with_mode(0o644, dir.path().join("b")).unwrap();
-        assert_eq!(mode(&dir.path().join("a")), 0o600);
-        assert_eq!(mode(&dir.path().join("b")), 0o644);
+        // Compare with independent native opens under the caller's actual umask.
+        use std::os::unix::fs::OpenOptionsExt as _;
+        for (name, requested) in [("a", 0o400), ("b", 0o644)] {
+            let path = dir.path().join(name);
+            let reference = dir.path().join(format!("control-{name}"));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(requested)
+                .open(&reference)
+                .unwrap();
+            options.open_with_mode(requested, &path).unwrap();
+            assert_eq!(mode(&path), mode(&reference));
+        }
     }
 
     #[test]
