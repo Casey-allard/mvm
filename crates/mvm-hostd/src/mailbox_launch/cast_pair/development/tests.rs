@@ -173,7 +173,21 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         now,
     )
     .unwrap();
-    let offer = issue_scoped(&chan, sa, db, g, &src, &dest, now).unwrap();
+    let offer = issue_with_policy(
+        &chan,
+        sa,
+        db,
+        g,
+        &src,
+        &dest,
+        now,
+        Some(destination::policy_digest(&src, &dest).unwrap()),
+    )
+    .unwrap();
+    original_b.setup.destination = Some(Box::new(
+        destination::PrivateDestination::new(&offer, &left, &right, &trust, g, &src, &dest)
+            .unwrap(),
+    ));
     assert_ne!(offer.source.0, offer.destination.0);
     let d = &offer.direction;
     let public = d
@@ -264,14 +278,10 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         )
         .is_err()
     );
-    dst.accept(
-        d,
-        EndpointRole::Destination,
-        &bowner,
-        &offer.destination,
-        now,
-    )
-    .unwrap();
+    let ingress = dst
+        .open_immutable_destination(&bowner, &b.grant)
+        .unwrap()
+        .unwrap();
     assert!(
         dst.accept(
             d,
@@ -479,6 +489,7 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
             )
             .is_ok()
     );
+    crate::mailbox_process::destination_ingress::qualify(&ingress, &b.keys, second, &retry, bytes);
     let mut revoked = receiving.clone();
     revoked
         .revoked_capabilities

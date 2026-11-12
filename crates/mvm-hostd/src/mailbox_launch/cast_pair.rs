@@ -76,6 +76,7 @@ pub struct InstalledCastMapping {
 pub struct ServingCastMapping {
     channel: CastChannel,
     destination_route: HostDialRoute,
+    destination_socket: std::path::PathBuf,
     source_vm: String,
     destination_vm: String,
     source_owner: MailboxWorkerOwner,
@@ -219,6 +220,7 @@ pub fn map_serving_cast_pair(
     let mapping = ServingCastMapping {
         channel,
         destination_route: route,
+        destination_socket: mvm_core::config::vm_mailbox_socket_at(&state),
         source_vm: a.to_owned(),
         destination_vm: b.to_owned(),
         source_owner: source.owner.clone(),
@@ -329,6 +331,24 @@ pub struct AuthorizedOpaqueCast<'a> {
     pub grants: AddressedCastGrants<'a>,
 }
 impl RoutedCast<'_> {
+    /// Forward to the original helper's preselected local data socket. Its
+    /// immediate peer verdict is an ingress result, never a journal receipt
+    /// or evidence of guest workload delivery. Source and destination policy
+    /// must be resampled after connecting, immediately before transmission.
+    pub fn forward_to_original_helper<'p>(
+        self,
+        direction: &development::DevelopmentDirection,
+        deadline: Instant,
+        current: impl FnOnce() -> Result<(&'p OpenContext, &'p OpenContext)>,
+    ) -> Result<Result<(), mvm_core::mailbox::frame::Refusal>> {
+        let deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(5));
+        let mut socket = mvm_agentd::vsock::connect_unix_before(&self.mapping.destination_socket, deadline)?;
+        let (source, destination) = current()?;
+        self.check_direction(direction, source, destination)?;
+        let body = mvm_core::mailbox::frame::encode_frame_from_canonical(self.grants.send, &self.canonical)?;
+        self.credit.exchange_with_original(&mut socket, &body, direction.commitment(), deadline)
+    }
+
     pub(crate) fn channel(&self) -> &CastChannel {
         &self.mapping.channel
     }

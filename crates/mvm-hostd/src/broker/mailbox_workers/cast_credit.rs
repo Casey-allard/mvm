@@ -7,13 +7,14 @@ pub(crate) const CAST_WORK_BYTES: usize = 8 * CAST_BODY_LIMIT;
 
 #[derive(Default)]
 pub(super) struct CastLane {
-    active: bool,
+    active: std::sync::Weak<HandoffWorkspace>,
     source_active: bool,
     last_admission: Option<Instant>,
 }
 
 pub(crate) struct CastCredit<'a> {
     workers: &'a MailboxWorkers,
+    charge: Arc<HandoffWorkspace>,
     source: (&'a str, &'a MailboxWorkerOwner),
     destination: (&'a str, &'a MailboxWorkerOwner),
 }
@@ -24,6 +25,15 @@ impl MailboxWorkers {
         source: (&str, &MailboxWorkerOwner),
         destination: (&str, &MailboxWorkerOwner),
     ) -> io::Result<()> {
+        self.with_cast_participants(source, destination, |_| Ok(()))
+    }
+
+    fn with_cast_participants<T>(
+        &self,
+        source: (&str, &MailboxWorkerOwner),
+        destination: (&str, &MailboxWorkerOwner),
+        operation: impl FnOnce(&mut Worker) -> io::Result<T>,
+    ) -> io::Result<T> {
         if source.0 == destination.0 || source.1 == destination.1 {
             return Err(refused("Cast requires two original workers"));
         }
@@ -63,7 +73,11 @@ impl MailboxWorkers {
                 return Err(refused("original Cast worker has exited"));
             }
         }
-        Ok(())
+        operation(
+            b.worker
+                .as_mut()
+                .ok_or_else(|| refused("destination child absent"))?,
+        )
     }
 
     /// Bind original slots directly in the coordinator that owns them. The
@@ -100,16 +114,25 @@ impl MailboxWorkers {
         let _activation = self.try_activation()?;
         self.check_cast_participants(source, destination)?;
         let mut lane = lock(&self.cast_lane)?;
-        if lane.active
+        if lane.active.upgrade().is_some()
             || lane
                 .last_admission
                 .is_some_and(|last| last.elapsed() < std::time::Duration::from_secs(60))
         {
             return Err(refused("addressed Cast lane busy or rate limited"));
         }
+        if self.budget.cleanup.failed.load(Ordering::Acquire) {
+            return Err(refused("original Cast accounting unavailable"));
+        }
         self.budget.charge_cast_space(&self.tenant)?;
-        lane.active = true;
+        let charge = Arc::new(HandoffWorkspace {
+            ledger: self.budget.ledger.clone(),
+            failed: self.budget.cleanup.failed.clone(),
+            tenant: self.tenant.clone(),
+        });
+        lane.active = Arc::downgrade(&charge);
         Ok(CastCredit {
+            charge,
             workers: self,
             source,
             destination,
@@ -211,22 +234,90 @@ impl CastCredit<'_> {
         Ok(())
     }
 }
-impl Drop for CastCredit<'_> {
+/// The routing call and the original receiving process can hold the same
+/// allocation. A dropped caller or a lost reply does not close the process.
+pub(super) struct HandoffWorkspace {
+    ledger: Arc<Mutex<Ledger>>,
+    failed: Arc<AtomicBool>,
+    tenant: String,
+}
+impl Drop for HandoffWorkspace {
     fn drop(&mut self) {
-        // Keep the lane closed on accounting failure; do not mint replacement credit.
-        let result = lock(&self.workers.cast_lane).and_then(|mut lane| {
-            let mut ledger = lock(&self.workers.budget.ledger)?;
-            refund_bytes(&mut ledger, &self.workers.tenant, CAST_WORK_BYTES)?;
-            lane.active = false;
-            Ok(())
-        });
-        if result.is_err() {
-            self.workers
-                .budget
-                .cleanup
-                .failed
-                .store(true, Ordering::Release);
+        if lock(&self.ledger)
+            .and_then(|mut ledger| refund_bytes(&mut ledger, &self.tenant, CAST_WORK_BYTES))
+            .is_err()
+        {
+            self.failed.store(true, Ordering::Release);
         }
+    }
+}
+
+impl CastCredit<'_> {
+    /// Link the real connected peer to its still-held original Child before
+    /// writing any bytes. An incomplete exchange retains the allocation
+    /// until that Child is collected. No PID reopen or filesystem receipt.
+    fn receiving_worker<T>(
+        &self,
+        pid: i32,
+        visit: impl FnOnce(&mut Worker) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let slots = lock(&self.workers.slots)?;
+        let mut slot = lock(
+            slots
+                .get(self.destination.0)
+                .ok_or_else(|| refused("destination slot absent"))?,
+        )?;
+        if &slot.owner != self.destination.1 || slot.busy {
+            return Err(refused("destination worker changed or busy"));
+        }
+        let worker = slot
+            .worker
+            .as_mut()
+            .ok_or_else(|| refused("destination worker absent"))?;
+        if u32::try_from(pid).ok() != Some(worker.child.id()) || collect_child(worker)?.is_some() {
+            return Err(refused(
+                "socket peer differs from the live original mailbox helper",
+            ));
+        }
+        visit(worker)
+    }
+    fn hold_for_peer(&self, peer: &UnixStream, direction: [u8; 32]) -> io::Result<i32> {
+        let _admission = self.workers.try_activation()?;
+        let peer_pid = mvm_vmm::host::uds_peer::connected_peer_pid(peer)?;
+        self.workers
+            .with_cast_participants(self.source, self.destination, |worker| {
+                if u32::try_from(peer_pid).ok() != Some(worker.child.id()) {
+                    return Err(refused("data socket is not held by original destination"));
+                }
+                if direction == [0; 32]
+                    || worker.ingress
+                        != crate::mailbox_process::owned_wire::ReadyIngress::CastDestination(
+                            direction,
+                        )
+                {
+                    return Err(refused(
+                        "original helper did not select this addressed ingress",
+                    ));
+                }
+                if worker.cast_workspace.is_some() {
+                    return Err(refused("original helper still owns an unresolved Cast"));
+                }
+                worker.cast_workspace = Some(self.charge.clone());
+                Ok(peer_pid)
+            })
+    }
+    fn finish_peer_turn(&self, authenticated_pid: i32) -> io::Result<()> {
+        self.receiving_worker(authenticated_pid, |worker| {
+            if !worker
+                .cast_workspace
+                .as_ref()
+                .is_some_and(|hold| Arc::ptr_eq(hold, &self.charge))
+            {
+                return Err(refused("no matching original Cast charge"));
+            }
+            worker.cast_workspace = None;
+            Ok(())
+        })
     }
 }
 
@@ -290,5 +381,33 @@ mod tests {
             budget.retire("local", name).unwrap();
             budget.return_cell(cell.unwrap());
         }
+    }
+}
+
+impl CastCredit<'_> {
+    /// One canonical peer frame on a fresh, kernel-identified connection.
+    /// Only a complete peer response closes this transfer's temporary
+    /// workspace. Errors leave the coordinator's charge on its original
+    /// receiving Child through collection, including after this call drops.
+    pub(crate) fn exchange_with_original(
+        &self,
+        stream: &mut UnixStream,
+        encoded: &[u8],
+        direction: [u8; 32],
+        deadline: Instant,
+    ) -> anyhow::Result<Result<(), mvm_core::mailbox::frame::Refusal>> {
+        let limit = crate::mailbox_process::installed_profile::pair_queue_limits().max_frame_bytes;
+        anyhow::ensure!(
+            !encoded.is_empty() && encoded.len() <= limit,
+            "invalid private peer frame size"
+        );
+        anyhow::ensure!(Instant::now() < deadline, "expired private handoff");
+        // macOS no longer exposes LOCAL_PEERPID after the peer closes.
+        // Keep the identity checked before writing on this same connection.
+        let authenticated_pid = self.hold_for_peer(stream, direction)?;
+        let mut io = crate::mailbox_process::owned_wire::DeadlineStream::new(stream, deadline);
+        let verdict = mvm_core::mailbox::frame::strict_peer_verdict(&mut io, encoded)?;
+        self.finish_peer_turn(authenticated_pid)?;
+        Ok(verdict)
     }
 }

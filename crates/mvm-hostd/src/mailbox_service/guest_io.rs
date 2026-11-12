@@ -40,10 +40,10 @@ fn add(value: &mut u64, n: u64, overflow: &mut bool) {
 }
 
 impl GuestStreamCounts {
-    pub(super) fn dial(&mut self) {
+    pub(crate) fn dial(&mut self) {
         add(&mut self.dial_attempts, 1, &mut self.overflow);
     }
-    pub(super) fn failed_dial(&mut self) {
+    pub(crate) fn failed_dial(&mut self) {
         add(&mut self.failed_dials, 1, &mut self.overflow);
     }
     pub(super) fn empty_connection(&mut self) {
@@ -51,13 +51,13 @@ impl GuestStreamCounts {
     }
 }
 
-pub(super) struct Measured<'a, S> {
+pub(crate) struct Measured<'a, S> {
     stream: S,
     counts: &'a mut GuestStreamCounts,
     moved_bytes: bool,
 }
 impl<'a, S> Measured<'a, S> {
-    pub(super) fn new(stream: S, counts: &'a mut GuestStreamCounts) -> Self {
+    pub(crate) fn new(stream: S, counts: &'a mut GuestStreamCounts) -> Self {
         Self {
             stream,
             counts,
