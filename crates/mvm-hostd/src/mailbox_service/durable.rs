@@ -102,6 +102,8 @@ pub(crate) struct GuestReaderAuthority {
 pub struct DurableMailboxService {
     #[cfg(feature = "durable-guest-io-witness")]
     guest_meter: Option<witness_io::Recorder>,
+    #[cfg(feature = "sender-ordinal-io-witness")]
+    aggregate_meter: Option<witness_io::aggregate::Aggregate>,
     shared: Arc<Shared>,
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -279,6 +281,8 @@ impl DurableMailboxService {
         Ok(Self {
             #[cfg(feature = "durable-guest-io-witness")]
             guest_meter: None,
+            #[cfg(feature = "sender-ordinal-io-witness")]
+            aggregate_meter: None,
             shared,
             path: path.to_owned(),
             stop,
@@ -291,6 +295,10 @@ impl DurableMailboxService {
         self.guest_meter = Some(witness_io::Recorder::create(
             &vm_state_dir.join(witness_io::FILE_NAME),
         )?);
+        #[cfg(feature = "sender-ordinal-io-witness")]
+        {
+            self.aggregate_meter = Some(witness_io::aggregate::Aggregate::create(vm_state_dir)?);
+        }
         Ok(self)
     }
 
@@ -345,6 +353,12 @@ impl DurableMailboxService {
         #[cfg(feature = "durable-guest-io-witness")]
         if let Some(meter) = &self.guest_meter {
             return meter.observe(&mut stream, |io, mark| {
+                #[cfg(feature = "sender-ordinal-io-witness")]
+                if let Some(aggregate) = &self.aggregate_meter {
+                    return aggregate.observe(io, |counted| {
+                        self.exchange_guest(sealer, turn, until, counted, mark)
+                    });
+                }
                 self.exchange_guest(sealer, turn, until, io, mark)
             });
         }

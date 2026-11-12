@@ -210,6 +210,8 @@ ctor = "0.2"
 [features]
 # Qualification build only. The original helper owns the numeric observation file.
 durable-guest-io-witness = []
+# Constant-space whole-session totals for an explicitly built sustained witness.
+sender-ordinal-io-witness = ["durable-guest-io-witness"]
 default = []
 # macOS-only protected caller opt-in; other platforms return Unsupported.
 native-caller-identity = ["dep:core-foundation", "dep:security-framework"]
