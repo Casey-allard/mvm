@@ -28,6 +28,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+struct StopOnExit<'a>(&'a AtomicBool);
+
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 struct Local<'a> {
     owner: &'a WorkerLaunch,
     local: EndpointMaterial,
@@ -62,13 +70,11 @@ impl Local<'_> {
         !self.stop.load(Ordering::Acquire) && self.owner.require_live().is_ok()
     }
     fn current(&self) -> Result<i64> {
-        ensure!(self.active(), "original mailbox worker stopped");
+        ensure!(self.active(), Refusal::Unavailable);
         Ok(self.owner.config.validate_current()?.now)
     }
     fn lock(&self) -> Result<MutexGuard<'_, MailboxJournal>> {
-        self.journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("original mailbox journal unavailable"))
+        self.journal.lock().map_err(|_| Refusal::Unavailable.into())
     }
     fn guest_request(
         &self,
@@ -230,11 +236,15 @@ impl Local<'_> {
         out: &carrier::Link,
         until: Instant,
     ) -> Result<()> {
-        let response =
-            self.guest_request(io, out, until)
-                .unwrap_or_else(|error| ReaderResponse::Refused {
-                    reason: refusal(&error),
-                });
+        let response = self
+            .guest_request(io, out, until)
+            .and_then(|answer| {
+                self.current()?;
+                Ok(answer)
+            })
+            .unwrap_or_else(|error| ReaderResponse::Refused {
+                reason: refusal(&error),
+            });
         self.owner.require_live()?;
         // This operation's guest connection can disappear after a durable commit.
         // The next connection can reconcile the same operation and original seal.
@@ -264,11 +274,11 @@ pub(super) fn run(owner: WorkerLaunch, [out, incoming]: [UnixStream; 2]) -> Resu
         let peer = std::thread::Builder::new()
             .name("original-object-inbound".into())
             .spawn_scoped(scope, || {
-                let result = local.incoming(&incoming);
-                local.stop.store(true, Ordering::Release);
-                result
+                let _stop = StopOnExit(&local.stop);
+                local.incoming(&incoming)
             })?;
         let guest = (|| -> Result<()> {
+            let _stop = StopOnExit(&local.stop);
             local.current()?;
             (&owner.channel).write_all(b"READY\n")?;
             local.guest(
@@ -277,7 +287,6 @@ pub(super) fn run(owner: WorkerLaunch, [out, incoming]: [UnixStream; 2]) -> Resu
                 &meter,
             )
         })();
-        local.stop.store(true, Ordering::Release);
         let _ = incoming.socket.shutdown(Shutdown::Both);
         let result = peer
             .join()
@@ -289,4 +298,31 @@ pub(super) fn run(owner: WorkerLaunch, [out, incoming]: [UnixStream; 2]) -> Resu
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unwinding_either_original_loop_wakes_its_sibling() {
+        let stop = AtomicBool::new(false);
+        let pair = UnixStream::pair().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        std::thread::scope(|scope| {
+            let wait = scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    assert!(Instant::now() < until);
+                    await_first_byte(&pair.0, Duration::from_millis(50), || {
+                        !stop.load(Ordering::Acquire)
+                    });
+                }
+            });
+            let fail = scope.spawn(|| {
+                let _guard = StopOnExit(&stop);
+                panic!("injected original worker failure");
+            });
+            assert!(fail.join().is_err());
+            wait.join().unwrap();
+        });
+    }
 }
