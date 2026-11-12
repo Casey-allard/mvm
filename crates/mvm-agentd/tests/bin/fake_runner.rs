@@ -43,6 +43,7 @@ enum Behavior {
     Ok,
     UserFault,
     CrashAfter(u64),
+    ExitWithPipeHolder,
     CrashDuringCallN(u64),
     MalformedFrameOnN(u64),
     Leak50MibPerCall,
@@ -65,8 +66,11 @@ impl Behavior {
     fn from_env() -> Self {
         let raw = env::var("MVM_FAKE_RUNNER_BEHAVIOR").unwrap_or_else(|_| "ok".into());
         let raw = raw.trim();
-        if raw == "ok" {
+        if raw == "graceful_retirement" || raw == "ok" {
             return Behavior::Ok;
+        }
+        if raw == "exit_with_pipe_holder" {
+            return Behavior::ExitWithPipeHolder;
         }
         if raw == "user_fault" {
             return Behavior::UserFault;
@@ -100,6 +104,14 @@ impl Behavior {
 }
 
 fn main() -> ExitCode {
+    // A qualification worker can keep draining during the pool's TERM
+    // grace; only this test binary installs the disposition.
+    if env::var("MVM_FAKE_RUNNER_BEHAVIOR").as_deref() == Ok("graceful_retirement") {
+        // SAFETY: install the POSIX constant disposition in this child.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+    }
     let behavior = Behavior::from_env();
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -133,6 +145,15 @@ fn main() -> ExitCode {
                     eprintln!("fake_runner: write frame error: {e}");
                     return ExitCode::from(2);
                 }
+            }
+            Behavior::ExitWithPipeHolder => {
+                // An ordinary same-group helper inherits stdout. Its fixed lifetime
+                // bounds this fixture even if supervisor cleanup fails.
+                let _holder = std::process::Command::new("/bin/sleep")
+                    .arg("4")
+                    .spawn()
+                    .unwrap();
+                return ExitCode::from(0);
             }
             Behavior::CrashAfter(after) => {
                 if call_no > *after {
