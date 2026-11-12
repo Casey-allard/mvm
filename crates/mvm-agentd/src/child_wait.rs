@@ -548,6 +548,52 @@ mod tests {
         panic!("child {pid} was never collected");
     }
 
+    /// The standard library waits for a child that cannot exec, inside
+    /// Command::spawn. Open that interval deterministically on a real fork.
+    #[test]
+    fn original_failed_exec_owns_reaping_until_std_returns_its_error() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::{net::UnixStream, process::CommandExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing_hook = directory.path().join("absent-after_start.sh");
+        let (mut observer, child_barrier) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let launch = std::thread::spawn(move || {
+            let fd = child_barrier.as_raw_fd();
+            let mut command = Command::new(missing_hook);
+            // SAFETY: only the two async-signal-safe I/O syscalls run after
+            // fork. The parent owns both endpoints through spawn completion.
+            unsafe {
+                command.pre_exec(move || {
+                    let mut byte = 1u8;
+                    if libc::write(fd, (&byte as *const u8).cast(), 1) != 1
+                        || libc::read(fd, (&mut byte as *mut u8).cast(), 1) != 1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            OriginalChild::spawn(&mut command).err().map(|e| e.kind())
+        });
+        let mut ready = [0];
+        observer.read_exact(&mut ready).unwrap();
+        // Always release the child before asserting a failure.
+        let excluded = matches!(
+            registry().try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        observer.write_all(&[1]).unwrap();
+        assert_eq!(launch.join().unwrap(), Some(io::ErrorKind::NotFound));
+        assert!(excluded, "the reaper could enter during original exec");
+        let mut later = OriginalChild::spawn(&mut Command::new("/usr/bin/true")).unwrap();
+        assert_eq!(later.wait().unwrap().code(), Some(0));
+    }
+
     #[test]
     fn the_global_entry_points_are_plain_child_waits_until_a_reaper_runs() {
         assert!(
