@@ -225,7 +225,7 @@ fn serve_local(
 ) -> Result<()> {
     let MailboxProcessConfig {
         grant,
-        keys,
+        mut keys,
         keys_dir,
         socket,
         route,
@@ -284,6 +284,7 @@ fn serve_local(
         ));
     }
     let paths = retained.storage_paths(&keys_dir).map_err(Error::other)?;
+    let delegated = keys.outbound_source.take();
     let derived = keys.with_retained(&retained)?;
     let (signer, _, _) = derived.durable_material();
     let (policy, sealer) = derived.trust();
@@ -309,12 +310,55 @@ fn serve_local(
         &sealer.capability,
         &signer,
     )?;
-    let mut policy=policy.with_grant(&grant)?;
-    let enrolled=paired_incoming::EnrolledIncoming::open(&keys_dir,&grant,&retained,binding,&reader).map_err(Error::other)?;
-    let inbound=if let Some(enrolled)=enrolled {
+    let mut directed = if let Some(private) = delegated.as_ref() {
+        let d = binding.outbound_journal_v1.ok_or_else(|| {
+            Error::new(
+                ErrorKind::PermissionDenied,
+                "A has no verified journal direction",
+            )
+        })?;
+        mvm_core::naming::validate_vm_name(&private.destination_name).map_err(Error::other)?;
+        let mut inbound = policy.context.clone();
+        inbound.expected_tenant = d.address.tenant;
+        inbound.expected_authorization_domain = d.address.authorization_domain;
+        inbound.expected_mailbox = d.address.mailbox;
+        inbound.expected_recipient = d.address.recipient;
+        inbound.expected_sender = d.source;
+        inbound.expected_capability_issuer =
+            mvm_contract::protocol::mailbox::PrincipalId::from_bytes(d.receipt_key);
+        inbound.current_execution_epoch = d.execution_epoch;
+        inbound.current_policy_epoch = d.policy_epoch;
+        let source =
+            crate::mailbox_service::directed_journal::DirectedJournalSource::from_original(
+                plan,
+                &binding,
+                &sealer,
+                &policy.context,
+                &inbound,
+                private.grants.clone(),
+                private.material(),
+                &vm_state_dir,
+                &mvm_core::config::vm_state_dir(&private.destination_name),
+            )
+            .map_err(Error::other)?;
+        Some(source)
+    } else {
+        None
+    };
+    let mut policy = policy.with_grant(&grant)?;
+    let enrolled =
+        paired_incoming::EnrolledIncoming::open(&keys_dir, &grant, &retained, binding, &reader)
+            .map_err(Error::other)?;
+    let inbound = if let Some(enrolled) = enrolled {
         enrolled.apply(&mut policy).map_err(Error::other)?;
-        Some(enrolled.send_guard(reader.revocations_path.clone()).map_err(Error::other)?)
-    } else {None};
+        Some(
+            enrolled
+                .send_guard(reader.revocations_path.clone())
+                .map_err(Error::other)?,
+        )
+    } else {
+        None
+    };
     let service = DurableMailboxService::bind_local_incoming(
         &socket,
         LAUNCH_LIMITS,
@@ -325,8 +369,22 @@ fn serve_local(
         inbound,
     )?;
     service.install_guest_reader(reader)?;
+    let mut dial = |until| {
+        delegated
+            .as_ref()
+            .ok_or(crate::mailbox_service::Refusal::Unavailable)?
+            .connect(&vm_state_dir, until)
+    };
     let mut turn = crate::mailbox_service::directed_journal::SourceTurn::from_boot(&binding)
         .map_err(Error::other)?;
+    if let Some(endpoint) = directed.as_mut() {
+        turn = turn.attach(endpoint, &mut dial).map_err(Error::other)?;
+    } else if binding.outbound_journal_v1.is_some() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "directed A helper lacks original delegated transport",
+        ));
+    }
     std::io::stdout().write_all(READY_MARKER)?;
     while keep_serving(launcher, &vm_state_dir) {
         if service
@@ -576,6 +634,12 @@ fn spawn_with_original<T>(
     let Some(grant) = &plan.mailbox else {
         return Ok(None);
     };
+    if grant.outbound_journal_v1.is_some() && !exclusive {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "directed A requires its original paired launcher",
+        ));
+    }
     let posture = posture.ok_or_else(|| {
         Error::new(
             ErrorKind::PermissionDenied,

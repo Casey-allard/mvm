@@ -7,8 +7,8 @@ use crate::mailbox_process::original_journal::authorization::{
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use mvm_contract::protocol::mailbox::{
-    EncryptionContext, MailboxJournalDirectionV1, MailboxOperation, MailboxRoutingFrame,
-    PrincipalId, SignedDestinationReceipt,
+    EncryptionContext, MailboxJournalDirectionV1, MailboxRoutingFrame, PrincipalId,
+    SignedDestinationReceipt,
 };
 use mvm_core::crypto::aead::Key;
 use mvm_core::mailbox::{
@@ -25,10 +25,10 @@ use std::time::{Duration, Instant};
 /// B's original role transfers the directional payload key alone to A. The
 /// original mailbox authority signer and retained local payload key stay at B.
 pub(crate) struct PairedSourceMaterial {
-    commitment: [u8; 32],
-    key: Key,
-    encryption: EncryptionContext,
-    routing: MailboxRoutingFrame,
+    pub(crate) commitment: [u8; 32],
+    pub(crate) key: Key,
+    pub(crate) encryption: EncryptionContext,
+    pub(crate) routing: MailboxRoutingFrame,
 }
 impl PairedSourceMaterial {
     pub(crate) fn from_enrollment(

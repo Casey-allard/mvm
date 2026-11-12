@@ -3,6 +3,7 @@
 //! retains the original Child until collection. A pidfile cannot recreate it.
 
 pub mod authorization;
+pub mod relay;
 
 use super::{MailboxLaunchPosture, MailboxProcessConfig, spawn_serving, spawn_with_original};
 use anyhow::{Context, Result, ensure};
@@ -21,7 +22,7 @@ use std::time::Instant;
 /// The program which starts B owns its real process. Borrowing the handle
 /// cannot transfer the mailbox keys, change its recipient, or reopen a PID.
 pub struct OriginalJournalDestination {
-    pub(super) incoming:Option<super::paired_incoming::EnrolledIncoming>,
+    pub(super) incoming: Option<super::paired_incoming::EnrolledIncoming>,
     child: Child,
     _original: std::sync::Arc<LaunchClaim>,
     marker: OriginalMarker,
@@ -31,6 +32,7 @@ pub struct OriginalJournalDestination {
     policy_epoch: u64,
     issuer: PrincipalId,
     keys_dir: PathBuf,
+    name: String,
     revocations_path: PathBuf,
     inbound: mvm_core::mailbox::OpenContext,
     sender_key: ed25519_dalek::VerifyingKey,
@@ -83,16 +85,41 @@ impl OriginalJournalDestination {
             mailbox: config.grant.mailbox,
             recipient: current.expected_recipient,
         };
-        let incoming=if config.grant.incoming_journal_policy_sha256_v1.is_some(){
-            let posture=config.posture.as_ref().context("missing original destination posture")?;
-            let retained=crate::mailbox_custody::RetainedMailboxKeys::open_existing(&config.keys_dir,plan,&plan.image.name,posture,Some(boot.boot),address)?;
-            let signer=config.keys.durable_material().0;
-            let reader=super::reader::load_or_enroll(&config.vm_state_dir,&config.grant,boot.clone(),&sealer.capability,&signer)?;
-            let enrolled=super::paired_incoming::EnrolledIncoming::open(&config.keys_dir,&config.grant,&retained,&boot,&reader)?.context("B incoming policy absent")?;
+        let incoming = if config.grant.incoming_journal_policy_sha256_v1.is_some() {
+            let posture = config
+                .posture
+                .as_ref()
+                .context("missing original destination posture")?;
+            let retained = crate::mailbox_custody::RetainedMailboxKeys::open_existing(
+                &config.keys_dir,
+                plan,
+                &plan.image.name,
+                posture,
+                Some(boot.boot),
+                address,
+            )?;
+            let signer = config.keys.durable_material().0;
+            let reader = super::reader::load_or_enroll(
+                &config.vm_state_dir,
+                &config.grant,
+                boot.clone(),
+                &sealer.capability,
+                &signer,
+            )?;
+            let enrolled = super::paired_incoming::EnrolledIncoming::open(
+                &config.keys_dir,
+                &config.grant,
+                &retained,
+                &boot,
+                &reader,
+            )?
+            .context("B incoming policy absent")?;
             enrolled.apply(&mut policy)?;
             Some(enrolled)
-        } else {None};
-        let current=&policy.context;
+        } else {
+            None
+        };
+        let current = &policy.context;
         let marker = OriginalMarker::claim(&guard.owner_dir)?;
         let child = spawn_serving(config, &config.vm_state_dir)?;
         Ok(Self {
@@ -106,6 +133,7 @@ impl OriginalJournalDestination {
             policy_epoch: current.current_policy_epoch,
             issuer: current.expected_capability_issuer,
             keys_dir: config.keys_dir.clone(),
+            name: plan.image.name.clone(),
             revocations_path: super::reader::revocations_path(&config.vm_state_dir),
             inbound: current.clone(),
             sender_key: policy.sender_key,

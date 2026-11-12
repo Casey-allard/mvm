@@ -844,9 +844,8 @@ pub struct RunPosture<'a> {
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
     incoming_journal: Option<&'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission>,
-    paired_journal: Option<
-        &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission<'a>,
-    >,
+    paired_journal:
+        Option<&'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission>,
 }
 
 impl<'a> RunPosture<'a> {
@@ -892,28 +891,37 @@ impl<'a> RunPosture<'a> {
     /// for this paired source admission. Ordinary admission remains unchanged.
     pub fn with_paired_journal(
         mut self,
-        pair: &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission<
-            'a,
-        >,
+        pair: &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission,
     ) -> Self {
         self.paired_journal = Some(pair);
         self
     }
 
-    pub fn with_incoming_journal(mut self, incoming: &'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission) -> Self {
-        self.incoming_journal=Some(incoming);
+    pub fn with_incoming_journal(
+        mut self,
+        incoming: &'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission,
+    ) -> Self {
+        self.incoming_journal = Some(incoming);
         self
     }
 
     fn enforce_journal(&self, plan: &ExecutionPlan, max_ms: Option<u64>) -> Result<()> {
-        if let Some(incoming)=self.incoming_journal {
-            anyhow::ensure!(self.paired_journal.is_none() && self.variant==Variant::Prod && self.backend.is_some(),
-                "incoming journal requires an original production destination backend");
-            grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(),max_ms)?;
+        if let Some(incoming) = self.incoming_journal {
+            anyhow::ensure!(
+                self.paired_journal.is_none()
+                    && self.variant == Variant::Prod
+                    && self.backend.is_some(),
+                "incoming journal requires an original production destination backend"
+            );
+            grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(), max_ms)?;
             return incoming.verify(plan);
         }
-        anyhow::ensure!(plan.mailbox.and_then(|g|g.incoming_journal_policy_sha256_v1).is_none(),
-            "incoming journal needs explicit original destination authorization");
+        anyhow::ensure!(
+            plan.mailbox
+                .and_then(|g| g.incoming_journal_policy_sha256_v1)
+                .is_none(),
+            "incoming journal needs explicit original destination authorization"
+        );
         let Some(pair) = self.paired_journal else {
             return enforce_mailbox_retention(plan.mailbox.as_ref(), max_ms);
         };

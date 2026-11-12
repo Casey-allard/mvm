@@ -17,6 +17,8 @@ use mvm_core::plan::{ExecutionPlan, Nonce};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// All three must be separately supplied, already signed original grants.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JournalCredentials {
     pub source_scope: SignedMailboxCapability,
     pub destination_send: SignedMailboxCapability,
@@ -356,26 +358,26 @@ mod tests {
 
 /// Borrowed only during the pre-sign / pre-dispatch decision. The underlying
 /// original process cannot be replaced or reconstructed from a public ID.
-pub struct PairedJournalAdmission<'a> {
-    original: std::sync::Mutex<&'a mut OriginalJournalDestination>,
-    grants: &'a JournalCredentials,
-    deadline: Instant,
+pub struct PairedJournalAdmission {
+    pub(super) original: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
+    pub(super) grants: std::sync::Arc<JournalCredentials>,
+    pub(super) deadline: Instant,
 }
 
-impl std::fmt::Debug for PairedJournalAdmission<'_> {
+impl std::fmt::Debug for PairedJournalAdmission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PairedJournalAdmission")
     }
 }
 
-impl<'a> PairedJournalAdmission<'a> {
+impl PairedJournalAdmission {
     pub fn new(
-        original: &'a mut OriginalJournalDestination,
-        grants: &'a JournalCredentials,
+        original: std::sync::Arc<std::sync::Mutex<OriginalJournalDestination>>,
+        grants: std::sync::Arc<JournalCredentials>,
         deadline: Instant,
     ) -> Self {
         Self {
-            original: std::sync::Mutex::new(original),
+            original,
             grants,
             deadline,
         }
@@ -385,6 +387,6 @@ impl<'a> PairedJournalAdmission<'a> {
         self.original
             .try_lock()
             .map_err(|_| anyhow::anyhow!("original destination is busy"))?
-            .check_proposal(plan, self.grants, self.deadline)
+            .check_proposal(plan, &self.grants, self.deadline)
     }
 }

@@ -176,7 +176,9 @@ pub fn authority_key_for(
 }
 
 pub(crate) fn journal_sender_for(keys: &Path, grant: &MailboxGrant) -> Result<VerifyingKey> {
-    Ok(derived_keys(keys,&grant.mailbox,grant.epoch)?.sender.verifying_key())
+    Ok(derived_keys(keys, &grant.mailbox, grant.epoch)?
+        .sender
+        .verifying_key())
 }
 
 /// Public identities only, derived by the original host before signing a
@@ -211,6 +213,9 @@ pub(crate) fn journal_scope_before_launch(
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivedMailboxKeys {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outbound_source:
+        Option<crate::mailbox_process::original_journal::relay::SourceConfiguration>,
     sender: [u8; 32],
     authority: [u8; 32],
     encryption: [u8; 32],
@@ -356,6 +361,7 @@ pub fn derive_launch_keys(
     }
     let template = template_for(keys_dir, &derived, grant, now_unix_ms())?;
     Ok(DerivedMailboxKeys {
+        outbound_source: None,
         sender: derived.sender.to_bytes(),
         authority: derived.authority.to_bytes(),
         encryption: *encryption,
@@ -393,8 +399,10 @@ fn template_for(
     grant: &MailboxGrant,
     now_ms: i64,
 ) -> Result<MailboxTemplate> {
-    if let Some(digest)=grant.incoming_journal_policy_sha256_v1 {
-        return crate::mailbox_process::paired_incoming::IncomingJournalPolicy::template(keys_dir,digest);
+    if let Some(digest) = grant.incoming_journal_policy_sha256_v1 {
+        return crate::mailbox_process::paired_incoming::IncomingJournalPolicy::template(
+            keys_dir, digest,
+        );
     }
     match std::fs::read(keys_dir.join(TEMPLATE_FILE)) {
         Ok(bytes) => serde_json::from_slice(&bytes)

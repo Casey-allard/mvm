@@ -51,7 +51,7 @@ pub mod durable;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SOURCE_INTENTS: usize = 64;
-const MAX_SOURCE_INTENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SOURCE_INTENT_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_ATTEMPTS: u8 = 8;
 /// How long a dialed guest may hold its connection before sending a frame:
 /// longer than the guest's own hold, so the guest ends it.
@@ -817,7 +817,7 @@ fn read_queued_frame(shared: &Shared, stream: &mut UnixStream) -> Option<Result<
     Some(read_rest(stream, &mut len, max))
 }
 
-fn read_frame(max: usize, stream: &mut impl Read) -> Result<Vec<u8>, Refusal> {
+pub(crate) fn read_frame(max: usize, stream: &mut impl Read) -> Result<Vec<u8>, Refusal> {
     let mut len = [0u8; 4];
     stream
         .read_exact(&mut len[..1])

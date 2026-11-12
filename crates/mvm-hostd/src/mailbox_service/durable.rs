@@ -41,9 +41,9 @@ const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 const GUEST_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_EXPIRY_RECORDS_PER_REQUEST: usize = 8;
 
-pub(super) struct GuestDeadline<'a> {
-    pub(super) stream: &'a mut UnixStream,
-    pub(super) until: Instant,
+pub(crate) struct GuestDeadline<'a> {
+    pub(crate) stream: &'a mut UnixStream,
+    pub(crate) until: Instant,
 }
 
 impl GuestDeadline<'_> {
@@ -105,8 +105,8 @@ struct State {
 }
 
 pub(crate) struct IncomingSendGuard {
-    pub(crate) digest:[u8;32],
-    pub(crate) revocations:PathBuf,
+    pub(crate) digest: [u8; 32],
+    pub(crate) revocations: PathBuf,
 }
 
 struct Shared {
@@ -215,7 +215,7 @@ impl DurableMailboxService {
         journal: MailboxJournal,
         anchor: FileJournalAnchor,
     ) -> std::io::Result<Self> {
-        Self::bind_local_incoming(path,limits,policy,signer,journal,anchor,None)
+        Self::bind_local_incoming(path, limits, policy, signer, journal, anchor, None)
     }
 
     pub(crate) fn bind_local_incoming(
@@ -225,7 +225,7 @@ impl DurableMailboxService {
         signer: SigningKey,
         journal: MailboxJournal,
         anchor: FileJournalAnchor,
-        incoming:Option<IncomingSendGuard>,
+        incoming: Option<IncomingSendGuard>,
     ) -> std::io::Result<Self> {
         journal
             .local_ready(&anchor, &signer.verifying_key())
@@ -255,7 +255,7 @@ impl DurableMailboxService {
         journal: MailboxJournal,
         anchor: Box<dyn JournalAnchor>,
         local_anchor: Option<Arc<FileJournalAnchor>>,
-        incoming:Option<IncomingSendGuard>,
+        incoming: Option<IncomingSendGuard>,
     ) -> std::io::Result<Self> {
         if signer.verifying_key() != policy.authority_key {
             return Err(std::io::Error::new(
@@ -696,11 +696,14 @@ fn admit(
         .as_millis();
     let now: i64 = now.try_into().map_err(|_| Refusal::Unavailable)?;
     let mut state = shared.state.lock().expect("mailbox journal lock poisoned");
-    if let Some(incoming)=&shared.incoming {
-        if mvm_core::mailbox::outbound::journal_capability_digest(capability).map_err(|_|Refusal::NotAuthorized)?!=incoming.digest {
+    if let Some(incoming) = &shared.incoming {
+        if mvm_core::mailbox::outbound::journal_capability_digest(capability)
+            .map_err(|_| Refusal::NotAuthorized)?
+            != incoming.digest
+        {
             return Err(Refusal::NotAuthorized);
         }
-        state.policy.context.revoked_capabilities=reader_revocations(&incoming.revocations)?;
+        state.policy.context.revoked_capabilities = reader_revocations(&incoming.revocations)?;
     }
     state.policy.context.now_unix_ms = now;
     let State { policy, journal } = &mut *state;

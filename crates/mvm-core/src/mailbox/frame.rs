@@ -22,7 +22,7 @@ use super::{decode_envelope, encode_envelope, verify_receipt};
 
 // A verdict contains no payload. Bound the response even when a peer never
 // closes or sends arbitrarily large error text.
-const MAX_VERDICT_BYTES: u64 = 4 * 1024;
+pub const MAX_VERDICT_BYTES: u64 = 4 * 1024;
 
 /// Why a frame was not queued. Sent back to the peer verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
