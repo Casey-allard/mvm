@@ -337,6 +337,11 @@ pub struct MailboxJournalDirectionV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxGrant {
+    /// Both original plan signers select the same digest of the ordered plan
+    /// nonces and independently signed Call and Reply credentials. Absence
+    /// preserves existing grant encodings; this selector alone admits no service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_object_pair_sha256_v1: Option<[u8; 32]>,
     /// Canonical hash of a separately provisioned, destination operator-approved incoming policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_journal_policy_sha256_v1: Option<[u8; 32]>,

@@ -343,6 +343,12 @@ pub fn derive_launch_keys(
     grant: &MailboxGrant,
     secret: &Key,
 ) -> Result<DerivedMailboxKeys> {
+    if grant.durable_object_pair_sha256_v1.is_some() {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "durable object Call/Reply service is not installed",
+        ));
+    }
     let derived = derived_keys(keys_dir, &grant.mailbox, grant.epoch)?;
     // After the signing seed above, so a wrong directory never mints a root.
     let encryption_root = Key::load_or_create(&keys_dir.join(ENCRYPTION_ROOT))?;
@@ -620,6 +626,7 @@ mod tests {
     fn grant_at(dir: &Path, mailbox: [u8; 32], n: u64) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes(mailbox);
         MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox,
@@ -634,6 +641,19 @@ mod tests {
 
     fn grant(dir: &Path, mailbox: [u8; 32]) -> MailboxGrant {
         grant_at(dir, mailbox, 1)
+    }
+
+    #[test]
+    fn selected_object_pair_cannot_fall_back_to_cast_keys() {
+        let keys = keys_dir();
+        let mut selected = grant(keys.path(), [41; 32]);
+        selected.durable_object_pair_sha256_v1 = Some([42; 32]);
+        let missing = keys.path().join("absent");
+        let err = derive_launch_keys(&missing, &selected, &test_secret())
+            .err()
+            .expect("unsupported");
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        assert!(!missing.exists());
     }
 
     #[test]

@@ -203,6 +203,7 @@ fn perform_exchange(
             };
             let boot = &pending.reader.boot;
             let grant = MailboxGrant {
+                durable_object_pair_sha256_v1: None,
                 incoming_journal_policy_sha256_v1: None,
                 outbound_journal_v1: None,
                 mailbox: boot.mailbox,
@@ -320,6 +321,7 @@ mod tests {
         let ack_seed = SEED.get_or_init(|| Zeroizing::new([7; 32]));
         let reader = Arc::new(GuestReader {
             boot: MailboxReaderBootBinding {
+                durable_object_pair_sha256_v1: None,
                 outbound_journal_v1: None,
                 plan_id: PlanId("current".into()),
                 plan_nonce: Nonce::from_bytes([1; 16]),

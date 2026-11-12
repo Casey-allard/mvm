@@ -50,6 +50,12 @@ pub(crate) fn capture_ack_key_before_privilege_drop() {
             return;
         }
     };
+    if binding.durable_object_pair_sha256_v1.is_some() {
+        // Record the selected but unavailable profile even if its ACK seed
+        // is missing. The ordinary listener cannot serve this original boot.
+        let _ = READER_BOOT.set(binding);
+        return;
+    }
     match load_ack_seed(&dir.join(MAILBOX_ACK_SIGNING_KEY_FILE), 0) {
         Ok(seed)
             if SigningKey::from_bytes(&seed).verifying_key().to_bytes()
@@ -215,6 +221,13 @@ pub(crate) fn init_mailbox() {
         return;
     }
     let reader_boot = READER_BOOT.get().cloned();
+    if reader_boot
+        .as_ref()
+        .is_some_and(|b| b.durable_object_pair_sha256_v1.is_some())
+    {
+        eprintln!("mvm-guest-agent: durable object Call/Reply service is not installed");
+        return;
+    }
     let ack_seed = ACK_SEED.get();
     let _ =
         mvm_agentd::detached::spawn_named("mailbox-listener", move || {
@@ -475,6 +488,7 @@ mod tests {
         let signer = SigningKey::from_bytes(&[51; 32]);
         let plan = mvm_core::plan::test_support::PlanFixture::new().build();
         let boot = MailboxReaderBootBinding {
+            durable_object_pair_sha256_v1: None,
             outbound_journal_v1: None,
             plan_id: plan.plan_id,
             plan_nonce: plan.nonce,

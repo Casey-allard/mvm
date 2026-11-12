@@ -521,6 +521,7 @@ fn verify_recovered_lease(
     now_unix_ms: i64,
 ) -> Result<VerifyingKey, JournalError> {
     let plan = MailboxGrant {
+        durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,
         mailbox: lease.lease.address.mailbox,

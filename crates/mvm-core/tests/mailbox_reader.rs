@@ -39,6 +39,7 @@ fn fixture() -> (
     };
     let epoch = ExecutionEpoch::new(7).unwrap();
     let plan = MailboxGrant {
+        durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,
         mailbox: address.mailbox,
@@ -96,6 +97,7 @@ fn fixture() -> (
 fn own_mailbox_grant_mints_a_distinct_boot_bound_receive_capability() {
     let (authority, guest, grant, plan_id, plan_nonce, mut send, mut enrollment) = fixture();
     let binding = MailboxReaderBootBinding {
+        durable_object_pair_sha256_v1: None,
         outbound_journal_v1: None,
         plan_id: plan_id.clone(),
         plan_nonce: plan_nonce.clone(),

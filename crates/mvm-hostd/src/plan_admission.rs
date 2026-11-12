@@ -906,6 +906,12 @@ impl<'a> RunPosture<'a> {
     }
 
     fn enforce_journal(&self, plan: &ExecutionPlan, max_ms: Option<u64>) -> Result<()> {
+        anyhow::ensure!(
+            plan.mailbox
+                .and_then(|g| g.durable_object_pair_sha256_v1)
+                .is_none(),
+            "durable object Call/Reply service is not installed"
+        );
         if let Some(incoming) = self.incoming_journal {
             anyhow::ensure!(
                 self.paired_journal.is_none()
@@ -2431,6 +2437,7 @@ mod tests {
     #[test]
     fn local_retention_requires_a_configured_host_ceiling() {
         let mut grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
@@ -2447,6 +2454,36 @@ mod tests {
         assert!(enforce_mailbox_retention(Some(&grant), Some(9_999)).is_err());
         assert!(enforce_mailbox_retention(Some(&grant), Some(10_000)).is_ok());
         assert!(enforce_mailbox_retention(Some(&grant), Some(20_000)).is_ok());
+    }
+
+    #[test]
+    fn selected_object_pair_requires_installed_endpoint_support() {
+        let mut grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
+            mailbox: MailboxId::from_bytes([1; 32]),
+            authority_key: [2; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: Some(MailboxRetentionPolicy::new(10_000).unwrap()),
+        };
+        let posture = RunPosture::without_backend(Variant::Prod);
+        let legacy = mvm_core::plan::test_support::PlanFixture::new()
+            .mailbox(grant)
+            .build();
+        assert!(posture.enforce_journal(&legacy, Some(10_000)).is_ok());
+        grant.durable_object_pair_sha256_v1 = Some([42; 32]);
+        let selected = mvm_core::plan::test_support::PlanFixture::new()
+            .mailbox(grant)
+            .build();
+        assert!(
+            posture
+                .enforce_journal(&selected, Some(10_000))
+                .unwrap_err()
+                .to_string()
+                .contains("not installed")
+        );
     }
 
     #[cfg(feature = "manifest-verify")]
@@ -4001,6 +4038,7 @@ mod tests {
         let keys = tempfile::tempdir().expect("keystore");
         let mut input = fixture_input("vm-retention");
         input.mailbox = Some(MailboxGrant {
+            durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
