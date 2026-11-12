@@ -50,6 +50,8 @@ use crate::plan_admission::{MailboxLaunchPosture, MailboxPostureHandoff};
 use crate::vm_lifetime::{endpoint_needed, launcher_is_alive};
 
 mod lifetime;
+#[cfg(target_os = "linux")]
+pub(crate) mod object_worker;
 pub mod original_journal;
 pub mod paired_incoming;
 pub(crate) mod reader;
