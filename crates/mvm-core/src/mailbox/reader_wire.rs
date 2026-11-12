@@ -67,6 +67,52 @@ impl std::fmt::Debug for ObjectSubmissionV1 {
     }
 }
 
+/// The original source custodian supplies these public identifiers from the
+/// retained sealed request on its authenticated, host-CID connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalObjectSealV1 {
+    pub pair: [u8; 32],
+    pub sender_boot: mvm_contract::protocol::mailbox::BootId,
+    pub intent_sha256: [u8; 32],
+    pub delivery_id: mvm_contract::protocol::mailbox::DeliveryId,
+    pub ciphertext_commitment: [u8; 32],
+}
+
+pub fn original_object_intent_digest(submission: &ObjectSubmissionV1) -> Result<[u8; 32], Refusal> {
+    use sha2::{Digest, Sha256};
+    if submission.payload().len() > MAX_REQUEST_BYTES {
+        return Err(Refusal::Oversized(MAX_REQUEST_BYTES));
+    }
+    let serialized = serde_jcs::to_vec(submission).map_err(|_| Refusal::Malformed)?;
+    if serialized.len() > MAX_REQUEST_BYTES {
+        return Err(Refusal::Oversized(MAX_REQUEST_BYTES));
+    }
+    let mut h = Sha256::new();
+    h.update(b"mvm.mailbox.original-object-intent.v1\0");
+    h.update(serialized);
+    Ok(h.finalize().into())
+}
+
+impl OriginalObjectSealV1 {
+    /// Call with the source original's immutable retained envelope, independently
+    /// of any returned receipt. This value confers no forward or receive authority.
+    pub fn from_original(
+        pair: [u8; 32],
+        sender_boot: mvm_contract::protocol::mailbox::BootId,
+        submission: &ObjectSubmissionV1,
+        stored: &mvm_contract::protocol::mailbox::MailboxEnvelope,
+    ) -> Result<Self, Refusal> {
+        Ok(Self {
+            pair,
+            sender_boot,
+            intent_sha256: original_object_intent_digest(submission)?,
+            delivery_id: stored.routing.delivery_id,
+            ciphertext_commitment: stored.ciphertext_commitment,
+        })
+    }
+}
+
 /// One on-demand guest request. `Possession` answers the immediately preceding
 /// destination challenge on the same connection, not an arbitrary old one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +170,11 @@ pub enum ApplicationReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderResponse {
+    /// Original source service -> guest agent only. Applications receive the verified V2.
+    ObjectSealAcceptedV1 {
+        original: OriginalObjectSealV1,
+        receipt: Box<mvm_contract::protocol::mailbox::SignedDestinationReceipt>,
+    },
     ObjectRoleV1 {
         signed: Box<super::object_pair::role::SignedObjectRoleV1>,
     },
