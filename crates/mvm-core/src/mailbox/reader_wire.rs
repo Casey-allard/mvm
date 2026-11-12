@@ -25,6 +25,48 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Guest-local socket for explicit application Receive and ACK-after-processing.
 pub const GUEST_READER_SOCKET_PATH: &str = "/run/mvm/mailbox/receive.sock";
 
+/// An application operation for one already selected durable object pair. The
+/// original sender, recipient, signing keys and return route come from MVM's
+/// retained owners. The application supplies only its own stable logical IDs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObjectSubmissionV1 {
+    Call {
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+        correlation_id: mvm_contract::protocol::mailbox::CorrelationId,
+        #[serde(with = "payload_base64")]
+        payload: Vec<u8>,
+    },
+    Reply {
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+        original_call: Box<SignedMailboxDeliveryLease>,
+        #[serde(with = "payload_base64")]
+        payload: Vec<u8>,
+    },
+}
+impl ObjectSubmissionV1 {
+    pub fn message_id(&self) -> mvm_contract::protocol::mailbox::MessageId {
+        match self {
+            Self::Call { message_id, .. } | Self::Reply { message_id, .. } => *message_id,
+        }
+    }
+    pub fn payload(&self) -> &[u8] {
+        match self {
+            Self::Call { payload, .. } | Self::Reply { payload, .. } => payload,
+        }
+    }
+}
+impl std::fmt::Debug for ObjectSubmissionV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(match self {
+            Self::Call { .. } => "ObjectCallV1",
+            Self::Reply { .. } => "ObjectReplyV1",
+        })
+        .field("payload_len", &self.payload().len())
+        .finish_non_exhaustive()
+    }
+}
+
 /// One on-demand guest request. `Possession` answers the immediately preceding
 /// destination challenge on the same connection, not an arbitrary old one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +89,10 @@ pub enum ReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApplicationReaderRequest {
+    StageObjectV1 {
+        pair: [u8; 32],
+        submission: Box<ObjectSubmissionV1>,
+    },
     ReceiveObjectPairV1 {
         pair: [u8; 32],
     },
@@ -80,6 +126,11 @@ pub enum ReaderResponse {
         content_type: ContentType,
         #[serde(with = "payload_base64")]
         payload: Vec<u8>,
+    },
+    /// The original guest has durably staged the operation locally.
+    ObjectStagedV1 {
+        pair: [u8; 32],
+        message_id: mvm_contract::protocol::mailbox::MessageId,
     },
     ObjectDeliveryV1 {
         lease: Box<SignedMailboxDeliveryLease>,

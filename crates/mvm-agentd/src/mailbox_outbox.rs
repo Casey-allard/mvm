@@ -20,6 +20,7 @@
 //! after [`forward_local_outbox`] verifies a boot-bound signed V2 receipt.
 
 pub mod journal_direction;
+pub mod object_pair;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

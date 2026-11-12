@@ -556,7 +556,8 @@ fn serve_reader(
         ReaderResponse::Empty => mark("reader_empty"),
         ReaderResponse::Challenge { .. } => mark("reader_challenge"),
         // A slot report belongs to the guest-local interface, not this host stream.
-        ReaderResponse::OutboundJournalAvailableV1 { .. } => {}
+        ReaderResponse::OutboundJournalAvailableV1 { .. }
+        | ReaderResponse::ObjectStagedV1 { .. } => {}
     }
     let _ = write_response(stream, &response);
 }
