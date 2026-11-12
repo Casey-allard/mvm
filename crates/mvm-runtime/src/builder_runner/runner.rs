@@ -253,6 +253,7 @@ impl<D: VmmDriver + 'static> BuilderRunner<D> {
             },
             egress_proxy: None,
             tls_intermediate: None,
+            admitted_network_plan: None,
             network_policy: Some(&builder_policy),
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
