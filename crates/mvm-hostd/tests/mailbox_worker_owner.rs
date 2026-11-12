@@ -955,3 +955,51 @@ async fn signed_lookup_is_read_only_and_recovers_original_after_expiry() {
     }).await.unwrap();
     task.abort();
 }
+
+/// Run a real signed request through the daemon while its canonical mutation
+/// lane is held. Query must remain usable without acquiring that lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_initial_worker_waits_for_held_mutation_lane_and_rechecks_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.sock");
+    let budget = MailboxWorkerBudget::new(WorkerLimits {
+        host_workers: 2, tenant_workers: 2,
+        host_bytes: 1_048_576, tenant_bytes: 1_048_576, bytes_per_worker: 65_536,
+    }).unwrap();
+    let workers = Arc::new(MailboxWorkers::new("tenant", budget.clone(), Arc::new(FixtureHelper)).unwrap());
+    let daemon = HostAgentDaemon::new("tenant", SigningKey::from_bytes(&[7;32]).verifying_key(),65_536)
+        .with_mailbox_workers(workers).unwrap();
+    let lane = daemon.mutation_lane();
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let server=tokio::spawn(HostAgentDaemon::run_shared_on_listener(Arc::new(tokio::sync::Mutex::new(daemon)),listener));
+    let invoke=|r:MailboxWorkerRequest| {
+        let socket=path.clone();
+        tokio::task::spawn_blocking(move || call(&socket,&r).map(|p|p.0))
+    };
+    let first=request("tenant","alpha");
+    let owner=invoke(first.clone()).await.unwrap().unwrap().owner;
+    let held=lane.clone().acquire_owned().await.unwrap();
+    let mut second=request("tenant","beta");
+    second.request_nonce=[6;32];
+    let mut pending=invoke(second.clone());
+    let early=tokio::time::timeout(Duration::from_millis(100), &mut pending).await;
+    assert!(early.is_err(),"contended signed Acquire returned before its deadline: {early:?}");
+    let mut query=first;
+    query.operation=MailboxWorkerOperation::Query {owner};
+    assert_eq!(invoke(query).await.unwrap().unwrap().state,MailboxWorkerState::Reserved);
+    assert_eq!(budget.usage().unwrap().workers,1);
+    drop(held);
+    assert_eq!(pending.await.unwrap().unwrap().state,MailboxWorkerState::Reserved);
+    assert_eq!(budget.usage().unwrap().workers,2);
+    let held=lane.acquire_owned().await.unwrap();
+    let mut expired=request("tenant","never-admitted");
+    expired.admission_expires_at_unix_ms=now()+300;
+    let mut denied=invoke(expired);
+    let early=tokio::time::timeout(Duration::from_millis(60), &mut denied).await;
+    assert!(early.is_err(),"request did not enter bounded wait: {early:?}");
+    tokio::time::sleep(Duration::from_millis(325)).await;
+    drop(held);
+    assert!(denied.await.unwrap().is_err());
+    assert_eq!(budget.usage().unwrap().workers,2);
+    server.abort();
+}
