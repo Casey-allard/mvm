@@ -109,6 +109,14 @@ pub struct OriginalJournalSourceHost {
     grants: std::sync::Arc<JournalCredentials>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CompletedRelayIo {
+    /// Exact userspace bytes read from A and written to B.
+    pub sealed_to_destination: usize,
+    /// Exact reply bytes read from B through EOF and written to A.
+    pub reply_to_source: usize,
+}
+
 impl OriginalJournalSourceHost {
     pub fn try_collect(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.marker.collect(&mut self.source)
@@ -117,6 +125,10 @@ impl OriginalJournalSourceHost {
     /// Nonblocking on an idle listener. One shared action deadline for all
     /// socket traffic and revocation sampling once A has connected.
     pub fn forward_once(&mut self, until: Instant) -> Result<bool> {
+        Ok(self.forward_once_with_counts(until)?.is_some())
+    }
+
+    pub fn forward_once_with_counts(&mut self, until: Instant) -> Result<Option<CompletedRelayIo>> {
         let d = self
             .plan
             .mailbox
@@ -137,7 +149,7 @@ impl OriginalJournalSourceHost {
         );
         let (mut a, _) = match self.listener.socket.accept() {
             Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         ensure!(
@@ -180,7 +192,10 @@ impl OriginalJournalSourceHost {
             "incomplete or oversized B journal reply"
         );
         a.write_all(&verdict)?;
-        Ok(true)
+        Ok(Some(CompletedRelayIo {
+            sealed_to_destination: 4 + body.len(),
+            reply_to_source: verdict.len(),
+        }))
     }
 }
 

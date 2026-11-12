@@ -35,8 +35,8 @@ fn original_plan(
     let state = mvm_core::config::vm_state_dir(name);
     mvm_core::private_fs::ensure_private_dir(&state)?;
     let guest = SigningKey::from_bytes(&rand::random()).verifying_key();
-    let ack = SigningKey::from_bytes(&rand::random()).verifying_key();
-    let boot = MailboxReaderBootBinding::mint(&plan, guest, ack.to_bytes())?;
+    let ack = SigningKey::from_bytes(&rand::random());
+    let boot = MailboxReaderBootBinding::mint(&plan, guest, ack.verifying_key().to_bytes())?;
     boot.persist(&state)?;
     mvm_vmm::host::flowmux_identity::InheritableIdentity {
         session_id: name.into(),
@@ -46,7 +46,7 @@ fn original_plan(
     .persist(&state)?;
     mvm_core::atomic_io::write_private(&state.join("plan.json"), &serde_json::to_vec(&plan)?)?;
     let posture = MailboxLaunchPosture::for_test(&plan, Variant::Prod);
-    Ok((plan, boot, posture))
+    Ok((plan, boot, posture, ack))
 }
 
 fn guest_stream(listener: &UnixListener, until: Instant) -> Result<UnixStream> {
@@ -71,13 +71,151 @@ fn guest_stream(listener: &UnixListener, until: Instant) -> Result<UnixStream> {
     Ok(stream)
 }
 
+fn fixture_listener(state: &Path) -> Result<UnixListener> {
+    let uds = mvm_agentd::vsock::vsock_uds_path(&state.to_string_lossy());
+    let uds = Path::new(&uds);
+    mvm_core::private_fs::ensure_private_dir(uds.parent().unwrap())?;
+    let listener = UnixListener::bind(uds)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+struct Wire {
+    stream: UnixStream,
+    read: usize,
+    written: usize,
+}
+impl Wire {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            read: 0,
+            written: 0,
+        }
+    }
+}
+impl Read for Wire {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.stream.read(b)?;
+        self.read += n;
+        Ok(n)
+    }
+}
+impl Write for Wire {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let n = self.stream.write(b)?;
+        self.written += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn read_and_ack(
+    listener: &UnixListener,
+    until: Instant,
+    boot: &MailboxReaderBootBinding,
+    grant: &MailboxGrant,
+    key: &SigningKey,
+    sent: &OutboxMessage,
+    received: &mvm_contract::protocol::mailbox::SignedDestinationReceipt,
+) -> Result<()> {
+    use mvm_contract::protocol::mailbox::{
+        DeliveryAckNonce, MailboxDeliveryAck, MailboxGuestReaderScope, ProtocolVersion,
+        SignatureAlgorithm,
+    };
+    use mvm_core::mailbox::{
+        reader::{
+            sign_delivery_ack, sign_reader_possession, verify_delivery_lease_signature,
+            verify_guest_reader_enrollment,
+        },
+        reader_wire::{ReaderRequest, ReaderResponse, read_response, write_request},
+    };
+    let authority = ed25519_dalek::VerifyingKey::from_bytes(&grant.authority_key)?;
+    let now = super::authorization::now_ms;
+    let mut s = Wire::new(guest_stream(listener, until)?);
+    write_request(&mut s, &ReaderRequest::Receive)?;
+    let ReaderResponse::Challenge {
+        enrollment,
+        capability,
+        challenge,
+    } = read_response(&mut s)?
+    else {
+        anyhow::bail!("missing real B reader challenge");
+    };
+    let scope = MailboxGuestReaderScope {
+        plan: grant,
+        plan_id: &boot.plan_id,
+        plan_nonce: &boot.plan_nonce,
+        receive: &capability.grant,
+        current_boot: boot.boot,
+        current_session: enrollment.enrollment.consumer_session,
+        now_unix_ms: now()?,
+    };
+    verify_guest_reader_enrollment(&enrollment, &capability, &scope, &authority, &[])?;
+    ensure!(enrollment.enrollment.ack_public_key == key.verifying_key().to_bytes());
+    let sig = sign_reader_possession(&enrollment, &challenge, key)?;
+    write_request(
+        &mut s,
+        &ReaderRequest::Possession {
+            signature: sig.to_vec(),
+        },
+    )?;
+    let ReaderResponse::Delivery { lease, payload, .. } = read_response(&mut s)? else {
+        anyhow::bail!("B reader did not lease original record");
+    };
+    verify_delivery_lease_signature(&lease, &authority)?;
+    ensure!(
+        payload == sent.body
+            && payload.len() == sent.body.len()
+            && lease.lease.message_id == sent.message_id
+            && lease.lease.address == received.receipt.address
+            && lease.lease.delivery_id == received.receipt.delivery_id
+            && lease.lease.ciphertext_commitment == received.receipt.ciphertext_commitment
+            && lease.lease.consumer_session == enrollment.enrollment.consumer_session
+    );
+    let reader_counts = (s.written, s.read);
+    drop(s);
+    let signed = sign_delivery_ack(
+        MailboxDeliveryAck {
+            protocol_version: ProtocolVersion::V1,
+            signature_algorithm: SignatureAlgorithm::ED25519,
+            lease: *lease,
+            ack_nonce: DeliveryAckNonce::from_bytes(rand::random()),
+            acknowledged_at_unix_ms: now()?,
+        },
+        key,
+    )?;
+    let mut s = Wire::new(guest_stream(listener, until)?);
+    write_request(
+        &mut s,
+        &ReaderRequest::Ack {
+            signed: Box::new(signed.clone()),
+        },
+    )?;
+    let ReaderResponse::Acknowledged { ack } = read_response(&mut s)? else {
+        anyhow::bail!("B failed to acknowledge signed lease");
+    };
+    ensure!(*ack == signed);
+    eprintln!(
+        "ORIGINAL_PAIRED_B_READER exact_bytes={} receive_guest_to_helper={} receive_helper_to_guest={} ack_guest_to_helper={} ack_helper_to_guest={}",
+        payload.len(),
+        reader_counts.0,
+        reader_counts.1,
+        s.written,
+        s.read
+    );
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let keys = mvm_core::config::mvm_keys_dir();
     mvm_core::private_fs::ensure_private_dir(&keys)?;
     let (b_grant, incoming, _) = setup(&keys);
     IncomingJournalAdmission::install(&b_grant, &incoming)?;
     let backend = AnyBackend::from_hypervisor("firecracker");
-    let (bp, boot_b, posture_b) = original_plan("journal-b", b_grant)?;
+    let (bp, boot_b, posture_b, ack_b) = original_plan("journal-b", b_grant)?;
+    let b_guest = fixture_listener(&mvm_core::config::vm_state_dir("journal-b"))?;
     let b = OriginalJournalDestination::start(&bp, &backend, "journal-b", &posture_b)?;
     let signed_recv = b.original_receive()?.clone();
     let grants = Arc::new(JournalCredentials {
@@ -134,13 +272,9 @@ fn run() -> Result<()> {
         outbound_journal_v1: Some(direction),
         incoming_journal_policy_sha256_v1: None,
     };
-    let (ap, _, posture_a) = original_plan("journal-a", a_grant)?;
+    let (ap, _, posture_a, _) = original_plan("journal-a", a_grant)?;
     let a_state = mvm_core::config::vm_state_dir("journal-a");
-    let uds = mvm_agentd::vsock::vsock_uds_path(&a_state.to_string_lossy());
-    let uds = Path::new(&uds);
-    mvm_core::private_fs::ensure_private_dir(uds.parent().unwrap())?;
-    let guest = UnixListener::bind(uds)?;
-    guest.set_nonblocking(true)?;
+    let guest = fixture_listener(&a_state)?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let admission = PairedJournalAdmission::new(b.clone(), grants, deadline);
     let mut a = admission.launch_original_source(&ap, &backend, "journal-a", &posture_a)?;
@@ -155,10 +289,17 @@ fn run() -> Result<()> {
         if turn == 0 {
             drop(socket.take());
         }
-        while !a.forward_once(deadline)? {
+        let relay = loop {
+            if let Some(value) = a.forward_once_with_counts(deadline)? {
+                break value;
+            }
             ensure!(Instant::now() < deadline, "A helper did not request relay");
             std::thread::sleep(Duration::from_millis(2));
-        }
+        };
+        eprintln!(
+            "ORIGINAL_PAIRED_RELAY turn={turn} sealed_to_b={} b_reply_to_a={}",
+            relay.sealed_to_destination, relay.reply_to_source
+        );
         if let Some(socket) = socket {
             let mut raw = Vec::new();
             socket.take(4097).read_to_end(&mut raw)?;
@@ -196,14 +337,25 @@ fn run() -> Result<()> {
             );
         }
     }
-    ensure!(receipt.is_some());
+    read_and_ack(
+        &b_guest,
+        deadline,
+        &boot_b,
+        &b_grant,
+        &ack_b,
+        &message,
+        receipt.as_ref().unwrap(),
+    )?;
+    drop(guest);
+    drop(b_guest);
+
     // Withdraw only the synthetic runtime state from this fixture. The helpers
     // observe this normally and the caller waits on the real original handles.
     for name in ["journal-a", "journal-b"] {
         let state = mvm_core::config::vm_state_dir(name);
         std::fs::rename(&state, state.with_file_name(format!("{name}-retired")))?;
     }
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + Duration::from_secs(9);
     loop {
         let ea = a.try_collect()?;
         let eb = b.lock().unwrap().try_collect()?;
