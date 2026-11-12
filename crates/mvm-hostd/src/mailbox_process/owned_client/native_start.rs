@@ -55,6 +55,18 @@ impl NativeStartCustody {
 
     pub(super) fn settle(&self, owner: &MailboxWorkerOwner) -> Result<()> {
         self.settle_with(owner, |error| {
+            #[cfg(target_os = "linux")]
+            let error = match error
+                .downcast::<mvm_runtime::workload_runner::runner::FirecrackerPostBootFailure>()
+            {
+                Ok(mut failure) => {
+                    if let Err(reason) = failure.retry_stop(owner) {
+                        return Err(anyhow::Error::new(failure).context(reason));
+                    }
+                    return Ok(());
+                }
+                Err(error) => error,
+            };
             let failure = error.downcast::<ColdHvfBootFailure>()?;
             // The existing native owner knows whether its original child was
             // never launched, already collected, or still requires a live stop.

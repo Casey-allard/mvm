@@ -59,6 +59,12 @@ mod broker;
 mod claim_lease;
 mod cold_hvf_channel;
 mod console_boot;
+#[cfg(target_os = "linux")]
+mod firecracker_failure;
+#[cfg(target_os = "linux")]
+pub(crate) mod firecracker_process;
+#[cfg(target_os = "linux")]
+pub use firecracker_failure::FirecrackerPostBootFailure;
 mod durability;
 mod parent_verify;
 mod preload;
@@ -393,6 +399,11 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         let result =
             self.boot_bound_workload_guarded(inputs, Some(&kernel_binding), writable_images);
         result.map_err(|error| {
+            #[cfg(target_os = "linux")]
+            let error = match error.downcast::<FirecrackerPostBootFailure>() {
+                Ok(failure) => return failure.with_lifetime(lifecycle, kernel_binding).into(),
+                Err(error) => error,
+            };
             cold_hvf_channel::retain_boot_error(error, (lifecycle, kernel_binding))
         })
     }
@@ -546,6 +557,14 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             redaction: inputs.redaction,
             retention: plan_stream_retention(inputs.config.plan_json.as_deref()),
         };
+        let owns_firecracker = cfg!(target_os = "linux")
+            && self.driver.kind() == BackendKind::Firecracker
+            && inputs.config.installed_mailbox_owner.is_some();
+        #[cfg(target_os = "linux")]
+        if owns_firecracker {
+            firecracker_process::require_peer_pidfd()
+                .context("installed Firecracker rollback requires SO_PEERPIDFD")?;
+        }
         durability::wait_for_unactivated_boot(inputs.config)?;
         if let Some(kernel) = kernel {
             kernel.before_boot(&spec)?;
@@ -595,28 +614,68 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 ));
             }
         };
-        if let Some(kernel) = kernel {
-            kernel.observe_booted(&*vm)?;
-        }
-        trace.mark("console_stream_start");
+        #[cfg(target_os = "linux")]
+        let mut process = None;
+        let finish = (|| {
+            #[cfg(target_os = "linux")]
+            if owns_firecracker {
+                process = Some(firecracker_process::OriginalFirecracker::capture(
+                    &*vm,
+                    &inputs.config.name,
+                    &state_dir,
+                )?);
+            }
+            if let Some(kernel) = kernel {
+                kernel.observe_booted(&*vm)?;
+            }
+            trace.mark("console_stream_start");
 
-        // Universal initramfs path: the guest PID-1 agent waits for a signed
-        // ActivateEnvironment before exposing operational RPCs. Send it now,
-        // while the broker registration below still has a guard that rolls back
-        // on failure. A rootfs boot whose universal initramfs could not be
-        // resolved was refused at launch resolution, before the VMM started.
-        if crate::microvm::booted_with_universal_initramfs(inputs.config) {
-            durability::wait_for_activation(inputs.config, &*vm, &*self.console_streamer)?;
-            trace.mark("admission_durable");
-            crate::microvm::activate_workload(&*vm, inputs.config)
-                .context("activate workload after boot")?;
-        }
-        trace.mark("activate_workload");
+            // Universal initramfs path: the guest PID-1 agent waits for a signed
+            // ActivateEnvironment before exposing operational RPCs. Send it now,
+            // while the broker registration below still has a guard that rolls back
+            // on failure. A rootfs boot whose universal initramfs could not be
+            // resolved was refused at launch resolution, before the VMM started.
+            if crate::microvm::booted_with_universal_initramfs(inputs.config) {
+                if owns_firecracker {
+                    durability::wait_for_owned_activation(inputs.config)?;
+                } else {
+                    durability::wait_for_activation(inputs.config, &*vm, &*self.console_streamer)?;
+                }
+                trace.mark("admission_durable");
+                crate::microvm::activate_workload(&*vm, inputs.config)
+                    .context("activate workload after boot")?;
+            }
+            trace.mark("activate_workload");
 
-        // Register the per-VM broker for the exact admitted host-service set.
-        // The guard's Drop reaps on any early return until it is defused. A
-        // requested service whose broker cannot start fails the launch closed.
-        let (mut broker_guard, services) = self.register_workload_broker(inputs.config, &socks)?;
+            // Register the per-VM broker for the exact admitted host-service set.
+            // The guard's Drop reaps on any early return until it is defused. A
+            // requested service whose broker cannot start fails the launch closed.
+            self.register_workload_broker(inputs.config, &socks)
+        })();
+        let (mut broker_guard, services) = match finish {
+            Ok(registered) => registered,
+            Err(error) => {
+                #[cfg(target_os = "linux")]
+                if owns_firecracker {
+                    let owner = &inputs
+                        .config
+                        .installed_mailbox_owner
+                        .as_ref()
+                        .expect("installed owner selected")
+                        .owner;
+                    return Err(FirecrackerPostBootFailure::new(
+                        error,
+                        owner.clone(),
+                        process,
+                        vm,
+                        endpoint,
+                        Arc::clone(&self.console_streamer),
+                    )
+                    .into());
+                }
+                return Err(error);
+            }
+        };
         endpoint.defuse();
         broker_guard.defuse();
         trace.mark("broker_register");

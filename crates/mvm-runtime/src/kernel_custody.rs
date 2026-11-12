@@ -366,6 +366,15 @@ pub(crate) fn release_after_process_exit(lifecycle: &RuntimeLifecycleLease) -> R
     })
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn release_after_original_firecracker_exit(
+    lifecycle: &RuntimeLifecycleLease,
+    process: &crate::workload_runner::runner::firecracker_process::OriginalFirecracker,
+) -> Result<()> {
+    process.verify_exit()?;
+    release_process_generation(lifecycle, &process.identity, || process.verify_exit())
+}
+
 #[cfg(unix)]
 fn release_process_generation(
     lifecycle: &RuntimeLifecycleLease,
