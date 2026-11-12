@@ -1,13 +1,10 @@
 //! Before the original destination VMM boots, project its authenticated
 //! reservation and plan into the guest's existing host-signed boot lineage.
-use super::cast_pair::InstalledCastParticipant;
+use super::cast_pair::{InstalledCastParticipant, development::DevelopmentDirection};
 use crate::host_signer::keystore::Keystore;
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
-use mvm_contract::protocol::{
-    mailbox::local::LocalGreeting,
-    mailbox_worker::{MailboxWorkerOwner, MailboxWorkerState},
-};
+use mvm_contract::protocol::mailbox_worker::{MailboxWorkerOwner, MailboxWorkerState};
 use mvm_core::{
     mailbox::{
         OpenContext,
@@ -25,8 +22,7 @@ pub struct OriginalCastBoot<'a> {
     pub destination_policy: &'a OpenContext,
     pub grants: AddressedCastGrants<'a>,
     pub trusted_plan_signers: &'a [(&'a str, &'a VerifyingKey)],
-    pub destination_greeting: LocalGreeting,
-    pub direction_commitment: [u8; 32],
+    pub direction: &'a DevelopmentDirection,
 }
 
 /// One prepared publication for the SDK's still-held destination VM claim.
@@ -159,6 +155,9 @@ impl OriginalCastBoot<'_> {
             "expected an original unbound boot grant"
         );
         let now = chrono::Utc::now();
+        let (direction_commitment, destination_greeting, direction_end) = self
+            .direction
+            .original_deliver_enrollment(&left, &right, self.grants, now.timestamp_millis())?;
         original_grant
             .grant
             .verify(&key, &config.name, &dst.nonce, now)?;
@@ -189,7 +188,7 @@ impl OriginalCastBoot<'_> {
             self.destination.plan.signed(),
             self.trusted_plan_signers,
             (self.source.plan.plan_id(), self.destination.plan.plan_id()),
-            self.destination_greeting,
+            destination_greeting,
             origin.expected_sender,
             target.expected_recipient,
             now.timestamp_millis(),
@@ -205,7 +204,7 @@ impl OriginalCastBoot<'_> {
             self.source.worker.acquire_request().plan_commitment,
             self.destination.worker.acquire_request().plan_commitment,
             hash_owner.finalize().into(),
-            self.direction_commitment,
+            direction_commitment,
             hex::decode(hash)?
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid image digest"))?,
@@ -223,7 +222,14 @@ impl OriginalCastBoot<'_> {
                 grant.grant.expires_at_unix_ms,
             )?;
         }
-        projection.narrow_validity(i64::MIN, original_grant.grant.not_after.timestamp_millis())?;
+        projection.narrow_validity(
+            i64::MIN,
+            original_grant
+                .grant
+                .not_after
+                .timestamp_millis()
+                .min(direction_end),
+        )?;
         let mut boot = original_grant.clone();
         boot.grant.cast_delivery_v1 = Some(projection.commitment()?);
         boot.grant.sig = signer.sign(&boot.grant.signing_bytes()).signature;
