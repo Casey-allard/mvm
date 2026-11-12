@@ -17,6 +17,7 @@ pub struct ObjectPairCredentials {
     pub receive_at_callee: SignedMailboxCapability,
 }
 
+#[derive(Clone)]
 pub struct PreparedObjectPair {
     credentials: ObjectPairCredentials,
     stamp: [u8; 32],
@@ -220,6 +221,7 @@ struct BootInput<'a> {
 pub struct InstalledObjectPair<'a> {
     caller: InstalledParticipant<'a>,
     callee: InstalledParticipant<'a>,
+    prepared: PreparedObjectPair,
     material: PairMaterial,
 }
 struct PairMaterial {
@@ -227,6 +229,7 @@ struct PairMaterial {
     callee: EndpointMaterial,
 }
 pub(crate) struct EndpointMaterial {
+    pub(crate) routing: MailboxRoutingFrame,
     pub(crate) public_role: mvm_core::mailbox::object_pair::role::SignedObjectRoleV1,
     pub(crate) reader: GuestReaderAuthority,
     pub(crate) inbound_key: Key,
@@ -241,8 +244,7 @@ impl InstalledObjectPair<'_> {
         &SignedMailboxGuestReaderEnrollment,
         &SignedMailboxGuestReaderEnrollment,
     )> {
-        check_original_native(&self.caller)?;
-        check_original_native(&self.callee)?;
+        self.check_current()?;
         Ok((
             &self.material.caller.reader.enrollment,
             &self.material.callee.reader.enrollment,
@@ -302,6 +304,7 @@ impl PreparedObjectPair {
         Ok(InstalledObjectPair {
             caller,
             callee,
+            prepared: self.clone(),
             material,
         })
     }
@@ -332,6 +335,7 @@ impl PreparedObjectPair {
         );
         let credentials = &self.credentials;
         let mut policies = [0_u64; 2];
+        let mut routes = Vec::with_capacity(2);
         for (idx, (role, plan, grant)) in [(&a, &pa, &self.caller), (&b, &pb, &self.callee)]
             .into_iter()
             .enumerate()
@@ -350,6 +354,7 @@ impl PreparedObjectPair {
                 "inconsistent installed policy epoch"
             );
             policies[idx] = template.header.policy_epoch;
+            routes.push(template.routing);
         }
         let read_revoked = |dir: &Path| {
             reader_revocations(&revocations_path(dir))
@@ -488,6 +493,12 @@ impl PreparedObjectPair {
                 now,
             )?;
             Ok(EndpointMaterial {
+                routing: routes[if g.mailbox == self.caller.mailbox {
+                    1
+                } else {
+                    0
+                }]
+                .clone(),
                 public_role,
                 reader,
                 sender: d.sender,
@@ -535,6 +546,9 @@ fn load_private_root(keys: &Path) -> Result<Key> {
     file.read_exact(&mut buf[..])?;
     Ok(Key::from_bytes(*buf))
 }
+
+mod operations;
+pub use operations::{OriginalObjectCallLease, SealedObjectTurn};
 
 #[cfg(test)]
 mod tests;
