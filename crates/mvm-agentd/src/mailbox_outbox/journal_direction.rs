@@ -227,6 +227,7 @@ mod tests {
         };
         let epoch = ExecutionEpoch::new(1).unwrap();
         let direction = MailboxJournalDirectionV1 {
+            sender_settlement: None,
             source: PrincipalId::from_bytes([12; 32]),
             destination_plan_sha256: [1; 32],
             destination_plan_nonce: [2; 16],

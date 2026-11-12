@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 
 use base64::Engine as _;
 use mvm_contract::protocol::mailbox::{
-    ContentType, SignedMailboxCapability, SignedMailboxDeliveryAck, SignedMailboxDeliveryLease,
+    ContentType, SignedDestinationReceipt, SignedMailboxCapability, SignedMailboxDeliveryAck, SignedMailboxDeliveryLease,
     SignedMailboxGuestReaderEnrollment,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -118,6 +118,9 @@ impl OriginalObjectSealV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderRequest {
+    SenderOrdinalV1 {
+        request: Box<super::sender_ordinal::SenderRequestV1>,
+    },
     /// Fresh, read-only sample for the exact retained, unacknowledged Call.
     AuthorizeObjectCallV1 {
         pair: [u8; 32],
@@ -182,6 +185,14 @@ pub enum ApplicationReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderResponse {
+    SenderAcceptedV1 {
+        handle: super::sender_ordinal::SenderOrdinalV1,
+        receipt: Box<SignedDestinationReceipt>,
+    },
+    SenderSettledV1 {
+        handle: super::sender_ordinal::SenderOrdinalV1,
+        retired_through: u64,
+    },
     /// Guest proof of a current check against its enrolled original host.
     ObjectCallAuthorityV1 {
         role: Box<super::object_pair::role::SignedObjectRoleV1>,
@@ -342,15 +353,15 @@ impl Write for BoundedBytes {
     }
 }
 
-mod payload_base64 {
+pub(super) mod payload_base64 {
     use super::*;
     use serde::{Deserializer, Serializer, de::Error as _};
 
-    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(in crate::mailbox) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(in crate::mailbox) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(deserializer)?;

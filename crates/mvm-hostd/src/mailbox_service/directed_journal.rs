@@ -1,4 +1,5 @@
 //! Original A-side dispatch for the opt-in local-durable direction.
+use super::sender_window::{Original, SenderWindow};
 use super::{GuestSealer, Refusal};
 use crate::mailbox_launch::MailboxTemplate;
 use crate::mailbox_process::original_journal::authorization::{
@@ -11,6 +12,8 @@ use mvm_contract::protocol::mailbox::{
     SignedDestinationReceipt,
 };
 use mvm_core::crypto::aead::Key;
+use mvm_core::mailbox::reader_wire::ReaderResponse;
+use mvm_core::mailbox::sender_ordinal::{MAX_ORDINAL_PAYLOAD, SenderRequestV1};
 use mvm_core::mailbox::{
     OpenContext,
     frame::{OutboxMessage, send_local_receipted_frame},
@@ -57,6 +60,8 @@ pub(crate) struct DirectedJournalSource {
     original_commitment: [u8; 32],
     grants: JournalCredentials,
     verifier: VerifyingKey,
+    ordinal_window: Option<SenderWindow>,
+    guest_settlement_key: VerifyingKey,
     source_revocations: PathBuf,
     destination_revocations: PathBuf,
 }
@@ -125,6 +130,11 @@ impl DirectedJournalSource {
             original_commitment: material.commitment,
             grants,
             verifier: VerifyingKey::from_bytes(&d.receipt_key)?,
+            ordinal_window: d
+                .sender_settlement
+                .map(|_| SenderWindow::reopen(source_state, material.commitment))
+                .transpose()?,
+            guest_settlement_key: VerifyingKey::from_bytes(&boot.ack_public_key)?,
             source_revocations: crate::mailbox_process::reader::revocations_path(source_state),
             destination_revocations: crate::mailbox_process::reader::revocations_path(
                 destination_state,
@@ -156,6 +166,113 @@ impl DirectedJournalSource {
         Ok(now)
     }
 
+    fn ordinal_turn(
+        &mut self,
+        request: SenderRequestV1,
+        until: Instant,
+        connect: impl FnOnce(Instant) -> Result<UnixStream, Refusal>,
+    ) -> Result<ReaderResponse, Refusal> {
+        if self.ordinal_window.is_none() || Instant::now() >= until {
+            return Err(Refusal::NotAuthorized);
+        }
+        match request {
+            SenderRequestV1::Settle { statement } => {
+                self.authorize(1)?;
+                let retired_through = self
+                    .ordinal_window
+                    .as_ref()
+                    .ok_or(Refusal::NotAuthorized)?
+                    .settle(&statement, &self.guest_settlement_key)?;
+                Ok(ReaderResponse::SenderSettledV1 {
+                    handle: statement.handle,
+                    retired_through,
+                })
+            }
+            SenderRequestV1::Submit { handle, payload } => {
+                if payload.is_empty() || payload.len() > MAX_ORDINAL_PAYLOAD {
+                    return Err(Refusal::Oversized(MAX_ORDINAL_PAYLOAD));
+                }
+                let length = payload.len() as u32;
+                let now = self.authorize(length)?;
+                let deadline = until.min(
+                    Instant::now()
+                        .checked_add(Duration::from_millis(
+                            self.direction.expires_at_unix_ms.saturating_sub(now) as u64,
+                        ))
+                        .unwrap_or(until),
+                );
+                let message = OutboxMessage {
+                    recipient: self.recipient(),
+                    message_id: handle.message_id()?,
+                    body: payload,
+                };
+                let intent = mvm_core::mailbox::outbound::journal_intent_digest(&message);
+                let send = &self.grants.destination_send;
+                let original = self
+                    .ordinal_window
+                    .as_ref()
+                    .ok_or(Refusal::NotAuthorized)?
+                    .reserve(handle, intent, || {
+                        let (cap, env, _) =
+                            self.sealer.seal_at(&message, Some(send), handle.ordinal)?;
+                        mvm_core::mailbox::frame::encode_frame(&cap, &env)
+                    })?;
+                let (bytes, prior) = match original {
+                    Original::Send(bytes) => (bytes, None),
+                    Original::Accepted(bytes, receipt) => (bytes, Some(receipt)),
+                };
+                let role = super::OriginalSend {
+                    signed: send,
+                    verifier: &self.verifier,
+                    commitment: self.original_commitment,
+                };
+                let (cap, env) =
+                    self.sealer
+                        .open_intent(&bytes, &message, Some(role), Some(handle.ordinal))?;
+                let mut expected = self.sealer.header.clone();
+                expected.message_id = message.message_id;
+                let receipt = if let Some(r) = prior {
+                    mvm_core::mailbox::frame::verify_expected_receipt(
+                        &r,
+                        &env,
+                        &expected,
+                        &self.verifier,
+                        &[mvm_contract::protocol::mailbox::DeliveryOutcome::AcceptedLocalDurable],
+                    )?;
+                    r
+                } else {
+                    self.authorize(length)?;
+                    if Instant::now() >= deadline {
+                        return Err(Refusal::Unavailable);
+                    }
+                    let stream = connect(deadline)?;
+                    self.authorize(length)?;
+                    let mut stream = super::durable::GuestDeadline::new(stream, deadline)
+                        .map_err(|_| Refusal::Unavailable)?;
+                    send_local_receipted_frame(&mut stream, &cap, &env, &expected, &self.verifier)?
+                };
+                if Instant::now() >= deadline
+                    || receipt.receipt.protocol_version
+                        != mvm_contract::protocol::mailbox::ProtocolVersion::V2
+                    || !(self.direction.not_before_unix_ms..self.direction.expires_at_unix_ms)
+                        .contains(&receipt.receipt.observed_at_unix_ms)
+                {
+                    return Err(Refusal::NotAuthorized);
+                }
+                self.authorize(length)?;
+                let receipt = self
+                    .ordinal_window
+                    .as_ref()
+                    .ok_or(Refusal::NotAuthorized)?
+                    .accept(handle, &bytes, receipt)?;
+                Ok(ReaderResponse::SenderAcceptedV1 {
+                    handle,
+                    receipt: Box::new(receipt),
+                })
+            }
+        }
+    }
+
     /// Persist A's canonical credential/envelope before opening the
     /// authenticated B connection. The same immutable bytes can be retried
     /// after an ambiguous reply or subsequent guest redial.
@@ -166,7 +283,7 @@ impl DirectedJournalSource {
         connect: impl FnOnce(Instant) -> Result<UnixStream, Refusal>,
     ) -> Result<SignedDestinationReceipt, Refusal> {
         let len = u32::try_from(message.body.len()).map_err(|_| Refusal::Malformed)?;
-        if message.recipient != self.recipient() {
+        if self.ordinal_window.is_some() || message.recipient != self.recipient() {
             return Err(Refusal::NotAuthorized);
         }
         let now = self.authorize(len)?;
@@ -250,6 +367,14 @@ impl<'a> SourceTurn<'a> {
         }
         self.transport = Some((endpoint, connect));
         Ok(self)
+    }
+    pub(super) fn ordinal_turn(
+        &mut self,
+        request: SenderRequestV1,
+        until: Instant,
+    ) -> Result<ReaderResponse, Refusal> {
+        let (source, connect) = self.transport.as_mut().ok_or(Refusal::NotAuthorized)?;
+        source.ordinal_turn(request, until, connect)
     }
     pub(super) fn send(
         &mut self,

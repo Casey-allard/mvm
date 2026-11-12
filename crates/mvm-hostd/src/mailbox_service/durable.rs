@@ -364,7 +364,7 @@ impl DurableMailboxService {
         let body = match body {
             Ok(body) if is_reader_frame(&body) => {
                 mark("reader_frame");
-                serve_reader(&self.shared, stream, &body, mark);
+                serve_reader(&self.shared, stream, &body, mark, turn, until);
                 return Ok(true);
             }
             other => other,
@@ -445,8 +445,13 @@ fn serve_reader(
     stream: &mut (impl Read + Write),
     body: &[u8],
     mark: &mut (impl FnMut(&'static str) + ?Sized),
+    turn: &mut super::directed_journal::SourceTurn<'_>,
+    until: Instant,
 ) {
     let result = decode_request_body(body).and_then(|request| {
+        if let ReaderRequest::SenderOrdinalV1 { request } = request {
+            return turn.ordinal_turn(*request, until);
+        }
         let reader = shared.reader.get().ok_or(Refusal::NotAuthorized)?;
         match request {
             ReaderRequest::Receive | ReaderRequest::ReceiveObjectPairV1 { .. } => {
@@ -543,7 +548,8 @@ fn serve_reader(
                     .map_err(reader_refusal)?;
                 Ok(ReaderResponse::Acknowledged { ack: signed })
             }
-            ReaderRequest::AuthorizeObjectCallV1 { .. }
+            ReaderRequest::SenderOrdinalV1 { .. }
+            | ReaderRequest::AuthorizeObjectCallV1 { .. }
             | ReaderRequest::GetObjectRoleV1 { .. }
             | ReaderRequest::SubmitObjectV1 { .. }
             | ReaderRequest::Possession { .. } => Err(Refusal::NotAuthorized),
@@ -558,6 +564,7 @@ fn serve_reader(
         ReaderResponse::Refused { .. } => mark("reader_refused"),
         ReaderResponse::Empty => mark("reader_empty"),
         ReaderResponse::Challenge { .. } => mark("reader_challenge"),
+        ReaderResponse::SenderAcceptedV1 { .. } | ReaderResponse::SenderSettledV1 { .. } => {}
         // A slot report belongs to the guest-local interface, not this host stream.
         ReaderResponse::OutboundJournalAvailableV1 { .. }
         | ReaderResponse::ObjectSealAcceptedV1 { .. }

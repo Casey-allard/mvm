@@ -220,7 +220,7 @@ fn lifetime_fixture(name: &str) -> Result<std::process::Child> {
     Ok(child)
 }
 
-fn run() -> Result<()> {
+fn run(ordinal: bool) -> Result<()> {
     let keys = mvm_core::config::mvm_keys_dir();
     mvm_core::private_fs::ensure_private_dir(&keys)?;
     let (b_grant, incoming, _) = setup(&keys);
@@ -263,6 +263,8 @@ fn run() -> Result<()> {
     .min()
     .unwrap();
     let direction = MailboxJournalDirectionV1 {
+        sender_settlement: ordinal
+            .then_some(mvm_contract::protocol::mailbox::SenderSettlementProfile::OrdinalV1),
         source: grants.destination_send.grant.subject,
         destination_plan_sha256: hex::decode(&bp.plan_id.0[7..])?.try_into().unwrap(),
         destination_plan_nonce: hex::decode(bp.nonce.as_hex())?.try_into().unwrap(),
@@ -293,7 +295,7 @@ fn run() -> Result<()> {
         durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: None,
     };
-    let (ap, _, posture_a, _) = original_plan("journal-a", a_grant)?;
+    let (ap, boot_a, posture_a, ack_a) = original_plan("journal-a", a_grant)?;
     let a_state = mvm_core::config::vm_state_dir("journal-a");
     let guest = fixture_listener(&a_state)?;
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -306,45 +308,51 @@ fn run() -> Result<()> {
     let mut a_vm = lifetime_fixture("journal-a")?;
     let mut a = admission.launch_custodied_source(&ap, &backend, "journal-a", &posture_a)?;
     a.require_ready()?;
-    let message = OutboxMessage::new(direction.address.recipient, (0..=255).chain([0]).collect());
-    let mut receipt = None;
-    let transaction = Instant::now();
-    for turn in 0..3 {
-        let mut socket = guest_stream(&guest, deadline)?;
-        let encoded = message.encode();
-        let send_start = Instant::now();
-        socket.write_all(&u32::try_from(encoded.len())?.to_be_bytes())?;
-        socket.write_all(&encoded)?;
-        let mut socket = Some(socket);
-        if turn == 0 {
-            drop(socket.take());
-        }
-        let relay = loop {
-            if let Some(value) = a.forward_once_with_counts(deadline)? {
-                break value;
+    if ordinal {
+        ordinal_exchange(
+            &guest, &b_guest, deadline, &mut a, &boot_a, &ack_a, &boot_b, &b_grant, &ack_b,
+        )?;
+    } else {
+        let message =
+            OutboxMessage::new(direction.address.recipient, (0..=255).chain([0]).collect());
+        let mut receipt = None;
+        let transaction = Instant::now();
+        for turn in 0..3 {
+            let mut socket = guest_stream(&guest, deadline)?;
+            let encoded = message.encode();
+            let send_start = Instant::now();
+            socket.write_all(&u32::try_from(encoded.len())?.to_be_bytes())?;
+            socket.write_all(&encoded)?;
+            let mut socket = Some(socket);
+            if turn == 0 {
+                drop(socket.take());
             }
-            ensure!(Instant::now() < deadline, "A helper did not request relay");
-            std::thread::sleep(Duration::from_millis(2));
-        };
-        eprintln!(
-            "ORIGINAL_PAIRED_RELAY turn={turn} sealed_to_b={} b_reply_to_a={}",
-            relay.sealed_to_destination, relay.reply_to_source
-        );
-        if let Some(socket) = socket {
-            let mut raw = Vec::new();
-            socket.take(4097).read_to_end(&mut raw)?;
-            ensure!(raw.len() <= 4096, "oversized fixture guest verdict");
-            let received = serde_json::from_slice::<
-                Result<
-                    mvm_contract::protocol::mailbox::SignedDestinationReceipt,
-                    mvm_core::mailbox::frame::Refusal,
-                >,
-            >(&raw)??;
-            mvm_core::mailbox::verify_receipt(
-                &received,
-                &ed25519_dalek::VerifyingKey::from_bytes(&direction.receipt_key)?,
-            )?;
-            ensure!(
+            let relay = loop {
+                if let Some(value) = a.forward_once_with_counts(deadline)? {
+                    break value;
+                }
+                ensure!(Instant::now() < deadline, "A helper did not request relay");
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            eprintln!(
+                "ORIGINAL_PAIRED_RELAY turn={turn} sealed_to_b={} b_reply_to_a={}",
+                relay.sealed_to_destination, relay.reply_to_source
+            );
+            if let Some(socket) = socket {
+                let mut raw = Vec::new();
+                socket.take(4097).read_to_end(&mut raw)?;
+                ensure!(raw.len() <= 4096, "oversized fixture guest verdict");
+                let received = serde_json::from_slice::<
+                    Result<
+                        mvm_contract::protocol::mailbox::SignedDestinationReceipt,
+                        mvm_core::mailbox::frame::Refusal,
+                    >,
+                >(&raw)??;
+                mvm_core::mailbox::verify_receipt(
+                    &received,
+                    &ed25519_dalek::VerifyingKey::from_bytes(&direction.receipt_key)?,
+                )?;
+                ensure!(
                 received.receipt.message_id == message.message_id
                     && received.receipt.address == direction.address
                     && received.receipt.execution_epoch == direction.execution_epoch
@@ -352,38 +360,39 @@ fn run() -> Result<()> {
                         == mvm_contract::protocol::mailbox::DeliveryOutcome::AcceptedLocalDurable,
                 "wrong guest verdict"
             );
-            if let Some(prior) = receipt.as_ref() {
-                ensure!(
-                    *prior == received,
-                    "duplicate returned different original receipt"
+                if let Some(prior) = receipt.as_ref() {
+                    ensure!(
+                        *prior == received,
+                        "duplicate returned different original receipt"
+                    );
+                }
+                receipt = Some(received);
+                eprintln!(
+                    "ORIGINAL_ACCEPT turn={turn} guest_submit_to_verified_v2_ns={}",
+                    send_start.elapsed().as_nanos()
+                );
+                eprintln!(
+                    "ORIGINAL_PAIRED_HELPERS turn={turn} plaintext_bytes={} guest_submit_bytes={} guest_receipt_bytes={}",
+                    message.body.len(),
+                    encoded.len() + 4,
+                    raw.len()
                 );
             }
-            receipt = Some(received);
-            eprintln!(
-                "ORIGINAL_ACCEPT turn={turn} guest_submit_to_verified_v2_ns={}",
-                send_start.elapsed().as_nanos()
-            );
-            eprintln!(
-                "ORIGINAL_PAIRED_HELPERS turn={turn} plaintext_bytes={} guest_submit_bytes={} guest_receipt_bytes={}",
-                message.body.len(),
-                encoded.len() + 4,
-                raw.len()
-            );
         }
+        read_and_ack(
+            &b_guest,
+            deadline,
+            &boot_b,
+            &b_grant,
+            &ack_b,
+            &message,
+            receipt.as_ref().unwrap(),
+        )?;
+        eprintln!(
+            "ORIGINAL_TRANSACTION first_connection_through_b_ack_ns={}",
+            transaction.elapsed().as_nanos()
+        );
     }
-    read_and_ack(
-        &b_guest,
-        deadline,
-        &boot_b,
-        &b_grant,
-        &ack_b,
-        &message,
-        receipt.as_ref().unwrap(),
-    )?;
-    eprintln!(
-        "ORIGINAL_TRANSACTION first_connection_through_b_ack_ns={}",
-        transaction.elapsed().as_nanos()
-    );
     // A holds a real mux connection waiting for the next guest frame. B has
     // no listener and may be in reconnect backoff. The SDK and both original
     // state directories stay alive throughout. Stop only A first.
@@ -444,7 +453,7 @@ fn run() -> Result<()> {
 fn original_a_and_b_helpers_relay_same_sealed_intent_after_lost_guest_reply() {
     const IDENT: &str = "MVM_ORIGINAL_JOURNAL_HOST_COMPONENT";
     if std::env::var_os(IDENT).is_some() {
-        run().unwrap();
+        run(false).unwrap();
         return;
     }
     let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -460,4 +469,106 @@ fn original_a_and_b_helpers_relay_same_sealed_intent_after_lost_guest_reply() {
         .args(["mailbox_process::original_journal::paired_process_tests::original_a_and_b_helpers_relay_same_sealed_intent_after_lost_guest_reply","--exact","--ignored","--nocapture"])
         .env(IDENT,"1").env("MVM_HOME",temp.path()).env("MVM_MAILBOX_PATH",helper).status().unwrap();
     assert!(child.success());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ordinal_exchange(
+    a_guest: &UnixListener,
+    b_guest: &UnixListener,
+    deadline: Instant,
+    original: &mut super::relay::OriginalJournalSourceHost,
+    boot_a: &MailboxReaderBootBinding,
+    key_a: &SigningKey,
+    boot_b: &MailboxReaderBootBinding,
+    grant_b: &MailboxGrant,
+    key_b: &SigningKey,
+) -> Result<()> {
+    use mvm_core::mailbox::{
+        frame::Refusal,
+        outbound::journal_direction_commitment,
+        reader_wire::{ReaderRequest, ReaderResponse, read_response, write_request},
+        sender_ordinal::{SenderOrdinalV1, SenderRequestV1, SenderSettlementV1},
+    };
+    let handle = SenderOrdinalV1 {
+        direction: journal_direction_commitment(boot_a)?,
+        ordinal: 1,
+    };
+    let message = OutboxMessage {
+        recipient: boot_a.outbound_journal_v1.unwrap().address.recipient,
+        message_id: handle.message_id()?,
+        body: (0..=255).chain([0]).collect(),
+    };
+    let submit = SenderRequestV1::Submit {
+        handle,
+        payload: message.body.clone(),
+    };
+    let request = |req: SenderRequestV1| -> Result<Wire> {
+        let mut socket = Wire::new(guest_stream(a_guest, deadline)?);
+        write_request(
+            &mut socket,
+            &ReaderRequest::SenderOrdinalV1 {
+                request: Box::new(req),
+            },
+        )?;
+        Ok(socket)
+    };
+    drop(request(submit.clone())?); // Original A cannot observe first receipt.
+    let transfer = loop {
+        if let Some(c) = original.forward_once_with_counts(deadline)? {
+            break c;
+        }
+        ensure!(Instant::now() < deadline, "no original authorized relay");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let mut socket = request(submit.clone())?;
+    let ReaderResponse::SenderAcceptedV1 {
+        handle: seen,
+        receipt,
+    } = read_response(&mut socket)?
+    else {
+        anyhow::bail!("original receipt unavailable on exact retry")
+    };
+    ensure!(seen == handle);
+    let statement = SenderSettlementV1::sign(boot_a, 1, &receipt, key_a)?;
+    drop(socket);
+    read_and_ack(
+        b_guest, deadline, boot_b, grant_b, key_b, &message, &receipt,
+    )?;
+    let settle = SenderRequestV1::Settle { statement };
+    drop(request(settle.clone())?); // Final settlement response lost too.
+    let mut socket = request(settle)?;
+    ensure!(
+        matches!(read_response(&mut socket)?, ReaderResponse::SenderSettledV1{handle:seen,retired_through:1} if seen==handle)
+    );
+    drop(socket);
+    let mut socket = request(submit)?;
+    ensure!(matches!(
+        read_response(&mut socket)?,
+        ReaderResponse::Refused {
+            reason: Refusal::SenderOrdinalRetired
+        }
+    ));
+    eprintln!(
+        "ORDINAL_ORIGINAL two_helpers=2 payload=257 original_relay_written={} original_relay_read={} contiguous_retired=1",
+        transfer.sealed_to_destination, transfer.reply_to_source
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the separately compiled mvm-mailbox binary from this exact tree"]
+fn original_helpers_settle_ordinal_only_on_signed_receipt() {
+    const IDENT: &str = "MVM_ORIGINAL_ORDINAL_COMPONENT";
+    if std::env::var_os(IDENT).is_some() {
+        run(true).unwrap();
+        return;
+    }
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let helper = exe.parent().unwrap().parent().unwrap().join("mvm-mailbox");
+    assert!(helper.is_file());
+    let status=std::process::Command::new(&exe).args([
+        "mailbox_process::original_journal::paired_process_tests::original_helpers_settle_ordinal_only_on_signed_receipt","--exact","--ignored","--nocapture"
+    ]).env(IDENT,"1").env("MVM_HOME",temp.path()).env("MVM_MAILBOX_PATH",helper).status().unwrap();
+    assert!(status.success());
 }

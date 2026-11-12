@@ -980,7 +980,14 @@ impl MailboxJournal {
                 signer,
             )?);
         }
-        if self.tip.cursor >= self.limits.max_records as u64 {
+        // Local checkpoints advance the authenticated cursor even when they
+        // retire old records. Charge every retained replay identity; append
+        // separately enforces the resident record and byte limits.
+        let at_capacity = match tier {
+            AcceptanceTier::Local => self.seen.len() >= self.limits.max_records,
+            AcceptanceTier::Independent => self.tip.cursor >= self.limits.max_records as u64,
+        };
+        if at_capacity {
             return Err(JournalError::Full);
         }
         let accepted = receipt(match tier {
@@ -1911,13 +1918,27 @@ mod anchor_tests {
         VerifyingKey,
         SigningKey,
     ) {
+        message_at(9, 1, 1_800_000_000_000)
+    }
+
+    fn message_at(
+        id: u8,
+        sequence: u64,
+        now: i64,
+    ) -> (
+        MailboxEnvelope,
+        SignedMailboxCapability,
+        OpenContext,
+        Key,
+        VerifyingKey,
+        SigningKey,
+    ) {
         let destination = address();
         let signer = SigningKey::from_bytes(&[6; 32]);
         let sender = SigningKey::from_bytes(&[7; 32]);
         let sender_id = PrincipalId::from_bytes(sender.verifying_key().to_bytes());
         let content_type = ContentType::parse("application/vnd.mvm.test", 1).expect("content type");
         let epoch = ExecutionEpoch::new(1).expect("epoch");
-        let now = 1_800_000_000_000;
         let header = MailboxEnvelopeHeader {
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
@@ -1928,16 +1949,16 @@ mod anchor_tests {
             mailbox: destination.mailbox,
             sender_boot: BootId::from_bytes([8; 32]),
             execution_epoch: epoch,
-            message_id: MessageId::from_bytes([9; 32]),
+            message_id: MessageId::from_bytes([id; 32]),
             correlation_id: CorrelationId::from_bytes([10; 32]),
             causation_id: CausationId::from_bytes([11; 32]),
             kind: MailboxMessageKind::Cast,
             reply_to: None,
             ordering_scope: OrderingScope::parse("test").expect("scope"),
-            sequence: SequenceNumber::new(1).expect("sequence"),
+            sequence: SequenceNumber::new(sequence).expect("sequence"),
             issued_at_unix_ms: now - 1,
             expires_at_unix_ms: now + 10_000,
-            nonce: ReplayNonce::from_bytes([12; 16]),
+            nonce: ReplayNonce::from_bytes([id.wrapping_add(3); 16]),
             content_type: content_type.clone(),
             capability_id: CapabilityId::from_bytes([13; 32]),
             policy_epoch: 1,
@@ -1951,7 +1972,7 @@ mod anchor_tests {
             protocol_version: ProtocolVersion::V1,
             authorization_domain_route_label: AuthorizationDomainRouteLabel::from_bytes([15; 32]),
             destination_route_token: DestinationRouteToken::from_bytes([16; 32]),
-            delivery_id: DeliveryId::from_bytes([17; 32]),
+            delivery_id: DeliveryId::from_bytes([id.wrapping_add(8); 32]),
             ciphertext_len: 0,
             padding: CiphertextPadding::Exact,
             expires_at_unix_ms: header.expires_at_unix_ms,
@@ -2467,6 +2488,155 @@ mod anchor_tests {
         .expect("empty retired generation reopens");
         assert!(recovered.seen.is_empty());
         assert_eq!(recovered.tip(), anchor.tip());
+    }
+
+    #[test]
+    fn retained_local_credit_survives_restart_without_resetting_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let anchor = FileJournalAnchor::open(
+            &dir.path().join("anchor").join("tip.json"),
+            address(),
+            [22; 32],
+        )
+        .unwrap();
+        let policy = local_retention();
+        let open = |limits| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                SigningKey::from_bytes(&[6; 32]).verifying_key(),
+                limits,
+                &custody,
+                &anchor,
+                policy,
+            )
+        };
+        let (old, send, context, key, a, b) = message();
+        let mut journal = open(limits()).unwrap();
+        let old_request = |context| admission(&old, &send, context, &key, &a, &b);
+        let original = journal.admit_local(old_request(&context), &anchor).unwrap();
+        journal
+            .compact_local(context.now_unix_ms, &b, &anchor)
+            .unwrap();
+        assert_eq!(
+            journal.admit_local(old_request(&context), &anchor).unwrap(),
+            original
+        );
+        let expiry = old.routing.expires_at_unix_ms;
+        journal
+            .expire_next(expiry, &b, |next| anchor.advance(next))
+            .unwrap();
+        let horizon = policy.retained_until(expiry).unwrap();
+        journal.compact_local(horizon, &b, &anchor).unwrap();
+        assert_eq!(
+            journal.seen.len(),
+            1,
+            "signed window includes its last millisecond"
+        );
+        journal.compact_local(horizon + 1, &b, &anchor).unwrap();
+        assert!(journal.seen.is_empty());
+        drop(journal);
+        let mut journal = open(limits()).unwrap();
+        let tip = anchor.tip();
+        assert!(tip.cursor >= limits().max_records as u64);
+        assert_eq!(journal.records, 1);
+        let mut stale = context.clone();
+        stale.now_unix_ms = horizon + 1;
+        assert!(matches!(
+            journal.admit_local(old_request(&stale), &anchor),
+            Err(JournalError::Mailbox(_))
+        ));
+        assert_eq!(anchor.tip(), tip);
+        let (fresh, grant, current, key2, a2, b2) = message_at(10, 2, horizon + 1);
+        let request = || admission(&fresh, &grant, &current, &key2, &a2, &b2);
+        let receipt = journal
+            .admit_local(request(), &anchor)
+            .expect("free retained capacity must admit a fresh signed identity");
+        assert_eq!(receipt.receipt.message_id, MessageId::from_bytes([10; 32]));
+        assert_eq!(journal.tip().cursor, tip.cursor + 1);
+        assert_eq!(journal.tip(), anchor.tip());
+        drop(journal);
+        let mut recovered = open(limits()).unwrap();
+        assert_eq!(recovered.admit_local(request(), &anchor).unwrap(), receipt);
+        assert_eq!(recovered.seen.len(), 1);
+    }
+
+    #[test]
+    fn local_checkpoints_keep_retained_identity_and_physical_quotas_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let b = SigningKey::from_bytes(&[6; 32]);
+        let anchor = FileJournalAnchor::open(
+            &dir.path().join("anchor").join("tip.json"),
+            address(),
+            [22; 32],
+        )
+        .unwrap();
+        let quota = JournalLimits {
+            max_records: 3,
+            max_bytes: 512 * 1024,
+        };
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                b.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
+                local_retention(),
+            )
+        };
+        let mut journal = open(quota).unwrap();
+        let now = 1_800_000_000_000;
+        let mut receipts = Vec::new();
+        for id in 1..=3 {
+            let (e, c, x, k, a, b) = message_at(id, id.into(), now);
+            receipts.push(
+                journal
+                    .admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor)
+                    .unwrap(),
+            );
+            if id < 3 {
+                journal.compact_local(now, &b, &anchor).unwrap();
+            }
+        }
+        // The checkpoint retains two identities, and one more was appended. A lower
+        // recovery quota must reject this combination even though its two files fit.
+        drop(journal);
+        let lower = JournalLimits {
+            max_records: 2,
+            ..quota
+        };
+        assert!(matches!(open(lower), Err(JournalError::Full)));
+        let mut journal = open(quota).unwrap();
+        journal.compact_local(now, &b, &anchor).unwrap();
+        drop(journal);
+        assert!(matches!(open(lower), Err(JournalError::Full)));
+        let mut journal = open(quota).unwrap();
+        assert_eq!(journal.records, 1);
+        assert_eq!(journal.seen.len(), 3);
+        let tip = anchor.tip();
+        let (e, c, x, k, a, b) = message_at(4, 4, now);
+        assert!(matches!(
+            journal.admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor),
+            Err(JournalError::Full)
+        ));
+        assert_eq!(anchor.tip(), tip);
+        // Fresh sealing under a prior identity conflicts; the old proof remains intact.
+        let (e, c, x, k, a, b) = message_at(1, 4, now);
+        assert!(matches!(
+            journal.admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor),
+            Err(JournalError::ConflictingRetry)
+        ));
+        assert_eq!(anchor.tip(), tip);
+        assert_eq!(
+            receipts[0].receipt.message_id,
+            MessageId::from_bytes([1; 32])
+        );
     }
 
     #[test]

@@ -103,6 +103,9 @@ impl MailboxJournal {
                 &Signature::from_bytes(&signature),
             )
             .map_err(|_| JournalError::Corrupt)?;
+        if state.entries.len() > self.limits.max_records {
+            return Err(JournalError::Full);
+        }
         let mut seen = BTreeMap::new();
         let mut order = Vec::new();
         for CheckpointEntry {

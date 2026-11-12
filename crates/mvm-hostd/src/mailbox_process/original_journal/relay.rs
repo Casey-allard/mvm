@@ -294,6 +294,15 @@ impl PairedJournalAdmission {
                         "source data key belongs to a different original boot"
                     );
 
+                    if boot
+                        .outbound_journal_v1
+                        .is_some_and(|d| d.sender_settlement.is_some())
+                    {
+                        crate::mailbox_service::sender_window::SenderWindow::provision(
+                            &config.vm_state_dir,
+                            material.commitment,
+                        )?;
+                    }
                     let delegated = SourceConfiguration {
                         parent: std::process::id(),
                         destination_name: dest.name.clone(),
