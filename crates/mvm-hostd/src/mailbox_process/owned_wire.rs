@@ -59,6 +59,10 @@ pub enum OwnedStatusV1 {
     },
     /// The helper has exclusively bound the addressed ingress. Emit only
     /// after selecting the dedicated authenticated parent-only handler.
+    ReadyCastSourceV1 {
+        owner: MailboxWorkerOwner,
+        direction_commitment: [u8; 32],
+    },
     ReadyCastDestinationV1 {
         owner: MailboxWorkerOwner,
         direction_commitment: [u8; 32],
@@ -96,7 +100,7 @@ pub fn read_ready(
 ) -> io::Result<()> {
     match validate_status(read_frame(stream, deadline)?, owner)? {
         ReadyIngress::Legacy => Ok(()),
-        ReadyIngress::CastDestination(_) => Err(Error::new(
+        ReadyIngress::CastSource(_) | ReadyIngress::CastDestination(_) => Err(Error::new(
             ErrorKind::PermissionDenied,
             "expected legacy readiness",
         )),
@@ -141,10 +145,15 @@ pub(crate) fn poll_ready(
 pub(crate) enum ReadyIngress {
     Legacy,
     CastDestination([u8; 32]),
+    CastSource([u8; 32]),
 }
 fn validate_status(status: OwnedStatusV1, owner: &MailboxWorkerOwner) -> io::Result<ReadyIngress> {
     match status {
         OwnedStatusV1::Ready { owner: received } if received == *owner => Ok(ReadyIngress::Legacy),
+        OwnedStatusV1::ReadyCastSourceV1 { owner: received, direction_commitment }
+            if received == *owner && direction_commitment != [0; 32] => {
+                Ok(ReadyIngress::CastSource(direction_commitment))
+            }
         OwnedStatusV1::ReadyCastDestinationV1 {
             owner: received,
             direction_commitment,

@@ -9,6 +9,7 @@ pub(crate) const CAST_WORK_BYTES: usize = 8 * CAST_BODY_LIMIT;
 pub(super) struct CastLane {
     active: std::sync::Weak<HandoffWorkspace>,
     source_active: bool,
+    original_source: std::sync::Weak<HandoffWorkspace>,
     last_admission: Option<Instant>,
 }
 
@@ -25,14 +26,14 @@ impl MailboxWorkers {
         source: (&str, &MailboxWorkerOwner),
         destination: (&str, &MailboxWorkerOwner),
     ) -> io::Result<()> {
-        self.with_cast_participants(source, destination, |_| Ok(()))
+        self.with_cast_participants(source, destination, |_, _| Ok(()))
     }
 
     fn with_cast_participants<T>(
         &self,
         source: (&str, &MailboxWorkerOwner),
         destination: (&str, &MailboxWorkerOwner),
-        operation: impl FnOnce(&mut Worker) -> io::Result<T>,
+        operation: impl FnOnce(&mut Worker, &mut Worker) -> io::Result<T>,
     ) -> io::Result<T> {
         if source.0 == destination.0 || source.1 == destination.1 {
             return Err(refused("Cast requires two original workers"));
@@ -74,6 +75,9 @@ impl MailboxWorkers {
             }
         }
         operation(
+            a.worker
+                .as_mut()
+                .ok_or_else(|| refused("source child absent"))?,
             b.worker
                 .as_mut()
                 .ok_or_else(|| refused("destination child absent"))?,
@@ -140,6 +144,59 @@ impl MailboxWorkers {
     }
 }
 
+impl MailboxWorkers {
+    /// Reserve the source generation before its first pull. A reconnect to
+    /// the same authenticated original reuses its reservation. The process
+    /// can still retain a sealed request after all its sockets are gone.
+    pub(crate) fn retain_original_source(
+        &self,
+        source: (&str, &MailboxWorkerOwner),
+        destination: (&str, &MailboxWorkerOwner),
+        peer: &UnixStream,
+        direction: [u8; 32],
+    ) -> io::Result<()> {
+        use crate::mailbox_process::owned_wire::ReadyIngress;
+        let _activation = self.try_activation()?;
+        let pid = mvm_vmm::host::uds_peer::connected_peer_pid(peer)?;
+        self.with_cast_participants(source, destination, |a, b| {
+            if u32::try_from(pid).ok() != Some(a.child.id())
+                || direction == [0; 32]
+                || a.ingress != ReadyIngress::CastSource(direction)
+                || b.ingress != ReadyIngress::CastDestination(direction)
+            {
+                return Err(refused("source socket or original role mismatch"));
+            }
+            if self.budget.cleanup.failed.load(Ordering::Acquire) {
+                return Err(refused("source accounting unavailable"));
+            }
+            let mut lane = lock(&self.cast_lane)?;
+            if let Some(held) = lane.original_source.upgrade() {
+                return if a
+                    .source_workspace
+                    .as_ref()
+                    .is_some_and(|w| Arc::ptr_eq(&held, w))
+                {
+                    Ok(())
+                } else {
+                    Err(refused("another original owns the source workspace"))
+                };
+            }
+            if lane.source_active || a.source_workspace.is_some() {
+                return Err(refused("source workspace already owned"));
+            }
+            self.budget.charge_cast_space(&self.tenant)?;
+            let allocation = Arc::new(HandoffWorkspace {
+                ledger: self.budget.ledger.clone(),
+                failed: self.budget.cleanup.failed.clone(),
+                tenant: self.tenant.clone(),
+            });
+            lane.original_source = Arc::downgrade(&allocation);
+            a.source_workspace = Some(allocation);
+            Ok(())
+        })
+    }
+}
+
 /// Distinct from the short forwarding credit: the original A helper must
 /// retain its exact sealed request across reconnects without blocking the
 /// A→B forwarding lane. Both draw from the same real tenant/host ledger.
@@ -153,7 +210,7 @@ impl MailboxWorkers {
         let _activation = self.try_activation()?;
         self.check_cast_participants(source, destination)?;
         let mut lane = lock(&self.cast_lane)?;
-        if lane.source_active {
+        if lane.source_active || lane.original_source.upgrade().is_some() {
             return Err(refused("original source slot is already retained"));
         }
         self.budget.charge_cast_space(&self.tenant)?;
@@ -285,7 +342,7 @@ impl CastCredit<'_> {
         let _admission = self.workers.try_activation()?;
         let peer_pid = mvm_vmm::host::uds_peer::connected_peer_pid(peer)?;
         self.workers
-            .with_cast_participants(self.source, self.destination, |worker| {
+            .with_cast_participants(self.source, self.destination, |_, worker| {
                 if u32::try_from(peer_pid).ok() != Some(worker.child.id()) {
                     return Err(refused("data socket is not held by original destination"));
                 }
