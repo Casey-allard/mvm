@@ -19,7 +19,12 @@ impl OriginalDirectory {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(path)?;
-        mvm_core::private_fs::require_current_owner(&fd.metadata()?)?;
+        let metadata = fd.metadata()?;
+        mvm_core::private_fs::require_current_owner(&metadata)?;
+        ensure!(
+            metadata.mode() & 0o022 == 0,
+            "mailbox registration directory writable by another principal"
+        );
         Ok(Self {
             path: path.into(),
             fd,
@@ -34,7 +39,9 @@ impl OriginalDirectory {
     fn require_current(&self) -> Result<()> {
         let current = fs::symlink_metadata(&self.path)?;
         ensure!(
-            current.is_dir() && (current.dev(), current.ino()) == self.identity()?,
+            current.is_dir()
+                && current.mode() & 0o022 == 0
+                && (current.dev(), current.ino()) == self.identity()?,
             "original mailbox registration directory changed"
         );
         Ok(())
@@ -45,12 +52,19 @@ struct Participant {
     _claim: Arc<LaunchClaim>,
     state: OriginalDirectory,
     owner: OriginalDirectory,
+    socket_dir: Option<OriginalDirectory>,
 }
 
 impl Participant {
     fn claim(keys: &Path, name: &str, state: &Path) -> Result<Self> {
         mvm_core::naming::validate_vm_name(name)?;
         let state = OriginalDirectory::open(state)?;
+        let socket_path = mvm_core::config::vm_socket_dir_at(&state.path);
+        let socket_dir = if socket_path != state.path {
+            Some(OriginalDirectory::open(&socket_path)?)
+        } else {
+            None
+        };
         let owner = OriginalDirectory::open(&owner_dir(keys, name)?)?;
         let claim = claim_launch(&state.path, &owner.path, true)?;
         state.require_current()?;
@@ -59,6 +73,7 @@ impl Participant {
             _claim: claim,
             state,
             owner,
+            socket_dir,
         })
     }
 }
@@ -92,6 +107,9 @@ impl Registration {
         for original in [&self.caller, &self.callee] {
             original.state.require_current()?;
             original.owner.require_current()?;
+            if let Some(socket_dir) = &original.socket_dir {
+                socket_dir.require_current()?;
+            }
         }
         Ok(())
     }
