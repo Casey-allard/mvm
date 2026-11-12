@@ -447,7 +447,7 @@ impl ObjectWorkerBootstrapV1 {
             self.local_journal == paths.journal
                 && self.local_anchor == paths.anchor
                 && self.local_intents == paths.source_intents
-                && self.route == original_mailbox_route(&local_state)
+                && self.route == original_mailbox_route(local_state)
                 && self.history_ref.address() == address
                 && self.history_ref.execution_epoch() == role.local().execution_epoch
                 && self.history_ref.key_id()

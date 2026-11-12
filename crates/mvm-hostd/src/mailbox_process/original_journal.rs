@@ -76,16 +76,6 @@ impl OriginalJournalDestination {
         vm_name: &str,
         posture: &MailboxLaunchPosture,
     ) -> Result<Self> {
-        Self::start_with_mode(plan, backend, vm_name, posture, stop::VmmMode::Installed)
-    }
-
-    fn start_with_mode(
-        plan: &ExecutionPlan,
-        backend: &AnyBackend,
-        vm_name: &str,
-        posture: &MailboxLaunchPosture,
-        mode: stop::VmmMode,
-    ) -> Result<Self> {
         ensure!(
             posture.variant() == Variant::Prod,
             "paired journal requires production admission"
@@ -97,7 +87,7 @@ impl OriginalJournalDestination {
             Some(posture),
             true,
             |config, plan, guard| {
-                Self::spawn(config, plan, backend, guard, mode).map_err(std::io::Error::other)
+                Self::spawn(config, plan, backend, guard).map_err(std::io::Error::other)
             },
         )?
         .context("destination VM has no admitted mailbox")
@@ -108,7 +98,6 @@ impl OriginalJournalDestination {
         plan: &ExecutionPlan,
         backend: &AnyBackend,
         guard: std::sync::Arc<LaunchClaim>,
-        mode: stop::VmmMode,
     ) -> Result<Self> {
         let boot = config
             .reader_boot
@@ -119,7 +108,7 @@ impl OriginalJournalDestination {
             config.grant.retention.is_some(),
             "destination has no admitted retention"
         );
-        let stop = stop::StopCustody::capture(config, backend, &plan.image.name, mode)?;
+        let stop = stop::StopCustody::capture(config, backend, &plan.image.name)?;
         let (mut policy, sealer) = config.keys.trust();
         let current = &policy.context;
         let address = MailboxAddress {
@@ -475,6 +464,7 @@ impl OriginalMarker {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn collect(&mut self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
         let Some(status) = child.try_wait()? else {
             return Ok(None);

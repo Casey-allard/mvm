@@ -245,23 +245,6 @@ impl PairedJournalAdmission {
         name: &str,
         posture: &super::MailboxLaunchPosture,
     ) -> Result<OriginalJournalSourceHost> {
-        self.launch_source_with_mode(
-            plan,
-            backend,
-            name,
-            posture,
-            super::stop::VmmMode::Installed,
-        )
-    }
-
-    pub(super) fn launch_source_with_mode(
-        &self,
-        plan: &ExecutionPlan,
-        backend: &mvm_runtime::backend::AnyBackend,
-        name: &str,
-        posture: &super::MailboxLaunchPosture,
-        mode: super::stop::VmmMode,
-    ) -> Result<OriginalJournalSourceHost> {
         ensure!(
             posture.variant() == mvm_core::plan::Variant::Prod,
             "paired source requires production posture"
@@ -275,7 +258,7 @@ impl PairedJournalAdmission {
             true,
             |config, plan, guard| {
                 let setup = (|| -> Result<_> {
-                    let stop = super::stop::StopCustody::capture(config, backend, name, mode)?;
+                    let stop = super::stop::StopCustody::capture(config, backend, name)?;
                     let boot = config.reader_boot.as_ref().context("absent A boot")?;
                     let mut dest = self
                         .original

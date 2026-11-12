@@ -38,7 +38,7 @@ struct Entry {
 }
 pub(super) enum Original {
     Send(Vec<u8>),
-    Accepted(Vec<u8>, SignedDestinationReceipt),
+    Accepted(Vec<u8>, Box<SignedDestinationReceipt>),
 }
 #[cfg(test)]
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -246,7 +246,7 @@ impl SenderWindow {
             }
             let bytes = hex::decode(&e.seal).map_err(|_| Refusal::Malformed)?;
             if let Some(r) = &e.receipt {
-                return Ok(Original::Accepted(bytes, r.clone()));
+                return Ok(Original::Accepted(bytes, Box::new(r.clone())));
             }
             if e.attempts >= MAX_SOURCE_ATTEMPTS {
                 return Err(Refusal::RetriesExhausted);

@@ -200,7 +200,7 @@ impl PreparedObjectPair {
     }
 }
 
-use crate::mailbox_process::reader::{enroll_object_reader, revocations_path};
+use crate::mailbox_process::reader::{ObjectReaderBoot, enroll_object_reader, revocations_path};
 use crate::mailbox_service::durable::{GuestReaderAuthority, reader_revocations};
 use crate::plan_admission::{AdmittedPlan, MailboxLaunchPosture};
 use mvm_core::crypto::aead::Key;
@@ -277,7 +277,7 @@ fn check_hvf_reader(
 }
 
 fn check_original_native(participant: &InstalledParticipant<'_>) -> Result<()> {
-    let original = match participant.original {
+    match participant.original {
         #[cfg(target_os = "linux")]
         OriginalNative::Firecracker(native) => {
             native.require_live()?;
@@ -285,16 +285,17 @@ fn check_original_native(participant: &InstalledParticipant<'_>) -> Result<()> {
                 participant.boot == native.boot()?,
                 "different original Firecracker guest boot"
             );
-            return participant.boot.check_plan(participant.admitted.plan());
+            participant.boot.check_plan(participant.admitted.plan())
         }
-        OriginalNative::Hvf(original) => original,
-    };
-    check_hvf_reader(
-        participant.admitted.plan(),
-        original.original_object_reader()?,
-        participant.boot,
-    )?;
-    check_hvf_config(participant.admitted, original)
+        OriginalNative::Hvf(original) => {
+            check_hvf_reader(
+                participant.admitted.plan(),
+                original.original_object_reader()?,
+                participant.boot,
+            )?;
+            check_hvf_config(participant.admitted, original)
+        }
+    }
 }
 
 fn check_hvf_config(
@@ -596,9 +597,11 @@ impl PreparedObjectPair {
          -> Result<InstalledEndpointMaterial> {
             let d = super::derived_keys(keys, &g.mailbox, g.epoch)?;
             let reader = enroll_object_reader(
-                role.state,
-                g,
-                role.boot,
+                ObjectReaderBoot {
+                    state: role.state,
+                    grant: g,
+                    boot: role.boot,
+                },
                 flow,
                 recv,
                 &d.authority,
@@ -716,6 +719,7 @@ fn load_private_root(keys: &Path) -> Result<Key> {
 pub(crate) mod bootstrap;
 pub(crate) mod operations;
 mod pending;
+pub(crate) use operations::TurnContext;
 pub use operations::{OriginalObjectCallLease, SealedObjectTurn};
 
 #[cfg(test)]

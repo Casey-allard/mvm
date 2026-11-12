@@ -365,19 +365,31 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
     let callbody = b"SC\0\x11\0";
     let replybody = b"reply\0\0";
     let call = material
-        .seal_turn(Caller, msg, Some(corr), seq, callbody, None, f.now)
+        .seal_turn(
+            TurnContext {
+                role: Caller,
+                now: f.now,
+            },
+            msg,
+            Some(corr),
+            seq,
+            callbody,
+            None,
+        )
         .unwrap();
     assert_eq!(call.header().correlation_id, corr);
     assert!(
         material
             .seal_turn(
-                Caller,
+                TurnContext {
+                    role: Caller,
+                    now: f.now
+                },
                 msg,
                 Some(CorrelationId::from_bytes([0; 32])),
                 seq,
                 callbody,
-                None,
-                f.now
+                None
             )
             .is_err()
     );
@@ -400,13 +412,15 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
         mvm_core::mailbox::frame::decode_frame(&original).unwrap();
     let restored = material
         .reopen(
-            Caller,
+            TurnContext {
+                role: Caller,
+                now: f.now,
+            },
             &restored_grant,
             restored_envelope,
             ordinal,
             &sub,
             None,
-            f.now,
         )
         .unwrap();
     let source_time = source_start.elapsed();
@@ -419,13 +433,15 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
     assert!(
         material
             .reopen(
-                Caller,
+                TurnContext {
+                    role: Caller,
+                    now: f.now
+                },
                 call.capability(),
                 call.envelope().clone(),
                 seq,
                 &incorrect,
-                None,
-                f.now
+                None
             )
             .is_err()
     );
@@ -647,13 +663,15 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
     let reply_id = MessageId::from_bytes([78; 32]);
     let reply = material
         .seal_turn(
-            Callee,
+            TurnContext {
+                role: Callee,
+                now: f.now,
+            },
             reply_id,
             None,
             seq,
             replybody,
             Some(&current),
-            f.now,
         )
         .unwrap();
     let recover = |dir: &std::path::Path, envelope: &MailboxEnvelope| {
@@ -704,13 +722,15 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
     assert_eq!(
         material
             .reopen(
-                Callee,
+                TurnContext {
+                    role: Callee,
+                    now: f.now
+                },
                 reply.capability(),
                 reply.envelope().clone(),
                 seq,
                 &rs,
-                Some(&current),
-                f.now
+                Some(&current)
             )
             .unwrap()
             .envelope(),

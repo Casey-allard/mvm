@@ -168,9 +168,8 @@ impl DurableMailboxService {
         Self::bind_with(
             path,
             limits,
-            policy,
+            State { policy, journal },
             signer,
-            journal,
             Box::new(anchor),
             None,
             None,
@@ -211,9 +210,8 @@ impl DurableMailboxService {
         Self::bind_with(
             path,
             limits,
-            policy,
+            State { policy, journal },
             signer,
-            journal,
             Box::new(commit),
             Some(anchor),
             incoming,
@@ -223,14 +221,13 @@ impl DurableMailboxService {
     fn bind_with(
         path: &Path,
         limits: MailboxLimits,
-        policy: MailboxPolicy,
+        state: State,
         signer: SigningKey,
-        journal: MailboxJournal,
         anchor: Box<dyn JournalAnchor>,
         local_anchor: Option<Arc<FileJournalAnchor>>,
         incoming: Option<IncomingSendGuard>,
     ) -> std::io::Result<Self> {
-        if signer.verifying_key() != policy.authority_key {
+        if signer.verifying_key() != state.policy.authority_key {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "destination signer does not match the trusted authority",
@@ -247,7 +244,7 @@ impl DurableMailboxService {
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
             limits,
-            state: Mutex::new(State { policy, journal }),
+            state: Mutex::new(state),
             signer,
             anchor,
             local_anchor,

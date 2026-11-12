@@ -117,13 +117,15 @@ impl InstalledObjectPair<'_> {
         body: &[u8],
     ) -> Result<SealedObjectTurn> {
         self.material.seal_turn(
-            ObjectParticipantRole::Caller,
+            TurnContext {
+                role: ObjectParticipantRole::Caller,
+                now: self.check_current()?,
+            },
             message,
             Some(correlation),
             sequence,
             body,
             None,
-            self.check_current()?,
         )
     }
 
@@ -135,13 +137,15 @@ impl InstalledObjectPair<'_> {
         original: OriginalObjectCallLease<'_>,
     ) -> Result<SealedObjectTurn> {
         self.material.seal_turn(
-            ObjectParticipantRole::Callee,
+            TurnContext {
+                role: ObjectParticipantRole::Callee,
+                now: self.check_current()?,
+            },
             message,
             None,
             sequence,
             body,
             Some(&original),
-            self.check_current()?,
         )
     }
     /// Reopen only an already bound outbound intent. The returned turn keeps
@@ -156,13 +160,15 @@ impl InstalledObjectPair<'_> {
         original: Option<&OriginalObjectCallLease<'_>>,
     ) -> Result<SealedObjectTurn> {
         self.material.reopen(
-            role,
+            TurnContext {
+                role,
+                now: self.check_current()?,
+            },
             cap,
             envelope,
             sequence,
             submission,
             original,
-            self.check_current()?,
         )
     }
 
@@ -253,6 +259,12 @@ pub(crate) fn verify_active_call(
     Ok(h.clone())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TurnContext {
+    pub(crate) role: ObjectParticipantRole,
+    pub(crate) now: i64,
+}
+
 impl PairMaterial {
     fn local(&self, role: ObjectParticipantRole) -> &EndpointMaterial {
         match role {
@@ -262,29 +274,33 @@ impl PairMaterial {
     }
     pub(super) fn seal_turn(
         &self,
-        role: ObjectParticipantRole,
+        context: TurnContext,
         message: MessageId,
         correlation_id: Option<CorrelationId>,
         sequence: SequenceNumber,
         body: &[u8],
         original: Option<&OriginalObjectCallLease<'_>>,
-        now: i64,
     ) -> Result<SealedObjectTurn> {
-        self.local(role)
-            .seal_turn(role, message, correlation_id, sequence, body, original, now)
+        self.local(context.role).seal_turn(
+            context,
+            message,
+            correlation_id,
+            sequence,
+            body,
+            original,
+        )
     }
     pub(super) fn reopen(
         &self,
-        role: ObjectParticipantRole,
+        context: TurnContext,
         cap: &SignedMailboxCapability,
         envelope: MailboxEnvelope,
         sequence: SequenceNumber,
         submission: &ObjectSubmissionV1,
         original: Option<&OriginalObjectCallLease<'_>>,
-        now: i64,
     ) -> Result<SealedObjectTurn> {
-        self.local(role)
-            .reopen(role, cap, envelope, sequence, submission, original, now)
+        self.local(context.role)
+            .reopen(context, cap, envelope, sequence, submission, original)
     }
     pub(super) fn verify_accepted(
         &self,
@@ -299,14 +315,14 @@ impl PairMaterial {
 impl EndpointMaterial {
     pub(crate) fn seal_turn(
         &self,
-        role: ObjectParticipantRole,
+        context: TurnContext,
         message: MessageId,
         correlation_id: Option<CorrelationId>,
         sequence: SequenceNumber,
         body: &[u8],
         original: Option<&OriginalObjectCallLease<'_>>,
-        now: i64,
     ) -> Result<SealedObjectTurn> {
+        let TurnContext { role, now } = context;
         let local = self;
         ensure!(
             role == self.public_role.role.role,
@@ -319,7 +335,7 @@ impl EndpointMaterial {
             "invalid original message or frame length"
         );
         let (kind, correlation, causation, reply_to, expires) =
-            self.original_fields(role, local, d, message, correlation_id, original, now)?;
+            Self::original_fields(role, local, d, message, correlation_id, original, now)?;
         let header = MailboxEnvelopeHeader {
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
@@ -367,7 +383,6 @@ impl EndpointMaterial {
         })
     }
     fn original_fields(
-        &self,
         role: ObjectParticipantRole,
         local: &EndpointMaterial,
         d: &mvm_core::mailbox::object_pair::role::ObjectRoleV1,
@@ -382,7 +397,6 @@ impl EndpointMaterial {
         Option<ReplyRoute>,
         i64,
     )> {
-        let g = &d.outbound().grant;
         let fields = match (role, original) {
             (ObjectParticipantRole::Caller, None) => (
                 MailboxMessageKind::Call,
@@ -416,14 +430,14 @@ impl EndpointMaterial {
     }
     pub(crate) fn reopen(
         &self,
-        role: ObjectParticipantRole,
+        context: TurnContext,
         cap: &SignedMailboxCapability,
         envelope: MailboxEnvelope,
         sequence: SequenceNumber,
         submission: &ObjectSubmissionV1,
         original: Option<&OriginalObjectCallLease<'_>>,
-        now: i64,
     ) -> Result<SealedObjectTurn> {
+        let TurnContext { role, now } = context;
         let local = self;
         ensure!(
             role == self.public_role.role.role,
@@ -467,7 +481,7 @@ impl EndpointMaterial {
         let opened = open_original(cap, op, &envelope, &local.outbound_key, now)?;
         let h = opened.header();
         let (kind, correlation, cause, route, expires) =
-            self.original_fields(role, local, d, message, correlation, original, now)?;
+            Self::original_fields(role, local, d, message, correlation, original, now)?;
         ensure!(
             message.as_bytes() != &[0; 32]
                 && h.message_id == message

@@ -3,6 +3,7 @@
 use crate::mailbox_launch::object_pair::bootstrap::ObjectWorkerBootstrapV1;
 use anyhow::{Context, Result, ensure};
 use mvm_vmm::host::network_endpoint_spawn::EndpointPid;
+#[cfg(target_os = "linux")]
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
@@ -246,7 +247,7 @@ pub(crate) fn send_launch(
     send_rights(channel, TAG[0], originals, until)?;
     #[cfg(target_os = "macos")]
     {
-        let _ = originals;
+        let () = originals;
         rustix::net::sockopt::set_socket_nosigpipe(channel, true)?;
     }
     send_rights(channel, 2, links.map(AsFd::as_fd), until)?;

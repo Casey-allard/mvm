@@ -1,7 +1,7 @@
 //! Crash-safe original source seals for the selected application Call/Reply service.
 use super::*;
 use crate::mailbox_launch::object_pair::{
-    EndpointMaterial, InstalledObjectPair, OriginalObjectCallLease, SealedObjectTurn,
+    EndpointMaterial, InstalledObjectPair, OriginalObjectCallLease, SealedObjectTurn, TurnContext,
 };
 use anyhow::{Context, Result, ensure};
 use mvm_contract::protocol::mailbox::{MessageId, SignedDestinationReceipt};
@@ -24,11 +24,11 @@ pub(super) struct ObjectIntentSlot {
     pub(super) original: Option<Vec<u8>>,
 }
 
+type RetainedObjectRecord = (SequenceNumber, [u8; 32], Vec<u8>);
+
 /// A reader opens only the already atomically published original. A lookup does
 /// not allocate an ID, change the attempt count, create a store or repair state.
-pub(crate) fn read_original_object(
-    path: &Path,
-) -> Result<Option<(SequenceNumber, [u8; 32], Vec<u8>)>> {
+pub(crate) fn read_original_object(path: &Path) -> Result<Option<RetainedObjectRecord>> {
     match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -172,13 +172,12 @@ impl OutboundObject<'_> {
         let turn = if let Some(record) = &slot.original {
             let (cap, envelope) = decode_frame(record)?;
             let turn = local.reopen(
-                role,
+                TurnContext { role, now },
                 &cap,
                 envelope,
                 slot.sequence,
                 self.submission,
                 self.original.as_ref(),
-                now,
             )?;
             // A previous writer may have stopped between publishing and syncing.
             sync_dir(dir)?;
@@ -193,13 +192,12 @@ impl OutboundObject<'_> {
                 ObjectSubmissionV1::Reply { payload, .. } => (None, payload),
             };
             let turn = local.seal_turn(
-                role,
+                TurnContext { role, now },
                 self.submission.message_id(),
                 corr,
                 slot.sequence,
                 payload,
                 self.original.as_ref(),
-                now,
             )?;
             slot.publish(&encode_frame(turn.capability(), turn.envelope())?)?;
             turn

@@ -317,7 +317,8 @@ impl RetainedMailboxKeys {
 
     /// Provision once under a verified launch posture; an interrupted first
     /// provision leaves an orphan bundle and refuses instead of replacing it.
-    pub(crate) fn provision(
+    #[cfg(test)]
+    fn provision(
         keys_dir: &Path,
         plan: &ExecutionPlan,
         vm_name: &str,

@@ -363,19 +363,23 @@ fn serve_local(
             mvm_contract::protocol::mailbox::PrincipalId::from_bytes(d.receipt_key);
         inbound.current_execution_epoch = d.execution_epoch;
         inbound.current_policy_epoch = d.policy_epoch;
-        let source =
-            crate::mailbox_service::directed_journal::DirectedJournalSource::from_original(
-                plan,
-                &binding,
-                &sealer,
-                &policy.context,
-                &inbound,
-                private.grants.clone(),
-                private.material(),
-                &vm_state_dir,
-                &vm_state_dir.with_file_name(&private.destination_name),
-            )
-            .map_err(Error::other)?;
+        use crate::mailbox_service::directed_journal::{DirectedJournalSource, JournalPeer};
+        let source = DirectedJournalSource::from_original(
+            plan,
+            binding,
+            &sealer,
+            JournalPeer {
+                context: &policy.context,
+                state: &vm_state_dir,
+            },
+            JournalPeer {
+                context: &inbound,
+                state: &vm_state_dir.with_file_name(&private.destination_name),
+            },
+            private.grants.clone(),
+            private.material(),
+        )
+        .map_err(Error::other)?;
         Some(source)
     } else {
         None
@@ -412,7 +416,7 @@ fn serve_local(
             .ok_or(crate::mailbox_service::Refusal::Unavailable)?
             .connect(&vm_state_dir, until)
     };
-    let mut turn = crate::mailbox_service::directed_journal::SourceTurn::from_boot(&binding)
+    let mut turn = crate::mailbox_service::directed_journal::SourceTurn::from_boot(binding)
         .map_err(Error::other)?;
     if let Some(endpoint) = directed.as_mut() {
         turn = turn.attach(endpoint, &mut dial).map_err(Error::other)?;

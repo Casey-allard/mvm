@@ -139,7 +139,10 @@ fn ordinal_reopens_exact_pending_at_capacity_and_fences_retired_prefix() {
         let original = window
             .reserve(h(ordinal), journal_intent_digest(&message(ordinal)), never)
             .unwrap();
-        assert!(matches!(original,Original::Accepted(s,receipt) if s==*bytes && receipt==*r));
+        assert!(matches!(
+            original,
+            Original::Accepted(seal, receipt) if seal == *bytes && receipt.as_ref() == r
+        ));
         if ordinal == 1 {
             let input = dir.path().join("fixture-settlement.json");
             mvm_core::atomic_io::write_private(&input, &serde_json::to_vec(&statement).unwrap())
@@ -153,9 +156,13 @@ fn ordinal_reopens_exact_pending_at_capacity_and_fences_retired_prefix() {
             };
             interrupt("before_rename", 81);
             let recovered = SenderWindow::reopen(dir.path(), id).unwrap();
-            assert!(
-                matches!(recovered.reserve(h(1),journal_intent_digest(&message(1)),never).unwrap(),Original::Accepted(ref s, ref receipt) if s==bytes && receipt==r)
-            );
+            let retried = recovered
+                .reserve(h(1), journal_intent_digest(&message(1)), never)
+                .unwrap();
+            assert!(matches!(
+                retried,
+                Original::Accepted(seal, receipt) if seal == *bytes && receipt.as_ref() == r
+            ));
             assert!(matches!(
                 recovered.reserve(h(65), [0; 32], never),
                 Err(Refusal::QueueFull(64))

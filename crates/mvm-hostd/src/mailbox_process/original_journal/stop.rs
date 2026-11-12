@@ -15,13 +15,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy)]
-pub(super) enum VmmMode {
-    Installed,
-    #[cfg(test)]
-    HelperFixture,
-}
-
 pub(super) struct StopCustody {
     state: File,
     split_socket: Option<(std::path::PathBuf, File)>,
@@ -43,26 +36,22 @@ impl StopCustody {
         config: &crate::mailbox_process::MailboxProcessConfig,
         backend: &AnyBackend,
         name: &str,
-        mode: VmmMode,
     ) -> Result<Self> {
-        let vmm = match mode {
-            VmmMode::Installed => {
-                let pid = backend
-                    .host_process_id(&VmId(name.into()))?
-                    .context("no installed VMM process to observe")?;
-                let original = EndpointPid::of_child(pid);
-                ensure!(original.is_live_and_ours(), "no live original VMM identity");
-                let observer = ProcessExitObserver::arm(original.pid)?;
-                ensure!(
-                    original.is_live_and_ours(),
-                    "original VMM changed while arming observer"
-                );
-                Some((original, observer))
-            }
-            #[cfg(test)]
-            VmmMode::HelperFixture => None,
-        };
-        Self::capture_state(&config.vm_state_dir, backend.kind(), vmm)
+        let pid = backend
+            .host_process_id(&VmId(name.into()))?
+            .context("no installed VMM process to observe")?;
+        let original = EndpointPid::of_child(pid);
+        ensure!(original.is_live_and_ours(), "no live original VMM identity");
+        let observer = ProcessExitObserver::arm(original.pid)?;
+        ensure!(
+            original.is_live_and_ours(),
+            "original VMM changed while arming observer"
+        );
+        Self::capture_state(
+            &config.vm_state_dir,
+            backend.kind(),
+            Some((original, observer)),
+        )
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -8,6 +8,7 @@ use crate::mailbox_service::{
     read_frame,
 };
 use anyhow::{Context, Result, ensure};
+#[cfg(target_os = "linux")]
 use mvm_contract::protocol::mailbox::MAILBOX_PORT;
 use mvm_core::mailbox::{
     frame::{MAX_VERDICT_BYTES, Refusal, decode_frame},

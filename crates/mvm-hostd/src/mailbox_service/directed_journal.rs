@@ -49,6 +49,11 @@ impl PairedSourceMaterial {
     }
 }
 
+pub(crate) struct JournalPeer<'a> {
+    pub(crate) context: &'a OpenContext,
+    pub(crate) state: &'a Path,
+}
+
 /// A never needs B's Child handle or signing secret. A's original launcher
 /// supplies one authenticated original-destination connection for each turn.
 pub(crate) struct DirectedJournalSource {
@@ -72,13 +77,19 @@ impl DirectedJournalSource {
         plan: &ExecutionPlan,
         boot: &MailboxReaderBootBinding,
         original: &GuestSealer,
-        local: &OpenContext,
-        destination: &OpenContext,
+        source_peer: JournalPeer<'_>,
+        destination_peer: JournalPeer<'_>,
         grants: JournalCredentials,
         material: PairedSourceMaterial,
-        source_state: &Path,
-        destination_state: &Path,
     ) -> Result<Self> {
+        let JournalPeer {
+            context: local,
+            state: source_state,
+        } = source_peer;
+        let JournalPeer {
+            context: destination,
+            state: destination_state,
+        } = destination_peer;
         boot.check_plan(plan)?;
         let local_grant = plan.mailbox.as_ref().context("A has no mailbox")?;
         let d = boot
@@ -219,7 +230,7 @@ impl DirectedJournalSource {
                     })?;
                 let (bytes, prior) = match original {
                     Original::Send(bytes) => (bytes, None),
-                    Original::Accepted(bytes, receipt) => (bytes, Some(receipt)),
+                    Original::Accepted(bytes, receipt) => (bytes, Some(*receipt)),
                 };
                 let role = super::OriginalSend {
                     signed: send,
@@ -324,16 +335,18 @@ impl DirectedJournalSource {
     }
 }
 
+type SourceTransport<'a> = (
+    &'a mut DirectedJournalSource,
+    &'a mut dyn FnMut(Instant) -> Result<UnixStream, Refusal>,
+);
+
 /// The selection is made from the original boot, before A's own seal/admit.
 /// Missing delegated data transport is an indeterminate directed operation,
 /// and never authorizes a retry through the local journal.
 pub(crate) struct SourceTurn<'a> {
     original_recipient: Option<PrincipalId>,
     original_commitment: Option<[u8; 32]>,
-    transport: Option<(
-        &'a mut DirectedJournalSource,
-        &'a mut dyn FnMut(Instant) -> Result<UnixStream, Refusal>,
-    )>,
+    transport: Option<SourceTransport<'a>>,
 }
 
 impl<'a> SourceTurn<'a> {

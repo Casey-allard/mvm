@@ -332,13 +332,17 @@ mod tests {
     }
 }
 
+pub(crate) struct ObjectReaderBoot<'a> {
+    pub(crate) state: &'a Path,
+    pub(crate) grant: &'a MailboxGrant,
+    pub(crate) boot: &'a MailboxReaderBootBinding,
+}
+
 /// Reader for a checked original object pair. It uses the operator's
 /// independently issued Receive credential verbatim and retains one exact
 /// destination-signed enrollment per original VM. It never mints Send.
 pub(crate) fn enroll_object_reader(
-    state: &Path,
-    grant: &MailboxGrant,
-    boot: &MailboxReaderBootBinding,
+    original: ObjectReaderBoot<'_>,
     direction: &SignedMailboxCapability,
     receive: &SignedMailboxCapability,
     signer: &SigningKey,
@@ -346,6 +350,7 @@ pub(crate) fn enroll_object_reader(
     revoked: &[mvm_contract::protocol::mailbox::RevocationId],
     now: i64,
 ) -> io::Result<GuestReaderAuthority> {
+    let ObjectReaderBoot { state, grant, boot } = original;
     if grant.durable_object_pair_sha256_v1.is_none()
         || boot.durable_object_pair_sha256_v1 != grant.durable_object_pair_sha256_v1
         || MailboxReaderBootBinding::load(state).map_err(invalid)? != *boot
