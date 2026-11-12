@@ -265,7 +265,7 @@ fn lease_and_reopen(reply: bool) {
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
             lease: *lease,
-            ack_nonce: DeliveryAckNonce::from_bytes([80; 32]),
+            ack_nonce: DeliveryAckNonce::from_bytes([80; 16]),
             acknowledged_at_unix_ms: NOW,
         },
         &guest,

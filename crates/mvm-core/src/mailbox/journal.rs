@@ -422,7 +422,8 @@ impl ObjectLeaseScope<'_> {
         entry: &Seen,
         request: &JournalReceive<'_>,
     ) -> Result<(), JournalError> {
-        if self.destination.boot != scope.current_boot
+        if &entry.capability != self.pair.retained_capability(self.original_call)
+            || self.destination.boot != scope.current_boot
             || self.destination.durable_object_pair_sha256_v1
                 != scope.plan.durable_object_pair_sha256_v1
             || &self.destination.plan_id != scope.plan_id
