@@ -321,6 +321,22 @@ impl<'a> ObjectPairV1<'a> {
         Ok(())
     }
 
+    /// Only the authenticated original caller may resolve a retained Reply.
+    pub(super) fn require_reply_reader(
+        &self,
+        destination: &MailboxReaderBootBinding,
+        capability: &SignedMailboxCapability,
+        now: i64,
+        state: PairAuthorityState<'_>,
+    ) -> Result<()> {
+        self.current(now, state)?;
+        ensure!(
+            destination == &self.caller_binding && capability == self.grants.reply,
+            "Reply reader differs from original caller or credential"
+        );
+        Ok(())
+    }
+
     pub(super) fn retained_capability(
         &self,
         pending: Option<&PendingObjectCall>,

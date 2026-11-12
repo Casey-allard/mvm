@@ -462,6 +462,65 @@ impl ObjectLeaseScope<'_> {
     }
 }
 
+/// Resolves A's original Call from its durable encrypted record. Resolution
+/// runs only after reader possession (lease) or the guest's signed ACK has
+/// been verified. The callback receives the journal's actual retained row.
+pub type OriginalCallResolver<'a> = dyn FnMut(
+        &SignedMailboxCapability,
+        &MailboxEnvelope,
+    ) -> Result<super::object_pair::PendingObjectCall, JournalError>
+    + 'a;
+
+enum ObjectCheck<'a, 'r> {
+    Fixed(ObjectLeaseScope<'a>),
+    ResolveReply(ObjectLeaseScope<'a>, &'r mut OriginalCallResolver<'r>),
+}
+
+impl ObjectCheck<'_, '_> {
+    fn operation(&self) -> MailboxOperation {
+        match self {
+            Self::Fixed(scope) => scope.operation(),
+            Self::ResolveReply(..) => MailboxOperation::Reply,
+        }
+    }
+    fn check_original(
+        self,
+        reader: &MailboxGuestReaderScope<'_>,
+        entry: &Seen,
+        receive: &JournalReceive<'_>,
+    ) -> Result<(), JournalError> {
+        match self {
+            Self::Fixed(scope) => scope.check_original(reader, entry, receive),
+            Self::ResolveReply(scope, resolve) => {
+                if scope.original_call.is_some()
+                    || scope.destination.boot != reader.current_boot
+                    || &scope.destination.plan_id != reader.plan_id
+                    || &scope.destination.plan_nonce != reader.plan_nonce
+                    || scope.destination.durable_object_pair_sha256_v1
+                        != reader.plan.durable_object_pair_sha256_v1
+                {
+                    return Err(JournalError::WrongAuthority);
+                }
+                scope
+                    .pair
+                    .require_reply_reader(
+                        scope.destination,
+                        &entry.capability,
+                        reader.now_unix_ms,
+                        scope.state,
+                    )
+                    .map_err(|_| JournalError::WrongAuthority)?;
+                let original = resolve(&entry.capability, &entry.envelope)?;
+                ObjectLeaseScope {
+                    original_call: Some(&original),
+                    ..scope
+                }
+                .check_original(reader, entry, receive)
+            }
+        }
+    }
+}
+
 /// A message whose signed lease was durably committed before payload release.
 pub struct LeasedMailboxMessage {
     message: ReceivedMailboxMessage,
@@ -1252,13 +1311,29 @@ impl MailboxJournal {
         scope: ObjectLeaseScope<'_>,
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
-        self.lease_next_inner(request, Some(scope), anchor)
+        self.lease_next_inner(request, Some(ObjectCheck::Fixed(scope)), anchor)
+    }
+
+    /// The installed caller recovers the correct pending Call from the immutable
+    /// source seal for the specific row chosen by this journal.
+    pub fn lease_next_object_reply<'r>(
+        &mut self,
+        request: JournalGuestLease<'_>,
+        scope: ObjectLeaseScope<'_>,
+        resolve: &'r mut OriginalCallResolver<'r>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
+        self.lease_next_inner(
+            request,
+            Some(ObjectCheck::ResolveReply(scope, resolve)),
+            anchor,
+        )
     }
 
     fn lease_next_inner(
         &mut self,
         request: JournalGuestLease<'_>,
-        paired: Option<ObjectLeaseScope<'_>>,
+        paired: Option<ObjectCheck<'_, '_>>,
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
         if request.plan.durable_object_pair_sha256_v1.is_some() != paired.is_some() {
@@ -1294,7 +1369,7 @@ impl MailboxJournal {
             request.receive,
             paired
                 .as_ref()
-                .map_or(MailboxOperation::Send, ObjectLeaseScope::operation),
+                .map_or(MailboxOperation::Send, ObjectCheck::operation),
         )?
         else {
             return Ok(None);
@@ -1477,12 +1552,26 @@ impl MailboxJournal {
         scope: ObjectLeaseScope<'_>,
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<JournalTip, JournalError> {
-        self.acknowledge_signed_inner(request, Some(scope), anchor)
+        self.acknowledge_signed_inner(request, Some(ObjectCheck::Fixed(scope)), anchor)
+    }
+    /// Recover only the original Call for the row matched by the verified ACK.
+    pub fn acknowledge_signed_object_reply<'r>(
+        &mut self,
+        request: JournalGuestAck<'_>,
+        scope: ObjectLeaseScope<'_>,
+        resolve: &'r mut OriginalCallResolver<'r>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<JournalTip, JournalError> {
+        self.acknowledge_signed_inner(
+            request,
+            Some(ObjectCheck::ResolveReply(scope, resolve)),
+            anchor,
+        )
     }
     fn acknowledge_signed_inner(
         &mut self,
         request: JournalGuestAck<'_>,
-        paired: Option<ObjectLeaseScope<'_>>,
+        paired: Option<ObjectCheck<'_, '_>>,
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<JournalTip, JournalError> {
         if request.plan.durable_object_pair_sha256_v1.is_some() != paired.is_some() {
@@ -1528,10 +1617,7 @@ impl MailboxJournal {
         }
         let operation = paired
             .as_ref()
-            .map_or(MailboxOperation::Send, ObjectLeaseScope::operation);
-        if let Some(scope) = paired {
-            scope.check_original(&request.scope, entry, &request.receive)?;
-        }
+            .map_or(MailboxOperation::Send, ObjectCheck::operation);
         let opened = self.open_for_reader(identity, entry, &request.receive, operation)?;
         let guest_key = VerifyingKey::from_bytes(&request.enrollment.enrollment.ack_public_key)
             .map_err(|_| JournalError::Mailbox(MailboxError::ReaderKeyInvalid))?;
@@ -1552,6 +1638,9 @@ impl MailboxJournal {
             request.enrollment,
             &guest_key,
         )?;
+        if let Some(scope) = paired {
+            scope.check_original(&request.scope, entry, &request.receive)?;
+        }
         if entry.acknowledged {
             return if entry.signed_ack.as_ref() == Some(request.signed) {
                 Ok(self.tip)

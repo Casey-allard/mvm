@@ -15,15 +15,20 @@ impl HistoryKeyCustody for OriginalKey {
 
 #[test]
 fn leased_call_survives_restart_with_exact_header_payload_and_original_signature() {
-    lease_and_reopen(false)
+    lease_and_reopen(false, false)
 }
 
 #[test]
 fn reply_only_lease_reopens_under_original_call_and_requires_signed_ack() {
-    lease_and_reopen(true)
+    lease_and_reopen(true, false)
 }
 
-fn lease_and_reopen(reply: bool) {
+#[test]
+fn resolved_reply_uses_original_journal_row_only_after_possession_or_ack_signature() {
+    lease_and_reopen(true, true)
+}
+
+fn lease_and_reopen(reply: bool, resolve_reply: bool) {
     let c = grant(false);
     let r = grant(true);
     let grants = ObjectPairGrants {
@@ -78,7 +83,19 @@ fn lease_and_reopen(reply: bool) {
     let envelope = if reply {
         sealed(&r, bb.boot, None, NOW - 1, 71, 60)
     } else {
-        call
+        call.clone()
+    };
+    let resolve = |capability: &SignedMailboxCapability, retained: &MailboxEnvelope| {
+        assert_eq!(capability, &r);
+        assert_eq!(retained, &envelope);
+        pair.pending_call(
+            call.clone(),
+            NOW,
+            state,
+            &Key::from_bytes([60; 32]),
+            &mut InMemoryReplayProtector::default(),
+        )
+        .map_err(|_| JournalError::WrongAuthority)
     };
     let context = crate::mailbox::OpenContext {
         expected_tenant: address.tenant,
@@ -221,10 +238,42 @@ fn lease_and_reopen(reply: bool) {
                 .is_err()
         );
         assert_eq!(journal.tip(), prior);
-        let record = journal
-            .lease_next_object(request(), authority(state), |tip| anchor.advance(tip))
-            .unwrap()
-            .unwrap();
+        let record = if resolve_reply {
+            let resolving = || ObjectLeaseScope {
+                original_call: None,
+                ..authority(state)
+            };
+            let mut invalid = request();
+            invalid.possession_signature = &[0; 64];
+            assert!(
+                journal
+                    .lease_next_object_reply(
+                        invalid,
+                        resolving(),
+                        &mut |_, _| panic!("invalid proof reached source lookup"),
+                        |_| panic!("no lease")
+                    )
+                    .is_err()
+            );
+            assert!(
+                journal
+                    .lease_next_object_reply(
+                        request(),
+                        resolving(),
+                        &mut |_, _| Err(JournalError::UnknownMessage),
+                        |_| panic!("absent source record must not mutate journal")
+                    )
+                    .is_err()
+            );
+            assert_eq!(journal.tip(), prior);
+            journal.lease_next_object_reply(request(), resolving(), &mut { resolve }, |tip| {
+                anchor.advance(tip)
+            })
+        } else {
+            journal.lease_next_object(request(), authority(state), |tip| anchor.advance(tip))
+        }
+        .unwrap()
+        .unwrap();
         let wire = record.into_reader_response(Some(selection)).unwrap();
         let mut bytes = Vec::new();
         write_response(&mut bytes, &wire).unwrap();
@@ -342,9 +391,44 @@ fn lease_and_reopen(reply: bool) {
         state,
         original_call: Some(&pending),
     };
-    let after = journal
-        .acknowledge_signed_object(req(), bound(), |tip| anchor.advance(tip))
-        .unwrap();
+    let after = if resolve_reply {
+        let resolving = || ObjectLeaseScope {
+            original_call: None,
+            ..bound()
+        };
+        let mut bad = signed.clone();
+        bad.signature[0] ^= 1;
+        assert!(
+            journal
+                .acknowledge_signed_object_reply(
+                    JournalGuestAck {
+                        signed: &bad,
+                        ..req()
+                    },
+                    resolving(),
+                    &mut |_, _| panic!("unverified ACK reached encrypted original"),
+                    |_| panic!("no ACK")
+                )
+                .is_err()
+        );
+        assert!(
+            journal
+                .acknowledge_signed_object_reply(
+                    req(),
+                    resolving(),
+                    &mut |_, _| Err(JournalError::UnknownMessage),
+                    |_| panic!("absent original must not ACK")
+                )
+                .is_err()
+        );
+        assert_eq!(journal.tip(), before);
+        journal.acknowledge_signed_object_reply(req(), resolving(), &mut { resolve }, |tip| {
+            anchor.advance(tip)
+        })
+    } else {
+        journal.acknowledge_signed_object(req(), bound(), |tip| anchor.advance(tip))
+    }
+    .unwrap();
     assert_eq!(after.cursor, before.cursor + 1);
     drop(journal);
     drop(anchor);
