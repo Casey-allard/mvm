@@ -1614,13 +1614,27 @@ mod anchor_tests {
         VerifyingKey,
         SigningKey,
     ) {
+        message_at(9, 1, 1_800_000_000_000)
+    }
+
+    fn message_at(
+        id: u8,
+        sequence: u64,
+        now: i64,
+    ) -> (
+        MailboxEnvelope,
+        SignedMailboxCapability,
+        OpenContext,
+        Key,
+        VerifyingKey,
+        SigningKey,
+    ) {
         let destination = address();
         let signer = SigningKey::from_bytes(&[6; 32]);
         let sender = SigningKey::from_bytes(&[7; 32]);
         let sender_id = PrincipalId::from_bytes(sender.verifying_key().to_bytes());
         let content_type = ContentType::parse("application/vnd.mvm.test", 1).expect("content type");
         let epoch = ExecutionEpoch::new(1).expect("epoch");
-        let now = 1_800_000_000_000;
         let header = MailboxEnvelopeHeader {
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
@@ -1631,16 +1645,16 @@ mod anchor_tests {
             mailbox: destination.mailbox,
             sender_boot: BootId::from_bytes([8; 32]),
             execution_epoch: epoch,
-            message_id: MessageId::from_bytes([9; 32]),
+            message_id: MessageId::from_bytes([id; 32]),
             correlation_id: CorrelationId::from_bytes([10; 32]),
             causation_id: CausationId::from_bytes([11; 32]),
             kind: MailboxMessageKind::Cast,
             reply_to: None,
             ordering_scope: OrderingScope::parse("test").expect("scope"),
-            sequence: SequenceNumber::new(1).expect("sequence"),
+            sequence: SequenceNumber::new(sequence).expect("sequence"),
             issued_at_unix_ms: now - 1,
             expires_at_unix_ms: now + 10_000,
-            nonce: ReplayNonce::from_bytes([12; 16]),
+            nonce: ReplayNonce::from_bytes([id.wrapping_add(3); 16]),
             content_type: content_type.clone(),
             capability_id: CapabilityId::from_bytes([13; 32]),
             policy_epoch: 1,
@@ -1654,7 +1668,7 @@ mod anchor_tests {
             protocol_version: ProtocolVersion::V1,
             authorization_domain_route_label: AuthorizationDomainRouteLabel::from_bytes([15; 32]),
             destination_route_token: DestinationRouteToken::from_bytes([16; 32]),
-            delivery_id: DeliveryId::from_bytes([17; 32]),
+            delivery_id: DeliveryId::from_bytes([id.wrapping_add(8); 32]),
             ciphertext_len: 0,
             padding: CiphertextPadding::Exact,
             expires_at_unix_ms: header.expires_at_unix_ms,
@@ -2170,6 +2184,79 @@ mod anchor_tests {
         .expect("empty retired generation reopens");
         assert!(recovered.seen.is_empty());
         assert_eq!(recovered.tip(), anchor.tip());
+    }
+
+    #[test]
+    fn retained_local_credit_survives_restart_without_resetting_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let anchor = FileJournalAnchor::open(
+            &dir.path().join("anchor").join("tip.json"),
+            address(),
+            [22; 32],
+        )
+        .unwrap();
+        let policy = local_retention();
+        let open = |limits| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                SigningKey::from_bytes(&[6; 32]).verifying_key(),
+                limits,
+                &custody,
+                &anchor,
+                policy,
+            )
+        };
+        let (old, send, context, key, a, b) = message();
+        let mut journal = open(limits()).unwrap();
+        let old_request = |context| admission(&old, &send, context, &key, &a, &b);
+        let original = journal.admit_local(old_request(&context), &anchor).unwrap();
+        journal
+            .compact_local(context.now_unix_ms, &b, &anchor)
+            .unwrap();
+        assert_eq!(
+            journal.admit_local(old_request(&context), &anchor).unwrap(),
+            original
+        );
+        let expiry = old.routing.expires_at_unix_ms;
+        journal
+            .expire_next(expiry, &b, |next| anchor.advance(next))
+            .unwrap();
+        let horizon = policy.retained_until(expiry).unwrap();
+        journal.compact_local(horizon, &b, &anchor).unwrap();
+        assert_eq!(
+            journal.seen.len(),
+            1,
+            "signed window includes its last millisecond"
+        );
+        journal.compact_local(horizon + 1, &b, &anchor).unwrap();
+        assert!(journal.seen.is_empty());
+        drop(journal);
+        let mut journal = open(limits()).unwrap();
+        let tip = anchor.tip();
+        assert!(tip.cursor >= limits().max_records as u64);
+        assert_eq!(journal.records, 1);
+        let mut stale = context.clone();
+        stale.now_unix_ms = horizon + 1;
+        assert!(matches!(
+            journal.admit_local(old_request(&stale), &anchor),
+            Err(JournalError::Mailbox(_))
+        ));
+        assert_eq!(anchor.tip(), tip);
+        let (fresh, grant, current, key2, a2, b2) = message_at(10, 2, horizon + 1);
+        let request = || admission(&fresh, &grant, &current, &key2, &a2, &b2);
+        let receipt = journal
+            .admit_local(request(), &anchor)
+            .expect("free retained capacity must admit a fresh signed identity");
+        assert_eq!(receipt.receipt.message_id, MessageId::from_bytes([10; 32]));
+        assert_eq!(journal.tip().cursor, tip.cursor + 1);
+        assert_eq!(journal.tip(), anchor.tip());
+        drop(journal);
+        let mut recovered = open(limits()).unwrap();
+        assert_eq!(recovered.admit_local(request(), &anchor).unwrap(), receipt);
+        assert_eq!(recovered.seen.len(), 1);
     }
 
     #[test]
