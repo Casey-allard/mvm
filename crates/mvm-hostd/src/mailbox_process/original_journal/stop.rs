@@ -25,6 +25,8 @@ pub(super) struct StopCustody {
     vm_stopped: bool,
     kernel_exit_observed: bool,
     assisted: bool,
+    sdk_cleanup: Option<ExitStatus>,
+    pub(super) stop_started: bool,
 }
 
 impl StopCustody {
@@ -55,6 +57,8 @@ impl StopCustody {
             vm_stopped: false,
             kernel_exit_observed: false,
             assisted: false,
+            sdk_cleanup: None,
+            stop_started: false,
         })
     }
 }
@@ -143,6 +147,16 @@ impl JournalOwner<'_> {
             mvm_core::config::vm_mailbox_original_owner_at(&mvm_core::config::mvm_keys_dir(), name);
         ensure!(owner == guard.owner_dir, "different original installation");
         let _boot = super::PairedBootReservation::for_original_lifecycle(name)?;
+        if let Some(status) = state.sdk_cleanup {
+            // The SDK already disposed only the original directories. A retry
+            // may finish the original marker's directory sync, but must not
+            // reopen a VM or run cleanup against a later path.
+            marker.clear_original()?;
+            return Ok(JournalStopOutcome {
+                helper_status: status,
+                assisted: state.assisted,
+            });
+        }
         let same_state = || -> Result<()> {
             let held = state.state.metadata()?;
             let current = std::fs::symlink_metadata(&dir)?;
@@ -176,6 +190,7 @@ impl JournalOwner<'_> {
             .vmm
             .as_ref()
             .context("no original kernel process identity")?;
+        state.stop_started = true;
         if !state.vm_stopped && !state.sdk_abort_confirmed {
             let backend =
                 AnyBackend::for_started_vm(name).context("original VMM backend is unavailable")?;
@@ -194,7 +209,6 @@ impl JournalOwner<'_> {
         let status = collect_after_vm(
             observer,
             &mut state.kernel_exit_observed,
-            marker,
             child,
             &mut state.assisted,
             until,
@@ -202,6 +216,8 @@ impl JournalOwner<'_> {
         same_state()?;
         super::super::shred_epoch_secret(&dir)?;
         finish(&plan, state.sdk_abort_confirmed)?;
+        state.sdk_cleanup = Some(status);
+        marker.clear_original()?;
         Ok(JournalStopOutcome {
             helper_status: status,
             assisted: state.assisted,
@@ -212,7 +228,6 @@ impl JournalOwner<'_> {
 fn collect_after_vm(
     observer: &ProcessExitObserver,
     kernel_exit_observed: &mut bool,
-    marker: &mut OriginalMarker,
     child: &mut Child,
     assisted: &mut bool,
     until: Instant,
@@ -226,7 +241,7 @@ fn collect_after_vm(
     }
     let natural = Instant::now() + Duration::from_millis(250);
     loop {
-        if let Some(status) = marker.collect(child)? {
+        if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
         let now = Instant::now();
@@ -255,7 +270,6 @@ mod tests {
         let early = collect_after_vm(
             &observer,
             &mut observed,
-            &mut marker,
             &mut helper,
             &mut assisted,
             Instant::now() + Duration::from_millis(20),
@@ -267,13 +281,12 @@ mod tests {
         let status = collect_after_vm(
             &observer,
             &mut observed,
-            &mut marker,
             &mut helper,
             &mut assisted,
             Instant::now() + Duration::from_secs(2),
         )
         .unwrap();
-        assert!(!status.success() && observed && assisted && !marker.path.exists());
+        assert!(!status.success() && observed && assisted && marker.path.exists());
         assert!(marker.collect(&mut helper).unwrap().is_some());
     }
 }

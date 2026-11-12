@@ -191,6 +191,9 @@ impl OriginalJournalDestination {
 
     /// Observe terminal status only by collecting the original Child.
     pub fn try_collect(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.stop.stop_started {
+            return self.child.try_wait();
+        }
         self.marker.collect(&mut self.child)
     }
 
