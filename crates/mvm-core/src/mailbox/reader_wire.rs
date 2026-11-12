@@ -73,6 +73,10 @@ impl std::fmt::Debug for ObjectSubmissionV1 {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderRequest {
     Receive,
+    SubmitObjectV1 {
+        pair: [u8; 32],
+        submission: Box<ObjectSubmissionV1>,
+    },
     ReceiveObjectPairV1 {
         pair: [u8; 32],
     },
@@ -126,6 +130,10 @@ pub enum ReaderResponse {
         content_type: ContentType,
         #[serde(with = "payload_base64")]
         payload: Vec<u8>,
+    },
+    /// Original destination-signed local-durable custody.
+    ObjectAcceptedV1 {
+        receipt: Box<mvm_contract::protocol::mailbox::SignedDestinationReceipt>,
     },
     /// The original guest has durably staged the operation locally.
     ObjectStagedV1 {

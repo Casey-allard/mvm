@@ -58,7 +58,8 @@ pub fn stage(
         Ok(_) if existing == bytes => sync_dir(dir).map_err(|_| Refusal::Unavailable),
         Ok(_) => Err(Refusal::QueueFull(1)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            atomic_write_new(&path, &bytes).map_err(|_| Refusal::Unavailable)
+            atomic_write_new(&path, &bytes).map_err(|_| Refusal::Unavailable)?;
+            sync_dir(dir).map_err(|_| Refusal::Unavailable)
         }
         Err(_) => Err(Refusal::Unavailable),
     }

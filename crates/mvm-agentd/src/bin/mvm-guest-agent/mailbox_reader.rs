@@ -358,7 +358,9 @@ fn perform_exchange(
             Ok(response)
         }
         ReaderRequest::Ack { signed } => correlate_ack(read_response(stream)?, signed),
-        ReaderRequest::Possession { .. } => Err(Refusal::NotAuthorized),
+        ReaderRequest::SubmitObjectV1 { .. } | ReaderRequest::Possession { .. } => {
+            Err(Refusal::NotAuthorized)
+        }
     }
 }
 
