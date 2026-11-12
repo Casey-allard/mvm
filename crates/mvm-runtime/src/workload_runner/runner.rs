@@ -86,6 +86,8 @@ use refusal::{
     require_late_volumes_mounted,
 };
 use sockets::standing_sockets;
+#[cfg(target_os = "linux")]
+pub(crate) use spawner::OriginalObjectSpawner;
 pub use spawner::{
     FlowMuxIdentitySource, NetworkEndpointSpawnRequest, NetworkEndpointSpawner,
     RealNetworkEndpointSpawner, SpawnedEndpoint, TelemetryStart,

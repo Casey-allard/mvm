@@ -96,15 +96,13 @@ impl OwnedClientBoot {
             .resources
             .as_ref()
             .context("original admission released")?;
-        Ok(
-            mvm_hostd::mailbox_launch::object_pair::InstalledParticipant {
-                admitted: &resources.admission.admitted,
-                original: group
-                    .runtime
-                    .as_ref()
-                    .context("original runtime not present")?,
-                boot,
-            },
+        mvm_hostd::mailbox_launch::object_pair::InstalledParticipant::from_owned_hvf(
+            &resources.admission.admitted,
+            group
+                .runtime
+                .as_ref()
+                .context("original runtime not present")?,
+            boot,
         )
     }
 
