@@ -16,6 +16,18 @@ fn main() -> Result<()> {
     // First statement in the process: a panic before this line would print
     // its payload unredacted.
     mvm_hostd::panic_hook::install("mailbox");
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--original-object-endpoint-v1"))
+    {
+        anyhow::ensure!(
+            std::env::args_os().len() == 2,
+            "unexpected object worker arguments"
+        );
+        #[cfg(target_os = "linux")]
+        return mvm_hostd::mailbox_process::serve_original_object();
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("original Firecracker object worker requires Linux");
+    }
     let raw = mvm_hostd::read_launch_config("mvm-mailbox")?;
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(

@@ -727,3 +727,69 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
             .is_err()
     );
 }
+
+#[test]
+fn per_role_sender_retries_the_original_seal_after_an_uncertain_carrier_result() {
+    use crate::mailbox_service::object_intent::OutboundObject;
+    use mvm_core::mailbox::reader_wire::ObjectSubmissionV1;
+    use std::time::{Duration, Instant};
+    let f = Originals::new();
+    let p = f.prepare(f.credentials.clone()).unwrap();
+    let (ag, bg) = p.selected_grants();
+    let a = BootFixture::new(f.dir.path(), ag, 1, f.now);
+    let b = BootFixture::new(f.dir.path(), bg, 2, f.now);
+    Key::load_or_create(&f.dir.path().join(super::super::ENCRYPTION_ROOT)).unwrap();
+    let pair = p
+        .bind_at(f.dir.path(), a.input(), b.input(), f.now)
+        .unwrap();
+    let dir = pair
+        .caller
+        .custody
+        .storage_paths(f.dir.path())
+        .unwrap()
+        .source_intents;
+    let sub = ObjectSubmissionV1::Call {
+        message_id: MessageId::from_bytes([72; 32]),
+        correlation_id: CorrelationId::from_bytes([73; 32]),
+        payload: b"SC\0\x11\0".to_vec(),
+    };
+    let tx = OutboundObject {
+        pair: p.stamp,
+        boot: a.boot.boot,
+        submission: &sub,
+        original: None,
+    };
+    let mut attempts = Vec::new();
+    for _ in 0..2 {
+        assert!(
+            tx.forward(
+                &pair.caller.local,
+                &dir,
+                Instant::now() + Duration::from_secs(5),
+                || Ok(super::super::now_unix_ms()),
+                |original, _| {
+                    attempts.push(original.envelope().clone());
+                    anyhow::bail!("lost peer response");
+                }
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
+    let wrong = OutboundObject {
+        boot: b.boot.boot,
+        ..tx
+    };
+    assert!(
+        wrong
+            .forward(
+                &pair.caller.local,
+                &dir,
+                Instant::now() + Duration::from_secs(5),
+                || Ok(f.now),
+                |_, _| panic!("wrong boot reached carrier")
+            )
+            .is_err()
+    );
+}

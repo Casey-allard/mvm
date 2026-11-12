@@ -52,6 +52,8 @@ use crate::vm_lifetime::{endpoint_needed, launcher_is_alive};
 mod lifetime;
 #[cfg(target_os = "linux")]
 pub(crate) mod object_worker;
+#[cfg(target_os="linux")]
+pub use object_worker::serve_original_object;
 pub mod original_journal;
 pub mod paired_incoming;
 pub(crate) mod reader;

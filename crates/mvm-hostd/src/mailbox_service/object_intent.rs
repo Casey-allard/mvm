@@ -1,11 +1,10 @@
 //! Crash-safe original source seals for the selected application Call/Reply service.
 use super::*;
 use crate::mailbox_launch::object_pair::{
-    InstalledObjectPair, OriginalObjectCallLease, SealedObjectTurn,
+    EndpointMaterial, InstalledObjectPair, OriginalObjectCallLease, SealedObjectTurn,
 };
-use crate::mailbox_process::original_journal::authorization::now_ms;
 use anyhow::{Context, Result, ensure};
-use mvm_contract::protocol::mailbox::MessageId;
+use mvm_contract::protocol::mailbox::{MessageId, SignedDestinationReceipt};
 use mvm_core::mailbox::frame::send_local_receipted_frame;
 use mvm_core::mailbox::{
     object_pair::role::ObjectParticipantRole,
@@ -130,24 +129,35 @@ impl ObjectIntentSlot {
 }
 
 /// Only built after the original source record and its attempt counter are durable.
-struct RetainedObjectSubmission {
+pub(crate) struct RetainedObjectSubmission {
+    expires: i64,
     turn: SealedObjectTurn,
     original: OriginalObjectSealV1,
 }
 
-impl InstalledObjectPair<'_> {
-    /// Return only the originally persisted seal. Revalidate live authority
-    /// and authenticate retained bytes even when staging an identical retry.
-    fn retain_submission(
+/// One guest operation bound to the local boot and, for a Reply, its live Call lease.
+pub(crate) struct OutboundObject<'a> {
+    pub(crate) pair: [u8; 32],
+    pub(crate) boot: BootId,
+    pub(crate) submission: &'a ObjectSubmissionV1,
+    pub(crate) original: Option<OriginalObjectCallLease<'a>>,
+}
+
+impl OutboundObject<'_> {
+    pub(crate) fn retain(
         &self,
-        role: ObjectParticipantRole,
-        pair: [u8; 32],
-        boot: BootId,
-        submission: &ObjectSubmissionV1,
-        original: Option<OriginalObjectCallLease<'_>>,
+        local: &EndpointMaterial,
+        dir: &Path,
+        current: &impl Fn() -> Result<i64>,
     ) -> Result<RetainedObjectSubmission> {
-        self.workload_role(role, pair, boot)?;
-        match (role, submission, &original) {
+        let role = local.public_role.role.role;
+        current()?;
+        ensure!(
+            Some(self.pair) == local.reader.boot.durable_object_pair_sha256_v1
+                && self.boot == local.reader.boot.boot,
+            "different original object pair or boot"
+        );
+        match (role, self.submission, self.original.as_ref()) {
             (ObjectParticipantRole::Caller, ObjectSubmissionV1::Call { .. }, None) => (),
             (
                 ObjectParticipantRole::Callee,
@@ -156,52 +166,125 @@ impl InstalledObjectPair<'_> {
             ) if row.lease() == original_call.as_ref() => (),
             _ => anyhow::bail!("submission does not match the original role and active Call lease"),
         }
-        let dir = self.source_intents(role)?;
-        let name = original_record_name(pair, boot, submission.message_id());
-        let slot = ObjectIntentSlot::open(&dir, &name, original_object_intent_digest(submission)?)?;
+        let name = original_record_name(self.pair, self.boot, self.submission.message_id());
+        let slot =
+            ObjectIntentSlot::open(dir, &name, original_object_intent_digest(self.submission)?)?;
+        let now = current()?;
         let turn = if let Some(record) = &slot.original {
             let (cap, envelope) = decode_frame(record)?;
-            let turn = self.reopen_turn(
+            let turn = local.reopen(
                 role,
                 &cap,
                 envelope,
                 slot.sequence,
-                submission,
-                original.as_ref(),
+                self.submission,
+                self.original.as_ref(),
+                now,
             )?;
             // A previous writer may have stopped between publishing and syncing.
-            sync_dir(&dir)?;
+            sync_dir(dir)?;
             turn
         } else {
-            let turn = match submission {
+            let (corr, payload) = match self.submission {
                 ObjectSubmissionV1::Call {
-                    message_id,
                     correlation_id,
                     payload,
-                } => self.seal_call(*message_id, *correlation_id, slot.sequence, payload)?,
-                ObjectSubmissionV1::Reply {
-                    message_id,
-                    payload,
                     ..
-                } => self.seal_reply(
-                    *message_id,
-                    slot.sequence,
-                    payload,
-                    original.context("active Call lease required")?,
-                )?,
+                } => (Some(*correlation_id), payload),
+                ObjectSubmissionV1::Reply { payload, .. } => (None, payload),
             };
+            let turn = local.seal_turn(
+                role,
+                self.submission.message_id(),
+                corr,
+                slot.sequence,
+                payload,
+                self.original.as_ref(),
+                now,
+            )?;
             slot.publish(&encode_frame(turn.capability(), turn.envelope())?)?;
             turn
         };
-        charge_source_attempt(&dir, &name)?;
-        let original =
-            OriginalObjectSealV1::from_original(pair, boot, submission, turn.envelope())?;
-        Ok(RetainedObjectSubmission { turn, original })
+        charge_source_attempt(dir, &name)?;
+        let original = OriginalObjectSealV1::from_original(
+            self.pair,
+            self.boot,
+            self.submission,
+            turn.envelope(),
+        )?;
+        let expires = self
+            .original
+            .as_ref()
+            .map_or(turn.header().expires_at_unix_ms, |row| {
+                row.lease()
+                    .lease
+                    .expires_at_unix_ms
+                    .min(turn.header().expires_at_unix_ms)
+            });
+        Ok(RetainedObjectSubmission {
+            turn,
+            original,
+            expires,
+        })
     }
 
-    /// Dispatch one canonical frame on the local peer socket selected by the
-    /// original owner. The guest cannot supply a socket or a destination key.
-    /// A retry enters this method again and charges a new durable attempt.
+    pub(crate) fn forward(
+        &self,
+        local: &EndpointMaterial,
+        dir: &Path,
+        deadline: Instant,
+        current: impl Fn() -> Result<i64>,
+        exchange: impl FnOnce(&SealedObjectTurn, Instant) -> Result<SignedDestinationReceipt>,
+    ) -> Result<ReaderResponse> {
+        ensure!(
+            Instant::now() < deadline,
+            "original peer exchange deadline passed"
+        );
+        self.retain(local, dir, &current)?
+            .send(local, deadline, current, exchange)
+    }
+}
+
+impl RetainedObjectSubmission {
+    pub(crate) fn send(
+        self,
+        local: &EndpointMaterial,
+        deadline: Instant,
+        current: impl Fn() -> Result<i64>,
+        exchange: impl FnOnce(&SealedObjectTurn, Instant) -> Result<SignedDestinationReceipt>,
+    ) -> Result<ReaderResponse> {
+        let held = self;
+        let header = held.turn.header();
+        let expires = held.expires;
+        let window = header.issued_at_unix_ms..expires;
+        let start = Instant::now();
+        let now = current()?;
+        ensure!(window.contains(&now), "original source seal expired");
+        let until = deadline.min(start + durable::GUEST_EXCHANGE_TIMEOUT).min(
+            start
+                .checked_add(Duration::from_millis(expires.abs_diff(now)))
+                .unwrap_or(deadline),
+        );
+        ensure!(
+            Instant::now() < until,
+            "source preparation exceeded exchange deadline"
+        );
+        let receipt = exchange(&held.turn, until)?;
+        let now = current()?;
+        local.verify_accepted(local.public_role.role.role, &held.turn, &receipt)?;
+        ensure!(
+            Instant::now() < until && window.contains(&now),
+            "original peer verdict expired"
+        );
+        Ok(ReaderResponse::ObjectSealAcceptedV1 {
+            original: held.original,
+            receipt: Box::new(receipt),
+        })
+    }
+}
+
+impl InstalledObjectPair<'_> {
+    /// Send the retained seal to the peer held by the original owner.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_submission(
         &self,
@@ -213,53 +296,32 @@ impl InstalledObjectPair<'_> {
         destination: &mut crate::mailbox_process::original_journal::OriginalJournalDestination,
         deadline: Instant,
     ) -> Result<ReaderResponse> {
-        ensure!(
-            Instant::now() < deadline,
-            "original peer exchange deadline passed"
-        );
-        let lease_end = original
-            .as_ref()
-            .map(|row| row.lease().lease.expires_at_unix_ms);
-        let held = self.retain_submission(role, pair, boot, submission, original)?;
         let endpoint = self.workload_role(role, pair, boot)?;
-        let verifier = VerifyingKey::from_bytes(&endpoint.role.peer().authority_key)?;
-        let header = held.turn.header();
-        let expires = lease_end.map_or(header.expires_at_unix_ms, |end| {
-            end.min(header.expires_at_unix_ms)
-        });
-        let now = now_ms()?;
-        ensure!(
-            (header.issued_at_unix_ms..expires).contains(&now),
-            "original source seal expired"
-        );
-        let window = Duration::from_millis(expires.abs_diff(now));
-        let start = Instant::now();
-        let until = deadline
-            .min(start + durable::GUEST_EXCHANGE_TIMEOUT)
-            .min(start.checked_add(window).unwrap_or(deadline));
-        let peer = destination.connect_object_recipient(&endpoint.role, until)?;
-        self.workload_role(role, pair, boot)?;
-        ensure!(
-            (header.issued_at_unix_ms..expires).contains(&now_ms()?),
-            "original lease expired before send"
-        );
-        let mut peer = durable::GuestDeadline::new(peer, until)?;
-        let receipt = send_local_receipted_frame(
-            &mut peer,
-            held.turn.capability(),
-            held.turn.envelope(),
-            header,
-            &verifier,
-        )?;
-        self.workload_role(role, pair, boot)?;
-        self.verify_accepted(role, &held.turn, &receipt)?;
-        ensure!(
-            Instant::now() < until && (header.issued_at_unix_ms..expires).contains(&now_ms()?),
-            "original peer verdict expired"
-        );
-        Ok(ReaderResponse::ObjectSealAcceptedV1 {
-            original: held.original,
-            receipt: Box::new(receipt),
-        })
+        let local = self.original_endpoint(role);
+        let dir = self.source_intents(role)?;
+        OutboundObject {
+            pair,
+            boot,
+            submission,
+            original,
+        }
+        .forward(
+            local,
+            &dir,
+            deadline,
+            || self.check_current(),
+            |turn, until| {
+                let stream = destination.connect_object_recipient(&endpoint.role, until)?;
+                self.workload_role(role, pair, boot)?;
+                let mut peer = durable::GuestDeadline::new(stream, until)?;
+                Ok(send_local_receipted_frame(
+                    &mut peer,
+                    turn.capability(),
+                    turn.envelope(),
+                    turn.header(),
+                    &VerifyingKey::from_bytes(&endpoint.role.peer().authority_key)?,
+                )?)
+            },
+        )
     }
 }
