@@ -205,7 +205,7 @@ impl OriginalJournalDestination {
             crate::mailbox_service::durable::reader_revocations(path)
                 .map_err(|e| anyhow::anyhow!("original mailbox revocation state: {e:?}"))
         };
-        let source_state = mvm_core::config::vm_state_dir(&plan.image.name);
+        let source_state = self.peer_state(&plan.image.name)?;
         let mut inbound = self.inbound.clone();
         inbound.revoked_capabilities = read_revocations(&self.revocations_path)?;
         let h = &source.header;

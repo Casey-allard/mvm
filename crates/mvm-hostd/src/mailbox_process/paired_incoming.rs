@@ -384,7 +384,7 @@ impl OriginalJournalDestination {
         posture.verify(plan, &plan.image.name)?;
         boot.check_plan(plan)?;
         mvm_core::naming::validate_vm_name(&plan.image.name)?;
-        let state = mvm_core::config::vm_state_dir(&plan.image.name);
+        let state = self.peer_state(&plan.image.name)?;
         ensure!(
             MailboxReaderBootBinding::load(&state)? == *boot,
             "A boot differs from original retained identity"

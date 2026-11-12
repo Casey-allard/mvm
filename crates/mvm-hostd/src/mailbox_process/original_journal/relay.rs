@@ -221,21 +221,22 @@ impl PairedJournalAdmission {
             |config, plan, guard| {
                 let setup = (|| -> Result<_> {
                     let boot = config.reader_boot.as_ref().context("absent A boot")?;
-                    let material = self
+                    let mut dest = self
                         .original
                         .try_lock()
-                        .map_err(|_| anyhow::anyhow!("original B busy"))?
-                        .source_material(plan, posture, boot, &self.grants, self.deadline)?;
+                        .map_err(|_| anyhow::anyhow!("original B busy"))?;
+                    ensure!(
+                        config.vm_state_dir == dest.peer_state(name)?
+                            && config.keys_dir == dest.keys_dir,
+                        "A and B require the same original installed authority"
+                    );
+                    let material =
+                        dest.source_material(plan, posture, boot, &self.grants, self.deadline)?;
                     ensure!(
                         material.commitment
                             == mvm_core::mailbox::outbound::journal_direction_commitment(boot)?,
                         "source data key belongs to a different original boot"
                     );
-                    let mut dest = self
-                        .original
-                        .try_lock()
-                        .map_err(|_| anyhow::anyhow!("original B busy"))?;
-                    dest.check_proposal(plan, &self.grants, self.deadline)?;
 
                     let delegated = SourceConfiguration {
                         parent: std::process::id(),
