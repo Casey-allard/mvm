@@ -544,7 +544,7 @@ pub fn spawn_for_launch(
     vm_name: &str,
     posture: Option<&MailboxLaunchPosture>,
 ) -> Result<Option<u32>> {
-    spawn_with_original(plan, backend, vm_name, posture, |config, _| {
+    spawn_with_original(plan, backend, vm_name, posture, false, |config, _, _| {
         Ok(spawn_serving(config, &config.vm_state_dir)?.id())
     })
 }
@@ -556,7 +556,12 @@ fn spawn_with_original<T>(
     backend: &AnyBackend,
     vm_name: &str,
     posture: Option<&MailboxLaunchPosture>,
-    start: impl FnOnce(&MailboxProcessConfig, &ExecutionPlan) -> Result<T>,
+    exclusive: bool,
+    start: impl FnOnce(
+        &MailboxProcessConfig,
+        &ExecutionPlan,
+        mvm_core::util::atomic_io::FileLock,
+    ) -> Result<T>,
 ) -> Result<Option<T>> {
     let Some(grant) = &plan.mailbox else {
         return Ok(None);
@@ -587,6 +592,7 @@ fn spawn_with_original<T>(
                 ),
             )
         })?;
+    let guard = original_journal::claim_launch(&state_dir, exclusive)?;
     let mut config = build_config(&mvm_core::config::mvm_keys_dir(), grant, &state_dir, route)?;
     let started = (|| {
         config.reader_boot = load_reader_boot_for_plan(&state_dir, plan)?;
@@ -616,7 +622,7 @@ fn spawn_with_original<T>(
         }
         config.posture =
             Some(posture.handoff(config.reader_boot.as_ref().map(|binding| binding.boot)));
-        start(&config, plan).map(Some)
+        start(&config, plan, guard).map(Some)
     })();
     if started.is_err() {
         let _ = shred_epoch_secret(&state_dir);

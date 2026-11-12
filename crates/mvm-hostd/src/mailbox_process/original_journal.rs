@@ -8,6 +8,7 @@ use mvm_agentd::vsock::connect_unix_before;
 use mvm_contract::protocol::mailbox::{MailboxAddress, PrincipalId};
 use mvm_core::mailbox::reader::MailboxReaderBootBinding;
 use mvm_core::plan::{ExecutionPlan, Variant};
+use mvm_core::util::atomic_io::FileLock;
 use mvm_runtime::backend::AnyBackend;
 use mvm_vmm::host::uds_peer::connected_peer_pid;
 use std::os::unix::net::UnixStream;
@@ -19,6 +20,7 @@ use std::time::Instant;
 /// cannot transfer the mailbox keys, change its recipient, or reopen a PID.
 pub struct OriginalJournalDestination {
     child: Child,
+    _original: FileLock,
     socket: PathBuf,
     boot: MailboxReaderBootBinding,
     address: MailboxAddress,
@@ -40,13 +42,18 @@ impl OriginalJournalDestination {
             posture.variant() == Variant::Prod,
             "paired journal requires production admission"
         );
-        spawn_with_original(plan, backend, vm_name, Some(posture), |config, plan| {
-            Self::spawn(config, plan).map_err(std::io::Error::other)
-        })?
+        spawn_with_original(
+            plan,
+            backend,
+            vm_name,
+            Some(posture),
+            true,
+            |config, plan, guard| Self::spawn(config, plan, guard).map_err(std::io::Error::other),
+        )?
         .context("destination VM has no admitted mailbox")
     }
 
-    fn spawn(config: &MailboxProcessConfig, plan: &ExecutionPlan) -> Result<Self> {
+    fn spawn(config: &MailboxProcessConfig, plan: &ExecutionPlan, guard: FileLock) -> Result<Self> {
         let boot = config
             .reader_boot
             .clone()
@@ -67,6 +74,7 @@ impl OriginalJournalDestination {
         let child = spawn_serving(config, &config.vm_state_dir)?;
         Ok(Self {
             child,
+            _original: guard,
             socket: config.socket.clone(),
             boot,
             address,
@@ -98,6 +106,31 @@ impl OriginalJournalDestination {
     pub fn issuer(&self) -> PrincipalId {
         self.issuer
     }
+}
+
+pub(super) fn claim_launch(state: &std::path::Path, exclusive: bool) -> std::io::Result<FileLock> {
+    use std::io::{Error, ErrorKind};
+    let guard = FileLock::try_acquire(&state.join("mailbox-launch"))
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "mailbox launch is owned"))?;
+    if exclusive {
+        for path in [
+            state.join(super::MAILBOX_PID_FILE),
+            mvm_core::config::vm_mailbox_socket_at(state),
+        ] {
+            match std::fs::symlink_metadata(path) {
+                Err(e) if e.kind() == ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+                Ok(_) => {
+                    return Err(Error::new(
+                        ErrorKind::AlreadyExists,
+                        "existing mailbox original requires canonical retirement",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(guard)
 }
 
 fn authenticated_connect(
@@ -159,6 +192,19 @@ mod tests {
                 .any(|l| l.contains("journal-child-listening"))
         );
         child
+    }
+
+    #[test]
+    fn a_second_launcher_cannot_rotate_a_live_original_or_adopt_stale_state() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let original = claim_launch(dir.path(), true).unwrap();
+        assert!(claim_launch(dir.path(), false).is_err());
+        assert!(claim_launch(dir.path(), true).is_err());
+        drop(original);
+        let path = dir.path().join(super::super::MAILBOX_PID_FILE);
+        std::fs::write(&path, "original marker").unwrap();
+        assert!(claim_launch(dir.path(), true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original marker");
     }
 
     #[test]
