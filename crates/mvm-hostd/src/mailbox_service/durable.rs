@@ -374,22 +374,25 @@ impl DurableMailboxService {
         if !await_first_byte(&stream, hold, active) {
             return Ok(false);
         }
+        let until = Instant::now() + GUEST_EXCHANGE_TIMEOUT;
         let mut stream = GuestDeadline {
             stream: &mut stream,
-            until: Instant::now() + GUEST_EXCHANGE_TIMEOUT,
+            until,
         };
         #[cfg(feature = "durable-guest-io-witness")]
         if let Some(meter) = &self.guest_meter {
             return meter.observe(&mut stream, |io, mark| {
-                self.exchange_guest(sealer, io, mark)
+                self.exchange_guest(sealer, turn, until, io, mark)
             });
         }
-        self.exchange_guest(sealer, &mut stream, &mut |_| {})
+        self.exchange_guest(sealer, turn, until, &mut stream, &mut |_| {})
     }
 
     fn exchange_guest(
         &self,
         sealer: &mut GuestSealer,
+        turn: &mut super::directed_journal::SourceTurn<'_>,
+        until: Instant,
         stream: &mut (impl Read + Write),
         mark: &mut (impl FnMut(&'static str) + ?Sized),
     ) -> std::io::Result<bool> {
@@ -406,7 +409,7 @@ impl DurableMailboxService {
         let verdict: Result<SignedDestinationReceipt, Refusal> = body
             .and_then(|body| OutboxMessage::decode(&body))
             .and_then(|message| {
-                turn.send(message, stream.until, |message| {
+                turn.send(message, until, |message| {
                     let (capability, envelope) = sealer.seal(message)?;
                     admit(&self.shared, &capability, &envelope)
                 })
@@ -576,13 +579,15 @@ fn serve_reader(
         }
     });
     let response = result.unwrap_or_else(|reason| ReaderResponse::Refused { reason });
-    mark(match &response {
-        ReaderResponse::Delivery { .. } => "lease_created",
-        ReaderResponse::Acknowledged { .. } => "ack_committed",
-        ReaderResponse::Refused { .. } => "reader_refused",
-        ReaderResponse::Empty => "reader_empty",
-        ReaderResponse::Challenge { .. } => "reader_challenge",
-    });
+    match &response {
+        ReaderResponse::Delivery { .. } => mark("lease_created"),
+        ReaderResponse::Acknowledged { .. } => mark("ack_committed"),
+        ReaderResponse::Refused { .. } => mark("reader_refused"),
+        ReaderResponse::Empty => mark("reader_empty"),
+        ReaderResponse::Challenge { .. } => mark("reader_challenge"),
+        // A slot report belongs to the guest-local interface, not this host stream.
+        ReaderResponse::OutboundJournalAvailableV1 { .. } => {}
+    }
     let _ = write_response(stream, &response);
 }
 
