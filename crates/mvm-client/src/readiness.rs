@@ -37,13 +37,9 @@ pub fn readiness_of(vm_name: &str) -> Option<InstanceReadiness> {
 /// blocks on registry I/O.
 pub fn touch_activity(vm_name: &str) {
     let path = mvm_runtime::vm::name_registry::registry_path();
-    if let Ok(mut reg) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&path)
-        && reg
-            .touch_last_active(vm_name, mvm_core::time::utc_now())
-            .unwrap_or(false)
-    {
-        let _ = reg.save(&path);
-    }
+    let _ = mvm_runtime::vm::name_registry::update_registry_if_changed(&path, |registry| {
+        registry.touch_last_active(vm_name, mvm_core::time::utc_now())
+    });
 }
 
 /// A live `ReadinessReport` from a running machine's guest agent — the

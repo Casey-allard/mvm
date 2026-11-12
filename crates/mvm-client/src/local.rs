@@ -875,10 +875,9 @@ pub(crate) fn remove_stopped_runtime_state(name: &str) -> Result<()> {
 /// stop this follows already succeeded regardless.
 pub(crate) fn deregister_from_name_registry(name: &str) {
     let path = mvm_runtime::vm::name_registry::registry_path();
-    if let Ok(mut registry) = VmNameRegistry::load(&path) {
-        registry.deregister(name);
-        let _ = registry.save(&path);
-    }
+    let _ = mvm_runtime::vm::name_registry::update_registry_if_changed(&path, |registry| {
+        Ok(registry.deregister(name).is_some())
+    });
 }
 
 pub(crate) fn lifecycle_err(e: anyhow::Error) -> MvmError {
@@ -960,26 +959,21 @@ fn path_collision_hint(image_ref: &str) -> String {
 /// nesting one. A machine with no registry entry is `NotFound`.
 pub fn set_machine_expiry(name: &str, expires_at: Option<String>) -> Result<()> {
     let path = mvm_runtime::vm::name_registry::registry_path();
-    let mut registry = VmNameRegistry::load(&path).map_err(|e| {
+    let updated = mvm_runtime::vm::name_registry::update_registry_if_changed(&path, |registry| {
+        registry.set_expires_at(name, expires_at)
+    })
+    .map_err(|e| {
         backend_err(format!(
-            "loading VM name registry at {}: {e}",
+            "updating VM name registry at {}: {e}",
             path.display()
         ))
     })?;
-    let updated = registry
-        .set_expires_at(name, expires_at)
-        .map_err(|e| backend_err(format!("updating registry record: {e}")))?;
     if !updated {
         return Err(MvmError::NotFound {
             id: name.to_string(),
         });
     }
-    registry.save(&path).map_err(|e| {
-        backend_err(format!(
-            "saving VM name registry at {}: {e}",
-            path.display()
-        ))
-    })
+    Ok(())
 }
 
 /// Materialize an OCI reference into a host `rootfs.ext4`, for a caller that

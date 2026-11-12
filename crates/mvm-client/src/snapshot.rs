@@ -40,10 +40,10 @@ pub fn remove_instance_snapshot(vm_name: &str) -> Result<bool> {
         return Ok(false);
     }
     let registry_path = mvm_runtime::vm::name_registry::registry_path();
-    if let Ok(mut registry) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path) {
-        let _ = registry.set_paused(vm_name, false);
-        let _ = registry.save(&registry_path);
-    }
+    let _ =
+        mvm_runtime::vm::name_registry::update_registry_if_changed(&registry_path, |registry| {
+            registry.set_paused(vm_name, false)
+        });
     mvm_core::audit_emit!(SnapshotDelete, vm: vm_name);
     Ok(true)
 }

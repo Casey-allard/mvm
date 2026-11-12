@@ -449,26 +449,31 @@ pub fn update_registry<T>(
     Ok(result)
 }
 
+/// Apply an optional field/row change under the same writer lock as
+/// `update_registry`. A missing entry leaves the original file untouched.
+pub fn update_registry_if_changed(
+    path: &Path,
+    change: impl FnOnce(&mut VmNameRegistry) -> Result<bool>,
+) -> Result<bool> {
+    let _lock = acquire_registry_lock(path)?;
+    let mut registry = VmNameRegistry::load(path)?;
+    let changed = change(&mut registry)?;
+    if changed {
+        registry.save(path)?;
+    }
+    Ok(changed)
+}
+
 /// Best-effort host-observed readiness update: load the registry, set the
 /// machine's readiness + change timestamp, save. Never gates control flow — a
 /// failure is logged and swallowed. Shared by the CLI lifecycle recorders and
 /// the health-probe daemon.
 pub fn record_readiness(vm_name: &str, readiness: InstanceReadiness) {
     let path = registry_path();
-    let mut reg = match VmNameRegistry::load(&path) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(err = %e, vm = vm_name, "readiness update: load registry failed");
-            return;
-        }
-    };
-    let now = mvm_core::time::utc_now();
-    match reg.set_readiness(vm_name, readiness, &now) {
-        Ok(true) => {
-            if let Err(e) = reg.save(&path) {
-                tracing::warn!(err = %e, vm = vm_name, "readiness update: save failed");
-            }
-        }
+    match update_registry_if_changed(&path, |registry| {
+        registry.set_readiness(vm_name, readiness, &mvm_core::time::utc_now())
+    }) {
+        Ok(true) => {}
         Ok(false) => tracing::debug!(vm = vm_name, "readiness update: no entry; skipping"),
         Err(e) => tracing::warn!(err = %e, vm = vm_name, "readiness update failed"),
     }

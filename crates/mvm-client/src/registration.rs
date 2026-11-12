@@ -61,9 +61,9 @@ impl MachineRegistration {
 /// dropped first so re-registration is idempotent.
 pub fn register_machine(reg: &MachineRegistration) {
     let path = mvm_runtime::vm::name_registry::registry_path();
-    if let Ok(mut registry) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&path) {
+    let _ = mvm_runtime::vm::name_registry::update_registry(&path, |registry| {
         registry.deregister(&reg.name);
-        let _ = registry.register(mvm_runtime::vm::name_registry::RegisterParams {
+        registry.register(mvm_runtime::vm::name_registry::RegisterParams {
             name: &reg.name,
             vm_dir: &reg.vm_dir,
             network: &reg.network,
@@ -72,9 +72,8 @@ pub fn register_machine(reg: &MachineRegistration) {
             tags: reg.tags.clone(),
             expires_at: reg.expires_at.clone(),
             auto_resume: reg.auto_resume,
-        });
-        let _ = registry.save(&path);
-    }
+        })
+    });
 }
 
 /// A registry entry whose VM is not currently live — a GC candidate.
@@ -120,6 +119,15 @@ pub fn gc_stale_registrations(
     apply: bool,
 ) -> Result<Vec<StaleRegistration>> {
     let path = mvm_runtime::vm::name_registry::registry_path();
+    // Dry-run only reads; application must see and edit the same snapshot.
+    let _lock = if apply {
+        Some(
+            mvm_runtime::vm::name_registry::acquire_registry_lock(&path)
+                .map_err(crate::local::backend_err)?,
+        )
+    } else {
+        None
+    };
     let mut registry =
         mvm_runtime::vm::name_registry::VmNameRegistry::load(&path).map_err(|e| {
             MvmError::Backend {
