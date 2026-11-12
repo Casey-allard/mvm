@@ -2711,6 +2711,105 @@ mod anchor_tests {
     }
 
     #[test]
+    fn deferred_checkpoint_retries_after_one_acknowledged_horizon() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let (old, send, context, key, sender, signer) = message();
+        let anchor =
+            FileJournalAnchor::open(&dir.path().join("anchor/tip"), address(), [22; 32]).unwrap();
+        let retention = local_retention();
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                signer.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
+                retention,
+            )
+            .unwrap()
+        };
+        let mut journal = open(limits());
+        journal
+            .admit_local(
+                admission(&old, &send, &context, &key, &sender, &signer),
+                &anchor,
+            )
+            .unwrap();
+        let mut grant = send.grant.clone();
+        grant.subject = address().recipient;
+        grant.capability_id = CapabilityId::from_bytes([31; 32]);
+        grant.operations = CapabilityOperations::from_operations(&[MailboxOperation::Receive]);
+        let receive = super::super::sign_capability(grant, &signer).unwrap();
+        let mut reader = context.clone();
+        reader.acting_principal = address().recipient;
+        reader.required_operation = MailboxOperation::Receive;
+        let old_id = journal.order[0];
+        journal
+            .acknowledge(
+                old_id,
+                JournalReceive {
+                    capability: &receive,
+                    context: &reader,
+                    encryption_key: &key,
+                    sender_key: &sender,
+                },
+                |tip| anchor.advance(tip),
+            )
+            .unwrap();
+
+        let horizon = retention
+            .retained_until(old.routing.expires_at_unix_ms)
+            .unwrap();
+        let (active, cap, mut ctx, dek, a, b) = message_at(3, 2, horizon - 1);
+        let original = journal
+            .admit_local(admission(&active, &cap, &ctx, &dek, &a, &b), &anchor)
+            .unwrap();
+        let active_id = journal.order[1];
+        // Room for one checkpoint entry plus its signed wrapper, but not both retained identities.
+        let one = serde_json::to_vec(&journal.seen[&active_id]).unwrap().len() as u64;
+        let quota = JournalLimits {
+            max_records: 100,
+            max_bytes: journal.bytes + one + 3000,
+        };
+        drop(journal);
+        let mut journal = open(quota);
+        let before = anchor.tip();
+        assert!(journal.local_compaction_due(horizon).unwrap());
+        journal
+            .maintain_local_checkpoint(horizon, &signer, &anchor)
+            .unwrap();
+        assert_eq!(anchor.tip(), before);
+        assert_eq!(journal.deferred_retirees, Some(0));
+        for _ in 0..64 {
+            assert!(!journal.local_compaction_due(horizon).unwrap());
+            journal
+                .maintain_local_checkpoint(horizon, &signer, &anchor)
+                .unwrap();
+        }
+        assert!(journal.seen.contains_key(&old_id));
+        ctx.now_unix_ms = horizon + 1;
+        assert!(journal.local_compaction_due(ctx.now_unix_ms).unwrap());
+        journal
+            .maintain_local_checkpoint(ctx.now_unix_ms, &signer, &anchor)
+            .unwrap();
+        assert_eq!(anchor.tip().cursor, before.cursor + 1);
+        assert_eq!(journal.records, 1);
+        assert!(!journal.seen.contains_key(&old_id));
+        drop(journal);
+        let mut recovered = open(quota);
+        assert_eq!(recovered.seen.len(), 1);
+        assert_eq!(
+            recovered
+                .admit_local(admission(&active, &cap, &ctx, &dek, &a, &b), &anchor)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn interrupted_terminal_expiry_reconciles_without_an_early_receipt() {
         let dir = tempfile::tempdir().expect("journal root");
         let root = dir.path().join("journal");
