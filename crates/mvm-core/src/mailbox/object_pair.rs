@@ -2,6 +2,8 @@
 //! supplies the two original boots from live local custody, not peer headers.
 //! This module cannot launch a helper, admit a journal entry, release a key,
 //! disclose cache membership, settle a reader lease or consume a reply.
+pub mod role;
+
 use super::{
     outbound::journal_capability_digest, reader::MailboxReaderBootBinding,
     verify_capability_signature,

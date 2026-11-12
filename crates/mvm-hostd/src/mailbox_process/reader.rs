@@ -407,6 +407,7 @@ pub(crate) fn enroll_object_reader(
         }
     };
     validate(&record)?;
+    mvm_core::util::atomic_io::sync_dir(state).map_err(io::Error::other)?;
     Ok(GuestReaderAuthority {
         grant: *grant,
         boot: boot.clone(),

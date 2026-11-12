@@ -181,42 +181,34 @@ use sha2::{Digest, Sha256};
 /// the original backend and passes the boot prepared for that precise launch.
 pub struct InstalledParticipant<'a> {
     pub admitted: &'a AdmittedPlan,
-    pub backend: &'a mvm_runtime::AnyBackend,
+    pub original: &'a mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch,
     pub boot: &'a MailboxReaderBootBinding,
 }
 
-struct HeldVmm {
-    id: mvm_vmm::host::network_endpoint_spawn::EndpointPid,
-    watch: mvm_vmm::host::process_exit::ProcessExitObserver,
+fn check_original_native(participant: &InstalledParticipant<'_>) -> Result<()> {
+    participant.original.validate_live()?;
+    let name = &participant.admitted.plan().image.name;
+    mvm_core::naming::validate_vm_name(name)?;
+    ensure!(
+        &participant.original.vm_id()?.0 == name,
+        "original native VM name differs"
+    );
+    let envelope: SignedExecutionPlan = serde_json::from_str(
+        participant
+            .original
+            .config()?
+            .plan_json
+            .as_deref()
+            .context("original native plan missing")?,
+    )?;
+    ensure!(
+        envelope.0.payload == participant.admitted.signed().0.payload
+            && envelope.0.signature == participant.admitted.signed().0.signature
+            && envelope.0.signer_id == participant.admitted.signed().0.signer_id,
+        "original native launch signed a different plan"
+    );
+    Ok(())
 }
-impl HeldVmm {
-    fn capture(participant: &InstalledParticipant<'_>) -> Result<Self> {
-        let name = &participant.admitted.plan().image.name;
-        mvm_core::naming::validate_vm_name(name)?;
-        let pid = participant
-            .backend
-            .host_process_id(&mvm_contract::protocol::vm_backend::VmId(name.clone()))?
-            .context("missing original VMM")?;
-        let id = mvm_vmm::host::network_endpoint_spawn::EndpointPid::of_child(pid);
-        ensure!(id.is_live_and_ours(), "missing original VMM identity");
-        let this = Self {
-            id,
-            watch: mvm_vmm::host::process_exit::ProcessExitObserver::arm(id.pid)?,
-        };
-        this.check()?;
-        Ok(this)
-    }
-    fn check(&self) -> Result<()> {
-        ensure!(
-            self.id.is_live_and_ours()
-                && self.watch.wait_event(std::time::Instant::now())?
-                    == mvm_vmm::host::process_exit::ProcessExitWait::TimedOut,
-            "original VMM no longer live"
-        );
-        Ok(())
-    }
-}
-
 struct BootInput<'a> {
     plan: &'a SignedExecutionPlan,
     posture: &'a MailboxLaunchPosture,
@@ -225,9 +217,9 @@ struct BootInput<'a> {
     current_epoch: ExecutionEpoch,
 }
 
-pub struct InstalledObjectPair {
-    _caller: HeldVmm,
-    _callee: HeldVmm,
+pub struct InstalledObjectPair<'a> {
+    caller: InstalledParticipant<'a>,
+    callee: InstalledParticipant<'a>,
     material: PairMaterial,
 }
 struct PairMaterial {
@@ -235,12 +227,13 @@ struct PairMaterial {
     callee: EndpointMaterial,
 }
 pub(crate) struct EndpointMaterial {
+    pub(crate) public_role: mvm_core::mailbox::object_pair::role::SignedObjectRoleV1,
     pub(crate) reader: GuestReaderAuthority,
     pub(crate) inbound_key: Key,
     pub(crate) outbound_key: Key,
     pub(crate) sender: ed25519_dalek::SigningKey,
 }
-impl InstalledObjectPair {
+impl InstalledObjectPair<'_> {
     /// Only public verifiers and signed reader proofs are observable by the SDK.
     pub fn original_readers(
         &self,
@@ -248,8 +241,8 @@ impl InstalledObjectPair {
         &SignedMailboxGuestReaderEnrollment,
         &SignedMailboxGuestReaderEnrollment,
     )> {
-        self._caller.check()?;
-        self._callee.check()?;
+        check_original_native(&self.caller)?;
+        check_original_native(&self.callee)?;
         Ok((
             &self.material.caller.reader.enrollment,
             &self.material.callee.reader.enrollment,
@@ -261,13 +254,13 @@ impl PreparedObjectPair {
     /// After both native launches: retain kernel lifetime observations, require
     /// exact production postures, live epoch and persisted public boot identities.
     /// Unsupported installed services continue to refuse admission before this.
-    pub fn bind_originals(
+    pub fn bind_originals<'a>(
         &self,
-        caller: InstalledParticipant<'_>,
-        callee: InstalledParticipant<'_>,
-    ) -> Result<InstalledObjectPair> {
-        let (a, b) = (HeldVmm::capture(&caller)?, HeldVmm::capture(&callee)?);
-        ensure!(a.id.pid != b.id.pid, "same original VMM");
+        caller: InstalledParticipant<'a>,
+        callee: InstalledParticipant<'a>,
+    ) -> Result<InstalledObjectPair<'a>> {
+        check_original_native(&caller)?;
+        check_original_native(&callee)?;
         let ap = caller
             .admitted
             .mailbox_posture()
@@ -304,11 +297,11 @@ impl PreparedObjectPair {
             },
             super::now_unix_ms(),
         )?;
-        a.check()?;
-        b.check()?;
+        check_original_native(&caller)?;
+        check_original_native(&callee)?;
         Ok(InstalledObjectPair {
-            _caller: a,
-            _callee: b,
+            caller,
+            callee,
             material,
         })
     }
@@ -460,7 +453,42 @@ impl PreparedObjectPair {
                 revoked,
                 now,
             )?;
+            let begin = pa
+                .valid_from
+                .timestamp_millis()
+                .max(pb.valid_from.timestamp_millis())
+                .max(credentials.call.grant.not_before_unix_ms)
+                .max(credentials.reply.grant.not_before_unix_ms)
+                .max(credentials.receive_at_caller.grant.not_before_unix_ms)
+                .max(credentials.receive_at_callee.grant.not_before_unix_ms);
+            let end = pa
+                .valid_until
+                .timestamp_millis()
+                .min(pb.valid_until.timestamp_millis())
+                .min(credentials.call.grant.expires_at_unix_ms)
+                .min(credentials.reply.grant.expires_at_unix_ms)
+                .min(credentials.receive_at_caller.grant.expires_at_unix_ms)
+                .min(credentials.receive_at_callee.grant.expires_at_unix_ms);
+            use mvm_core::mailbox::object_pair::role::*;
+            let public_role = SignedObjectRoleV1::issue(
+                ObjectRoleV1 {
+                    role: if g.mailbox == self.caller.mailbox {
+                        ObjectParticipantRole::Caller
+                    } else {
+                        ObjectParticipantRole::Callee
+                    },
+                    caller: a.boot.clone(),
+                    callee: b.boot.clone(),
+                    call: credentials.call.clone(),
+                    reply: credentials.reply.clone(),
+                    not_before_unix_ms: begin,
+                    expires_at_unix_ms: end,
+                },
+                &d.authority,
+                now,
+            )?;
             Ok(EndpointMaterial {
+                public_role,
                 reader,
                 sender: d.sender,
                 inbound_key: Key::from_bytes(*incoming),
