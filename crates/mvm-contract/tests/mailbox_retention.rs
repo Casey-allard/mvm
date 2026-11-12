@@ -91,3 +91,11 @@ fn malformed_or_unbounded_retention_cannot_enter_a_signed_grant() {
         );
     }
 }
+
+#[test]
+fn explicitly_selected_durable_object_pair_commitment_survives_plan_roundtrip() {
+    let mut selected = serde_json::to_value(grant()).unwrap();
+    selected["durable_object_pair_sha256_v1"] = serde_json::json!([7u8; 32].to_vec());
+    let decoded: MailboxGrant = serde_json::from_value(selected.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), selected);
+}
