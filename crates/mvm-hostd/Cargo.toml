@@ -208,6 +208,8 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net"
 ctor = "0.2"
 
 [features]
+# Qualification build only. The original helper owns the numeric observation file.
+durable-guest-io-witness = []
 default = []
 # macOS-only protected caller opt-in; other platforms return Unsupported.
 native-caller-identity = ["dep:core-foundation", "dep:security-framework"]

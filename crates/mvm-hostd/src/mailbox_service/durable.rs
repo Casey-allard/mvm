@@ -41,6 +41,9 @@ const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 const GUEST_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_EXPIRY_RECORDS_PER_REQUEST: usize = 8;
 
+#[cfg(feature = "durable-guest-io-witness")]
+mod witness_io;
+
 pub(crate) struct GuestDeadline<'a> {
     pub(crate) stream: &'a mut UnixStream,
     pub(crate) until: Instant,
@@ -131,6 +134,8 @@ pub(crate) struct GuestReaderAuthority {
 
 /// One destination authority's bounded, journal-backed admission socket.
 pub struct DurableMailboxService {
+    #[cfg(feature = "durable-guest-io-witness")]
+    guest_meter: Option<witness_io::Recorder>,
     shared: Arc<Shared>,
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -306,11 +311,21 @@ impl DurableMailboxService {
             })
         };
         Ok(Self {
+            #[cfg(feature = "durable-guest-io-witness")]
+            guest_meter: None,
             shared,
             path: path.to_owned(),
             stop,
             worker: Some(worker),
         })
+    }
+
+    #[cfg(feature = "durable-guest-io-witness")]
+    pub(crate) fn with_guest_meter(mut self, vm_state_dir: &Path) -> std::io::Result<Self> {
+        self.guest_meter = Some(witness_io::Recorder::create(
+            &vm_state_dir.join(witness_io::FILE_NAME),
+        )?);
+        Ok(self)
     }
 
     /// Read one guest outbox operation over its dedicated mailbox port. The
@@ -363,11 +378,27 @@ impl DurableMailboxService {
             stream: &mut stream,
             until: Instant::now() + GUEST_EXCHANGE_TIMEOUT,
         };
-        let body = read_frame(self.shared.limits.max_frame_bytes, &mut stream);
+        #[cfg(feature = "durable-guest-io-witness")]
+        if let Some(meter) = &self.guest_meter {
+            return meter.observe(&mut stream, |io, mark| {
+                self.exchange_guest(sealer, io, mark)
+            });
+        }
+        self.exchange_guest(sealer, &mut stream, &mut |_| {})
+    }
+
+    fn exchange_guest(
+        &self,
+        sealer: &mut GuestSealer,
+        stream: &mut (impl Read + Write),
+        mark: &mut (impl FnMut(&'static str) + ?Sized),
+    ) -> std::io::Result<bool> {
+        let body = read_frame(self.shared.limits.max_frame_bytes, stream);
         let received = body.is_ok();
         let body = match body {
             Ok(body) if is_reader_frame(&body) => {
-                serve_reader(&self.shared, &mut stream, &body);
+                mark("reader_frame");
+                serve_reader(&self.shared, stream, &body, mark);
                 return Ok(true);
             }
             other => other,
@@ -386,6 +417,7 @@ impl DurableMailboxService {
             serde_json::to_vec(&verdict.map(|_| ()))
         };
         if let Ok(reply) = reply {
+            mark("submit_verdict");
             let _ = stream.write_all(&reply);
         }
         Ok(received)
@@ -442,7 +474,12 @@ impl DurableMailboxService {
     }
 }
 
-fn serve_reader(shared: &Shared, stream: &mut (impl Read + Write), body: &[u8]) {
+fn serve_reader(
+    shared: &Shared,
+    stream: &mut (impl Read + Write),
+    body: &[u8],
+    mark: &mut (impl FnMut(&'static str) + ?Sized),
+) {
     let result = decode_request_body(body).and_then(|request| {
         let reader = shared.reader.get().ok_or(Refusal::NotAuthorized)?;
         match request {
@@ -473,9 +510,11 @@ fn serve_reader(shared: &Shared, stream: &mut (impl Read + Write), body: &[u8]) 
                         challenge,
                     },
                 )?;
+                mark("challenge_written");
                 let ReaderRequest::Possession { signature } = read_request(stream)? else {
                     return Err(Refusal::NotAuthorized);
                 };
+                mark("possession_received");
                 let mut state = shared.state.lock().expect("mailbox journal lock poisoned");
                 let context = guest_context(&state.policy, reader)?;
                 let scope = guest_scope(reader, &context);
@@ -537,6 +576,13 @@ fn serve_reader(shared: &Shared, stream: &mut (impl Read + Write), body: &[u8]) 
         }
     });
     let response = result.unwrap_or_else(|reason| ReaderResponse::Refused { reason });
+    mark(match &response {
+        ReaderResponse::Delivery { .. } => "lease_created",
+        ReaderResponse::Acknowledged { .. } => "ack_committed",
+        ReaderResponse::Refused { .. } => "reader_refused",
+        ReaderResponse::Empty => "reader_empty",
+        ReaderResponse::Challenge { .. } => "reader_challenge",
+    });
     let _ = write_response(stream, &response);
 }
 

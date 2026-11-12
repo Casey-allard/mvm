@@ -368,6 +368,8 @@ fn serve_local(
         anchor,
         inbound,
     )?;
+    #[cfg(feature = "durable-guest-io-witness")]
+    let service = service.with_guest_meter(&vm_state_dir)?;
     service.install_guest_reader(reader)?;
     let mut dial = |until| {
         delegated
