@@ -228,3 +228,126 @@ impl OriginalJournalDestination {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mvm_contract::protocol::mailbox::{
+        BootId, CapabilityOperations, ExecutionEpoch, MailboxGrant, MailboxId, RevocationId,
+    };
+    use mvm_core::crypto::aead::Key;
+    use mvm_core::mailbox::sign_capability;
+
+    #[test]
+    fn signatures_original_shared_scope_and_current_revocations_gate_the_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::audit::host_keypair::load_or_init_at(dir.path()).unwrap();
+        let make = |id: u8| {
+            let mailbox = MailboxId::from_bytes([id; 32]);
+            let epoch = ExecutionEpoch::new(2).unwrap();
+            let grant = MailboxGrant {
+                mailbox,
+                epoch,
+                authority_key: crate::mailbox_launch::authority_key_for(
+                    dir.path(),
+                    &mailbox,
+                    epoch,
+                )
+                .unwrap()
+                .to_bytes(),
+                report: None,
+                retention: None,
+                outbound_journal_v1: None,
+            };
+            crate::mailbox_launch::derive_launch_keys(dir.path(), &grant, &Key::random())
+                .unwrap()
+                .trust()
+        };
+        let (a_policy, a) = make(11);
+        let (b_policy, b) = make(12);
+        let source = MailboxTemplate {
+            header: a.header.clone(),
+            routing: a.routing.clone(),
+            capability: a.capability.clone(),
+        };
+        let mut a_scope = a.capability.clone();
+        a_scope.message_kinds = vec![MailboxMessageKind::Cast];
+        let scope = sign_capability(a_scope, &a.authority_key).unwrap();
+        let mut b_send = b.capability.clone();
+        b_send.address.tenant = a.header.tenant;
+        b_send.address.authorization_domain = a.header.authorization_domain;
+        b_send.subject = a.header.sender;
+        b_send.message_kinds = vec![MailboxMessageKind::Cast];
+        let mut b_recv = b_send.clone();
+        b_recv.revocation_id = RevocationId::from_bytes([32; 32]);
+        b_recv.operations = CapabilityOperations::from_operations(&[MailboxOperation::Receive]);
+        b_recv.subject = b_send.address.recipient;
+        let address = b_send.address;
+        let send = sign_capability(b_send, &b.authority_key).unwrap();
+        let receive = sign_capability(b_recv, &b.authority_key).unwrap();
+        let start = scope
+            .grant
+            .not_before_unix_ms
+            .max(send.grant.not_before_unix_ms);
+        let end = scope
+            .grant
+            .expires_at_unix_ms
+            .min(send.grant.expires_at_unix_ms);
+        let d = MailboxJournalDirectionV1 {
+            source: a.header.sender,
+            destination_plan_sha256: [4; 32],
+            destination_plan_nonce: [3; 16],
+            destination_boot: BootId::from_bytes([5; 32]),
+            address,
+            execution_epoch: b.header.execution_epoch,
+            policy_epoch: b.header.policy_epoch,
+            receipt_key: b.authority_key.verifying_key().to_bytes(),
+            source_scope_grant_sha256: journal_capability_digest(&scope).unwrap(),
+            send_grant_sha256: journal_capability_digest(&send).unwrap(),
+            receive_grant_sha256: journal_capability_digest(&receive).unwrap(),
+            not_before_unix_ms: start,
+            expires_at_unix_ms: end,
+            max_payload_bytes: 313,
+        };
+        let grants = JournalCredentials {
+            source_scope: scope,
+            destination_send: send,
+            destination_receive: receive,
+        };
+        let mut inbound = b_policy.context.clone();
+        inbound.expected_tenant = address.tenant;
+        inbound.expected_authorization_domain = address.authorization_domain;
+        inbound.expected_sender = a.header.sender;
+        let now = start + 1;
+        let check = |a: &OpenContext,
+                     b: &OpenContext,
+                     g: &JournalCredentials,
+                     d: &MailboxJournalDirectionV1| {
+            check_credentials(&source, d, g, a, b, now, 313)
+        };
+        assert!(check(&a_policy.context, &inbound, &grants, &d).is_ok());
+        assert!(check(&a_policy.context, &b_policy.context, &grants, &d).is_err());
+        let mut a_revoked = a_policy.context.clone();
+        a_revoked
+            .revoked_capabilities
+            .push(grants.source_scope.grant.revocation_id);
+        assert!(check(&a_revoked, &inbound, &grants, &d).is_err());
+        for id in [
+            grants.destination_send.grant.revocation_id,
+            grants.destination_receive.grant.revocation_id,
+        ] {
+            let mut revoked = inbound.clone();
+            revoked.revoked_capabilities.push(id);
+            assert!(check(&a_policy.context, &revoked, &grants, &d).is_err());
+        }
+        let mut stale = inbound.clone();
+        stale.current_policy_epoch += 1;
+        assert!(check(&a_policy.context, &stale, &grants, &d).is_err());
+        let mut foreign = d;
+        foreign.send_grant_sha256 = [0; 32];
+        assert!(check(&a_policy.context, &inbound, &grants, &foreign).is_err());
+        let mut excess = d;
+        excess.max_payload_bytes = grants.destination_send.grant.max_payload_bytes + 1;
+        assert!(check(&a_policy.context, &inbound, &grants, &excess).is_err());
+    }
+}
