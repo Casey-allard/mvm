@@ -107,10 +107,37 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         receive: &receive,
     };
     let bad = mailbox::sign_capability(am.grant.clone(), &bk).unwrap();
-    assert!(LaunchCustody::attach(&mut a, &aowner, EndpointRole::Source, &bad).is_err());
-    let sa = LaunchCustody::attach(&mut a, &aowner, EndpointRole::Source, &am).unwrap();
-    assert!(LaunchCustody::attach(&mut a, &aowner, EndpointRole::Source, &am).is_err());
-    let db = LaunchCustody::attach(&mut b, &bowner, EndpointRole::Destination, &receive).unwrap();
+    let now = super::super::now_unix_ms();
+    assert!(
+        prepare_at(
+            home.path(),
+            a.grant,
+            &aowner,
+            EndpointRole::Source,
+            &bad,
+            now
+        )
+        .is_err()
+    );
+    let (sa, mut original_a) = prepare_at(
+        home.path(),
+        a.grant,
+        &aowner,
+        EndpointRole::Source,
+        &am,
+        now,
+    )
+    .unwrap();
+    let (db, mut original_b) = prepare_at(
+        home.path(),
+        b.grant,
+        &bowner,
+        EndpointRole::Destination,
+        &receive,
+        now,
+    )
+    .unwrap();
+    assert!(a.keys.development_cast.is_none() && b.keys.development_cast.is_none());
     let src = sa.policy().clone();
     let dest = db.policy().clone();
     assert_ne!(b.keys.template.header.tenant, dest.expected_tenant);
@@ -177,6 +204,20 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         .is_err()
     );
 
+    original_a.bind(d).unwrap();
+    original_b.bind(d).unwrap();
+    assert!(original_a.bind(d).is_err());
+    assert!(
+        original_a
+            .check_recipient(&bowner, Some(d.commitment()))
+            .is_err()
+    );
+    assert!(original_a.check_recipient(&aowner, Some([37; 32])).is_err());
+    original_a
+        .check_recipient(&aowner, Some(d.commitment()))
+        .unwrap();
+    original_a.install(&mut a, &aowner).unwrap();
+    original_b.install(&mut b, &bowner).unwrap();
     let mut dst = PrivateSlot::new(&mut b, &bowner).unwrap();
     let mut src_slot = PrivateSlot::new(&mut a, &aowner).unwrap();
     assert!(
