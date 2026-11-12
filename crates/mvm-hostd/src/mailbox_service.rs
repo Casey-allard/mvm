@@ -138,8 +138,29 @@ impl GuestSealer {
         &mut self,
         message: OutboxMessage,
     ) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal> {
+        self.seal_using(message, None)
+    }
+
+    /// The original A signer and the destination-authorized Send grant have
+    /// distinct owners. Never use A's authority to re-sign a B credential.
+    fn seal_using(
+        &mut self,
+        message: OutboxMessage,
+        external: Option<(&SignedMailboxCapability, &VerifyingKey)>,
+    ) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal> {
+        if let Some((send, key)) = external {
+            if self.intent_dir.is_none()
+                || send.grant != self.capability
+                || message.recipient != self.header.recipient
+            {
+                return Err(Refusal::NotAuthorized);
+            }
+            mvm_core::mailbox::verify_capability_signature(send, key)
+                .map_err(|_| Refusal::NotAuthorized)?;
+        }
         let Some(dir) = self.intent_dir.clone() else {
-            let (capability, envelope, n) = self.seal_new(&message)?;
+            let (capability, envelope, n) =
+                self.seal_new(&message, external.map(|(send, _)| send))?;
             self.sent = n;
             return Ok((capability, envelope));
         };
@@ -150,7 +171,7 @@ impl GuestSealer {
             .ok_or(Refusal::Unavailable)?;
         let path = dir.join(hex::encode(message.message_id.as_bytes()));
         if path.exists() {
-            let reused = self.read_intent(&path, &message)?;
+            let reused = self.read_intent(&path, &message, external)?;
             charge_source_attempt(&dir, &message)?;
             return Ok(reused);
         }
@@ -166,7 +187,7 @@ impl GuestSealer {
                 return Err(Refusal::QueueFull(MAX_SOURCE_INTENTS));
             }
         }
-        let (capability, envelope, n) = self.seal_new(&message)?;
+        let (capability, envelope, n) = self.seal_new(&message, external.map(|(send, _)| send))?;
         let bytes = encode_frame(&capability, &envelope)?;
         if bytes.len() > MAX_SOURCE_INTENT_BYTES {
             return Err(Refusal::Oversized(MAX_SOURCE_INTENT_BYTES));
@@ -182,6 +203,7 @@ impl GuestSealer {
         &self,
         path: &Path,
         message: &OutboxMessage,
+        external: Option<(&SignedMailboxCapability, &VerifyingKey)>,
     ) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal> {
         let meta = std::fs::symlink_metadata(path).map_err(|_| Refusal::Unavailable)?;
         if !meta.file_type().is_file()
@@ -200,6 +222,11 @@ impl GuestSealer {
             return Err(Refusal::Oversized(MAX_SOURCE_INTENT_BYTES));
         }
         let (capability, envelope) = decode_frame(&bytes)?;
+        if external.is_some_and(|(send, _)| send != &capability) {
+            return Err(Refusal::NotAuthorized);
+        }
+        let own_verifier = self.authority_key.verifying_key();
+        let verifier = external.map_or(&own_verifier, |(_, key)| key);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Refusal::Unavailable)?
@@ -227,11 +254,12 @@ impl GuestSealer {
             &context,
             &self.encryption_key,
             &self.sender_key.verifying_key(),
-            &self.authority_key.verifying_key(),
+            verifier,
             &mut InMemoryReplayProtector::default(),
         )
         .map_err(|e| Refusal::Mailbox(e.to_string()))?;
-        if opened.header().message_id != message.message_id
+        if (external.is_some() && opened.header().sender_boot != self.header.sender_boot)
+            || opened.header().message_id != message.message_id
             || opened.header().kind != self.header.kind
             || opened.payload() != message.body
         {
@@ -245,6 +273,7 @@ impl GuestSealer {
     fn seal_new(
         &self,
         message: &OutboxMessage,
+        external_send: Option<&SignedMailboxCapability>,
     ) -> Result<(SignedMailboxCapability, MailboxEnvelope, u64), Refusal> {
         let gate = |e: mvm_core::mailbox::MailboxError| Refusal::Mailbox(e.to_string());
         let n = self.sent.checked_add(1).ok_or(Refusal::Malformed)?;
@@ -264,8 +293,10 @@ impl GuestSealer {
             .len()
             .try_into()
             .map_err(|_| Refusal::Malformed)?;
-        let capability =
-            sign_capability(self.capability.clone(), &self.authority_key).map_err(gate)?;
+        let capability = match external_send {
+            Some(send) => send.clone(),
+            None => sign_capability(self.capability.clone(), &self.authority_key).map_err(gate)?,
+        };
         let mut routing = self.routing.clone();
         routing.delivery_id = DeliveryId::from_bytes(rand::random());
         let envelope = seal_envelope(
@@ -1009,6 +1040,56 @@ mod tests {
             message_id: MessageId::from_bytes([7; 32]),
             body: b"epoch one secret".to_vec(),
         }
+    }
+
+    #[test]
+    fn original_external_send_and_sealed_bytes_survive_an_ambiguous_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::audit::host_keypair::load_or_init_at(dir.path()).unwrap();
+        let keys =
+            derive_launch_keys(dir.path(), &grant_at(dir.path(), 1), &test_secret()).unwrap();
+        let (_, mut sealer) = keys.trust();
+        let b = SigningKey::from_bytes(&[79; 32]);
+        let verifier = b.verifying_key();
+        assert_ne!(sealer.authority_key.verifying_key(), verifier);
+        sealer.capability.issuer = PrincipalId::from_bytes(verifier.to_bytes());
+        sealer.header.kind = mvm_contract::protocol::mailbox::MailboxMessageKind::Cast;
+        sealer.header.reply_to = None;
+        sealer.capability.message_kinds = vec![sealer.header.kind];
+        let send = sign_capability(sealer.capability.clone(), &b).unwrap();
+        let message = OutboxMessage::new(sealer.header.recipient, vec![0, 7, 0]);
+        sealer.intent_dir = Some(dir.path().join("original-direction"));
+        let wrong = sign_capability(send.grant.clone(), &sealer.authority_key).unwrap();
+        assert!(
+            sealer
+                .seal_using(message.clone(), Some((&wrong, &verifier)))
+                .is_err()
+        );
+        assert!(!sealer.intent_dir.as_ref().unwrap().exists());
+        let first = sealer
+            .seal_using(message.clone(), Some((&send, &verifier)))
+            .unwrap();
+        let again = sealer
+            .seal_using(message.clone(), Some((&send, &verifier)))
+            .unwrap();
+        assert_eq!(first.0, send);
+        assert_eq!(
+            encode_frame(&first.0, &first.1).unwrap(),
+            encode_frame(&again.0, &again.1).unwrap()
+        );
+        let mut changed = message.clone();
+        changed.body.push(0);
+        assert!(
+            sealer
+                .seal_using(changed, Some((&send, &verifier)))
+                .is_err()
+        );
+        sealer.header.sender_boot = BootId::from_bytes([67; 32]);
+        assert!(
+            sealer
+                .seal_using(message, Some((&send, &verifier)))
+                .is_err()
+        );
     }
 
     // These historical-epoch fixtures use their fixed context time; production
