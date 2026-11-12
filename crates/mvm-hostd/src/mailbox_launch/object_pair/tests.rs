@@ -1033,3 +1033,59 @@ fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_c
     ));
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_sdk_pair_wait_is_bounded_and_one_failed_start_wakes_its_peer() {
+    use std::time::{Duration, Instant};
+    let f = Originals::new();
+    let p = f.prepare(f.credentials.clone()).unwrap();
+    let now = Instant::now();
+    assert!(
+        p.reserve_original_workers("vm-1", [1; 32], "vm-2", [2; 32], now)
+            .is_err()
+    );
+    assert!(
+        p.reserve_original_workers(
+            "vm-1",
+            [1; 32],
+            "vm-2",
+            [2; 32],
+            now + Duration::from_secs(181)
+        )
+        .is_err()
+    );
+    let (caller, callee) = p
+        .reserve_original_workers(
+            "vm-1",
+            [1; 32],
+            "vm-2",
+            [2; 32],
+            now + Duration::from_secs(12),
+        )
+        .unwrap();
+    let boot = BootFixture::new(f.dir.path(), caller.plan().grant(), 1, f.now);
+    let host = host_keypair::load_or_init_at(f.dir.path()).unwrap();
+    let signer = host_keypair::host_signer_id();
+    let plan = verify_plan(&boot.signed, &[(signer.as_str(), &host.verifying)]).unwrap();
+    let original_id = plan.plan_id.clone();
+    let admitted = AdmittedPlan::for_test(plan, signer, boot.signed);
+    std::thread::scope(|threads| {
+        let worker = threads.spawn(|| {
+            let mut owner = None;
+            let (same, reason) = caller.join(admitted, &mut owner);
+            assert_eq!(same.plan_id(), &original_id);
+            assert!(owner.is_none());
+            assert!(reason.is_err());
+        });
+        // Wait until the original A admission is actually parked in the gate.
+        let limit = Instant::now() + Duration::from_secs(2);
+        while caller.require_open().is_ok() {
+            assert!(Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        drop(callee.guard());
+        worker.join().unwrap();
+    });
+    assert!(now.elapsed() < Duration::from_secs(5) && callee.require_open().is_err());
+}
