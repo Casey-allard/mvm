@@ -15,6 +15,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone, Copy)]
+pub(super) enum VmmMode {
+    Installed,
+    #[cfg(test)]
+    HelperFixture,
+}
+
 pub(super) struct StopCustody {
     state: File,
     split_socket: Option<(std::path::PathBuf, File)>,
@@ -27,7 +34,6 @@ pub(super) struct StopCustody {
     kernel_exit_observed: bool,
     assisted: bool,
     sdk_cleanup: Option<ExitStatus>,
-    pub(super) stop_started: bool,
 }
 
 impl StopCustody {
@@ -35,6 +41,7 @@ impl StopCustody {
         config: &crate::mailbox_process::MailboxProcessConfig,
         backend: &AnyBackend,
         name: &str,
+        mode: VmmMode,
     ) -> Result<Self> {
         let state = File::options()
             .read(true)
@@ -50,16 +57,23 @@ impl StopCustody {
         } else {
             None
         };
-        let vmm = backend
-            .host_process_id(&VmId(name.into()))
-            .ok()
-            .flatten()
-            .map(EndpointPid::of_child)
-            .filter(EndpointPid::is_live_and_ours)
-            .and_then(|original| {
-                let observer = ProcessExitObserver::arm(original.pid).ok()?;
-                original.is_live_and_ours().then_some((original, observer))
-            });
+        let vmm = match mode {
+            VmmMode::Installed => {
+                let pid = backend
+                    .host_process_id(&VmId(name.into()))?
+                    .context("no installed VMM process to observe")?;
+                let original = EndpointPid::of_child(pid);
+                ensure!(original.is_live_and_ours(), "no live original VMM identity");
+                let observer = ProcessExitObserver::arm(original.pid)?;
+                ensure!(
+                    original.is_live_and_ours(),
+                    "original VMM changed while arming observer"
+                );
+                Some((original, observer))
+            }
+            #[cfg(test)]
+            VmmMode::HelperFixture => None,
+        };
         Ok(Self {
             state,
             split_socket,
@@ -70,8 +84,25 @@ impl StopCustody {
             kernel_exit_observed: false,
             assisted: false,
             sdk_cleanup: None,
-            stop_started: false,
         })
+    }
+    pub(super) fn observe_helper(
+        &self,
+        marker: &mut OriginalMarker,
+        child: &mut Child,
+    ) -> std::io::Result<Option<ExitStatus>> {
+        if self.vmm.is_some() {
+            return child.try_wait(); // Durable original claim survives through typed SDK cleanup.
+        }
+        #[cfg(test)]
+        {
+            return marker.collect(child);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = marker;
+            Err(std::io::Error::other("missing installed VMM custody"))
+        }
     }
 }
 
@@ -200,7 +231,6 @@ impl JournalOwner<'_> {
             .vmm
             .as_ref()
             .context("no original kernel process identity")?;
-        state.stop_started = true;
         if !state.vm_stopped && !state.sdk_abort_confirmed {
             let backend =
                 AnyBackend::for_started_vm(name).context("original VMM backend is unavailable")?;

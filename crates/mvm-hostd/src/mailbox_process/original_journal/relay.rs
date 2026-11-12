@@ -129,10 +129,7 @@ impl OriginalJournalSourceHost {
     }
 
     pub fn try_collect(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        if self.stop.stop_started {
-            return self.source.try_wait();
-        }
-        self.marker.collect(&mut self.source)
+        self.stop.observe_helper(&mut self.marker, &mut self.source)
     }
 
     /// Nonblocking on an idle listener. One shared action deadline for all
@@ -247,6 +244,23 @@ impl PairedJournalAdmission {
         name: &str,
         posture: &super::MailboxLaunchPosture,
     ) -> Result<OriginalJournalSourceHost> {
+        self.launch_source_with_mode(
+            plan,
+            backend,
+            name,
+            posture,
+            super::stop::VmmMode::Installed,
+        )
+    }
+
+    pub(super) fn launch_source_with_mode(
+        &self,
+        plan: &ExecutionPlan,
+        backend: &mvm_runtime::backend::AnyBackend,
+        name: &str,
+        posture: &super::MailboxLaunchPosture,
+        mode: super::stop::VmmMode,
+    ) -> Result<OriginalJournalSourceHost> {
         ensure!(
             posture.variant() == mvm_core::plan::Variant::Prod,
             "paired source requires production posture"
@@ -260,6 +274,7 @@ impl PairedJournalAdmission {
             true,
             |config, plan, guard| {
                 let setup = (|| -> Result<_> {
+                    let stop = super::stop::StopCustody::capture(config, backend, name, mode)?;
                     let boot = config.reader_boot.as_ref().context("absent A boot")?;
                     let mut dest = self
                         .original
@@ -289,7 +304,6 @@ impl PairedJournalAdmission {
                     };
                     config.keys.outbound_source = Some(delegated);
                     let listener = OwnedListener::bind(&config.vm_state_dir)?;
-                    let stop = super::stop::StopCustody::capture(config, backend, name)?;
                     let (mut source, marker) =
                         super::spawn_claimed(&guard.owner_dir, super::super::serving_command()?)?;
                     let readiness = super::super::configure_serving(config, &mut source)

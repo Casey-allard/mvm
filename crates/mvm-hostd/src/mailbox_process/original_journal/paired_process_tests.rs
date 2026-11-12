@@ -217,7 +217,20 @@ fn run() -> Result<()> {
     let backend = AnyBackend::from_hypervisor("firecracker");
     let (bp, boot_b, posture_b, ack_b) = original_plan("journal-b", b_grant)?;
     let b_guest = fixture_listener(&mvm_core::config::vm_state_dir("journal-b"))?;
-    let b = OriginalJournalDestination::start(&bp, &backend, "journal-b", &posture_b)?;
+    // An installed SDK B refuses before creating a helper when the original
+    // VMM cannot be observed. Only this explicit test fixture may omit it.
+    ensure!(
+        OriginalJournalDestination::start_custodied(&bp, &backend, "journal-b", &posture_b)
+            .is_err()
+    );
+    let b = OriginalJournalDestination::start_with_mode(
+        &bp,
+        &backend,
+        "journal-b",
+        &posture_b,
+        super::stop::VmmMode::HelperFixture,
+    )?;
+    b.require_ready()?;
     let signed_recv = b.original_receive()?.clone();
     let grants = Arc::new(JournalCredentials {
         source_scope: incoming.source_scope.clone(),
@@ -278,7 +291,19 @@ fn run() -> Result<()> {
     let guest = fixture_listener(&a_state)?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let admission = PairedJournalAdmission::new(b.clone(), grants, deadline);
-    let mut a = admission.launch_original_source(&ap, &backend, "journal-a", &posture_a)?;
+    ensure!(
+        admission
+            .launch_custodied_source(&ap, &backend, "journal-a", &posture_a)
+            .is_err()
+    );
+    let mut a = admission.launch_source_with_mode(
+        &ap,
+        &backend,
+        "journal-a",
+        &posture_a,
+        super::stop::VmmMode::HelperFixture,
+    )?;
+    a.require_ready()?;
     let message = OutboxMessage::new(direction.address.recipient, (0..=255).chain([0]).collect());
     let mut receipt = None;
     let transaction = Instant::now();
