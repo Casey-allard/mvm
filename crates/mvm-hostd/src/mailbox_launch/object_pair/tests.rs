@@ -571,7 +571,7 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
     assert_eq!(reply.header().causation_id.as_bytes(), msg.as_bytes());
     assert_eq!(reply.header().correlation_id, corr);
     let mut bad = signed.clone();
-    bad.lease.lease_nonce = DeliveryLeaseNonce::from_bytes([0; 32]);
+    bad.lease.lease_nonce = DeliveryLeaseNonce::from_bytes([0; 16]);
     assert!(journal.original_object_call(&bad, f.now).is_err());
     assert!(
         journal
