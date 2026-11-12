@@ -853,6 +853,77 @@ impl TenantLifecycleGate {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn two_original_launches_wait_for_live_publication_and_refuse_stranded_intent() -> Result<()> {
+        use std::sync::mpsc::sync_channel;
+
+        for failed_writer in [false, true] {
+            let home = tempfile::tempdir()?;
+            crate::private_fs::create_owned_private_dir(home.path())?;
+            let generation = LifecycleGeneration::new([7; 32], 1)?;
+            let deadline = || Instant::now() + Duration::from_secs(3);
+            let coordinator = LifecycleCoordinator::prepare_after_exclusion(
+                home.path(), "tenant-a", generation.clone(), 2, deadline()
+            )?;
+            coordinator.activate_after_reconciliation(&generation, deadline())?;
+            let first = coordinator.gate.reserve_launch("vm-a", "plan-a", deadline())?;
+            let (published, observed) = sync_channel(0);
+            let (resume, proceed) = sync_channel(0);
+            let second_gate = std::thread::scope(|scope| -> Result<TenantLifecycleGate> {
+                let gate = &coordinator.gate;
+                let writer = scope.spawn(move || -> Result<()> {
+                    let _held = gate.lock(deadline())?;
+                    let record = gate.read_record()?;
+                    gate.write_record_with(&record, |path, bytes| {
+                        published.send(()).map_err(std::io::Error::other)?;
+                        proceed.recv_timeout(Duration::from_secs(3)).map_err(std::io::Error::other)?;
+                        if failed_writer {
+                            return Err(std::io::Error::other("fixture publication interrupted"));
+                        }
+                        write_private(path, bytes)
+                    })
+                });
+                observed.recv_timeout(Duration::from_secs(3))?;
+                // The actual writer already published the durable intent and
+                // still owns the original file lock. A second constructor
+                // confers no admission. Its operation must wait or time out.
+                let result = (|| -> Result<TenantLifecycleGate> {
+                    let gate = TenantLifecycleGate::new(home.path(), "tenant-a")?;
+                    let error = gate.reserve_launch("vm-b", "plan-b", Instant::now() + Duration::from_millis(15))
+                        .err().context("a second reservation passed the live publisher")?;
+                    ensure!(error.to_string().contains("lifecycle lock deadline expired"), "{error}");
+                    Ok(gate)
+                })();
+                resume.send(())?;
+                let writer_result = writer.join().expect("original writer panicked");
+                if failed_writer {
+                    ensure!(writer_result.unwrap_err().to_string().contains("fixture publication interrupted"));
+                } else {
+                    writer_result?;
+                }
+                result
+            })?;
+            if failed_writer {
+                assert!(TenantLifecycleGate::new(home.path(), "tenant-a").is_err());
+                let error = second_gate.reserve_launch("vm-b", "plan-b", deadline()).err()
+                    .context("a stranded publication admitted the second original")?;
+                assert!(error.to_string().contains("publication intent remains unresolved"));
+                assert!(coordinator.gate.directory.join(".lifecycle.intent").is_file());
+                continue;
+            }
+            let mut second = second_gate.reserve_launch("vm-b", "plan-b", deadline())?;
+            assert_ne!(first.id(), second.id());
+            assert_eq!(second.generation(), first.generation());
+            let snapshot = coordinator.snapshot(deadline())?;
+            assert_eq!(snapshot.pending().len(), 2);
+            second.settle_after_original_cleanup(deadline(), || Ok(()))?;
+            let snapshot = coordinator.snapshot(deadline())?;
+            assert_eq!(snapshot.pending().len(), 1);
+            assert_eq!(snapshot.pending()[0].id(), first.id());
+        }
+        Ok(())
+    }
+
 
     #[test]
     fn activation_deadline_expiring_after_active_commit_never_releases_publication() {
