@@ -37,9 +37,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::process::{Child, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// How often the orphan reaper sweeps. Zombie orphans are harmless while
@@ -69,6 +69,9 @@ static REAPER_RUNNING: AtomicBool = AtomicBool::new(false);
 /// status" are a single atomic step against an owner's own wait.
 #[derive(Default)]
 struct Registry {
+    // This form registers at spawn, before another thread can reap. Each
+    // generation owns its own status even after the kernel reuses the PID.
+    originals: HashMap<i32, Arc<OnceLock<ExitStatus>>>,
     owned: HashSet<i32>,
     reaped: HashMap<i32, i32>,
 }
@@ -76,6 +79,115 @@ struct Registry {
 fn registry() -> &'static Mutex<Registry> {
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
     REGISTRY.get_or_init(Mutex::default)
+}
+
+/// Original status and signal authority for one supervised process.
+#[derive(Clone)]
+pub(crate) struct OriginalProcess {
+    pid: i32,
+    exit: Arc<OnceLock<ExitStatus>>,
+}
+
+impl OriginalProcess {
+    /// Check the original generation while holding the reaper lock. An exit
+    /// between this check and kill remains a zombie, so the PID cannot have
+    /// been recycled under our feet.
+    pub(crate) fn signal(&self, group: bool, signal: i32) -> io::Result<()> {
+        let reg = registry()
+            .lock()
+            .map_err(|_| io::Error::other("child registry poisoned"))?;
+        if self.exit.get().is_some() {
+            return Ok(());
+        }
+        if !reg
+            .originals
+            .get(&self.pid)
+            .is_some_and(|v| Arc::ptr_eq(v, &self.exit))
+        {
+            return Err(io::Error::other("original child identity unavailable"));
+        }
+        let target = if group { -self.pid } else { self.pid };
+        // SAFETY: kill has no pointer arguments. Only the still-held original
+        // child (or its group created at spawn) can be targeted.
+        if unsafe { libc::kill(target, signal) } < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct OriginalChild {
+    pub(crate) child: Child,
+    pub(crate) original: OriginalProcess,
+}
+
+impl OriginalChild {
+    /// std may wait for its own failed-exec child *inside* Command::spawn.
+    /// Cover that interval too, then publish the successful original before
+    /// the PID-1 reaper can consume its exit. Waiting for a running child is
+    /// always outside this critical section.
+    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| io::Error::other("child registry poisoned"))?;
+        let child = command.spawn()?;
+        let original = OriginalProcess {
+            pid: child.id() as i32,
+            exit: Arc::new(OnceLock::new()),
+        };
+        reg.originals.insert(original.pid, original.exit.clone());
+        Ok(Self { child, original })
+    }
+
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| io::Error::other("child registry poisoned"))?;
+        if let Some(status) = self.original.exit.get() {
+            return Ok(Some(*status));
+        }
+        if !reg
+            .originals
+            .get(&self.original.pid)
+            .is_some_and(|v| Arc::ptr_eq(v, &self.original.exit))
+        {
+            return Err(io::Error::other("original child status unavailable"));
+        }
+        if let Some(status) = self.child.try_wait()? {
+            let _ = self.original.exit.set(status);
+            reg.originals.remove(&self.original.pid);
+            return Ok(Some(status));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        let mut gap = WAIT_POLL_MIN;
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(gap);
+            gap = (gap * 2).min(WAIT_POLL_MAX);
+        }
+    }
+}
+
+impl Drop for OriginalChild {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = registry().lock() {
+            if reg
+                .originals
+                .get(&self.original.pid)
+                .is_some_and(|v| Arc::ptr_eq(v, &self.original.exit))
+            {
+                reg.originals.remove(&self.original.pid);
+            }
+        }
+    }
 }
 
 /// Registration token for a child this process spawned and will wait on.
@@ -267,7 +379,9 @@ fn reap_in(reg: &Mutex<Registry>, mut waitpid: impl FnMut(&mut i32) -> i32) {
         if pid <= 0 {
             return;
         }
-        if reg.owned.contains(&pid) {
+        if let Some(exit) = reg.originals.remove(&pid) {
+            let _ = exit.set(exit_status_from_raw(raw));
+        } else if reg.owned.contains(&pid) {
             reg.reaped.insert(pid, raw);
         }
     }

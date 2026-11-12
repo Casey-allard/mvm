@@ -26,7 +26,7 @@ use std::io::{self, BufReader};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -49,7 +49,7 @@ pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(2);
 /// needs between calls.
 pub(crate) struct WorkerHandle {
     pid: u32,
-    child: Child,
+    child: crate::child_wait::OriginalChild,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     /// stderr drains in the background to avoid blocking the worker
@@ -73,7 +73,25 @@ impl Drop for WorkerHandle {
         // typically race ahead of Drop; this is the catch-all when
         // the pool itself is being torn down or the handle is
         // dropped due to a panic.
-        entrypoint::kill_and_reap(&mut self.child, DEFAULT_KILL_GRACE);
+        let _ = self.retire();
+    }
+}
+
+impl WorkerHandle {
+    fn retire(&mut self) -> io::Result<()> {
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        self.child.original.signal(true, libc::SIGTERM)?;
+        let deadline = Instant::now() + DEFAULT_KILL_GRACE;
+        while Instant::now() < deadline {
+            if self.child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        self.child.original.signal(true, libc::SIGKILL)?;
+        self.child.wait().map(|_| ())
     }
 }
 
@@ -353,12 +371,12 @@ impl WorkerPool {
             return Err(DispatchError::NotReady);
         }
         let (idx, mut handle) = self.acquire()?;
-        let pgid = handle.pid as i32;
+        let original = handle.child.original.clone();
 
         // Watchdog: SIGKILLs the worker group at deadline. Cancelled
         // on response by setting the atomic. Joined regardless.
         let cancelled = Arc::new(AtomicBool::new(false));
-        let watchdog = spawn_watchdog(pgid, timeout_secs, Arc::clone(&cancelled));
+        let watchdog = spawn_watchdog(original, timeout_secs, Arc::clone(&cancelled));
 
         let result = run_one_call(&mut handle, stdin, timeout_secs, env);
         cancelled.store(true, Ordering::Release);
@@ -635,19 +653,22 @@ fn spawn_worker(
     }
     crate::workload_seccomp::confine(&mut cmd);
 
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
+    let mut child = crate::child_wait::OriginalChild::spawn(&mut cmd)?;
+    let pid = child.child.id();
     let stdin = child
+        .child
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("stdin pipe missing"))?;
     let stdout = BufReader::new(
         child
+            .child
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("stdout pipe missing"))?,
     );
     let stderr = child
+        .child
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("stderr pipe missing"))?;
@@ -796,7 +817,7 @@ impl WorkerPool {
 }
 
 fn spawn_watchdog(
-    pgid: i32,
+    original: crate::child_wait::OriginalProcess,
     timeout_secs: u64,
     cancelled: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
@@ -812,10 +833,7 @@ fn spawn_watchdog(
         if cancelled.load(Ordering::Acquire) {
             return;
         }
-        // SAFETY: kill is async-signal-safe.
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
+        let _ = original.signal(true, libc::SIGKILL);
     })
 }
 
