@@ -5,7 +5,7 @@ use super::{
     cast_enrollment::{OriginalCastBoot, PreparedOriginalCastBoot},
     cast_pair::{
         InstalledCastParticipant,
-        development::{self, DirectionDelivery, Participant, PreparedRole},
+        development::{self, Participant, PreparedRole},
     },
     derived_keys, now_unix_ms, template_for,
 };
@@ -17,7 +17,7 @@ use mvm_contract::protocol::{
 };
 use mvm_core::{
     crypto::aead::Key,
-    mailbox::{OpenContext, frame::cast::route::AddressedCastGrants, sign_capability},
+    mailbox::{frame::cast::route::AddressedCastGrants, sign_capability},
     vm_backend::VmStartConfig,
 };
 use std::{path::Path, time::Instant};
@@ -30,27 +30,10 @@ pub struct ReservedFixture<'a> {
     pub original: InstalledCastParticipant<'a>,
     pub config: &'a VmStartConfig,
 }
-pub struct SignedFixtureDirection {
-    pub delivery: DirectionDelivery,
-    pub source_scope: SignedMailboxCapability,
-    pub send: SignedMailboxCapability,
-    pub receive: SignedMailboxCapability,
-    pub source_policy: OpenContext,
-    pub destination_policy: OpenContext,
-}
-impl SignedFixtureDirection {
-    pub fn grants(&self) -> AddressedCastGrants<'_> {
-        AddressedCastGrants {
-            source_scope: &self.source_scope,
-            send: &self.send,
-            receive: &self.receive,
-        }
-    }
-}
 pub struct PairedFixture {
     pub source: (PreparedOriginalCastBoot, PreparedRole),
     pub destination: (PreparedOriginalCastBoot, PreparedRole),
-    pub retained: SignedFixtureDirection,
+    pub retained: crate::mailbox_process::owned_client::InstalledCastTurn,
 }
 fn bounded(
     mut c: MailboxCapabilityGrant,
@@ -239,6 +222,10 @@ pub fn prepare(
         grants,
         deadline,
     )?;
+    let retained = a
+        .original
+        .worker
+        .prepare_cast_turn(b.original.worker, prepared.public_control()?)?;
     let mut routed = pb.clone();
     routed.expected_sender = pa.expected_sender;
     routed.acting_principal = pa.acting_principal;
@@ -263,13 +250,6 @@ pub fn prepare(
     Ok(PairedFixture {
         source: (first, prepared.source),
         destination: (second, prepared.destination),
-        retained: SignedFixtureDirection {
-            delivery: prepared.delivery,
-            source_scope,
-            send,
-            receive,
-            source_policy: pa,
-            destination_policy: pb,
-        },
+        retained,
     })
 }
