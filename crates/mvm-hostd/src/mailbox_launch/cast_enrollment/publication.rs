@@ -164,7 +164,7 @@ impl ExpectedCastPublication {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn expected(dir: &std::path::Path, bytes: &[u8], number: u8) -> Side {
         Side {
@@ -186,6 +186,9 @@ mod tests {
     fn pair_publication_rejects_missing_stale_and_replaced_original_sidecars() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
+        for dir in [&a, &b] {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let a_bytes = b"prepared original alpha";
         let b_bytes = b"prepared original bravo";
         let sides = [
@@ -202,6 +205,10 @@ mod tests {
         write(&pb, a_bytes).unwrap();
         assert!(verify().is_err(), "equal-size substituted content");
         write(&pb, b_bytes).unwrap();
+        verify().unwrap();
+        std::fs::set_permissions(b.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(verify().is_err(), "group-writable original directory");
+        std::fs::set_permissions(b.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         verify().unwrap();
         let relocated = b.path().join("moved.json");
         std::fs::rename(&pb, &relocated).unwrap();

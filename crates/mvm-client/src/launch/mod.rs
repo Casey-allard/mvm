@@ -18,6 +18,8 @@ pub mod grants_report;
 pub mod host_agent_mailbox;
 #[cfg(unix)]
 pub mod cast_rendezvous;
+#[cfg(unix)]
+mod cast_state;
 pub mod machine_start;
 pub mod mailbox_owner;
 pub mod manifest_ref;
