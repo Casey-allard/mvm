@@ -197,7 +197,7 @@ impl InstalledObjectPair<'_> {
     }
 }
 
-fn verify_active_call(
+pub(crate) fn verify_active_call(
     local: &EndpointMaterial,
     d: &mvm_core::mailbox::object_pair::role::ObjectRoleV1,
     call: &OriginalObjectCallLease<'_>,
@@ -250,6 +250,12 @@ fn verify_active_call(
 }
 
 impl PairMaterial {
+    fn local(&self, role: ObjectParticipantRole) -> &EndpointMaterial {
+        match role {
+            ObjectParticipantRole::Caller => &self.caller,
+            ObjectParticipantRole::Callee => &self.callee,
+        }
+    }
     pub(super) fn seal_turn(
         &self,
         role: ObjectParticipantRole,
@@ -260,10 +266,48 @@ impl PairMaterial {
         original: Option<&OriginalObjectCallLease<'_>>,
         now: i64,
     ) -> Result<SealedObjectTurn> {
-        let local = match role {
-            ObjectParticipantRole::Caller => &self.caller,
-            ObjectParticipantRole::Callee => &self.callee,
-        };
+        self.local(role)
+            .seal_turn(role, message, correlation_id, sequence, body, original, now)
+    }
+    pub(super) fn reopen(
+        &self,
+        role: ObjectParticipantRole,
+        cap: &SignedMailboxCapability,
+        envelope: MailboxEnvelope,
+        sequence: SequenceNumber,
+        submission: &ObjectSubmissionV1,
+        original: Option<&OriginalObjectCallLease<'_>>,
+        now: i64,
+    ) -> Result<SealedObjectTurn> {
+        self.local(role)
+            .reopen(role, cap, envelope, sequence, submission, original, now)
+    }
+    pub(super) fn verify_accepted(
+        &self,
+        role: ObjectParticipantRole,
+        turn: &SealedObjectTurn,
+        signed: &SignedDestinationReceipt,
+    ) -> Result<()> {
+        self.local(role).verify_accepted(role, turn, signed)
+    }
+}
+
+impl EndpointMaterial {
+    pub(crate) fn seal_turn(
+        &self,
+        role: ObjectParticipantRole,
+        message: MessageId,
+        correlation_id: Option<CorrelationId>,
+        sequence: SequenceNumber,
+        body: &[u8],
+        original: Option<&OriginalObjectCallLease<'_>>,
+        now: i64,
+    ) -> Result<SealedObjectTurn> {
+        let local = self;
+        ensure!(
+            role == self.public_role.role.role,
+            "wrong original endpoint material"
+        );
         let d = local.public_role.verify(&local.reader.boot, now)?;
         let g = &d.outbound().grant;
         ensure!(
@@ -366,7 +410,7 @@ impl PairMaterial {
         };
         Ok(fields)
     }
-    pub(super) fn reopen(
+    pub(crate) fn reopen(
         &self,
         role: ObjectParticipantRole,
         cap: &SignedMailboxCapability,
@@ -376,10 +420,11 @@ impl PairMaterial {
         original: Option<&OriginalObjectCallLease<'_>>,
         now: i64,
     ) -> Result<SealedObjectTurn> {
-        let local = match role {
-            ObjectParticipantRole::Caller => &self.caller,
-            ObjectParticipantRole::Callee => &self.callee,
-        };
+        let local = self;
+        ensure!(
+            role == self.public_role.role.role,
+            "wrong original endpoint material"
+        );
         let d = local.public_role.verify(&local.reader.boot, now)?;
         ensure!(
             cap == d.outbound(),
@@ -442,16 +487,17 @@ impl PairMaterial {
         })
     }
 
-    pub(super) fn verify_accepted(
+    pub(crate) fn verify_accepted(
         &self,
         role: ObjectParticipantRole,
         turn: &SealedObjectTurn,
         signed: &SignedDestinationReceipt,
     ) -> Result<()> {
-        let endpoint = match role {
-            ObjectParticipantRole::Caller => &self.caller,
-            ObjectParticipantRole::Callee => &self.callee,
-        };
+        let endpoint = self;
+        ensure!(
+            role == self.public_role.role.role,
+            "wrong original endpoint material"
+        );
         let d = &endpoint.public_role.role;
         let g = &d.outbound().grant;
         mvm_core::mailbox::verify_receipt(
