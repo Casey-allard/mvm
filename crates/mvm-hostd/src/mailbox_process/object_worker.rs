@@ -252,6 +252,8 @@ impl WorkerLaunch {
             channel,
         };
         launch.require_live()?;
+        launch.config.validate_current()?;
+        launch.require_live()?;
         ensure!(
             Instant::now() < until,
             "original object worker bootstrap timed out"
