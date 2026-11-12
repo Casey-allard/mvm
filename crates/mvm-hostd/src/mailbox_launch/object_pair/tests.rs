@@ -257,6 +257,17 @@ fn independent_direction_keys_and_original_reader_possession_survive_restart() {
     let root = f.dir.path().join(super::super::ENCRYPTION_ROOT);
     Key::load_or_create(&root).unwrap();
     let first = bind().unwrap();
+    let caller_store = first.caller.custody.storage_paths(f.dir.path()).unwrap();
+    let callee_store = first.callee.custody.storage_paths(f.dir.path()).unwrap();
+    assert_ne!(caller_store.source_intents, callee_store.source_intents);
+    assert_eq!(
+        first.caller.custody.address(),
+        f.credentials.reply.grant.address
+    );
+    assert_eq!(
+        first.callee.custody.address(),
+        f.credentials.call.grant.address
+    );
     assert_eq!(
         first.caller.reader.capability,
         f.credentials.receive_at_caller
@@ -285,6 +296,14 @@ fn independent_direction_keys_and_original_reader_possession_survive_restart() {
         .unwrap();
     }
     let second = bind().unwrap();
+    assert_eq!(
+        second.caller.custody.history_reference(),
+        first.caller.custody.history_reference()
+    );
+    assert_eq!(
+        second.callee.custody.history_reference(),
+        first.callee.custody.history_reference()
+    );
     assert_eq!(
         first.caller.reader.enrollment,
         second.caller.reader.enrollment
@@ -449,6 +468,39 @@ fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_le
         )
         .unwrap();
     material.verify_accepted(Caller, &call, &receipt).unwrap();
+    let a_alt_state = tempfile::tempdir().unwrap();
+    a.boot.persist(a_alt_state.path()).unwrap();
+    let b2 = BootFixture::new(f.dir.path(), bg, 2, f.now);
+    assert_ne!(b.boot.boot, b2.boot.boot);
+    let other = p
+        .bind_at(
+            f.dir.path(),
+            BootInput {
+                state: a_alt_state.path(),
+                ..a.input()
+            },
+            b2.input(),
+            f.now,
+        )
+        .unwrap();
+    assert!(
+        other.verify_accepted(Caller, &call, &receipt).is_err(),
+        "another receiver incarnation accepted this original ciphertext"
+    );
+    for t in [
+        call.header().issued_at_unix_ms - 1,
+        call.header().expires_at_unix_ms,
+    ] {
+        let mut replacement = receipt.receipt.clone();
+        replacement.observed_at_unix_ms = t;
+        let replacement = mvm_core::mailbox::sign_receipt(replacement, &signer).unwrap();
+        assert!(
+            material
+                .verify_accepted(Caller, &call, &replacement)
+                .is_err(),
+            "receipt outside original validity"
+        );
+    }
     assert!(material.verify_accepted(Callee, &call, &receipt).is_err());
     let reader = &material.callee.reader;
     let enroll = &reader.enrollment;

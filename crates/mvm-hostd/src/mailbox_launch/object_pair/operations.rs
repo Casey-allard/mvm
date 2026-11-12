@@ -184,7 +184,6 @@ impl PairMaterial {
         original: Option<&OriginalObjectCallLease<'_>>,
         now: i64,
     ) -> Result<SealedObjectTurn> {
-        use rand::Rng as _;
         let local = match role {
             ObjectParticipantRole::Caller => &self.caller,
             ObjectParticipantRole::Callee => &self.callee,
@@ -216,7 +215,7 @@ impl PairMaterial {
             sequence,
             issued_at_unix_ms: now,
             expires_at_unix_ms: expires,
-            nonce: ReplayNonce::from_bytes(rand::rng().random()),
+            nonce: ReplayNonce::from_bytes(rand::random()),
             content_type: g.content_types[0].clone(),
             capability_id: g.capability_id,
             policy_epoch: g.policy_epoch,
@@ -227,7 +226,7 @@ impl PairMaterial {
             plaintext_len: body.len().try_into()?,
         };
         let mut routing = local.routing.clone();
-        routing.delivery_id = DeliveryId::from_bytes(rand::rng().random());
+        routing.delivery_id = DeliveryId::from_bytes(rand::random());
         routing.expires_at_unix_ms = expires;
         Ok(SealedObjectTurn {
             envelope: seal_envelope(
@@ -429,6 +428,9 @@ impl PairMaterial {
             turn.capability == *d.outbound()
                 && h.sender_boot == endpoint.reader.boot.boot
                 && h.capability_id == g.capability_id
+                && h.encryption.key_id
+                    == <[u8; 32]>::from(Sha256::digest(endpoint.outbound_key.expose_bytes()))
+                && (h.issued_at_unix_ms..h.expires_at_unix_ms).contains(&r.observed_at_unix_ms)
                 && r.protocol_version == ProtocolVersion::V2
                 && r.outcome == DeliveryOutcome::AcceptedLocalDurable
                 && r.address == g.address
