@@ -19,6 +19,9 @@
 //! declares the capability. A grant on one that does not refuses the launch
 //! rather than boot a guest that asserts a mailbox nobody serves.
 
+pub mod owned;
+pub mod owned_wire;
+
 use std::io::{Error, ErrorKind, Result, Write as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
