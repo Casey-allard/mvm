@@ -14,6 +14,15 @@ use std::{
 };
 const MARKER: u8 = 0x4d;
 const CONTROL_WORDS: usize = 32;
+// XNU sockargs(MT_CONTROL) bounds an entire sendmsg control record by one
+// MCLBYTES cluster (2048 bytes on supported Intel and Apple Silicon hosts).
+// Receive that entire record so every installed descriptor is returned to
+// userspace for disposal, even when the protocol rejects excess rights.
+#[cfg(target_os = "macos")]
+const RECEIVE_CONTROL_WORDS: usize = 2048 / mem::size_of::<usize>();
+#[cfg(not(target_os = "macos"))]
+const RECEIVE_CONTROL_WORDS: usize = CONTROL_WORDS;
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -340,7 +349,7 @@ fn receive_chunk(
 ) -> io::Result<(usize, Option<OwnedFd>)> {
     loop {
         ready(stream.as_raw_fd(), libc::POLLIN, deadline)?;
-        let mut control = [0usize; CONTROL_WORDS];
+        let mut control = [0usize; RECEIVE_CONTROL_WORDS];
         let mut iov = libc::iovec {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: bytes.len(),
