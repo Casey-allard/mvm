@@ -3663,16 +3663,28 @@ async fn execute_mutation(
                 "another original service occupies this identity"
             );
             if let Some(prepared) = original.prepared.as_mut() {
-                let registration = prepared.registration().clone();
-                let (live, start) = prepared.take_suspended_parts()?;
-                map.vms.insert(vm_id.clone(), live);
-                daemon.registrations.insert(vm_id.clone(), registration);
-                // Actual original map ownership precedes any dispatch exposure.
-                start.release()?;
-                anyhow::ensure!(
-                    prepared.service_transferred(),
-                    "service ownership transfer incomplete"
-                );
+                let original_workers = daemon.mailbox_workers.clone();
+                let mut publish = || -> Result<()> {
+                    let registration = prepared.registration().clone();
+                    let (live, start) = prepared.take_suspended_parts()?;
+                    map.vms.insert(vm_id.clone(), live);
+                    daemon.registrations.insert(vm_id.clone(), registration);
+                    // Actual original map ownership precedes any dispatch exposure.
+                    start.release()?;
+                    anyhow::ensure!(
+                        prepared.service_transferred(),
+                        "service ownership transfer incomplete"
+                    );
+                    Ok(())
+                };
+                if let Some(owner) = &context.mailbox_owner {
+                    original_workers
+                        .as_ref()
+                        .context("installed mailbox profile missing")?
+                        .try_publish_service(&vm_id, owner, publish)?;
+                } else {
+                    publish()?;
+                }
                 original.prepared = None;
             } else {
                 daemon.registrations.remove(&vm_id);

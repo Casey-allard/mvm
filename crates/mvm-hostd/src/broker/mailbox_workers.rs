@@ -722,6 +722,18 @@ impl Drop for TerminalMetadata {
         }
     }
 }
+fn service_lock_error<T>(error: std::sync::TryLockError<T>) -> io::Error {
+    match error {
+        std::sync::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+        std::sync::TryLockError::Poisoned(_) => refused("mailbox service inventory poisoned"),
+    }
+}
+impl Slot {
+    fn allows_service_activation(&self) -> bool {
+        !self.reservation_released && !self.stop_requested
+            && matches!(self.state, MailboxWorkerState::Reserved | MailboxWorkerState::Starting | MailboxWorkerState::Serving)
+    }
+}
 struct WorkerLoan {
     slot: Arc<Mutex<Slot>>,
     worker: Option<Worker>,
@@ -1295,24 +1307,32 @@ impl MailboxWorkers {
         Ok(slots.contains_key(vm))
     }
     /// Bounded observation while reconciling sibling service registration.
-    /// Terminal slots retain their original identity for exact deregistration.
-    /// An in-flight slot mutation must finish before registration can proceed.
     pub(crate) fn try_service_owner(&self, vm: &str) -> io::Result<Option<(MailboxWorkerOwner, bool)>> {
-        fn inventory_error<T>(error: std::sync::TryLockError<T>) -> io::Error {
-            match error {
-                std::sync::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
-                std::sync::TryLockError::Poisoned(_) => refused("mailbox service inventory poisoned"),
-            }
-        }
-        let slots = self.slots.try_lock().map_err(inventory_error)?;
-        let Some(slot) = slots.get(vm) else { return Ok(None) };
-        let slot = slot.try_lock().map_err(inventory_error)?;
-        if slot.busy {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-        }
-        let live = !slot.reservation_released && !slot.stop_requested
-            && matches!(slot.state, MailboxWorkerState::Reserved | MailboxWorkerState::Starting | MailboxWorkerState::Serving);
-        Ok(Some((slot.owner.clone(), live)))
+        self.try_service_slot(vm, |slot| slot.map(|slot| (slot.owner.clone(), slot.allows_service_activation())))
+    }
+
+    fn try_service_slot<T>(&self, vm: &str, inspect: impl FnOnce(Option<&Slot>) -> T) -> io::Result<T> {
+        let slots = self.slots.try_lock().map_err(service_lock_error)?;
+        let Some(slot) = slots.get(vm) else { return Ok(inspect(None)) };
+        let slot = slot.try_lock().map_err(service_lock_error)?;
+        if slot.busy { return Err(io::Error::from(io::ErrorKind::WouldBlock)); }
+        Ok(inspect(Some(&slot)))
+    }
+
+    /// Linearize the local broker map insertion and suspended-start release
+    /// against both terminal transitions and the provider's activation fence.
+    /// The callback must perform only the pre-reserved synchronous publication.
+    pub(crate) fn try_publish_service<T>(
+        &self, vm: &str, original: &MailboxWorkerOwner,
+        publish: impl FnOnce() -> anyhow::Result<T>
+    ) -> anyhow::Result<T> {
+        let fence = self.fence.state.try_lock().map_err(service_lock_error)?;
+        anyhow::ensure!(!fence.failed && fence.deadline.is_none(), "mailbox activation is fenced");
+        self.try_service_slot(vm, |slot| {
+            anyhow::ensure!(slot.is_some_and(|slot| &slot.owner == original && slot.allows_service_activation()),
+                "mailbox has closed or changed before broker publication");
+            publish()
+        })?
     }
 
     fn expire_terminals(&self) -> io::Result<()> {
@@ -1877,6 +1897,40 @@ mod tests {
             bytes_per_worker: 65_536,
         }
     }
+    #[test]
+    fn paired_publication_holds_original_slot_until_listener_activation() {
+        let budget = MailboxWorkerBudget::new(limits()).unwrap();
+        let provider = MailboxWorkers::new("tenant", budget.clone(), Arc::new(NeverSpawn)).unwrap();
+        let mut req = request(&budget, "tenant");
+        let owner = provider.handle(&req).unwrap().0.owner;
+        let slot = provider.slots.lock().unwrap()[&req.vm_id].clone();
+        let mut competing = req.clone();
+        competing.operation = MailboxWorkerOperation::ReleaseUnstartedV1{owner:owner.clone()};
+        let (started, starting) = mpsc::sync_channel(0);
+        let (published, after_publish) = mpsc::sync_channel(0);
+        std::thread::scope(|scope| {
+            let provider = &provider;
+            let release = scope.spawn(move || {
+                // Wait until the actual publish closure owns its slot, then
+                // attempt signed-operation handling on the ordinary owner.
+                starting.recv().unwrap();
+                published.send(()).unwrap();
+                provider.handle(&competing).unwrap().0.state
+            });
+            provider.try_publish_service(&req.vm_id, &owner, || {
+                started.send(()).unwrap();
+                after_publish.recv_timeout(std::time::Duration::from_secs(2))?;
+                assert!(matches!(slot.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+                assert!(matches!(provider.fence.state.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+                Ok(())
+            }).unwrap();
+            assert_eq!(release.join().unwrap(), MailboxWorkerState::ReleasedBeforeSpawn);
+        });
+        assert!(provider.try_publish_service(&req.vm_id, &owner, || -> anyhow::Result<()> { panic!("released slot published a listener") }).is_err());
+        req.operation = MailboxWorkerOperation::LookupExistingV1;
+        assert_eq!(provider.handle(&req).unwrap().0.state,MailboxWorkerState::ReleasedBeforeSpawn);
+    }
+
     #[test]
     fn provider_fence_waits_original_activation_beyond_grace_without_renewing_it() {
         let budget = MailboxWorkerBudget::new(limits()).unwrap();
