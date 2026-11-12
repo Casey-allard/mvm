@@ -16,7 +16,7 @@ use mvm_hostd::{
 /// readiness or resource-accounting failure. Stop the VM and collect that
 /// exact helper before releasing the slot. A recovered PID is insufficient.
 pub enum InstalledJournal<'a> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Object {
         launch:
             &'a mvm_hostd::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<
@@ -62,7 +62,7 @@ pub(crate) fn validate_slot(
     endpoint: Option<&InstalledJournal<'_>>,
     grant: Option<&MailboxGrant>,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(InstalledJournal::Object { launch, owner }) = endpoint {
         ensure!(
             owner.is_none() && grant == Some(&launch.plan().grant()),
@@ -75,7 +75,7 @@ pub(crate) fn validate_slot(
         "selected object grant requires the original pair launcher"
     );
     let role = match endpoint {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         Some(InstalledJournal::Object { .. }) => unreachable!(),
         Some(InstalledJournal::Destination { owner, .. }) => {
             ensure!(
@@ -99,7 +99,7 @@ pub(crate) fn validate_slot(
 impl InstalledJournal<'_> {
     pub(crate) fn authorize<'a>(&'a self, posture: RunPosture<'a>) -> RunPosture<'a> {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Object { launch, .. } => posture.with_original_object_worker(launch),
             Self::Destination { admission, .. } => posture.with_incoming_journal(admission),
             Self::Source { admission, .. } => posture.with_paired_journal(admission),
@@ -114,7 +114,7 @@ impl InstalledJournal<'_> {
         use mvm_hostd::mailbox_process::original_journal::JournalOwner;
         let plan = admitted.plan();
         let original = match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Object { owner, .. } => {
                 return match owner.as_mut() {
                     Some(w) => {
@@ -144,7 +144,7 @@ impl InstalledJournal<'_> {
         let name = &started.vm_id().0;
         let backend = started.backend();
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Object { .. } => anyhow::bail!("object worker requires bilateral original join"),
             Self::Destination { owner, .. } => {
                 **owner = Some(OriginalJournalDestination::start_custodied(

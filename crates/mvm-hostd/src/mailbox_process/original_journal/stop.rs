@@ -29,6 +29,8 @@ pub(super) struct StopCustody {
     // Component-only helper fixtures need no VMM. A real typed stop always
     // requires the originally observed kernel identity before touching a VMM.
     vmm: Option<(EndpointPid, ProcessExitObserver)>,
+    #[cfg(target_os = "macos")]
+    pub(super) hvf: Option<crate::plan_admission::object_hvf::OriginalHvf>,
     sdk_abort_confirmed: bool,
     vm_stopped: bool,
     kernel_exit_observed: bool,
@@ -63,7 +65,7 @@ impl StopCustody {
         Self::capture_state(&config.vm_state_dir, backend.kind(), vmm)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn capture_object(
         state_dir: &std::path::Path,
         original: crate::mailbox_launch::object_pair::bootstrap::OriginalVmmId,
@@ -74,14 +76,18 @@ impl StopCustody {
         };
         ensure!(
             id.is_live_and_ours(),
-            "original Firecracker generation changed"
+            "original object VMM generation changed"
         );
         let observer = ProcessExitObserver::arm(id.pid)?;
         ensure!(
             id.is_live_and_ours(),
-            "original Firecracker generation changed during observation"
+            "original object VMM generation changed during observation"
         );
-        Self::capture_state(state_dir, BackendKind::Firecracker, Some((id, observer)))
+        #[cfg(target_os = "linux")]
+        let kind = BackendKind::Firecracker;
+        #[cfg(target_os = "macos")]
+        let kind = BackendKind::Hvf;
+        Self::capture_state(state_dir, kind, Some((id, observer)))
     }
     fn capture_state(
         state_dir: &std::path::Path,
@@ -107,6 +113,8 @@ impl StopCustody {
             split_socket,
             kind,
             vmm,
+            #[cfg(target_os = "macos")]
+            hvf: None,
             sdk_abort_confirmed: false,
             vm_stopped: false,
             kernel_exit_observed: false,
@@ -164,7 +172,7 @@ impl StopCustody {
 pub enum JournalOwner<'a> {
     Source(&'a mut OriginalJournalSourceHost),
     Destination(&'a mut OriginalJournalDestination),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Object(&'a mut super::object_workers::OriginalObjectWorker),
 }
 
@@ -186,7 +194,7 @@ impl JournalOwner<'_> {
         &mut Child,
     ) {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Object(w) => (
                 &w.name,
                 &w.boot,
@@ -223,6 +231,8 @@ impl JournalOwner<'_> {
         backend: &AnyBackend,
         id: &VmId,
     ) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        let is_object = matches!(self, Self::Object(_));
         let (name, boot, _, state, _, _) = self.parts();
         ensure!(
             name == plan.image.name && name == id.0,
@@ -230,6 +240,20 @@ impl JournalOwner<'_> {
         );
         boot.check_plan(plan)?;
         let (original, _) = state.vmm.as_ref().context("original VMM observer absent")?;
+        #[cfg(target_os = "macos")]
+        if is_object {
+            let hvf = state
+                .hvf
+                .as_ref()
+                .context("original HVF worker has no retained native stop authority")?;
+            ensure!(
+                backend.kind() == BackendKind::Hvf,
+                "different original backend"
+            );
+            hvf.stop()?;
+            state.sdk_abort_confirmed = true;
+            return Ok(());
+        }
         ensure!(
             backend.kind() == state.kind
                 && original.is_live_and_ours()
@@ -249,6 +273,8 @@ impl JournalOwner<'_> {
         until: Instant,
         finish: impl FnOnce(&ExecutionPlan, bool) -> Result<()>,
     ) -> Result<JournalStopOutcome> {
+        #[cfg(target_os = "macos")]
+        let is_object = matches!(self, Self::Object(_));
         let (original_name, boot, guard, state, marker, child) = self.parts();
         ensure!(original_name == name, "different original machine name");
         let dir = mvm_core::config::vm_state_dir(name);
@@ -298,18 +324,33 @@ impl JournalOwner<'_> {
             .as_ref()
             .context("no original kernel process identity")?;
         if !state.vm_stopped && !state.sdk_abort_confirmed {
-            let backend =
-                AnyBackend::for_started_vm(name).context("original VMM backend is unavailable")?;
-            let vm = VmId(name.to_owned());
-            ensure!(
-                backend.kind() == state.kind
-                    && original.is_live_and_ours()
-                    && backend.host_process_id(&vm)? == Some(original.pid as u32),
-                "original VMM identity changed"
-            );
-            // The normal backend confirms kernel stop and handles all other
-            // admitted services. The paired mailbox has no numeric PID record.
-            backend.stop(&vm)?;
+            let stop_registered = || -> Result<()> {
+                let backend = AnyBackend::for_started_vm(name)
+                    .context("original VMM backend is unavailable")?;
+                let vm = VmId(name.to_owned());
+                ensure!(
+                    backend.kind() == state.kind
+                        && original.is_live_and_ours()
+                        && backend.host_process_id(&vm)? == Some(original.pid as u32),
+                    "original VMM identity changed"
+                );
+                // The normal backend confirms kernel stop and handles all other
+                // admitted services. The paired mailbox has no numeric PID record.
+                backend.stop(&vm)?;
+                Ok(())
+            };
+            #[cfg(target_os = "macos")]
+            if is_object {
+                state
+                    .hvf
+                    .as_ref()
+                    .context("missing original HVF worker stop authority")?
+                    .stop()?;
+            } else {
+                stop_registered()?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            stop_registered()?;
             state.vm_stopped = true;
         }
         let status = collect_after_vm(
@@ -392,6 +433,8 @@ mod tests {
             split_socket: None,
             kind: BackendKind::Firecracker,
             vmm: Some((pid, ProcessExitObserver::arm(pid.pid).unwrap())),
+            #[cfg(target_os = "macos")]
+            hvf: None,
             sdk_abort_confirmed: false,
             vm_stopped: false,
             kernel_exit_observed: false,

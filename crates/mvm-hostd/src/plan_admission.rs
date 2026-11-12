@@ -100,6 +100,8 @@ mod grant_validation;
 mod host_gates;
 mod mailbox_posture;
 mod nonce_ledger;
+#[cfg(target_os = "macos")]
+pub(crate) mod object_hvf;
 mod registry_pack;
 mod verb_grant_sidecar;
 
@@ -171,6 +173,8 @@ pub struct AdmittedPlan {
     dispatched: bool,
     #[cfg(target_os = "linux")]
     object_firecracker: Option<mvm_runtime::backend::OriginalObjectFirecracker>,
+    #[cfg(target_os = "macos")]
+    object_hvf: Option<object_hvf::OriginalHvf>,
 }
 
 /// Re-verified host artifact behind one extension binding in the signed plan.
@@ -178,6 +182,15 @@ pub struct AdmittedPlan {
 pub struct AdmittedExtension {
     pub binding: mvm_contract::protocol::extension_pack::ExtensionPlanBinding,
     pub root: std::path::PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+fn object_host_backend() -> BackendKind {
+    BackendKind::Hvf
+}
+#[cfg(target_os = "linux")]
+fn object_host_backend() -> BackendKind {
+    BackendKind::Firecracker
 }
 
 impl AdmittedPlan {
@@ -199,7 +212,7 @@ impl AdmittedPlan {
     /// Dispatch a selected persistent SDK boot only under this original
     /// reservation, rootfs digest and signed local plan. This consumes the
     /// admission even if the backend subsequently reports a launch error.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn start_persistent_object_original(
         &mut self,
         launch: &crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<'_>,
@@ -211,9 +224,9 @@ impl AdmittedPlan {
         anyhow::ensure!(
             !self.dispatched
                 && self.variant == Variant::Prod
-                && self.backend == Some(BackendKind::Firecracker)
-                && backend.kind() == BackendKind::Firecracker,
-            "requires fresh original Firecracker admission"
+                && self.backend == Some(object_host_backend())
+                && backend.kind() == object_host_backend(),
+            "requires a fresh original object admission for this native backend"
         );
         launch.require_open()?;
         launch
@@ -249,10 +262,15 @@ impl AdmittedPlan {
             self.mailbox_posture().as_ref(),
         )?;
         self.dispatched = true;
-        let (id, original) =
-            backend.start_original_object_firecracker_custodied(&config, images)?;
-        self.object_firecracker = Some(original);
-        Ok(id)
+        #[cfg(target_os = "linux")]
+        {
+            let (id, original) =
+                backend.start_original_object_firecracker_custodied(&config, images)?;
+            self.object_firecracker = Some(original);
+            Ok(id)
+        }
+        #[cfg(target_os = "macos")]
+        self.activate_object_hvf(launch.hvf_original(), backend, config, images)
     }
 
     #[cfg(target_os = "linux")]
@@ -335,6 +353,8 @@ impl AdmittedPlan {
             dispatched: false,
             #[cfg(target_os = "linux")]
             object_firecracker: None,
+            #[cfg(target_os = "macos")]
+            object_hvf: None,
         }
     }
 
@@ -737,6 +757,8 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         dispatched: false,
         #[cfg(target_os = "linux")]
         object_firecracker: None,
+        #[cfg(target_os = "macos")]
+        object_hvf: None,
     })
 }
 
@@ -933,7 +955,7 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     object_worker: Option<
         &'a crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<'a>,
     >,
@@ -952,7 +974,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             object_worker: None,
             object_plan: None,
             incoming_journal: None,
@@ -973,7 +995,7 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             object_worker: None,
             object_plan: None,
             incoming_journal: None,
@@ -1016,7 +1038,7 @@ impl<'a> RunPosture<'a> {
         self
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn with_original_object_worker(
         mut self,
         launch: &'a crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<
@@ -1041,12 +1063,12 @@ impl<'a> RunPosture<'a> {
                 "object selection requires a dedicated sealed native participant"
             );
             original.verify_selected_plan(plan, SystemClock.now().timestamp_millis())?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Some(worker) = self.object_worker {
                 anyhow::ensure!(
                     std::ptr::eq(original, worker.plan())
-                        && self.backend == Some(BackendKind::Firecracker),
-                    "original Linux worker selection required"
+                        && self.backend == Some(object_host_backend()),
+                    "original platform worker selection required"
                 );
                 worker.require_open()?;
                 return grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(), max_ms);

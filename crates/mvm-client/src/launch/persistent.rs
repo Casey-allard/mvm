@@ -520,7 +520,7 @@ fn finish_legacy_persistent(
         if let Some(state) = fresh_state {
             state.commit();
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(journal::InstalledJournal::Object { launch, .. }) = journal.as_deref() {
             let id = admission.admitted.start_persistent_object_original(
                 launch,
@@ -557,7 +557,7 @@ fn finish_legacy_persistent(
     // host side starts here or the launch is rolled back.
     let paired = journal.is_some();
     if let Some(endpoint) = journal.as_deref_mut() {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let served = if let journal::InstalledJournal::Object { launch, owner } = endpoint {
             let (original, result) = launch.join(admission.admitted, owner);
             admission.admitted = original;
@@ -565,7 +565,7 @@ fn finish_legacy_persistent(
         } else {
             endpoint.serve(&admission.admitted, &started)
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let served = endpoint.serve(&admission.admitted, &started);
         if let Err(error) = served {
             match endpoint.abort_original(&admission.admitted, &started) {

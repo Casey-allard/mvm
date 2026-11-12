@@ -4,7 +4,7 @@
 
 pub mod authorization;
 pub(crate) mod object_registration;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod object_workers;
 #[cfg(test)]
 mod paired_process_tests;

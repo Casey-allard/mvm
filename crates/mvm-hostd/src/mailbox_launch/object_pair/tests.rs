@@ -1046,7 +1046,7 @@ fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_c
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn original_sdk_pair_wait_is_bounded_and_one_failed_start_wakes_its_peer() {
     use std::time::{Duration, Instant};
@@ -1076,6 +1076,23 @@ fn original_sdk_pair_wait_is_bounded_and_one_failed_start_wakes_its_peer() {
             now + Duration::from_secs(12),
         )
         .unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        // Merely owning either admission lane cannot stop a running VMM or
+        // retry a rollback that the SDK has never attempted.
+        assert!(
+            caller
+                .hvf_original()
+                .same_reservation(caller.hvf_original())
+        );
+        assert!(
+            !caller
+                .hvf_original()
+                .same_reservation(callee.hvf_original())
+        );
+        assert!(caller.retry_unserved_hvf_rollback().is_err());
+        assert!(callee.retry_unserved_hvf_rollback().is_err());
+    }
     let boot = BootFixture::new(f.dir.path(), caller.plan().grant(), 1, f.now);
     let host = host_keypair::load_or_init_at(f.dir.path()).unwrap();
     let signer = host_keypair::host_signer_id();

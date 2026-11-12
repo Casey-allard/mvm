@@ -1276,7 +1276,7 @@ impl LocalBackend {
         grant: mvm_contract::protocol::mailbox::MailboxGrant,
         journal: &mut persistent::journal::InstalledJournal<'_>,
     ) -> Result<machine_start::MachineStart> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let _wake_peer = match &*journal {
             persistent::journal::InstalledJournal::Object { launch, .. } => Some(launch.guard()),
             _ => None,

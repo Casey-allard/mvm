@@ -39,6 +39,8 @@ pub struct OriginalObjectLaunch<'a> {
     plan: OriginalObjectPlan<'a>,
     pair: &'a PreparedObjectPair,
     idx: usize,
+    #[cfg(target_os = "macos")]
+    hvf: crate::plan_admission::object_hvf::OriginalHvf,
     gate: Arc<PairGate>,
 }
 
@@ -66,12 +68,23 @@ impl PreparedObjectPair {
             plan,
             pair: self,
             idx,
+            #[cfg(target_os = "macos")]
+            hvf: Default::default(),
             gate: Arc::clone(&gate),
         };
         Ok((lane(a, 0), lane(b, 1)))
     }
 }
 impl OriginalObjectLaunch<'_> {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn hvf_original(&self) -> &crate::plan_admission::object_hvf::OriginalHvf {
+        &self.hvf
+    }
+    /// Retry only an unconfirmed pre-worker rollback of this reservation.
+    #[cfg(target_os = "macos")]
+    pub fn retry_unserved_hvf_rollback(&self) -> Result<()> {
+        self.hvf.retry_unserved()
+    }
     pub fn plan(&self) -> &OriginalObjectPlan<'_> {
         &self.plan
     }
@@ -95,17 +108,43 @@ impl OriginalObjectLaunch<'_> {
     fn start(&self, s: &mut PairState) -> Result<()> {
         let a = s.originals[0].as_ref().unwrap();
         let b = s.originals[1].as_ref().unwrap();
-        let pair = self.pair.bind_originals(
-            InstalledParticipant::from_original_firecracker(a)?,
-            InstalledParticipant::from_original_firecracker(b)?,
-        )?;
         // Backend selection supplies the guest mux address only. The VMM
         // identity and authority always come from each original config session.
         let backend_a = AnyBackend::for_started_vm(&a.plan().image.name)
             .ok_or_else(|| anyhow::anyhow!("original A backend unavailable"))?;
         let backend_b = AnyBackend::for_started_vm(&b.plan().image.name)
             .ok_or_else(|| anyhow::anyhow!("original B backend unavailable"))?;
-        pair.start_original_workers(&backend_a, &backend_b, &mut s.owners, self.gate.until)
+        #[cfg(target_os = "linux")]
+        {
+            let pair = self.pair.bind_originals(
+                InstalledParticipant::from_original_firecracker(a)?,
+                InstalledParticipant::from_original_firecracker(b)?,
+            )?;
+            pair.start_original_workers(&backend_a, &backend_b, &mut s.owners, self.gate.until)
+        }
+        #[cfg(target_os = "macos")]
+        a.object_hvf()?.with_live(|ra| {
+            b.object_hvf()?.with_live(|rb| {
+                let pair = self.pair.bind_originals(
+                    InstalledParticipant::from_original_hvf(a, ra)?,
+                    InstalledParticipant::from_original_hvf(b, rb)?,
+                )?;
+                let result = pair.start_original_workers(
+                    &backend_a,
+                    &backend_b,
+                    &mut s.owners,
+                    self.gate.until,
+                );
+                // A helper may exist even if its peer failed before READY.
+                if let Some(worker) = s.owners.caller.as_mut() {
+                    worker.stop.hvf = Some(a.object_hvf()?.clone());
+                }
+                if let Some(worker) = s.owners.callee.as_mut() {
+                    worker.stop.hvf = Some(b.object_hvf()?.clone());
+                }
+                result
+            })
+        })
     }
 
     /// Return the same admission even on a failed join. An exec'd helper
@@ -115,6 +154,18 @@ impl OriginalObjectLaunch<'_> {
         admitted: AdmittedPlan,
         owner: &mut Option<OriginalObjectWorker>,
     ) -> (AdmittedPlan, Result<()>) {
+        #[cfg(target_os = "macos")]
+        if admitted
+            .object_hvf()
+            .is_ok_and(|held| !held.same_reservation(&self.hvf))
+        {
+            return (
+                admitted,
+                Err(anyhow::anyhow!(
+                    "original HVF belongs to a different SDK reservation"
+                )),
+            );
+        }
         let mut s = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
         if owner.is_some() || s.originals[self.idx].is_some() || s.outcome.is_some() {
             return (
