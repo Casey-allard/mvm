@@ -596,7 +596,7 @@ fn prepare_profile(
         destination: destination_setup,
     })
 }
-fn issue_scoped(
+fn issue_with_policy(
     channel: &CastChannel,
     source: LaunchCustody,
     destination: LaunchCustody,
@@ -604,6 +604,7 @@ fn issue_scoped(
     source_policy: &OpenContext,
     destination_policy: &OpenContext,
     now: i64,
+    immutable_policy: Option<[u8; 32]>,
 ) -> Result<DirectionDelivery> {
     issue_with_policy(
         channel,

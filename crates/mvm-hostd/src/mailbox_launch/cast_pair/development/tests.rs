@@ -6,39 +6,7 @@ use mvm_core::{
     vm_backend::HostDialRoute,
 };
 
-#[derive(Default)]
-struct Meter<S> {
-    io: S,
-    read: usize,
-    written: usize,
-}
-impl<S: std::io::Read> std::io::Read for Meter<S> {
-    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.io.read(b)?;
-        self.read += n;
-        Ok(n)
-    }
-}
-impl<S: std::io::Write> std::io::Write for Meter<S> {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        let n = self.io.write(b)?;
-        self.written += n;
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.io.flush()
-    }
-}
-fn thread_cpu() -> u64 {
-    let mut t = std::mem::MaybeUninit::<libc::timespec>::uninit();
-    // SAFETY: on success clock_gettime initializes the provided timespec.
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, t.as_mut_ptr()) },
-        0
-    );
-    let t = unsafe { t.assume_init() };
-    (t.tv_sec as u64) * 1_000_000_000 + t.tv_nsec as u64
-}
+use crate::mailbox_process::destination_ingress::test_meter::{Meter, thread_cpu};
 fn owner(b: u8) -> MailboxWorkerOwner {
     MailboxWorkerOwner {
         daemon_boot_nonce: [42; 32],

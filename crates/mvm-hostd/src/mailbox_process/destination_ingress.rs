@@ -342,6 +342,43 @@ pub(super) fn run(
 }
 
 #[cfg(test)]
+pub(crate) mod test_meter {
+    #[derive(Default)]
+    pub(crate) struct Meter<S> {
+        pub(crate) io: S,
+        pub(crate) read: usize,
+        pub(crate) written: usize,
+    }
+    impl<S: std::io::Read> std::io::Read for Meter<S> {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.io.read(b)?;
+            self.read += n;
+            Ok(n)
+        }
+    }
+    impl<S: std::io::Write> std::io::Write for Meter<S> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let n = self.io.write(b)?;
+            self.written += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.io.flush()
+        }
+    }
+    pub(crate) fn thread_cpu() -> u64 {
+        let mut t = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: on success clock_gettime initializes the provided timespec.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, t.as_mut_ptr()) },
+            0
+        );
+        let t = unsafe { t.assume_init() };
+        (t.tv_sec as u64) * 1_000_000_000 + t.tv_nsec as u64
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn qualify(
     role: &DestinationRole,
     keys: &DerivedMailboxKeys,
@@ -350,6 +387,7 @@ pub(crate) fn qualify(
     original: &[u8],
 ) {
     use std::{cell::Cell, net::Shutdown};
+    use test_meter::{Meter, thread_cpu};
     struct Current {
         samples: Cell<usize>,
         deny_after_first: bool,
@@ -389,28 +427,43 @@ pub(crate) fn qualify(
         ),
         Err(TurnFailure::Definite(_))
     ));
-    let (mut client, mut peer) = UnixStream::pair().unwrap();
-    let (host, mut guest) = UnixStream::pair().unwrap();
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    let (host, guest) = UnixStream::pair().unwrap();
     for s in [&client, &peer, &host, &guest] {
         s.set_read_timeout(Some(TURN)).unwrap();
         s.set_write_timeout(Some(TURN)).unwrap();
     }
+    let mut client = Meter {
+        io: client,
+        read: 0,
+        written: 0,
+    };
+    let mut guest = Meter {
+        io: guest,
+        read: 0,
+        written: 0,
+    };
     let start = Instant::now();
     std::thread::scope(|threads| {
         let remote = threads.spawn(|| {
+            let cpu = thread_cpu();
             let mut inbox = role.channel.inbox();
             role.channel
                 .receive_on(&mut guest, crate::mailbox_launch::now_unix_ms, &mut inbox)
                 .unwrap();
-            inbox
+            let result = inbox
                 .consume_with(|v| Ok::<_, ()>(v.body.clone()))
                 .unwrap()
-                .unwrap()
+                .unwrap();
+            (result, thread_cpu() - cpu, guest.read, guest.written)
         });
         let source = threads.spawn(|| {
+            let cpu = thread_cpu();
             let result = frame::strict_peer_verdict(&mut client, &frame).unwrap();
             assert!(result.is_ok());
+            (thread_cpu() - cpu, client.written, client.read)
         });
+        let cpu = thread_cpu();
         let ok = deliver(&mut peer, role, keys, key, &mut history, &current, || {
             Ok(host)
         });
@@ -418,13 +471,22 @@ pub(crate) fn qualify(
         let reply = serde_json::to_vec(&Result::<(), Refusal>::Ok(())).unwrap();
         peer.write_all(&reply).unwrap();
         peer.shutdown(Shutdown::Write).unwrap();
-        source.join().unwrap();
-        assert_eq!(remote.join().unwrap(), original);
+        let helper_cpu = thread_cpu() - cpu;
+        let (source_cpu, forward, reverse) = source.join().unwrap();
+        let (actual, guest_cpu, delivered, acked) = remote.join().unwrap();
+        assert_eq!(actual, original);
+        assert_eq!(forward, frame.len() + 4);
+        assert_eq!(reverse, reply.len());
         eprintln!(
-            "ORIGINAL_DESTINATION_COMPONENT payload={} framed_bytes_written={} verdict_bytes_read={} receive_through_join_ns={}",
+            "ORIGINAL_DESTINATION_COMPONENT payload={} peer_forward={} peer_reverse={} role_forward={} role_reverse={} peer_cpu_ns={} helper_cpu_ns={} guest_cpu_ns={} receive_through_join_ns={}",
             original.len(),
-            frame.len() + 4,
-            reply.len(),
+            forward,
+            reverse,
+            delivered,
+            acked,
+            source_cpu,
+            helper_cpu,
+            guest_cpu,
             start.elapsed().as_nanos()
         );
     });
