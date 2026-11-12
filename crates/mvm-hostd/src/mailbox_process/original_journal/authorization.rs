@@ -310,6 +310,7 @@ mod tests {
             .expires_at_unix_ms
             .min(send.grant.expires_at_unix_ms);
         let d = MailboxJournalDirectionV1 {
+            sender_settlement: None,
             source: a.header.sender,
             destination_plan_sha256: [4; 32],
             destination_plan_nonce: [3; 16],

@@ -305,11 +305,21 @@ impl From<MailboxRetentionPolicy> for MailboxRetentionPolicyWire {
     }
 }
 
+/// Opt-in, original-sender allocation and settlement. A missing choice keeps
+/// the legacy arbitrary message-ID path and its existing retention limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SenderSettlementProfile {
+    OrdinalV1,
+}
+
 /// One approved outbound trusted-host journal direction. B is admitted before A
 /// so none of these immutable fields refer circularly to A's eventual plan ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxJournalDirectionV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_settlement: Option<SenderSettlementProfile>,
     pub source: PrincipalId,
     pub destination_plan_sha256: [u8; 32],
     pub destination_plan_nonce: [u8; 16],

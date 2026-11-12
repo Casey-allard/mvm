@@ -263,6 +263,7 @@ fn run() -> Result<()> {
     .min()
     .unwrap();
     let direction = MailboxJournalDirectionV1 {
+        sender_settlement: None,
         source: grants.destination_send.grant.subject,
         destination_plan_sha256: hex::decode(&bp.plan_id.0[7..])?.try_into().unwrap(),
         destination_plan_nonce: hex::decode(bp.nonce.as_hex())?.try_into().unwrap(),

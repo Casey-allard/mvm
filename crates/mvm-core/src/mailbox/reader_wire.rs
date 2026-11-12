@@ -118,6 +118,9 @@ impl OriginalObjectSealV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderRequest {
+    SenderOrdinalV1 {
+        request: Box<super::sender_ordinal::SenderRequestV1>,
+    },
     /// Fresh, read-only sample for the exact retained, unacknowledged Call.
     AuthorizeObjectCallV1 {
         pair: [u8; 32],
@@ -182,6 +185,14 @@ pub enum ApplicationReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderResponse {
+    SenderAcceptedV1 {
+        handle: super::sender_ordinal::SenderOrdinalV1,
+        receipt: Box<SignedDestinationReceipt>,
+    },
+    SenderSettledV1 {
+        handle: super::sender_ordinal::SenderOrdinalV1,
+        retired_through: u64,
+    },
     /// Guest proof of a current check against its enrolled original host.
     ObjectCallAuthorityV1 {
         role: Box<super::object_pair::role::SignedObjectRoleV1>,
@@ -342,7 +353,7 @@ impl Write for BoundedBytes {
     }
 }
 
-mod payload_base64 {
+pub(super) mod payload_base64 {
     use super::*;
     use serde::{Deserializer, Serializer, de::Error as _};
 

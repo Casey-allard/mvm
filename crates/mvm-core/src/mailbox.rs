@@ -31,6 +31,7 @@ pub mod frame;
 
 /// Original boot projection for one separately admitted remote journal.
 pub mod outbound;
+pub mod sender_ordinal;
 
 /// Signed-plan preflight for the optional durable object Call/Reply mapping.
 pub mod object_pair;
