@@ -77,6 +77,12 @@ pub(crate) struct PrivateDestination {
     policies: [Policy; 2],
 }
 impl PrivateDestination {
+    pub(super) fn for_source(&self, capsule: &Capsule) -> Self {
+        let mut source = self.clone();
+        source.capsule = capsule.0.to_vec();
+        source
+    }
+
     pub(super) fn new(
         delivery: &DirectionDelivery,
         a: &SignedExecutionPlan,
@@ -128,6 +134,15 @@ pub(crate) struct DestinationRole {
     policies: [Policy; 2],
 }
 impl DestinationRole {
+    pub(crate) fn source_for<'a>(&'a self, key: &'a InstalledDirection) -> VerifiedSourceRole<'a> {
+        VerifiedSourceRole {
+            channel: &self.channel,
+            grants: self.grants(),
+            direction: &self.direction,
+            key,
+        }
+    }
+
     pub(crate) fn grants(&self) -> AddressedCastGrants<'_> {
         AddressedCastGrants {
             source_scope: &self.creds[0],
@@ -158,10 +173,27 @@ impl PrivateSlot {
         owner: &MailboxWorkerOwner,
         original_grant: &MailboxGrant,
     ) -> Result<Option<DestinationRole>> {
+        self.open_immutable_role(owner, original_grant, EndpointRole::Destination)
+    }
+
+    pub(crate) fn open_immutable_role(
+        &mut self,
+        owner: &MailboxWorkerOwner,
+        original_grant: &MailboxGrant,
+        endpoint: EndpointRole,
+    ) -> Result<Option<DestinationRole>> {
         let Self::Pending(p) = self else {
             return Ok(None);
         };
-        let Some(bundle) = p.destination.take() else {
+        ensure!(
+            p.destination.is_none() || p.source.is_none(),
+            "ambiguous original private roles"
+        );
+        let original = match endpoint {
+            EndpointRole::Source => &mut p.source,
+            EndpointRole::Destination => &mut p.destination,
+        };
+        let Some(bundle) = original.take() else {
             return Ok(None);
         };
         let now = super::super::now_unix_ms();
@@ -170,9 +202,9 @@ impl PrivateSlot {
             commitment: commit(b"mvm-development-directional-aes-256-gcm-v1", &fields)?,
             fields,
         };
-        direction.fields.destination.original(owner)?;
+        direction.end(endpoint).original(owner)?;
         ensure!(
-            p.end.role == EndpointRole::Destination && p.direction == Some(direction.commitment()),
+            p.end.role == endpoint && p.direction == Some(direction.commitment()),
             "private direction or recipient mismatch"
         );
         let keys = [
@@ -200,7 +232,12 @@ impl PrivateSlot {
         )?;
         channel.restrict_frame_budget(super::super::CAST_BODY_LIMIT as u32)?;
         ensure!(
-            channel.is_bounded_destination(original_grant, super::super::CAST_BODY_LIMIT),
+            match endpoint {
+                EndpointRole::Source =>
+                    channel.is_bounded_source(original_grant, super::super::CAST_BODY_LIMIT),
+                EndpointRole::Destination =>
+                    channel.is_bounded_destination(original_grant, super::super::CAST_BODY_LIMIT),
+            },
             "signed plans do not bind original destination"
         );
         let role = DestinationRole {
@@ -210,7 +247,11 @@ impl PrivateSlot {
             policies: bundle.policies,
         };
         ensure!(
-            role.creds[2] == p.scope
+            role.creds[if endpoint == EndpointRole::Source {
+                0
+            } else {
+                2
+            }] == p.scope
                 && credentials(role.grants())? == role.direction.fields.credentials,
             "signed original grant changed"
         );
@@ -221,13 +262,7 @@ impl PrivateSlot {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("wrong wrapped key length"))?,
         );
-        self.accept(
-            &role.direction,
-            EndpointRole::Destination,
-            owner,
-            &wrapped,
-            now,
-        )?;
+        self.accept(&role.direction, endpoint, owner, &wrapped, now)?;
         Ok(Some(role))
     }
 }

@@ -20,6 +20,8 @@
 //! rather than boot a guest that asserts a mailbox nobody serves.
 
 pub(crate) mod destination_ingress;
+#[cfg(unix)]
+mod source_ingress;
 pub mod installed_profile;
 pub mod owned;
 pub mod owned_client;

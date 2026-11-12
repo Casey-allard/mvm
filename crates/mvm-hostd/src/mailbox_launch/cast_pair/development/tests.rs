@@ -156,6 +156,7 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         destination::PrivateDestination::new(&offer, &left, &right, &trust, g, &src, &dest)
             .unwrap(),
     ));
+    original_a.setup.source = Some(Box::new(original_b.setup.destination.as_ref().unwrap().for_source(&offer.source)));
     assert_ne!(offer.source.0, offer.destination.0);
     let d = &offer.direction;
     let public = d
@@ -260,9 +261,7 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         )
         .is_err()
     );
-    src_slot
-        .accept(d, EndpointRole::Source, &aowner, &offer.source, now)
-        .unwrap();
+    let source_role = src_slot.open_immutable_role(&aowner, &a.grant, EndpointRole::Source).unwrap().unwrap();
     let first = src_slot
         .installed(d, EndpointRole::Source, &aowner)
         .unwrap();
@@ -296,6 +295,8 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
         &a.grant.local_service.unwrap().limits,
     )
     .unwrap();
+    let observed=crate::mailbox_process::source_ingress::qualify(&source_role, first, &a.keys, &original, a.grant.local_service.unwrap().limits);
+    crate::mailbox_process::destination_ingress::qualify(&ingress, &b.keys, second, &observed, bytes);
     let mut sealer = a.keys.trust().1;
     // A fixture credit is sufficient for this source/crypto component;
     // BoundSourceGeneration obtains an actual shared ledger reservation.

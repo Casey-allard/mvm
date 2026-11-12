@@ -34,7 +34,7 @@ fn denied() -> io::Error {
         "original Cast owner unavailable",
     )
 }
-fn fence(ctrl: &UnixStream, parent: u32) -> io::Result<()> {
+pub(super) fn fence(ctrl: &UnixStream, parent: u32) -> io::Result<()> {
     // SAFETY: getppid has no preconditions. Only poll the inherited FD.
     if unsafe { libc::getppid() } as u32 != parent {
         return Err(denied());
@@ -66,7 +66,7 @@ fn original_peer(stream: &UnixStream, parent: u32) -> io::Result<()> {
     }
     Ok(())
 }
-fn bind(path: &Path) -> io::Result<UnixListener> {
+pub(super) fn bind(path: &Path) -> io::Result<UnixListener> {
     let dir = std::fs::symlink_metadata(path.parent().ok_or_else(denied)?)?;
     // SAFETY: geteuid has no preconditions.
     if !dir.is_dir() || dir.mode() & 0o022 != 0 || dir.uid() != unsafe { libc::geteuid() } {
@@ -79,7 +79,7 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
     l.set_nonblocking(true)?;
     Ok(l)
 }
-fn bound_route(
+pub(super) fn bound_route(
     route: &mvm_core::vm_backend::HostDialRoute,
     deadline: Instant,
 ) -> io::Result<UnixStream> {
@@ -95,10 +95,10 @@ fn bound_route(
     .map_err(io::Error::other)
 }
 
-struct LiveIo<'a> {
-    io: DeadlineStream<'a>,
-    ctrl: &'a UnixStream,
-    parent: u32,
+pub(super) struct LiveIo<'a> {
+    pub(super) io: DeadlineStream<'a>,
+    pub(super) ctrl: &'a UnixStream,
+    pub(super) parent: u32,
 }
 impl Read for LiveIo<'_> {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
@@ -244,6 +244,42 @@ fn deliver<R: Read, S: Read + Write>(
         }
     }
 }
+/// Accept only the process identified on the inherited control stream. A
+/// separate peer data connection cannot substitute a new parent or helper.
+pub(super) fn next_original(control:&UnixStream, parent:u32, l:&UnixListener) -> io::Result<Option<UnixStream>> {
+    loop {
+        let mut fds = [control.as_raw_fd(), l.as_raw_fd()].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 500) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if fds[0].revents != 0 {
+            return Ok(None);
+        }
+        fence(control, parent)?;
+        if fds[1].revents == 0 {
+            continue;
+        }
+        let incoming = match l.accept() {
+            Ok((s, _)) => s,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        };
+        if original_peer(&incoming, parent).is_err() {
+            continue;
+        }
+        return Ok(Some(incoming));
+    }
+}
+
 pub(super) fn run(
     original: super::owned::BoundCastEndpoint<'_>,
     role: DestinationRole,
@@ -272,34 +308,7 @@ pub(super) fn run(
         pid: parent,
     };
     loop {
-        let mut fds = [control.as_raw_fd(), l.as_raw_fd()].map(|fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 500) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        if fds[0].revents != 0 {
-            return Ok(counts);
-        }
-        fence(control, parent)?;
-        if fds[1].revents == 0 {
-            continue;
-        }
-        let incoming = match l.accept() {
-            Ok((s, _)) => s,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
-        };
-        if original_peer(&incoming, parent).is_err() {
-            continue;
-        }
+        let Some(incoming) = next_original(control, parent, &l)? else { return Ok(counts); };
         let until = Instant::now() + TURN;
         let mut peer = LiveIo {
             io: DeadlineStream::new(&incoming, until),
