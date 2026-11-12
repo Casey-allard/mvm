@@ -776,6 +776,25 @@ mod tests {
         drop(peer);
     }
 
+    #[test]
+    fn post_exec_handshake_failure_retains_original_child_and_marker() {
+        let keys = keys_dir();
+        let state = tempfile::tempdir().unwrap();
+        let config =
+            build_config(keys.path(), &grant(keys.path()), state.path(), test_route()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("15");
+        let (mut child, mut marker) = original_journal::spawn_claimed(dir.path(), command).unwrap();
+        assert!(configure_serving(&config, &mut child).is_err());
+        assert!(marker.collect(&mut child).unwrap().is_none());
+        assert!(dir.path().join(original_journal::MARKER).is_file());
+        assert!(!state.path().join(MAILBOX_PID_FILE).exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(marker.collect(&mut child).unwrap().is_some());
+    }
+
     fn test_route() -> HostDialRoute {
         HostDialRoute::PortSocket(PathBuf::from("/p"))
     }
