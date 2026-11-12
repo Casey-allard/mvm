@@ -212,7 +212,19 @@ mod tests {
         }
         let (mut parent, child) = UnixStream::pair().unwrap();
         assert!(Controller::capture(&parent).is_err());
-        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","mailbox_process::object_worker::hvf::tests::original_darwin_controller_requires_full_connection_after_config"]).env(CHILD,"1").stdin(std::process::Stdio::from(OwnedFd::from(child))).stdout(Stdio::null()).spawn().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                concat!(
+                    "mailbox_process::object_worker::hvf::tests::",
+                    "original_darwin_controller_requires_full_connection_after_config"
+                ),
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::from(OwnedFd::from(child)))
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
         parent
             .set_read_timeout(Some(Duration::from_secs(6)))
             .unwrap();
@@ -229,7 +241,7 @@ mod tests {
         let (b, _b) = UnixStream::pair().unwrap();
         for (second, ok) in [(&b, true), (&a, false)] {
             send_rights(&parent, 2, [a.as_fd(), second.as_fd()], deadline()).unwrap();
-            let links = receive_links(&controller);
+            let links = receive_links(&controller, deadline());
             assert_eq!(links.is_ok(), ok);
             if let Ok(links) = links {
                 for l in &links {
