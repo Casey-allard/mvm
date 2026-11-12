@@ -636,3 +636,27 @@ fn test_object_projection(
         Some(object_delivery_commitment(&pair, &changed, b"hello").unwrap());
     assert!(check(&pair, &changed, b"hello", &forged).is_err());
 }
+
+#[cfg(not(unix))]
+#[test]
+fn unsupported_host_refuses_boot_file_authority() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let error = MailboxReaderBootBinding::load(directory.path())
+        .expect_err("unsupported boot file loading");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .expect("typed refusal")
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    let error = MailboxReaderBootBinding::load_guest_original()
+        .expect_err("unsupported guest boot authority");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .expect("typed refusal")
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+}

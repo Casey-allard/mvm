@@ -6,6 +6,13 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
+#[path = "reader/platforms/unix.rs"]
+mod platform;
+#[cfg(not(unix))]
+#[path = "reader/platforms/unsupported.rs"]
+mod platform;
+
 use anyhow::{Context as _, Result as AnyResult};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use mvm_contract::protocol::mailbox::{
@@ -161,43 +168,11 @@ impl MailboxReaderBootBinding {
     /// agent from its identity drive. The original boot is never supplied in
     /// application input or learned from the peer that is proving possession.
     pub fn load_guest_original() -> AnyResult<Self> {
-        use std::os::unix::fs::MetadataExt as _;
-        let dir = Path::new("/run/mvm");
-        for ancestor in dir.ancestors() {
-            let m = std::fs::symlink_metadata(ancestor)?;
-            anyhow::ensure!(
-                m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0,
-                "untrusted original boot directory"
-            );
-        }
-        Self::load_binding(dir, true)
+        platform::load_guest_original()
     }
 
     fn load_binding(state_dir: &Path, guest_original: bool) -> AnyResult<Self> {
-        use std::io::Read as _;
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-        let path = state_dir.join(MAILBOX_READER_BOOT_FILE);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
-        let metadata = file.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file()
-                && (!guest_original || (metadata.uid() == 0 && metadata.mode() & 0o222 == 0))
-                && metadata.nlink() == 1
-                && metadata.len() <= MAX_MAILBOX_READER_BOOT_BYTES,
-            "mailbox reader boot binding is not a bounded regular file"
-        );
-        let mut bytes = Vec::new();
-        file.take(MAX_MAILBOX_READER_BOOT_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        anyhow::ensure!(
-            bytes.len() as u64 <= MAX_MAILBOX_READER_BOOT_BYTES,
-            "mailbox reader boot binding exceeds the encoded bound"
-        );
-        serde_json::from_slice(&bytes).context("decode mailbox reader boot binding")
+        platform::load_binding(state_dir, guest_original)
     }
 
     /// Refuse a stale parent or moved mailbox before this boot can enroll.

@@ -6,10 +6,11 @@
 //! acceptance only after the journal and independent anchor commit. A hash
 //! chain alone cannot detect deletion of its suffix.
 
+use crate::private_fs;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
@@ -1740,12 +1741,12 @@ fn record_path(root: &Path, cursor: u64) -> PathBuf {
 }
 
 fn read_record(path: &Path) -> Result<Vec<u8>, JournalError> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    let file = private_fs::open_readonly_nofollow(path)?;
     let meta = file.metadata()?;
-    if !meta.file_type().is_file() || meta.nlink() != 1 || meta.len() > MAX_RECORD_BYTES as u64 {
+    if !meta.file_type().is_file()
+        || private_fs::hard_link_count(&meta)? != 1
+        || meta.len() > MAX_RECORD_BYTES as u64
+    {
         return Err(JournalError::Corrupt);
     }
     let mut bytes = Vec::new();
@@ -2389,6 +2390,7 @@ mod anchor_tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_never_follows_a_replaced_record_outside_its_private_directory() {
         let dir = tempfile::tempdir().expect("journal root");

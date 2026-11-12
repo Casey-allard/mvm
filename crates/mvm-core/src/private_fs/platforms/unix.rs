@@ -171,3 +171,17 @@ pub(super) fn sync_managed_directory_chain_with(
     }
     Ok(())
 }
+
+/// Open an existing record without following a final symlink or waiting on a FIFO.
+pub(crate) fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+pub(crate) fn hard_link_count(metadata: &Metadata) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(metadata.nlink())
+}
