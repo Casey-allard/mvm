@@ -25,7 +25,7 @@ impl ObjectWorkerBootstrapV1 {
             self.history_ref.address(),
             self.secrets.anchor,
         )?;
-        let journal = MailboxJournal::open_local_with_custody(
+        let mut journal = MailboxJournal::open_local_with_custody(
             &self.local_journal,
             self.history_ref,
             VerifyingKey::from_bytes(&plan.authority_key)?,
@@ -37,7 +37,27 @@ impl ObjectWorkerBootstrapV1 {
             &anchor,
             plan.retention.context("original retention absent")?,
         )?;
+        match self.maintain(&mut journal, &anchor, a.now) {
+            // Resume on the very next turn; the journal stays open and cannot
+            // accept new input while its bounded expiry pass remains pending.
+            Ok(()) | Err(JournalError::MaintenancePending) => (),
+            Err(e) => return Err(e.into()),
+        }
         Ok((journal, anchor))
+    }
+    fn maintain(
+        &self,
+        journal: &mut MailboxJournal,
+        anchor: &FileJournalAnchor,
+        now: i64,
+    ) -> Result<(), JournalError> {
+        let signer = SigningKey::from_bytes(&self.secrets.local_authority);
+        if journal.local_compaction_due(now)? {
+            journal.compact_local(now, &signer, anchor)?;
+        }
+        crate::mailbox_service::durable::settle_expired_at(journal, now, &signer, |tip| {
+            anchor.advance(tip)
+        })
     }
     fn incoming(&self) -> &SignedMailboxCapability {
         match self.role.role.role {
@@ -87,6 +107,7 @@ impl ObjectWorkerBootstrapV1 {
             self.incoming() == cap,
             "different original recipient credential"
         );
+        self.maintain(journal, anchor, a.now)?;
         let original_window = match self.role.role.role {
             ObjectParticipantRole::Caller => {
                 let (_, validity) = super::super::pending::recover(
@@ -152,6 +173,8 @@ impl ObjectWorkerBootstrapV1 {
         proof: &[u8],
     ) -> Result<ReaderResponse> {
         let local = self.endpoint_material()?;
+        let a = self.validate_current()?;
+        self.maintain(journal, anchor, a.now)?;
         let a = self.validate_current()?;
         let ctx = self.context(&a, true);
         let sender = VerifyingKey::from_bytes(self.incoming().grant.subject.as_bytes())?;
@@ -227,6 +250,8 @@ impl ObjectWorkerBootstrapV1 {
         signed: &SignedMailboxDeliveryAck,
     ) -> Result<JournalTip> {
         let local = self.endpoint_material()?;
+        let a = self.validate_current()?;
+        self.maintain(journal, anchor, a.now)?;
         let a = self.validate_current()?;
         let ctx = self.context(&a, true);
         let sender = VerifyingKey::from_bytes(self.incoming().grant.subject.as_bytes())?;

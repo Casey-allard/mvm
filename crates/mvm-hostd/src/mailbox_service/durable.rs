@@ -658,11 +658,19 @@ fn settle_expired(
     journal: &mut MailboxJournal,
     now_unix_ms: i64,
 ) -> Result<(), JournalError> {
+    settle_expired_at(journal, now_unix_ms, &shared.signer, |tip| {
+        shared.anchor.commit(tip)
+    })
+}
+
+pub(crate) fn settle_expired_at(
+    journal: &mut MailboxJournal,
+    now_unix_ms: i64,
+    signer: &SigningKey,
+    anchor: impl Fn(JournalTip) -> Result<(), JournalError>,
+) -> Result<(), JournalError> {
     for _ in 0..MAX_EXPIRY_RECORDS_PER_REQUEST {
-        if journal
-            .expire_next(now_unix_ms, &shared.signer, |tip| shared.anchor.commit(tip))?
-            .is_none()
-        {
+        if journal.expire_next(now_unix_ms, signer, &anchor)?.is_none() {
             return Ok(());
         }
     }

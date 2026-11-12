@@ -89,6 +89,31 @@ impl InstalledObjectPair<'_> {
             ObjectParticipantRole::Caller => (&self.caller, &self.material.caller),
             ObjectParticipantRole::Callee => (&self.callee, &self.material.callee),
         };
+        let state = mvm_core::config::vm_state_dir(&source.admitted.plan().image.name);
+        let route = backend
+            .host_dial_route(&state, MAILBOX_PORT)
+            .context("no admitted guest mailbox route")?;
+        let config = self.material.local_bootstrap(
+            local,
+            &self.prepared.credentials,
+            [self.caller.admitted.signed(), self.callee.admitted.signed()],
+            [a, b],
+            route,
+        )?;
+        self.check_current()?;
+        Ok((config, [afd, bfd]))
+    }
+}
+
+impl PairMaterial {
+    pub(super) fn local_bootstrap(
+        &self,
+        local: &InstalledEndpointMaterial,
+        creds: &ObjectPairCredentials,
+        plans: [&SignedExecutionPlan; 2],
+        [a, b]: [OriginalVmmId; 2],
+        route: HostDialRoute,
+    ) -> Result<ObjectWorkerBootstrapV1> {
         let keys = mvm_core::config::mvm_keys_dir();
         let paths = local.custody.storage_paths(&keys)?;
         let local_keys = super::super::derived_keys(
@@ -101,19 +126,15 @@ impl InstalledObjectPair<'_> {
                 && local_keys.sender.verifying_key() == local.sender.verifying_key(),
             "local worker signer changed"
         );
-        let state = mvm_core::config::vm_state_dir(&source.admitted.plan().image.name);
-        let route = backend
-            .host_dial_route(&state, MAILBOX_PORT)
-            .context("no admitted guest mailbox route")?;
         let history_ref = local.custody.history_reference();
         let history = local.custody.load_existing(&history_ref)?;
         let config = ObjectWorkerBootstrapV1 {
             role: local.public_role.clone(),
-            caller_plan: self.caller.admitted.signed().clone(),
-            callee_plan: self.callee.admitted.signed().clone(),
-            plan_verifier: self.material.plan_verifier.to_bytes(),
-            caller_receive: self.prepared.credentials.receive_at_caller.clone(),
-            callee_receive: self.prepared.credentials.receive_at_callee.clone(),
+            caller_plan: plans[0].clone(),
+            callee_plan: plans[1].clone(),
+            plan_verifier: self.plan_verifier.to_bytes(),
+            caller_receive: creds.receive_at_caller.clone(),
+            callee_receive: creds.receive_at_callee.clone(),
             reader_enrollment: local.reader.enrollment.clone(),
             caller_vmm: a,
             callee_vmm: b,
@@ -133,8 +154,7 @@ impl InstalledObjectPair<'_> {
                 anchor: local.custody.anchor_key(),
             },
         };
-        self.check_current()?;
-        Ok((config, [afd, bfd]))
+        Ok(config)
     }
 }
 
@@ -263,6 +283,7 @@ impl ObjectWorkerBootstrapV1 {
             ensure!(
                 crate::mailbox_process::load_admitted_plan(state)? == *plan
                     && MailboxReaderBootBinding::load(state)? == *boot
+                    && !ledger.entry(&plan.image.name).quarantined
                     && ledger.entry(&plan.image.name).epoch.0 == boot.execution_epoch.get()
                     && incoming.grant.policy_epoch == template
                     && !revoked.contains(&incoming.grant.revocation_id),

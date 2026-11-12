@@ -879,3 +879,157 @@ fn per_role_sender_retries_the_original_seal_after_an_uncertain_carrier_result()
             .is_err()
     );
 }
+
+#[test]
+fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_call()
+-> anyhow::Result<()> {
+    use crate::mailbox_service::object_intent::OutboundObject;
+    use bootstrap::OriginalVmmId;
+    use mvm_core::mailbox::{
+        reader::sign_delivery_ack,
+        reader_wire::{ObjectSubmissionV1, ReaderResponse},
+    };
+    use std::time::{Duration, Instant};
+    let _env = mvm_core::util::test_env::TestEnv::new();
+    let f = Originals::new();
+    let keys = mvm_core::config::mvm_keys_dir();
+    mvm_core::private_fs::ensure_private_dir(&keys)?;
+    for file in [super::super::SIGNER_SECRET, super::super::SIGNER_PUBLIC] {
+        std::fs::copy(f.dir.path().join(file), keys.join(file))?;
+    }
+    Key::load_or_create(&keys.join(super::super::ENCRYPTION_ROOT))?;
+    let p = f.prepare(f.credentials.clone())?;
+    let (ag, bg) = p.selected_grants();
+    let a = BootFixture::new(&keys, ag, 1, f.now);
+    let b = BootFixture::new(&keys, bg, 2, f.now);
+    let original_state = |n, boot: &BootFixture| -> anyhow::Result<_> {
+        let d = mvm_core::config::vm_state_dir(&format!("vm-{n}"));
+        mvm_core::private_fs::ensure_private_dir(&d)?;
+        boot.boot.persist(&d)?;
+        std::fs::write(d.join("plan.json"), serde_json::to_vec(&boot.signed)?)?;
+        Ok(d)
+    };
+    let ad = original_state(1, &a)?;
+    let bd = original_state(2, &b)?;
+    let material = p.bind_at(
+        &keys,
+        BootInput {
+            state: &ad,
+            ..a.input()
+        },
+        BootInput {
+            state: &bd,
+            ..b.input()
+        },
+        f.now,
+    )?;
+    let bootstrap = |local, d: &Path| {
+        material.local_bootstrap(
+            local,
+            &p.credentials,
+            [&a.signed, &b.signed],
+            [
+                OriginalVmmId { pid: 1, birth: 1 },
+                OriginalVmmId { pid: 2, birth: 2 },
+            ],
+            mvm_core::vm_backend::HostDialRoute::Mux(
+                mvm_agentd::vsock::vsock_uds_path(&d.to_string_lossy()).into(),
+            ),
+        )
+    };
+    let ca = bootstrap(&material.caller, &ad)?;
+    let mut cb = bootstrap(&material.callee, &bd)?;
+    cb.validate_current()?;
+    cb.secrets.anchor[0] ^= 1;
+    assert!(cb.open_journal().is_err());
+    cb.secrets.anchor[0] ^= 1;
+    cb.secrets.history[0] ^= 1;
+    assert!(cb.open_journal().is_err());
+    cb.secrets.history[0] ^= 1;
+    let (mut ja, aa) = ca.open_journal()?;
+    let (mut jb, ab) = cb.open_journal()?;
+    let call = ObjectSubmissionV1::Call {
+        message_id: MessageId::from_bytes([72; 32]),
+        correlation_id: CorrelationId::from_bytes([73; 32]),
+        payload: b"SC\0\x11\0".to_vec(),
+    };
+    let now = || super::super::now_unix_ms();
+    let until = Instant::now() + Duration::from_secs(10);
+    let sent = OutboundObject {
+        pair: p.stamp,
+        boot: a.boot.boot,
+        submission: &call,
+        original: None,
+    }
+    .forward(
+        &ca.endpoint_material()?,
+        &ca.local_intents,
+        until,
+        || Ok(ca.validate_current()?.now),
+        |turn, _| cb.admit_original(&mut jb, &ab, turn.capability(), turn.envelope()),
+    )?;
+    assert!(matches!(sent, ReaderResponse::ObjectSealAcceptedV1 { .. }));
+    let challenge = [19; 32];
+    let proof = sign_reader_possession(&cb.reader_enrollment, &challenge, &b.ack)?;
+    let ReaderResponse::ObjectDeliveryV1 {
+        payload,
+        lease,
+        header,
+    } = cb.lease_original(&mut jb, &ab, &challenge, &proof)?
+    else {
+        anyhow::bail!("B delivery missing")
+    };
+    assert_eq!(payload.as_slice(), call.payload());
+    assert_eq!(header.message_id, call.message_id());
+    cb.authorize_call(&jb, &lease)?;
+    let reply = ObjectSubmissionV1::Reply {
+        message_id: MessageId::from_bytes([74; 32]),
+        original_call: lease.clone(),
+        payload: b"reply\0\0".to_vec(),
+    };
+    let original = jb.original_object_call(&lease, now())?;
+    let sent = OutboundObject {
+        pair: p.stamp,
+        boot: b.boot.boot,
+        submission: &reply,
+        original: Some(&original),
+    }
+    .forward(
+        &cb.endpoint_material()?,
+        &cb.local_intents,
+        until,
+        || Ok(cb.validate_current()?.now),
+        |turn, _| ca.admit_original(&mut ja, &aa, turn.capability(), turn.envelope()),
+    )?;
+    assert!(matches!(sent, ReaderResponse::ObjectSealAcceptedV1 { .. }));
+    let ack = |lease, guest| {
+        sign_delivery_ack(
+            MailboxDeliveryAck {
+                protocol_version: ProtocolVersion::V1,
+                signature_algorithm: SignatureAlgorithm::ED25519,
+                lease,
+                ack_nonce: DeliveryAckNonce::from_bytes([31; 32]),
+                acknowledged_at_unix_ms: now(),
+            },
+            guest,
+        )
+    };
+    cb.acknowledge_original(&mut jb, &ab, &ack(*lease, &b.ack)?)?;
+    let proof = sign_reader_possession(&ca.reader_enrollment, &challenge, &a.ack)?;
+    let ReaderResponse::ObjectDeliveryV1 {
+        payload,
+        lease,
+        header,
+    } = ca.lease_original(&mut ja, &aa, &challenge, &proof)?
+    else {
+        anyhow::bail!("A reply missing")
+    };
+    assert_eq!(payload.as_slice(), reply.payload());
+    assert_eq!(header.causation_id.as_bytes(), call.message_id().as_bytes());
+    ca.acknowledge_original(&mut ja, &aa, &ack(*lease, &a.ack)?)?;
+    assert!(matches!(
+        ca.lease_original(&mut ja, &aa, &challenge, &proof)?,
+        ReaderResponse::Empty
+    ));
+    Ok(())
+}
