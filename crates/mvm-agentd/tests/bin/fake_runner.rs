@@ -65,7 +65,7 @@ impl Behavior {
     fn from_env() -> Self {
         let raw = env::var("MVM_FAKE_RUNNER_BEHAVIOR").unwrap_or_else(|_| "ok".into());
         let raw = raw.trim();
-        if raw == "ok" {
+        if raw == "graceful_retirement" || raw == "ok" {
             return Behavior::Ok;
         }
         if raw == "user_fault" {
@@ -100,6 +100,14 @@ impl Behavior {
 }
 
 fn main() -> ExitCode {
+    // A qualification worker can keep draining during the pool's TERM
+    // grace; only this test binary installs the disposition.
+    if env::var("MVM_FAKE_RUNNER_BEHAVIOR").as_deref() == Ok("graceful_retirement") {
+        // SAFETY: install the POSIX constant disposition in this child.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+    }
     let behavior = Behavior::from_env();
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();

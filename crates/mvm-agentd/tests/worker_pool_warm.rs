@@ -636,6 +636,15 @@ fn retained_warm_response_survives_original_child_reaped_between_calls() {
     const INNER: &str = "MVM_TEST_ORIGINAL_WORKER_REAPER";
     if std::env::var_os(INNER).is_some() {
         mvm_agentd::child_wait::install_orphan_reaper();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent-after_start.sh");
+        for _ in 0..4 {
+            assert!(matches!(
+                mvm_agentd::lifecycle_hooks::poll_readiness(&ReadinessConfig::new(&missing)),
+                Err(mvm_agentd::lifecycle_hooks::ReadinessError::ScriptMissing { .. })
+            ));
+        }
+        mvm_agentd::lifecycle_hooks::poll_readiness(&ReadinessConfig::new("/bin/true")).unwrap();
         let pool = start_pool_with_behavior(cfg(1, 100, 1024), Some("crash_after_n=1"));
         let original = idle_pid(&pool);
         let body: Vec<u8> = (0u8..=255).chain(std::iter::once(0)).collect();
@@ -643,14 +652,11 @@ fn retained_warm_response_survives_original_child_reaped_between_calls() {
         let first = dispatch(&pool, &body);
         assert_eq!(first.stdout, body);
         let first_ns = start.elapsed().as_nanos();
-        wait_until(
-            "original child collected by the test reaper",
-            || {
-                // Signal zero checks disappearance only; no process is signalled.
-                (unsafe { libc::kill(original as i32, 0) }) == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            },
-        );
+        wait_until("original child collected by the test reaper", || {
+            // Signal zero checks disappearance only; no process is signalled.
+            (unsafe { libc::kill(original as i32, 0) }) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        });
         let second = Instant::now();
         assert!(matches!(
             dispatch(&pool, b"observe transport closure").outcome,
@@ -687,4 +693,30 @@ fn retained_warm_response_survives_original_child_reaped_between_calls() {
         }
         std::thread::sleep(Duration::from_millis(15));
     }
+}
+
+#[test]
+fn completed_single_call_returns_while_original_drains() {
+    let pool = start_pool_with_behavior(cfg(1, 1, 1024), Some("graceful_retirement"));
+    let original = idle_pid(&pool);
+    let body: Vec<u8> = (0u8..=255).chain(std::iter::once(0)).collect();
+    let started = Instant::now();
+    let response = dispatch(&pool, &body);
+    let response_ns = started.elapsed().as_nanos();
+    assert_eq!(response.stdout, body);
+    // The complete response is available before the old worker's grace
+    // ends, and the slot remains unavailable until it is actually collected.
+    let before = pool.snapshot();
+    println!("completed_response body=257 elapsed_ns={response_ns} slot={before:?}");
+    assert!(matches!(before.as_slice(), [SlotSnapshot::Busy]));
+    wait_until("replacement after original collection", || {
+        pool.snapshot()
+            .iter()
+            .any(|slot| matches!(slot,SlotSnapshot::Idle{pid,..} if *pid!=original))
+    });
+    println!(
+        "completed_response through_replacement_ns={}",
+        started.elapsed().as_nanos()
+    );
+    pool.shutdown(Duration::ZERO);
 }
