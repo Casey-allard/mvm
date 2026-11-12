@@ -223,6 +223,7 @@ async fn signed_deregister_with_journal(inventory: FixtureJournal) {
     let file_at_retry = std::fs::read(&journal_path).unwrap();
     let current = broker_control::sign(
         ControlRequest::Deregister(broker_control::DeregisterVm {
+            mailbox_owner_v1: None,
             vm_id: "recover-a".into(),
         }),
         &signing.to_bytes(),

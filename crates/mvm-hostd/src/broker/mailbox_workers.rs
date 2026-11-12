@@ -1294,6 +1294,27 @@ impl MailboxWorkers {
         })?;
         Ok(slots.contains_key(vm))
     }
+    /// Bounded observation while reconciling sibling service registration.
+    /// Terminal slots retain their original identity for exact deregistration.
+    /// An in-flight slot mutation must finish before registration can proceed.
+    pub(crate) fn try_service_owner(&self, vm: &str) -> io::Result<Option<(MailboxWorkerOwner, bool)>> {
+        fn inventory_error<T>(error: std::sync::TryLockError<T>) -> io::Error {
+            match error {
+                std::sync::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+                std::sync::TryLockError::Poisoned(_) => refused("mailbox service inventory poisoned"),
+            }
+        }
+        let slots = self.slots.try_lock().map_err(inventory_error)?;
+        let Some(slot) = slots.get(vm) else { return Ok(None) };
+        let slot = slot.try_lock().map_err(inventory_error)?;
+        if slot.busy {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let live = !slot.reservation_released && !slot.stop_requested
+            && matches!(slot.state, MailboxWorkerState::Reserved | MailboxWorkerState::Starting | MailboxWorkerState::Serving);
+        Ok(Some((slot.owner.clone(), live)))
+    }
+
     fn expire_terminals(&self) -> io::Result<()> {
         let fence = lock(&self.fence.state)?;
         if fence.deadline.is_some() {

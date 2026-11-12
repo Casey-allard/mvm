@@ -38,7 +38,7 @@ fn key() -> VerifyingKey {
 #[test]
 fn legacy_signed_shape_and_unit_ok_stay_exact() {
     let r = ControlRequest::Deregister(DeregisterVm {
-        vm_id: "vm-1".into(),
+        mailbox_owner_v1: None, vm_id: "vm-1".into(),
     });
     assert_eq!(
         serde_jcs::to_vec(&r).unwrap(),

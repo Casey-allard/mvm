@@ -1161,7 +1161,10 @@ mod tests {
         let lane = daemon.mutation_lane();
         let mut permit = Some(lane.clone().try_acquire_owned().unwrap());
         let descriptor = |vm: &str| {
-            let request = ControlRequest::Deregister(DeregisterVm { vm_id: vm.into() });
+            let request = ControlRequest::Deregister(DeregisterVm {
+                mailbox_owner_v1: None,
+                vm_id: vm.into(),
+            });
             let signed = broker_control::sign(request.clone(), &signing.to_bytes()).unwrap();
             daemon
                 .original_operation_descriptor(request, Some(signed), None)

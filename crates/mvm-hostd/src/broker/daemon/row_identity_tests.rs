@@ -121,6 +121,7 @@ impl Fixture {
     fn removal(&self) -> SignedControl {
         broker_control::sign(
             ControlRequest::Deregister(broker_control::DeregisterVm {
+                mailbox_owner_v1: None,
                 vm_id: "row-vm".into(),
             }),
             &self.signing.to_bytes(),

@@ -83,6 +83,7 @@ mod tests {
 
     fn sample_register() -> ControlRequest {
         ControlRequest::Register(Box::new(RegisterVm {
+            mailbox_owner_v1: None,
             vm_id: "vm-1".into(),
             workload_id: Some("wl-1".into()),
             tenant_id: "local".into(),

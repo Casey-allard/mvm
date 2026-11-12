@@ -244,6 +244,7 @@ fn isolated_blocked_rebind_entry() {
         let signed = mvm_core::protocol::broker_control::sign(
             mvm_core::protocol::broker_control::ControlRequest::Register(Box::new(
                 mvm_core::protocol::broker_control::RegisterVm {
+                    mailbox_owner_v1: None,
                     vm_id: "vm-rpc".into(),
                     workload_id: Some("rpc-fixture".into()),
                     tenant_id: config.tenant_id.clone(),

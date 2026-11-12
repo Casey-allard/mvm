@@ -405,12 +405,17 @@ fn dispatch_worker_control(
 ) -> Result<()> {
     use mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation;
     let _admission = match request.operation {
-        MailboxWorkerOperation::Acquire | MailboxWorkerOperation::ProvisionAdmittedV1 { .. } | MailboxWorkerOperation::DelegateConfig { .. } => {
+        MailboxWorkerOperation::Acquire
+        | MailboxWorkerOperation::ProvisionAdmittedV1 { .. }
+        | MailboxWorkerOperation::DelegateConfig { .. } => {
             Some(active_worker_turn(lifecycle, deadline, || {
                 Ok(workers.try_activation()?)
             })?)
         }
-        MailboxWorkerOperation::LookupExistingV1 | MailboxWorkerOperation::Query { .. } | MailboxWorkerOperation::Stop { .. } | MailboxWorkerOperation::ReleaseUnstartedV1 { .. } => None,
+        MailboxWorkerOperation::LookupExistingV1
+        | MailboxWorkerOperation::Query { .. }
+        | MailboxWorkerOperation::Stop { .. }
+        | MailboxWorkerOperation::ReleaseUnstartedV1 { .. } => None,
     };
     let (result, fd) = workers.handle(request)?;
     let _publication = if fd.is_some() {
@@ -1802,6 +1807,24 @@ impl HostAgentDaemon {
         registration: &RegisterVm,
     ) -> Result<RegistrationSnapshot> {
         validate_registration(&self.tenant_id, registration)?;
+        if registration.mailbox_owner_v1.is_some() {
+            anyhow::ensure!(
+                registration.workload_id.as_deref() == Some(registration.vm_id.as_str()),
+                "paired broker workload differs from the admitted VM"
+            );
+            let slot = self
+                .mailbox_workers
+                .as_ref()
+                .map(|workers| workers.try_service_owner(&registration.vm_id))
+                .transpose()?
+                .flatten();
+            verify_broker_sibling(
+                registration.mailbox_owner_v1.as_ref(),
+                self.registrations.get(&registration.vm_id),
+                slot.as_ref(),
+                false,
+            )?;
+        }
         if self.lifecycle_admission.is_some() {
             require_nonblocking_publication(registration)?;
         }
@@ -2142,12 +2165,18 @@ impl HostAgentDaemon {
             .registrations
             .values()
             .filter(|registration| registration_owner_is_dead(registration))
-            .map(|registration| registration.vm_id.clone())
+            .cloned()
             .collect();
-        for vm_id in &dead {
-            self.apply(&ControlRequest::Deregister(broker_control::DeregisterVm {
-                vm_id: vm_id.clone(),
-            }))
+        for registration in &dead {
+            execute_mutation(
+                DaemonAccess::Owned(self),
+                ControlRequest::Deregister(broker_control::DeregisterVm {
+                    mailbox_owner_v1: registration.mailbox_owner_v1.clone(),
+                    vm_id: registration.vm_id.clone(),
+                }),
+                None,
+                Some(registration.clone()),
+            )
             .await?;
         }
         Ok(dead.len())
@@ -2169,6 +2198,7 @@ impl HostAgentDaemon {
             execute_mutation(
                 DaemonAccess::Shared(daemon.clone()),
                 ControlRequest::Deregister(broker_control::DeregisterVm {
+                    mailbox_owner_v1: original.mailbox_owner_v1.clone(),
                     vm_id: original.vm_id.clone(),
                 }),
                 None,
@@ -2712,6 +2742,21 @@ impl HostAgentDaemon {
                                     | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::ReleaseUnstartedV1 { .. }))
                             .cloned()
                         });
+                        // Share the mutation lane with original broker registration. A
+                        // mailbox cannot appear between the latter's collision check
+                        // and publication. Keep the lane through worker slot admission.
+                        let reservation_lane = if let Some(request) = verified.as_ref().filter(|req| matches!(req.operation,
+                            mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Acquire
+                            | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::ProvisionAdmittedV1 { .. })) {
+                            let original = daemon.lock().await;
+                            let Ok(lane) = original.mutation_lane().try_acquire_owned() else { return Ok(()) };
+                            if let Some(existing) = original.registrations.get(&request.vm_id) {
+                                let matching = workers.try_service_owner(&request.vm_id).ok().flatten()
+                                    .is_some_and(|(owner, active)| active && existing.mailbox_owner_v1.as_ref() == Some(&owner));
+                                if !matching { return Ok(()); }
+                            }
+                            Some(lane)
+                        } else { None };
                         let Ok(mut stream) = stream.into_std() else {
                             return Ok(());
                         };
@@ -2719,6 +2764,7 @@ impl HostAgentDaemon {
                             // A canceled async waiter cannot release workspace
                             // credit while this blocking operation still runs.
                             let _permit = permit;
+                            let _reservation_lane = reservation_lane;
                             let Some(request) = verified else {
                                 let _ = super::mailbox_workers::write_error(
                                     &mut stream,
@@ -2918,10 +2964,42 @@ struct MutationContext {
     resources: Option<Arc<mvm_vmm::host::installed_owner::InstallationBinding>>,
     custody: Arc<MutationCell>,
     registration: Option<RegistrationSnapshot>,
+    mailbox_owner: Option<mvm_core::protocol::mailbox_worker_control::MailboxWorkerOwner>,
+    checked_probe: bool,
     vm_id: String,
     original: Vec<RegisterVm>,
     candidate: Vec<RegisterVm>,
     operation: Option<MutationOperationDescriptor>,
+}
+
+/// Same-name services retain independent authorization. Only the signed owner
+/// selects a shared VM incarnation. A retained stale slot may authorize teardown
+/// of its original broker, never activation or transfer to a new owner.
+fn verify_broker_sibling(
+    supplied: Option<&mvm_core::protocol::mailbox_worker_control::MailboxWorkerOwner>,
+    previous: Option<&RegisterVm>,
+    slot: Option<&(
+        mvm_core::protocol::mailbox_worker_control::MailboxWorkerOwner,
+        bool,
+    )>,
+    cleanup: bool,
+) -> Result<()> {
+    if let Some(previous) = previous {
+        anyhow::ensure!(
+            previous.mailbox_owner_v1.as_ref() == supplied,
+            "broker service belongs to a different original admission"
+        );
+    }
+    match (slot, supplied) {
+        (Some((original, active)), Some(bound)) if original == bound && (cleanup || *active) => {
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        // A checked original registration still authenticates its own removal
+        // after the worker's terminal metadata expires, or after cleanup replay.
+        (None, Some(_)) if cleanup => Ok(()),
+        _ => bail!("original mailbox worker differs from broker admission"),
+    }
 }
 
 impl MutationContext {
@@ -2970,12 +3048,23 @@ impl MutationContext {
             cleanup || !self.custody.stop_requested(),
             "original service admission stopped"
         );
-        if let Some(workers) = &daemon.mailbox_workers {
-            anyhow::ensure!(
-                !workers.try_contains(&self.vm_id)?,
-                "original mailbox worker retains this VM identity"
-            );
-        }
+        anyhow::ensure!(
+            self.mailbox_owner.is_none() || signed.is_some() || (cleanup && self.checked_probe),
+            "paired broker mutation needs signed admission or original cleanup proof"
+        );
+        let previous = daemon.registrations.get(&self.vm_id);
+        let slot = daemon
+            .mailbox_workers
+            .as_ref()
+            .map(|workers| workers.try_service_owner(&self.vm_id))
+            .transpose()?
+            .flatten();
+        verify_broker_sibling(
+            self.mailbox_owner.as_ref(),
+            previous,
+            slot.as_ref(),
+            cleanup,
+        )?;
         Ok(())
     }
 }
@@ -3006,7 +3095,13 @@ fn check_original_recovery(
             bail!("only current canonical removal may request retained reconciliation");
         };
         anyhow::ensure!(
-            removal.vm_id == operation.vm_id,
+            removal.vm_id == operation.vm_id
+                && removal.mailbox_owner_v1.as_ref()
+                    == match &operation.request {
+                        ControlRequest::Register(record) => record.mailbox_owner_v1.as_ref(),
+                        ControlRequest::Deregister(record) => record.mailbox_owner_v1.as_ref(),
+                        _ => bail!("original operation is not a service mutation"),
+                    },
             "current cleanup does not name the retained original VM"
         );
     }
@@ -3322,6 +3417,35 @@ async fn execute_mutation(
         lane.try_acquire_owned()
             .context("original daemon mutation remains busy")?,
     );
+    // Idempotent paired removal never invokes a helper or mutates a journal
+    // for a missing broker. The same held mutation lane also excludes mailbox
+    // provisioning and another registration until this reply is determined.
+    if let ControlRequest::Deregister(removal) = &request
+        && removal.mailbox_owner_v1.is_some()
+        && signed.is_some()
+        && access
+            .memory(|daemon| {
+                validate_vm_id(&vm_id)?;
+                if daemon.registrations.contains_key(&vm_id) {
+                    return Ok(false);
+                }
+                let original = daemon
+                    .mailbox_workers
+                    .as_ref()
+                    .context("installed mailbox profile unavailable")?;
+                let slot = original.try_service_owner(&vm_id)?;
+                verify_broker_sibling(
+                    removal.mailbox_owner_v1.as_ref(),
+                    None,
+                    slot.as_ref(),
+                    true,
+                )?;
+                Ok(true)
+            })
+            .await?
+    {
+        return Ok(());
+    }
     let mut context = access
         .memory(|daemon| {
             validate_vm_id(&vm_id)?;
@@ -3346,7 +3470,14 @@ async fn execute_mutation(
             if let ControlRequest::Register(registration) = &request {
                 candidate.push(registration.as_ref().clone());
             }
+            let mailbox_owner = match &request {
+                ControlRequest::Register(record) => record.mailbox_owner_v1.clone(),
+                ControlRequest::Deregister(record) => record.mailbox_owner_v1.clone(),
+                _ => unreachable!("verified service mutation"),
+            };
             let context = MutationContext {
+                checked_probe: expected_registration.is_some(),
+                mailbox_owner,
                 tenant: daemon.tenant_id.clone(),
                 key: daemon.verifying_key,
                 helper: daemon.signer_helper_uds_path.clone(),
@@ -3906,6 +4037,7 @@ mod tests {
         signer: Option<PathBuf>,
     ) -> RegisterVm {
         RegisterVm {
+            mailbox_owner_v1: None,
             vm_id: vm.into(),
             workload_id: Some(format!("wl-{vm}")),
             tenant_id: tenant.into(),
@@ -4007,6 +4139,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_broker_and_mailbox_share_only_the_original_vm_admission() -> Result<()> {
+        use crate::broker::mailbox_workers::{
+            MailboxWorkerBudget, MailboxWorkerFactory, MailboxWorkers, SpawnedMailboxWorker,
+            WorkerLimits,
+        };
+        use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
+        use mvm_core::protocol::mailbox_worker_control::*;
+
+        struct NoSpawn;
+        impl MailboxWorkerFactory for NoSpawn {
+            fn spawn(
+                &self,
+                _: &MailboxWorkerRequest,
+                _: &MailboxWorkerOwner,
+            ) -> std::io::Result<SpawnedMailboxWorker> {
+                panic!("broker admission must never spawn a mailbox")
+            }
+        }
+        let workers = Arc::new(MailboxWorkers::new(
+            "local",
+            MailboxWorkerBudget::new(WorkerLimits {
+                host_workers: 1,
+                tenant_workers: 1,
+                host_bytes: 1048576,
+                tenant_bytes: 1048576,
+                bytes_per_worker: 65536,
+            })?,
+            Arc::new(NoSpawn),
+        )?);
+        let now = workers.now_unix_ms()?;
+        let mut request = MailboxWorkerRequest {
+            domain: MAILBOX_WORKER_DOMAIN.into(),
+            version: 1,
+            request_nonce: [3; 32],
+            tenant: "local".into(),
+            vm_id: "paired".into(),
+            workload_id: "paired".into(),
+            plan_commitment: [7; 32],
+            mailbox_grant: MailboxGrant {
+                mailbox: MailboxId::from_bytes([9; 32]),
+                authority_key: [11; 32],
+                epoch: ExecutionEpoch::new(1).unwrap(),
+                local_service: None,
+            },
+            admission_expires_at_unix_ms: now + 20000,
+            deadline_unix_ms: now + MAX_WORKER_OPERATION_MS,
+            backend: MailboxWorkerBackend::Firecracker,
+            operation: MailboxWorkerOperation::Acquire,
+        };
+        let owner = workers.handle(&request)?.0.owner;
+        let mut foreign = owner.clone();
+        foreign.context_commitment = [0xf3; 32];
+        let daemon = Arc::new(Mutex::new(
+            daemon("local").with_mailbox_workers(workers.clone())?,
+        ));
+        let apply = |request| {
+            HostAgentDaemon::apply_signed_shared(
+                daemon.clone(),
+                broker_control::sign(request, &[5; 32]).unwrap(),
+            )
+        };
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let mut reg = register(dir.path(), "paired", "local", None);
+        reg.workload_id = Some("paired".into());
+        for binding in [None, Some(foreign.clone())] {
+            reg.mailbox_owner_v1 = binding;
+            assert!(apply(register_control(reg.clone())).await.is_err());
+            assert!(!Path::new(&reg.broker_listen_socket).exists());
+        }
+        reg.mailbox_owner_v1 = Some(owner.clone());
+        apply(register_control(reg.clone())).await?;
+        assert!(Path::new(&reg.broker_listen_socket).exists());
+        assert!(daemon.lock().await.is_registered("paired")?);
+        for binding in [None, Some(foreign)] {
+            assert!(
+                apply(ControlRequest::Deregister(DeregisterVm {
+                    vm_id: "paired".into(),
+                    mailbox_owner_v1: binding
+                }))
+                .await
+                .is_err()
+            );
+            assert!(daemon.lock().await.is_registered("paired")?);
+        }
+        request.operation = MailboxWorkerOperation::ReleaseUnstartedV1 {
+            owner: owner.clone(),
+        };
+        assert_eq!(
+            workers.handle(&request)?.0.state,
+            MailboxWorkerState::ReleasedBeforeSpawn
+        );
+        assert!(
+            apply(register_control(reg.clone())).await.is_err(),
+            "released mailbox cannot reactivate its broker"
+        );
+        apply(ControlRequest::Deregister(DeregisterVm {
+            vm_id: "paired".into(),
+            mailbox_owner_v1: Some(owner.clone()),
+        }))
+        .await?;
+        assert!(!daemon.lock().await.is_registered("paired")?);
+        assert!(!Path::new(&reg.broker_listen_socket).exists());
+        assert_eq!(
+            workers.try_service_owner("paired")?,
+            Some((owner.clone(), false))
+        );
+        apply(ControlRequest::Deregister(DeregisterVm {
+            vm_id: "paired".into(),
+            mailbox_owner_v1: Some(owner),
+        }))
+        .await?;
+        assert!(daemon.lock().await.registrations.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn register_binds_socket_then_deregister_unbinds() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = daemon("local");
@@ -4018,6 +4266,7 @@ mod tests {
         assert!(sock.exists(), "broker socket bound");
 
         d.apply(&ControlRequest::Deregister(DeregisterVm {
+            mailbox_owner_v1: None,
             vm_id: "vm-1".into(),
         }))
         .await
@@ -4143,6 +4392,7 @@ mod tests {
         );
 
         d.apply(&ControlRequest::Deregister(DeregisterVm {
+            mailbox_owner_v1: None,
             vm_id: "vm-1".into(),
         }))
         .await
@@ -4264,6 +4514,7 @@ mod tests {
         assert_eq!(d.registrations.len(), 3);
 
         d.apply(&ControlRequest::Deregister(DeregisterVm {
+            mailbox_owner_v1: None,
             vm_id: "vm-2".into(),
         }))
         .await

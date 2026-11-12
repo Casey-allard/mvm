@@ -85,6 +85,12 @@ impl InstalledMailboxPeer {
     }
 }
 
+impl mvm_core::vm_backend::InstalledBrokerPeer for InstalledMailboxPeer {
+    fn authenticate(&self, stream: &UnixStream) -> Result<()> {
+        InstalledMailboxPeer::authenticate(self, stream)
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum Authority {
     Fresh,
@@ -360,17 +366,40 @@ impl InstalledMailboxClient {
             secret.as_bytes(),
         )?;
         verify_request(&signed, &public, now_ms()?)?;
+        let mut stream = self.connect_original(deadline)?;
+        send_request(&stream, &signed, deadline)?;
+        Ok(recv_response(&mut stream, &request, deadline)?)
+    }
+
+    fn connect_original(&self, deadline: Instant) -> Result<UnixStream> {
         let peer = self
             .peer
             .as_ref()
             .context("installed mailbox daemon binding required")?;
-        let mut stream = mvm_agentd::vsock::connect_unix_before(
-            &mvm_core::config::host_agent_control_socket(&request.tenant),
+        let stream = mvm_agentd::vsock::connect_unix_before(
+            &mvm_core::config::host_agent_control_socket(&self.acquire.tenant),
             deadline,
         )?;
         peer.authenticate(&stream)?;
-        send_request(&stream, &signed, deadline)?;
-        Ok(recv_response(&mut stream, &request, deadline)?)
+        Ok(stream)
+    }
+
+    /// Confirm removal of separately registered companion services under
+    /// the same original owner before removing persistent machine state.
+    pub fn remove_companion_services(&self, until: Instant) -> Result<()> {
+        let deadline = until.min(Instant::now() + Duration::from_millis(MAX_WORKER_OPERATION_MS));
+        let request = broker_control::DeregisterVm {
+            vm_id: self.acquire.vm_id.clone(),
+            mailbox_owner_v1: Some(self.original()?),
+        };
+        let (key, _) = host_key()?;
+        let signed = broker_control::sign(ControlRequest::Deregister(request), key.as_bytes())?;
+        let stream = self.connect_original(deadline)?;
+        Ok(
+            mvm_vmm::host::mailbox_worker_transport::deregister_companion(
+                &stream, &signed, deadline,
+            )?,
+        )
     }
 
     /// Attest this original admitted context and reserve its acquisition nonce.
@@ -519,6 +548,8 @@ mod tests {
                 Err(e) => panic!("fixture failed to accept: {e}"),
             }
         };
+        // Darwin accepts children with the listener's nonblocking mode.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

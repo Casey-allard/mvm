@@ -713,6 +713,7 @@ fn retained_registration_reply_precedes_original_worker_recovery_exit() {
         )?;
         let removal = broker_control::sign(
             ControlRequest::Deregister(DeregisterVm {
+                mailbox_owner_v1: None,
                 vm_id: "inline-recovery".into(),
             }),
             &signer.signing.to_bytes(),

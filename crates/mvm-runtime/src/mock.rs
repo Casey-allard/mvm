@@ -523,6 +523,7 @@ mod tests {
             volumes: Vec::new(),
             extensions: Vec::new(),
             extension_plan_id: None,
+            installed_mailbox_owner: None,
             service_proxies: Vec::new(),
             config_files: Vec::new(),
             secret_files: Vec::new(),

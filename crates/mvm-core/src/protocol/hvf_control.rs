@@ -200,6 +200,7 @@ mod tests {
         assert!(verify_finalized(&request, &root(), &instance()).is_err());
         request.request =
             ControlRequest::Deregister(mvm_contract::protocol::broker_control::DeregisterVm {
+                mailbox_owner_v1: None,
                 vm_id: instance().vm_id,
             });
         assert!(broker_control::verify(&request, &root()).is_err());
@@ -213,6 +214,7 @@ mod tests {
         assert!(text.contains(r#""operation":"stop_hvf_instance""#));
         let request =
             ControlRequest::Deregister(mvm_contract::protocol::broker_control::DeregisterVm {
+                mailbox_owner_v1: None,
                 vm_id: "vm-1".into(),
             });
         assert_eq!(

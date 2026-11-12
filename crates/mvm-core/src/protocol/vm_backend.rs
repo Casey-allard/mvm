@@ -215,6 +215,8 @@ pub struct VmStartConfig {
     pub extensions: Vec<mvm_contract::protocol::extension_pack::ExtensionPlanBinding>,
     /// Plan identity shared by all entries in `extensions`.
     pub extension_plan_id: Option<String>,
+    /// Original installed mailbox owner associated with this admitted boot only.
+    pub installed_mailbox_owner: Option<InstalledBrokerBinding>,
     /// Optional controller-backed typed broker services. Empty for ordinary
     /// launches; populated only after admission creates a host-only endpoint.
     pub service_proxies: Vec<mvm_contract::protocol::broker_control::ServiceProxyBinding>,
@@ -301,6 +303,23 @@ pub struct VmStartConfig {
     pub admission_durability: Option<crate::admission_durability::AdmissionDurability>,
 }
 
+/// Attests a connected broker socket against the original installed host
+/// process retained by the admitted SDK launch.
+pub trait InstalledBrokerPeer: Send + Sync {
+    #[cfg(unix)]
+    fn authenticate(&self, stream: &std::os::unix::net::UnixStream) -> anyhow::Result<()>;
+}
+#[derive(Clone)]
+pub struct InstalledBrokerBinding {
+    pub owner: mvm_contract::protocol::mailbox_worker::MailboxWorkerOwner,
+    pub peer: std::sync::Arc<dyn InstalledBrokerPeer>,
+}
+impl std::fmt::Debug for InstalledBrokerBinding {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("InstalledBrokerBinding")
+            .finish_non_exhaustive()
+    }
+}
 impl VmStartConfig {
     /// Wait for the admission's audit sync when it is still in flight; see
     /// [`Self::admission_durability`]. Waiting again once the sync has

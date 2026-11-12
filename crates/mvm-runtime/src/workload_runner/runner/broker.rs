@@ -19,6 +19,7 @@ impl BrokerRegistrar for RealBrokerRegistrar {
         let guard = if mvm_vmm::host::host_agent_spawn::host_agent_daemon_enabled() {
             mvm_vmm::host::host_agent_spawn::register_host_agent_services_if_admitted(
                 mvm_vmm::host::host_agent_spawn::HostAgentServicesParams {
+                    mailbox_owner: req.mailbox_owner,
                     workload_id: req.vm_name,
                     tenant_id: Some(tenant),
                     vm_name: req.vm_name,
@@ -31,6 +32,9 @@ impl BrokerRegistrar for RealBrokerRegistrar {
             )
             .map(mvm_vmm::host::host_agent_spawn::ServicesGuard::Agent)?
         } else {
+            if req.mailbox_owner.is_some() {
+                bail!("installed mailbox co-admission requires the resident broker");
+            }
             if !req.service_proxies.is_empty() {
                 bail!("controller-backed typed services require the resident host-agent path");
             }

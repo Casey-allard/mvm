@@ -1,6 +1,6 @@
 //! Durable locator for the original installed mailbox provider and helper.
 //! A Pending reservation may have reached the daemon. Preserve it on uncertain
-//! delivery or restart. Only the original daemon's Stop can prove collection.
+//! delivery or restart. Only the original daemon can prove collection or release.
 use anyhow::{Context, Result, bail, ensure};
 use mvm_core::protocol::{broker_control::SignedControl, mailbox_worker_control::*};
 use mvm_hostd::{
@@ -249,6 +249,7 @@ pub(crate) fn without_owner<T>(name: &str, action: impl FnOnce() -> Result<T>) -
 pub(crate) struct OwnedLaunch {
     claim: Claim,
     client: InstalledMailboxClient,
+    original_peer: Arc<InstalledMailboxPeer>,
     rollback_on_drop: bool,
 }
 impl OwnedLaunch {
@@ -270,6 +271,7 @@ impl OwnedLaunch {
         let mut launch = Self {
             claim,
             client,
+            original_peer: original.clone(),
             rollback_on_drop: true,
         };
         let peer = provisioner.provision(admitted, backend, launch.client.acquire_request())?;
@@ -282,6 +284,16 @@ impl OwnedLaunch {
             stop: Box::new(launch.client.signed_stop_locator()?),
         })?;
         Ok(launch)
+    }
+    pub(crate) fn broker_binding(&self) -> Result<mvm_core::vm_backend::InstalledBrokerBinding> {
+        Ok(mvm_core::vm_backend::InstalledBrokerBinding {
+            owner: self
+                .client
+                .owner()
+                .context("installed mailbox owner missing after acquisition")?
+                .clone(),
+            peer: self.original_peer.clone(),
+        })
     }
     pub(crate) fn configure_and_wait(&self, backend: &AnyBackend) -> Result<()> {
         self.client.configure_and_wait(backend, deadline())
@@ -296,6 +308,7 @@ impl OwnedLaunch {
     ) -> Result<()> {
         self.rollback_on_drop = false;
         collect(&self.client)?;
+        self.client.remove_companion_services(deadline())?;
         cleanup()?;
         self.claim.remove()
     }
@@ -349,15 +362,18 @@ fn stop_claim<T>(
         Some(Record::PendingV1 { lookup }) => {
             let mut client = InstalledMailboxClient::from_pending_locator(name, &lookup)?;
             let resolver = provisioner.context("original installed mailbox daemon unavailable")?;
-            client.bind_peer(resolver.resolve_original(&lookup)?)?;
+            let original = resolver.resolve_original(&lookup)?;
+            client.bind_peer(original.clone())?;
             // The recovery operation can look up ONLY the original reservation.
             // An unknown slot or foreign daemon leaves the Pending record intact.
             client.recover_owner(deadline())?;
             let stop = client.signed_stop_locator()?;
+            let mut stopping = InstalledMailboxClient::from_stop_locator(name, &stop)?;
+            stopping.bind_peer(original)?;
             claim.write(&Record::Owned {
                 stop: Box::new(stop),
             })?;
-            client
+            stopping
         }
         Some(Record::Owned { stop }) => {
             let mut client = InstalledMailboxClient::from_stop_locator(name, &stop)?;
@@ -367,6 +383,7 @@ fn stop_claim<T>(
         }
     };
     collect(&client)?;
+    client.remove_companion_services(deadline())?;
     let value = cleanup()?;
     claim.remove()?;
     Ok(value)
@@ -534,6 +551,200 @@ mod tests {
         );
         let claim = Claim::acquire(home.path(), "test", false).unwrap().unwrap();
         assert!(matches!(claim.read().unwrap(), Some(Record::Owned { .. })));
+    }
+    // This peer uses real framed control I/O and deliberately drops its Acquire
+    // response. The callback is the fault injector, not a production daemon.
+    fn lost_ack_peer() -> Result<()> {
+        use mvm_vmm::host::mailbox_worker_transport::send_response;
+        use std::os::unix::net::UnixListener;
+
+        let path = mvm_core::config::host_agent_control_socket("local");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let listener = UnixListener::bind(path)?;
+        let key =
+            mvm_hostd::audit::host_keypair::load_or_init_at(&mvm_core::config::mvm_keys_dir())?;
+        let record = mvm_core::config::mvm_home_strict()?.join("state/mailbox-owners-v1/test.json");
+        let mut acquisition = None;
+        let mut owner = None;
+        for step in 0..5 {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            let mut length = [0; 4];
+            stream.read_exact(&mut length)?;
+            let length = u32::from_be_bytes(length) as usize;
+            ensure!(length <= MAX_WORKER_CONTROL_BYTES);
+            let mut body = vec![0u8; length];
+            stream.read_exact(&mut body)?;
+            let signed: SignedControl = serde_json::from_slice(&body)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?;
+            if step == 4 {
+                use mvm_core::protocol::broker_control::{self, ControlRequest, ControlResponse};
+                ensure!(
+                    matches!(broker_control::verify(&signed, &key.verifying)?, ControlRequest::Deregister(request)
+                    if request.vm_id == "test" && request.mailbox_owner_v1 == owner)
+                );
+                let body = serde_json::to_vec(&ControlResponse::Ok)?;
+                stream.write_all(&(body.len() as u32).to_be_bytes())?;
+                stream.write_all(&body)?;
+                continue;
+            }
+            let req = verify_request(&signed, &key.verifying, now)?;
+            let current: Record = serde_json::from_slice(&std::fs::read(&record)?)?;
+            let state = match (&req.operation, step, current) {
+                (MailboxWorkerOperation::Acquire, 0, Record::PendingV1 { lookup }) => {
+                    let original = verify_pending_locator(&lookup, &key.verifying, "test")?;
+                    ensure!(
+                        original.request_nonce == req.request_nonce
+                            && context_commitment(original)? == context_commitment(req)?
+                    );
+                    acquisition = Some(req.request_nonce);
+                    owner = Some(MailboxWorkerOwner {
+                        daemon_boot_nonce: [7; 32],
+                        lease: [8; 32],
+                        generation: 1,
+                        context_commitment: context_commitment(req)?,
+                    });
+                    continue; // Simulate committed reservation, then loss of its reply.
+                }
+                (MailboxWorkerOperation::LookupExistingV1, 1, Record::PendingV1 { .. }) => {
+                    ensure!(Some(req.request_nonce) == acquisition);
+                    MailboxWorkerState::Reserved
+                }
+                (MailboxWorkerOperation::Stop { owner }, 2, Record::Owned { stop }) => {
+                    let stored = verify_stop_locator(&stop, &key.verifying, "test")?;
+                    ensure!(
+                        matches!(&stored.operation, MailboxWorkerOperation::Stop { owner: original } if original == owner)
+                    );
+                    ensure!(stored.request_nonce == acquisition.unwrap());
+                    MailboxWorkerState::Reserved
+                }
+                (MailboxWorkerOperation::ReleaseUnstartedV1 { .. }, 3, Record::Owned { .. }) => {
+                    MailboxWorkerState::ReleasedBeforeSpawn
+                }
+                _ => bail!("unexpected operation or durable owner phase for step {step}"),
+            };
+            let result = MailboxWorkerResult {
+                request_nonce: req.request_nonce,
+                owner: owner.clone().unwrap(),
+                state,
+                delegates_config: false,
+            };
+            send_response(&mut stream, &result, None, deadline())?;
+        }
+        Ok(())
+    }
+
+    struct FixtureInstallation(Arc<InstalledMailboxPeer>);
+    impl InstalledMailboxProvisioner for FixtureInstallation {
+        fn original_peer(
+            &self,
+            _: &AdmittedPlan,
+            _: &AnyBackend,
+            _: &MailboxWorkerRequest,
+        ) -> Result<Arc<InstalledMailboxPeer>> {
+            Ok(self.0.clone())
+        }
+        fn provision(
+            &self,
+            _: &AdmittedPlan,
+            _: &AnyBackend,
+            _: &MailboxWorkerRequest,
+        ) -> Result<Arc<InstalledMailboxPeer>> {
+            Ok(self.0.clone())
+        }
+        fn resolve_original(&self, _: &SignedControl) -> Result<Arc<InstalledMailboxPeer>> {
+            Ok(self.0.clone())
+        }
+    }
+    struct TestProcess(std::process::Child);
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    #[test]
+    fn lost_acquire_reply_recovers_only_original_and_persists_stop_before_cleanup() -> Result<()> {
+        use crate::admission::{admit_plan_for_boot, admit_plan_tests::pinning_params};
+        use mvm_hostd::plan_admission::InMemoryNonceLedger;
+        use std::process::Command;
+
+        const WORKER: &str = "MVM_TEST_OWNER_LOST_ACK_WORKER";
+        if std::env::var_os(WORKER).is_some() {
+            return lost_ack_peer();
+        }
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        let home = tempfile::tempdir_in("/tmp")?;
+        env.set("MVM_HOME", home.path());
+        let rootfs = home.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"synthetic mailbox fixture")?;
+        let ledger = InMemoryNonceLedger::new();
+        let mut params = pinning_params(&rootfs, &ledger);
+        params.vm_name = "test";
+        let Record::Pending { acquire } = pending() else {
+            unreachable!()
+        };
+        params.mailbox = Some(acquire.mailbox_grant);
+        let admitted = admit_plan_for_boot(params)?;
+        let mut worker = TestProcess(Command::new(std::env::current_exe()?)
+            .args(["--exact", "launch::mailbox_owner::tests::lost_acquire_reply_recovers_only_original_and_persists_stop_before_cleanup", "--test-threads=1"])
+            .env(WORKER,"1").spawn()?);
+        let original =
+            FixtureInstallation(Arc::new(InstalledMailboxPeer::from_child(&mut worker.0)?));
+        let socket = mvm_core::config::host_agent_control_socket("local");
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            ensure!(
+                Instant::now() < until && worker.0.try_wait()?.is_none(),
+                "fixture listener unavailable"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let result = OwnedLaunch::begin(
+            &original,
+            &admitted.admitted,
+            &AnyBackend::from_hypervisor("firecracker"),
+            VacantOwner::claim("test")?,
+        );
+        ensure!(result.is_err(), "lost Acquire reply reported success");
+        drop(result);
+        let claim = Claim::acquire(home.path(), "test", false)?.unwrap();
+        ensure!(matches!(claim.read()?, Some(Record::PendingV1 { .. })));
+        drop(claim);
+
+        let mut other = TestProcess(Command::new("sleep").arg("20").spawn()?);
+        let replacement =
+            FixtureInstallation(Arc::new(InstalledMailboxPeer::from_child(&mut other.0)?));
+        let err = stop_with("test", Some(&replacement), || -> Result<()> {
+            panic!("wrong original allowed cleanup")
+        })
+        .unwrap_err();
+        ensure!(
+            err.to_string().contains("issuer differs"),
+            "unexpected refusal: {err}"
+        );
+        let claim = Claim::acquire(home.path(), "test", false)?.unwrap();
+        ensure!(matches!(claim.read()?, Some(Record::PendingV1 { .. })));
+        drop(claim);
+
+        let value = stop_with("test", Some(&original), || {
+            ensure!(
+                refuse_existing("test").is_err(),
+                "cleanup ran without original claim"
+            );
+            Ok(17)
+        })?;
+        ensure!(value == 17);
+        ensure!(
+            worker.0.wait()?.success(),
+            "fixture refused recovery sequence"
+        );
+        let claim = Claim::acquire(home.path(), "test", false)?.unwrap();
+        ensure!(claim.read()?.is_none());
+        Ok(())
     }
     #[test]
     fn refuses_linked_state_directory_and_claim_file() {

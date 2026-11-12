@@ -120,6 +120,10 @@ pub enum ServiceProxyResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisterVm {
+    /// Original installed mailbox owner when a separately admitted broker shares this VM.
+    /// Omission preserves legacy host-signed canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_owner_v1: Option<super::mailbox_worker::MailboxWorkerOwner>,
     /// Server-side VM identity. The daemon keys every dispatch and every
     /// forwarded audit entry off the socket that accepted the connection, not
     /// off any guest-supplied field; this label is how the host names that VM
@@ -187,6 +191,10 @@ pub struct RegisterVm {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeregisterVm {
+    /// Original installed mailbox owner when a separately admitted broker shares this VM.
+    /// Omission preserves legacy host-signed canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_owner_v1: Option<super::mailbox_worker::MailboxWorkerOwner>,
     /// The VM to drop, matching a prior [`RegisterVm::vm_id`].
     pub vm_id: String,
 }
@@ -268,6 +276,7 @@ mod tests {
 
     fn sample_register() -> ControlRequest {
         ControlRequest::Register(Box::new(RegisterVm {
+            mailbox_owner_v1: None,
             vm_id: "vm-1".into(),
             workload_id: Some("wl-1".into()),
             tenant_id: "local".into(),
@@ -287,6 +296,7 @@ mod tests {
         for req in [
             sample_register(),
             ControlRequest::Deregister(DeregisterVm {
+                mailbox_owner_v1: None,
                 vm_id: "vm-1".into(),
             }),
         ] {

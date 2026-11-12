@@ -238,6 +238,7 @@ pub fn deregister_vm(control_socket: &Path, key_bytes: &[u8; 32], vm_id: &str) -
         control_socket,
         key_bytes,
         ControlRequest::Deregister(DeregisterVm {
+            mailbox_owner_v1: None,
             vm_id: vm_id.to_string(),
         }),
     )
@@ -247,10 +248,55 @@ pub fn deregister_vm(control_socket: &Path, key_bytes: &[u8; 32], vm_id: &str) -
 /// daemon this VM registered with — so `stop()` can deregister without a flag
 /// or a re-derivation of the tenant.
 const HOST_AGENT_TENANT_REF: &str = "host-agent.tenant";
+const PAIRED_REMOVAL_REF: &str = "host-agent.mailbox-removal-v1";
+
+fn stored_removal(dir: &Path) -> Result<Option<broker_control::SignedControl>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = match std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(PAIRED_REMOVAL_REF))
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let meta = file.metadata()?;
+    mvm_core::private_fs::require_current_owner(&meta)?;
+    anyhow::ensure!(
+        meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o777 == 0o600 && meta.len() <= 4096,
+        "unsafe paired broker removal record"
+    );
+    let mut data = Vec::new();
+    file.take(4097).read_to_end(&mut data)?;
+    anyhow::ensure!(data.len() <= 4096, "oversized paired broker removal");
+    Ok(Some(serde_json::from_slice(&data)?))
+}
+
+fn remove_paired_registration(
+    tenant: &str,
+    vm: &str,
+    signed: &broker_control::SignedControl,
+    original: &dyn mvm_core::vm_backend::InstalledBrokerPeer,
+) -> Result<()> {
+    let key = ed25519_dalek::SigningKey::from_bytes(&load_host_signing_key()?);
+    anyhow::ensure!(
+        tenant == "local"
+            && matches!(broker_control::verify(signed, &key.verifying_key())?,
+        ControlRequest::Deregister(record) if record.vm_id == vm && record.mailbox_owner_v1.is_some()),
+        "wrong paired broker removal"
+    );
+    send_signed_control(
+        &mvm_core::config::host_agent_control_socket(tenant),
+        signed,
+        Some(original),
+    )
+}
 
 /// Inputs to [`register_host_agent_services_if_admitted`] — mirrors the per-VM
 /// fork's `BrokerServicesSpawnParams`.
 pub struct HostAgentServicesParams<'a> {
+    pub mailbox_owner: Option<&'a mvm_core::vm_backend::InstalledBrokerBinding>,
     /// Admitted workload id.
     pub workload_id: &'a str,
     /// Tenant id from the admitted plan. `None` ⇒ no admitted plan ⇒ defused
@@ -373,6 +419,7 @@ impl<'a> HostAgentServicesParamsBuilder<'a> {
     /// Finish, or name the first required field left unset.
     pub fn build(self) -> Result<HostAgentServicesParams<'a>, BuilderError> {
         Ok(HostAgentServicesParams {
+            mailbox_owner: None,
             workload_id: self.workload_id.ok_or(BuilderError::missing(
                 "HostAgentServicesParams",
                 "workload_id",
@@ -421,6 +468,7 @@ pub fn register_host_agent_services_if_admitted(
     params: HostAgentServicesParams<'_>,
 ) -> Result<HostAgentServicesGuard> {
     let HostAgentServicesParams {
+        mailbox_owner,
         workload_id,
         tenant_id,
         vm_name,
@@ -435,43 +483,76 @@ pub fn register_host_agent_services_if_admitted(
     };
 
     // Arm before any spawn so a failure below reaps what already started.
-    let guard = HostAgentServicesGuard::armed(state_dir, tenant, vm_name);
+    let mut guard = HostAgentServicesGuard::armed(state_dir, tenant, vm_name);
+    // A paired launch must not let a name-only rollback tear down another
+    // incarnation if an error precedes preparation of its signed removal.
+    if mailbox_owner.is_some() {
+        guard.defuse();
+    }
 
     warm_claim_debug("ensure_daemon_begin");
-    let control_socket = ensure_host_agent_daemon(tenant)?;
+    let control_socket = if mailbox_owner.is_some() {
+        // Only the already installed original can satisfy a paired admission.
+        mvm_core::config::host_agent_control_socket(tenant)
+    } else {
+        ensure_host_agent_daemon(tenant)?
+    };
     warm_claim_debug("ensure_daemon_done");
     let key = load_host_signing_key()?;
     warm_claim_debug("load_key_done");
+    if let Some(binding) = mailbox_owner {
+        let remove = broker_control::sign(
+            ControlRequest::Deregister(DeregisterVm {
+                vm_id: vm_name.to_owned(),
+                mailbox_owner_v1: Some(binding.owner.clone()),
+            }),
+            &key,
+        )?;
+        let marker = state_dir.join(PAIRED_REMOVAL_REF);
+        mvm_core::util::atomic_io::write_private(&marker, &serde_json::to_vec(&remove)?)?;
+        // Publish teardown routing before the daemon may accept registration.
+        mvm_core::util::atomic_io::write_private(
+            &state_dir.join(HOST_AGENT_TENANT_REF),
+            tenant.as_bytes(),
+        )?;
+        guard = HostAgentServicesGuard::armed(state_dir, tenant, vm_name);
+        guard.paired_removal = Some((remove, binding.peer.clone()));
+    }
     write_host_agent_owner_ref(state_dir)?;
     warm_claim_debug("owner_ref_done");
-    register_vm(
-        &control_socket,
-        &key,
-        RegisterVm {
-            vm_id: vm_name.to_string(),
-            workload_id: Some(workload_id.to_string()),
-            tenant_id: tenant.to_string(),
-            broker_listen_socket: broker_listen_socket.to_string_lossy().into_owned(),
-            workload_chain_path: mvm_core::config::workload_audit_path(tenant, vm_name)
+    let registration = RegisterVm {
+        mailbox_owner_v1: mailbox_owner.map(|binding| binding.owner.clone()),
+        vm_id: vm_name.to_string(),
+        workload_id: Some(workload_id.to_string()),
+        tenant_id: tenant.to_string(),
+        broker_listen_socket: broker_listen_socket.to_string_lossy().into_owned(),
+        workload_chain_path: mvm_core::config::workload_audit_path(tenant, vm_name)
+            .to_string_lossy()
+            .into_owned(),
+        workload_chain_head_path: Some(
+            state_dir
+                .join(AUDIT_SIGNER_HEAD_FILE)
                 .to_string_lossy()
                 .into_owned(),
-            workload_chain_head_path: Some(
-                state_dir
-                    .join(AUDIT_SIGNER_HEAD_FILE)
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            audit_signer_uds_path: None,
-            services_bindings: services.to_vec(),
-            capability_bindings: capability_bindings.to_vec(),
-            service_proxies: service_proxies.to_vec(),
-            assurance: None,
-        },
-    )?;
+        ),
+        audit_signer_uds_path: None,
+        services_bindings: services.to_vec(),
+        capability_bindings: capability_bindings.to_vec(),
+        service_proxies: service_proxies.to_vec(),
+        assurance: None,
+    };
+    if let Some(binding) = mailbox_owner {
+        let request = broker_control::sign(ControlRequest::Register(Box::new(registration)), &key)?;
+        send_signed_control(&control_socket, &request, Some(binding.peer.as_ref()))?;
+    } else {
+        register_vm(&control_socket, &key, registration)?;
+    }
     warm_claim_debug("register_vm_done");
     // Record the tenant so the stop path can deregister without a flag.
-    std::fs::write(state_dir.join(HOST_AGENT_TENANT_REF), tenant)
-        .with_context(|| format!("write host-agent tenant ref in {}", state_dir.display()))?;
+    if mailbox_owner.is_none() {
+        std::fs::write(state_dir.join(HOST_AGENT_TENANT_REF), tenant)
+            .with_context(|| format!("write host-agent tenant ref in {}", state_dir.display()))?;
+    }
     warm_claim_debug("tenant_ref_done");
     Ok(guard)
 }
@@ -480,10 +561,18 @@ pub fn register_host_agent_services_if_admitted(
 /// (best-effort — the daemon stays warm). Also reaps the legacy per-VM
 /// audit-signer if an older daemon-path launch left one behind. Idempotent.
 pub fn reap_host_agent_services(state_dir: &Path, tenant: &str, vm_name: &str) {
-    if let Ok(key) = load_host_signing_key() {
-        let control_socket = mvm_core::config::host_agent_control_socket(tenant);
-        // Best-effort: a missing daemon (already gone) is fine.
-        let _ = deregister_vm(&control_socket, &key, vm_name);
+    match stored_removal(state_dir) {
+        // Only the installed SDK with original process custody can settle
+        // this marker. It verifies deregistration before destructive cleanup.
+        Ok(Some(_)) => return,
+        Err(_) => return, // Preserve uncertain ownership for a fresh SDK Stop.
+        Ok(None) => {
+            if let Ok(key) = load_host_signing_key() {
+                let control_socket = mvm_core::config::host_agent_control_socket(tenant);
+                // Best-effort: a missing daemon (already gone) is fine.
+                let _ = deregister_vm(&control_socket, &key, vm_name);
+            }
+        }
     }
     crate::host::broker_services_spawn::reap_audit_signer(state_dir);
     let _ = std::fs::remove_file(state_dir.join(HOST_AGENT_TENANT_REF));
@@ -522,11 +611,16 @@ pub fn reap_host_agent_services_from_state(state_dir: &Path, vm_name: &str) {
 pub struct HostAgentServicesGuard {
     /// `Some((state_dir, tenant, vm))` while armed; `None` once defused.
     armed: Option<(PathBuf, String, String)>,
+    paired_removal: Option<(
+        broker_control::SignedControl,
+        std::sync::Arc<dyn mvm_core::vm_backend::InstalledBrokerPeer>,
+    )>,
 }
 
 impl HostAgentServicesGuard {
     fn armed(state_dir: &Path, tenant: &str, vm_name: &str) -> Self {
         Self {
+            paired_removal: None,
             armed: Some((
                 state_dir.to_path_buf(),
                 tenant.to_string(),
@@ -536,7 +630,10 @@ impl HostAgentServicesGuard {
     }
     /// A guard for a VM that registered nothing — Drop is a no-op.
     pub fn defused() -> Self {
-        Self { armed: None }
+        Self {
+            armed: None,
+            paired_removal: None,
+        }
     }
     /// Disarm: the VM is up; the `stop` path now owns teardown.
     pub fn defuse(&mut self) {
@@ -547,7 +644,13 @@ impl HostAgentServicesGuard {
 impl Drop for HostAgentServicesGuard {
     fn drop(&mut self) {
         if let Some((state_dir, tenant, vm)) = self.armed.take() {
-            reap_host_agent_services(&state_dir, &tenant, &vm);
+            if let Some((original, peer)) = &self.paired_removal {
+                // A concurrent recovery may have installed a newer marker.
+                // This guard may send only its original signed operation.
+                let _ = remove_paired_registration(&tenant, &vm, original, peer.as_ref());
+            } else {
+                reap_host_agent_services(&state_dir, &tenant, &vm);
+            }
         }
     }
 }
@@ -612,6 +715,14 @@ fn send_control(
 ) -> Result<()> {
     let signed =
         broker_control::sign(request, key_bytes).context("sign host-agent control request")?;
+    send_signed_control(control_socket, &signed, None)
+}
+
+fn send_signed_control(
+    control_socket: &Path,
+    signed: &broker_control::SignedControl,
+    peer: Option<&dyn mvm_core::vm_backend::InstalledBrokerPeer>,
+) -> Result<()> {
     let mut last_err = None;
     for attempt in 0..CONTROL_RETRIES {
         let result = (|| -> Result<()> {
@@ -627,7 +738,10 @@ fn send_control(
             stream
                 .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
                 .context("set host-agent control write timeout")?;
-            write_framed(&mut stream, &signed)?;
+            if let Some(original) = peer {
+                original.authenticate(&stream)?;
+            }
+            write_framed(&mut stream, signed)?;
             match read_framed::<ControlResponse>(&mut stream)? {
                 ControlResponse::Ok => Ok(()),
                 ControlResponse::MailboxWorkerV1(_) => {
@@ -794,6 +908,7 @@ mod tests {
 
     fn sample_register(dir: &Path) -> RegisterVm {
         RegisterVm {
+            mailbox_owner_v1: None,
             vm_id: "vm-1".into(),
             workload_id: Some("wl-1".into()),
             tenant_id: "local".into(),
@@ -984,6 +1099,7 @@ mod tests {
     fn unadmitted_register_is_a_defused_no_op() {
         let dir = tempfile::tempdir().unwrap();
         let guard = register_host_agent_services_if_admitted(HostAgentServicesParams {
+            mailbox_owner: None,
             workload_id: "wl",
             tenant_id: None,
             vm_name: "vm",

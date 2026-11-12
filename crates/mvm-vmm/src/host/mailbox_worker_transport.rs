@@ -282,6 +282,14 @@ pub fn send_request(
     if !matches!(signed.request, ControlRequest::MailboxWorkerV1(_)) {
         return Err(invalid("expected a signed mailbox worker request"));
     }
+    send_signed_frame(stream, signed, deadline)
+}
+
+fn send_signed_frame(
+    stream: &UnixStream,
+    signed: &SignedControl,
+    deadline: Instant,
+) -> io::Result<()> {
     let mut buffer = vec![0u8; MAX_WORKER_CONTROL_BYTES];
     let mut body = io::Cursor::new(buffer.as_mut_slice());
     serde_json::to_writer(&mut body, signed).map_err(invalid_encoding)?;
@@ -455,15 +463,7 @@ pub fn recv_response(
     if marker[0] != MARKER {
         return Err(invalid("worker control marker"));
     }
-    let mut len = [0; 4];
-    receive_exact(stream, &mut len, deadline)?;
-    let len = u32::from_be_bytes(len) as usize;
-    if len == 0 || len > MAX_WORKER_CONTROL_BYTES {
-        return Err(invalid("worker frame length"));
-    }
-    let mut body = vec![0; len];
-    receive_exact(stream, &mut body, deadline)?;
-    let response: ControlResponse = serde_json::from_slice(&body).map_err(invalid_encoding)?;
+    let response = read_control_response(stream, deadline)?;
     let ControlResponse::MailboxWorkerV1(result) = response else {
         return Err(invalid("unexpected legacy response in worker control"));
     };
@@ -473,4 +473,42 @@ pub fn recv_response(
         return Err(invalid("worker descriptor count disagrees with result"));
     }
     Ok((result, fd))
+}
+
+fn read_control_response(stream: &UnixStream, deadline: Instant) -> io::Result<ControlResponse> {
+    let mut len = [0; 4];
+    receive_exact(stream, &mut len, deadline)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len == 0 || len > MAX_WORKER_CONTROL_BYTES {
+        return Err(invalid("worker frame length"));
+    }
+    let mut body = vec![0; len];
+    receive_exact(stream, &mut body, deadline)?;
+    serde_json::from_slice(&body).map_err(invalid_encoding)
+}
+
+/// A regular canonical Deregister/Ok frame pair. No worker marker or
+/// descriptors are legal in its response. The caller binds the original peer.
+pub fn deregister_companion(
+    stream: &UnixStream,
+    signed: &SignedControl,
+    deadline: Instant,
+) -> io::Result<()> {
+    peer(stream)?;
+    remaining(deadline)?;
+    if !matches!(&signed.request, ControlRequest::Deregister(request) if request.mailbox_owner_v1.is_some())
+    {
+        return Err(invalid("owner-bound deregistration required"));
+    }
+    send_signed_frame(stream, signed, deadline)?;
+    match read_control_response(stream, deadline)? {
+        ControlResponse::Ok => Ok(()),
+        ControlResponse::Err { .. } => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "companion deregistration refused",
+        )),
+        ControlResponse::MailboxWorkerV1(_) => {
+            Err(invalid("unexpected worker response to deregistration"))
+        }
+    }
 }

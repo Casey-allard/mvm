@@ -91,6 +91,7 @@ impl HostAgentFixture {
         let worker_pid_path = config::host_agent_worker_pid(&tenant_id);
 
         let reg = RegisterVm {
+            mailbox_owner_v1: None,
             vm_id: vm_name.clone(),
             workload_id: Some("wl-vm-1".to_string()),
             tenant_id: tenant_id.clone(),

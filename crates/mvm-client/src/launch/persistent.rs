@@ -493,7 +493,7 @@ fn complete_writable_images(
 
 fn finish_persistent(
     backend: mvm_runtime::backend::AnyBackend,
-    start_config: mvm_core::vm_backend::VmStartConfig,
+    mut start_config: mvm_core::vm_backend::VmStartConfig,
     admission: crate::admission::AdmissionContext,
     mut prepared_volumes: crate::volume::LaunchPreparation,
     name: &str,
@@ -511,6 +511,9 @@ fn finish_persistent(
         )?),
         _ => None,
     };
+    if let Some(worker) = &owned {
+        start_config.installed_mailbox_owner = Some(worker.broker_binding()?);
+    }
     // VMM selection + workload-support check + start move behind the facade; the
     // admission gate (above) and the launched/failed emits stay here.
     #[cfg(unix)]

@@ -396,3 +396,61 @@ fn worker_request_uses_the_daemons_existing_length_and_signed_body() {
     assert_eq!(wire[..4], (expected.len() as u32).to_be_bytes());
     assert_eq!(wire[4..], expected);
 }
+
+#[test]
+fn companion_deregister_requires_the_bound_owner_and_a_regular_ok_reply() {
+    use mvm_core::protocol::broker_control::{ControlRequest, ControlResponse, DeregisterVm, sign};
+    use mvm_vmm::host::mailbox_worker_transport::deregister_companion;
+
+    let (request, worker) = fixture();
+    let signed = sign(
+        ControlRequest::Deregister(DeregisterVm {
+            vm_id: request.vm_id.clone(),
+            mailbox_owner_v1: Some(worker.owner.clone()),
+        }),
+        &[9; 32],
+    )
+    .unwrap();
+    for (response, accepted) in [
+        (ControlResponse::Ok, true),
+        (
+            ControlResponse::Err {
+                message: "refused".into(),
+            },
+            false,
+        ),
+        (
+            ControlResponse::MailboxWorkerV1(Box::new(worker.clone())),
+            false,
+        ),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reply = serde_json::to_vec(&response).unwrap();
+        server
+            .write_all(&(reply.len() as u32).to_be_bytes())
+            .unwrap();
+        server.write_all(&reply).unwrap();
+        assert_eq!(
+            deregister_companion(&client, &signed, deadline()).is_ok(),
+            accepted
+        );
+        drop(client);
+        let mut wire = Vec::new();
+        server.read_to_end(&mut wire).unwrap();
+        let expected = serde_json::to_vec(&signed).unwrap();
+        assert_eq!(&wire[..4], &(expected.len() as u32).to_be_bytes());
+        assert_eq!(&wire[4..], &expected);
+    }
+    let legacy = sign(
+        ControlRequest::Deregister(DeregisterVm {
+            vm_id: request.vm_id,
+            mailbox_owner_v1: None,
+        }),
+        &[9; 32],
+    )
+    .unwrap();
+    let (client, mut server) = UnixStream::pair().unwrap();
+    assert!(deregister_companion(&client, &legacy, deadline()).is_err());
+    drop(client);
+    assert_eq!(server.read(&mut [0u8; 1]).unwrap(), 0);
+}

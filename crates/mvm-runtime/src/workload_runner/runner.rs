@@ -91,6 +91,7 @@ pub use spawner::{
 };
 /// What the runner needs to register the per-VM host-services broker after boot.
 pub struct BrokerRegisterRequest<'a> {
+    pub mailbox_owner: Option<&'a mvm_core::vm_backend::InstalledBrokerBinding>,
     /// VM name — the registration's `vm_id`, workload id, and per-VM chain key.
     pub vm_name: &'a str,
     /// Per-VM state dir (audit-signer pid/sock + the daemon tenant-ref marker).
@@ -633,6 +634,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         let (services, capability_bindings) =
             admitted_broker_bindings(config.plan_json.as_deref())?;
         let guard = self.broker.register(&BrokerRegisterRequest {
+            mailbox_owner: config.installed_mailbox_owner.as_ref(),
             vm_name: &config.name,
             state_dir: &state_dir,
             tenant: config.tenant_id.as_deref(),
@@ -946,6 +948,8 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         let mut broker_guard = self
             .broker
             .register(&BrokerRegisterRequest {
+                // A fork must never reuse its parent's mailbox reservation.
+                mailbox_owner: None,
                 vm_name: &child.0,
                 state_dir: &child_dir,
                 tenant: child_cfg.tenant_id.as_deref(),
