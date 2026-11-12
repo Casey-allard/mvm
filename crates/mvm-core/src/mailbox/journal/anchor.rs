@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -60,12 +59,11 @@ impl FileJournalAnchor {
                 return Err(JournalError::Corrupt);
             }
             Ok(_) => {
-                let file = fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                    .open(path)?;
+                let file = private_fs::open_readonly_nofollow(path)?;
                 let meta = file.metadata()?;
-                if !meta.file_type().is_file() || meta.nlink() != 1 || meta.len() > MAX_ANCHOR_BYTES
+                if !meta.file_type().is_file()
+                    || private_fs::hard_link_count(&meta)? != 1
+                    || meta.len() > MAX_ANCHOR_BYTES
                 {
                     return Err(JournalError::Corrupt);
                 }

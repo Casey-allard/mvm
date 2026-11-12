@@ -37,6 +37,8 @@ mod platform;
 #[path = "private_fs/platforms/unsupported.rs"]
 mod platform;
 
+pub(crate) use platform::{hard_link_count, open_readonly_nofollow};
+
 pub use platform::{
     create_owned_private_dir, ensure_private_dir, mode_bits, permissions, require_current_owner,
     set_mode, sync_managed_directory_chain,
@@ -366,5 +368,49 @@ mod refusal_tests {
         let message = err.to_string();
         assert!(message.starts_with("/srv/state/keys: "), "{message}");
         assert!(message.contains("Linux and macOS"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod readonly_platform_tests {
+    use super::*;
+
+    #[test]
+    fn readonly_open_checks_the_original_single_link_file() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("record");
+        std::fs::write(&path, b"original").expect("fixture record");
+        #[cfg(unix)]
+        {
+            let file = open_readonly_nofollow(&path).expect("open original");
+            assert_eq!(
+                hard_link_count(&file.metadata().expect("original metadata")).expect("link count"),
+                1
+            );
+            let alias = directory.path().join("alias");
+            std::fs::hard_link(&path, &alias).expect("hard link fixture");
+            assert_eq!(
+                hard_link_count(&file.metadata().expect("aliased metadata")).expect("link count"),
+                2
+            );
+            let link = directory.path().join("symlink");
+            std::os::unix::fs::symlink(&path, &link).expect("symlink fixture");
+            assert!(open_readonly_nofollow(&link).is_err());
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(
+                open_readonly_nofollow(&path)
+                    .expect_err("unsupported secure open")
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+            assert_eq!(
+                hard_link_count(&std::fs::metadata(&path).expect("fixture metadata"))
+                    .expect_err("unsupported link check")
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
     }
 }
