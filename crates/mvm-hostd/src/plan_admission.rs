@@ -936,6 +936,19 @@ impl<'a> RunPosture<'a> {
     }
 
     fn enforce_journal(&self, plan: &ExecutionPlan, max_ms: Option<u64>) -> Result<()> {
+        if let Some(original) = self.object_plan {
+            anyhow::ensure!(
+                self.variant == Variant::Prod
+                    && matches!(
+                        self.backend,
+                        Some(BackendKind::Firecracker | BackendKind::Hvf)
+                    )
+                    && self.incoming_journal.is_none()
+                    && self.paired_journal.is_none(),
+                "object selection requires a dedicated sealed native participant"
+            );
+            original.verify_selected_plan(plan, SystemClock.now().timestamp_millis())?;
+        }
         anyhow::ensure!(
             plan.mailbox
                 .and_then(|g| g.durable_object_pair_sha256_v1)
