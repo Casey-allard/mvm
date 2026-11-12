@@ -40,6 +40,9 @@ use mvm_core::mailbox::{
     sign_capability,
 };
 
+pub mod guest_io;
+use guest_io::{GuestStreamCounts, Measured};
+
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a dialed guest may hold its connection before sending a frame:
 /// longer than the guest's own hold, so the guest ends it.
@@ -377,7 +380,7 @@ impl MailboxService {
         route: &mvm_core::vm_backend::HostDialRoute,
         sealer: &mut GuestSealer,
     ) -> std::io::Result<()> {
-        self.serve_guest_waiting(route, sealer, IO_TIMEOUT, &AtomicBool::new(false))
+        self.serve_guest_waiting(route, sealer, IO_TIMEOUT, &AtomicBool::new(false), None)
     }
 
     /// [`Self::serve_guest`] for the launch path: waits up to
@@ -390,7 +393,17 @@ impl MailboxService {
         sealer: &mut GuestSealer,
         stop: &AtomicBool,
     ) -> std::io::Result<()> {
-        self.serve_guest_waiting(route, sealer, GUEST_HOLD_TIMEOUT, stop)
+        self.serve_guest_measured(route, sealer, stop, None)
+    }
+
+    pub(crate) fn serve_guest_measured(
+        &self,
+        route: &mvm_core::vm_backend::HostDialRoute,
+        sealer: &mut GuestSealer,
+        stop: &AtomicBool,
+        counts: Option<&mut GuestStreamCounts>,
+    ) -> std::io::Result<()> {
+        self.serve_guest_waiting(route, sealer, GUEST_HOLD_TIMEOUT, stop, counts)
     }
 
     fn serve_guest_waiting(
@@ -399,17 +412,33 @@ impl MailboxService {
         sealer: &mut GuestSealer,
         first_byte: Duration,
         stop: &AtomicBool,
+        mut counts: Option<&mut GuestStreamCounts>,
     ) -> std::io::Result<()> {
+        if let Some(totals) = counts.as_deref_mut() {
+            totals.dial();
+        }
         let stream = crate::telemetry_collector::dial_route(
             route,
             mvm_contract::protocol::mailbox::MAILBOX_PORT,
-        )?;
+        )
+        .inspect_err(|_| {
+            if let Some(totals) = counts.as_deref_mut() {
+                totals.failed_dial();
+            }
+        })?;
         if !await_first_byte(&stream, first_byte, stop) {
+            if let Some(totals) = counts {
+                totals.empty_connection();
+            }
             return Err(std::io::Error::other("the guest sent no mailbox frame"));
         }
-        match serve(&self.shared, stream, |body| {
-            sealer.seal(OutboxMessage::decode(body)?)
-        }) {
+        arm(&stream);
+        let seal = |body: &[u8]| sealer.seal(OutboxMessage::decode(body)?);
+        let served = match counts {
+            Some(totals) => serve_frame(&self.shared, &mut Measured::new(stream, totals), seal),
+            None => serve_frame(&self.shared, &mut &stream, seal),
+        };
+        match served {
             Served::Frame => Ok(()),
             Served::QueueFull => Err(std::io::Error::other(
                 "the mailbox queue is full; the guest keeps its frame",
@@ -471,17 +500,16 @@ enum Served {
 
 /// Read one frame, turn it into a capability and envelope with `prepare`, and
 /// answer with the admission verdict.
-fn serve(
+fn serve_frame(
     shared: &Shared,
-    mut stream: UnixStream,
+    stream: &mut (impl Read + Write),
     prepare: impl FnOnce(&[u8]) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal>,
 ) -> Served {
-    arm(&stream);
-    let Some(frame) = read_frame(shared, &mut stream) else {
+    let Some(frame) = read_frame(shared, stream) else {
         return Served::NoFrame;
     };
     let received = frame.is_ok();
-    let verdict = answer(shared, &mut stream, frame, prepare);
+    let verdict = answer(shared, stream, frame, prepare);
     match (received, verdict) {
         (false, _) => Served::NoFrame,
         (true, Err(Refusal::QueueFull(_))) => Served::QueueFull,
@@ -553,7 +581,7 @@ fn arm(stream: &UnixStream) {
 
 fn answer(
     shared: &Shared,
-    stream: &mut UnixStream,
+    stream: &mut impl Write,
     frame: Result<Vec<u8>, Refusal>,
     prepare: impl FnOnce(&[u8]) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal>,
 ) -> Result<(), Refusal> {
@@ -564,7 +592,7 @@ fn answer(
     verdict
 }
 
-fn reply_with<T: serde::Serialize>(stream: &mut UnixStream, reply: &Result<T, Refusal>) {
+fn reply_with<T: serde::Serialize>(stream: &mut impl Write, reply: &Result<T, Refusal>) {
     if let Ok(reply) = serde_json::to_vec(reply) {
         let _ = stream.write_all(&reply);
     }
@@ -572,7 +600,7 @@ fn reply_with<T: serde::Serialize>(stream: &mut UnixStream, reply: &Result<T, Re
 
 /// `None` means the peer sent not one byte (hung up, reset or timed out), so
 /// there is nobody to answer; a peer that began a frame gets its refusal.
-fn read_frame(shared: &Shared, stream: &mut UnixStream) -> Option<Result<Vec<u8>, Refusal>> {
+fn read_frame(shared: &Shared, stream: &mut impl Read) -> Option<Result<Vec<u8>, Refusal>> {
     let max = shared.limits.max_frame_bytes;
     let mut len = [0u8; 4];
     match stream.read(&mut len[..1]) {
@@ -582,7 +610,7 @@ fn read_frame(shared: &Shared, stream: &mut UnixStream) -> Option<Result<Vec<u8>
     Some(read_rest(stream, &mut len, max))
 }
 
-fn read_rest(stream: &mut UnixStream, len: &mut [u8; 4], max: usize) -> Result<Vec<u8>, Refusal> {
+fn read_rest(stream: &mut impl Read, len: &mut [u8; 4], max: usize) -> Result<Vec<u8>, Refusal> {
     stream
         .read_exact(&mut len[1..])
         .map_err(|_| Refusal::Malformed)?;
@@ -709,8 +737,9 @@ mod accept_loop_tests {
     fn guest(service: &MailboxService, bytes: &[u8]) -> (Vec<u8>, bool) {
         let mut no_frame = false;
         let got = exchange(bytes, |s| {
+            arm(&s);
             no_frame = matches!(
-                serve(&service.shared, s, |_| Err(Refusal::Malformed)),
+                serve_frame(&service.shared, &mut &s, |_| Err(Refusal::Malformed)),
                 Served::NoFrame
             );
         });

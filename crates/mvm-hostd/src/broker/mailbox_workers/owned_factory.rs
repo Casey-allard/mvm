@@ -126,6 +126,10 @@ impl MailboxWorkerFactory for OwnedMailboxWorkerFactory {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
+        if let Some(socket) = crate::mailbox_service::guest_io::inherited_report_socket()? {
+            let fd: std::os::fd::OwnedFd=socket.into();
+            cmd.env(crate::mailbox_service::guest_io::ENABLE_ENV, "1").stdout(Stdio::from(fd));
+        }
         let (child, parent_lease) = spawn_with_resource_lease_and_control(cmd, lease, &helper)?;
         Ok(SpawnedMailboxWorker {
             child,
