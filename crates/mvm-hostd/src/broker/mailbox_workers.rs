@@ -2267,7 +2267,8 @@ mod tests {
                 r.request_nonce = [nonce; 32];
                 r.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: 2 };
                 let envelope = broker_control::sign(ControlRequest::MailboxWorkerV1(Box::new(r.clone())), &key.to_bytes()).unwrap();
-                verify_request(&envelope, &key.verifying_key(), budget.now_unix_ms().unwrap()).unwrap();
+                verify_request(&envelope, &key.verifying_key(), budget.now_unix_ms()?)
+                .map_err(|_| refused("canonical worker binding refused"))?;
                 workers.handle(&r)
             };
             reserve("alpha", 4).unwrap();
@@ -2285,7 +2286,8 @@ mod tests {
         let key = SigningKey::from_bytes(&[7; 32]);
         let call = |request: &MailboxWorkerRequest| {
             let envelope = broker_control::sign(ControlRequest::MailboxWorkerV1(Box::new(request.clone())), &key.to_bytes()).unwrap();
-            verify_request(&envelope, &key.verifying_key(), budget.now_unix_ms().unwrap()).unwrap();
+            verify_request(&envelope, &key.verifying_key(), budget.now_unix_ms()?)
+                .map_err(|_| refused("canonical worker binding refused"))?;
             workers.handle(request)
         };
         let request_for = |vm: &str, nonce: u8| {
