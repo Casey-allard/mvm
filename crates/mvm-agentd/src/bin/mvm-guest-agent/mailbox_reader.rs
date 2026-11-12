@@ -1,8 +1,11 @@
 //! Explicit guest-local Receive and ACK-after-processing over the existing
 //! mailbox vsock port. The workload can read the socket, not the ACK key.
 
+#[path = "mailbox_reader/object_submit.rs"]
+pub(crate) mod object_submit;
 #[path = "mailbox_reader/validity.rs"]
 mod validity;
+use mvm_core::mailbox::object_pair::role::SignedObjectRoleV1;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -36,6 +39,9 @@ struct ActiveLease {
 }
 
 struct GuestReader {
+    role: Option<SignedObjectRoleV1>,
+    settlement: object_submit::Settlement,
+    outbox: std::path::PathBuf,
     boot: MailboxReaderBootBinding,
     ack_seed: &'static Zeroizing<[u8; 32]>,
     active: Mutex<Option<ActiveLease>>,
@@ -62,6 +68,7 @@ pub(crate) fn now_unix_ms() -> Result<i64, Refusal> {
 pub(crate) fn start(
     boot: MailboxReaderBootBinding,
     ack_seed: &'static Zeroizing<[u8; 32]>,
+    role: Option<SignedObjectRoleV1>,
 ) -> Option<mpsc::Receiver<PendingReader>> {
     let path = Path::new(GUEST_READER_SOCKET_PATH);
     let result = (|| {
@@ -89,6 +96,11 @@ pub(crate) fn start(
     let (tx, rx) = mpsc::sync_channel(1);
     let state = Arc::new(GuestReader {
         boot,
+        role,
+        settlement: Default::default(),
+        outbox: Path::new(mvm_agentd::mailbox_outbox::LOCAL_OUTBOX_PATH)
+            .parent()?
+            .into(),
         ack_seed,
         active: Mutex::new(None),
     });
@@ -111,6 +123,12 @@ fn application_request(
     reader: &Arc<GuestReader>,
 ) -> Result<ReaderResponse, Refusal> {
     let request = match read_application_request(stream)? {
+        ApplicationReaderRequest::ObjectSubmissionStatusV1 { pair, message_id } => {
+            match object_submit::status(reader, pair, message_id)? {
+                object_submit::Status::Cached(result) => return Ok(result),
+                object_submit::Status::Query(request) => request,
+            }
+        }
         ApplicationReaderRequest::StageObjectV1 { pair, submission } => {
             use mvm_core::mailbox::reader_wire::ObjectSubmissionV1;
             let message_id = submission.message_id();
@@ -137,10 +155,7 @@ fn application_request(
                 }
                 _ => return Err(Refusal::NotAuthorized),
             }
-            let dir = Path::new(mvm_agentd::mailbox_outbox::LOCAL_OUTBOX_PATH)
-                .parent()
-                .ok_or(Refusal::Unavailable)?;
-            mvm_agentd::mailbox_outbox::object_pair::stage(dir, &reader.boot, pair, &submission)?;
+            object_submit::stage(reader, pair, &submission)?;
             return Ok(ReaderResponse::ObjectStagedV1 { pair, message_id });
         }
         ApplicationReaderRequest::CheckOutboundJournalV1 {
@@ -177,6 +192,9 @@ fn application_request(
             if active.lease != *lease {
                 return Err(Refusal::NotAuthorized);
             }
+            if active.object_call {
+                object_submit::allows_call_ack(reader, &active.lease)?;
+            }
             let ack = if let Some(ack) = &active.ack {
                 ack.clone()
             } else {
@@ -206,16 +224,31 @@ fn application_request(
         }
     };
     let (reply, received) = mpsc::sync_channel(1);
-    tx.try_send(PendingReader {
+    let pending_status = match &request {
+        ReaderRequest::SubmitObjectV1 { pair, submission } => {
+            Some(ReaderResponse::ObjectPendingV1 {
+                pair: *pair,
+                message_id: submission.message_id(),
+            })
+        }
+        _ => None,
+    };
+    if let Err(error) = tx.try_send(PendingReader {
         wait_until: Instant::now() + validity::MAX_WINDOW_WAIT,
         request,
         reply,
         reader: reader.clone(),
-    })
-    .map_err(|_| Refusal::Unavailable)?;
-    received
-        .recv_timeout(LOCAL_TIMEOUT)
-        .map_err(|_| Refusal::Unavailable)
+    }) {
+        if matches!(error, mpsc::TrySendError::Full(_)) {
+            return pending_status.ok_or(Refusal::Unavailable);
+        }
+        return Err(Refusal::Unavailable);
+    }
+    match received.recv_timeout(LOCAL_TIMEOUT) {
+        Ok(response) => Ok(response),
+        Err(mpsc::RecvTimeoutError::Timeout) => pending_status.ok_or(Refusal::Unavailable),
+        Err(_) => Err(Refusal::Unavailable),
+    }
 }
 
 /// The mailbox listener calls this only when an application operation is
@@ -236,7 +269,20 @@ fn perform_exchange(
     stream: &mut (impl Read + Write),
     pending: &PendingReader,
 ) -> Result<ReaderResponse, Refusal> {
-    write_request(stream, &pending.request)?;
+    if let ReaderRequest::SubmitObjectV1 { pair, submission } = &pending.request {
+        object_submit::preflight(&pending.reader, *pair, submission)?;
+        match write_request(stream, &pending.request) {
+            Err(Refusal::Unavailable) => {
+                return Ok(ReaderResponse::ObjectPendingV1 {
+                    pair: *pair,
+                    message_id: submission.message_id(),
+                });
+            }
+            result => result?,
+        }
+    } else {
+        write_request(stream, &pending.request)?;
+    }
     match &pending.request {
         ReaderRequest::Receive | ReaderRequest::ReceiveObjectPairV1 { .. } => {
             let pair = match pending.request {
@@ -358,7 +404,12 @@ fn perform_exchange(
             Ok(response)
         }
         ReaderRequest::Ack { signed } => correlate_ack(read_response(stream)?, signed),
-        ReaderRequest::Possession { .. } => Err(Refusal::NotAuthorized),
+        ReaderRequest::SubmitObjectV1 { pair, submission } => {
+            object_submit::settle(stream, &pending.reader, *pair, submission)
+        }
+        ReaderRequest::GetObjectRoleV1 { .. } | ReaderRequest::Possession { .. } => {
+            Err(Refusal::NotAuthorized)
+        }
     }
 }
 
@@ -394,6 +445,9 @@ mod tests {
     fn local_receive_is_explicit_and_an_empty_reply_does_not_sign_an_ack() {
         let ack_seed = SEED.get_or_init(|| Zeroizing::new([7; 32]));
         let reader = Arc::new(GuestReader {
+            role: None,
+            settlement: Default::default(),
+            outbox: Default::default(),
             boot: MailboxReaderBootBinding {
                 durable_object_pair_sha256_v1: None,
                 outbound_journal_v1: None,

@@ -50,12 +50,6 @@ pub(crate) fn capture_ack_key_before_privilege_drop() {
             return;
         }
     };
-    if binding.durable_object_pair_sha256_v1.is_some() {
-        // Record the selected but unavailable profile even if its ACK seed
-        // is missing. The ordinary listener cannot serve this original boot.
-        let _ = READER_BOOT.set(binding);
-        return;
-    }
     match load_ack_seed(&dir.join(MAILBOX_ACK_SIGNING_KEY_FILE), 0) {
         Ok(seed)
             if SigningKey::from_bytes(&seed).verifying_key().to_bytes()
@@ -65,7 +59,12 @@ pub(crate) fn capture_ack_key_before_privilege_drop() {
                 eprintln!("mvm-guest-agent: mailbox ACK identity already initialized");
             }
         }
-        Ok(_) | Err(_) => eprintln!("mvm-guest-agent: mailbox ACK key does not match this boot"),
+        Ok(_) | Err(_) => {
+            if binding.durable_object_pair_sha256_v1.is_some() {
+                let _ = READER_BOOT.set(binding);
+            }
+            eprintln!("mvm-guest-agent: mailbox ACK key does not match this boot");
+        }
     }
 }
 
@@ -221,11 +220,10 @@ pub(crate) fn init_mailbox() {
         return;
     }
     let reader_boot = READER_BOOT.get().cloned();
-    if reader_boot
+    let selected = reader_boot
         .as_ref()
-        .is_some_and(|b| b.durable_object_pair_sha256_v1.is_some())
-    {
-        eprintln!("mvm-guest-agent: durable object Call/Reply service is not installed");
+        .is_some_and(|b| b.durable_object_pair_sha256_v1.is_some());
+    if selected && ACK_SEED.get().is_none() {
         return;
     }
     let ack_seed = ACK_SEED.get();
@@ -234,7 +232,9 @@ pub(crate) fn init_mailbox() {
             match bind_vsock_listener(MAILBOX_PORT) {
                 Ok(fd) => {
                     let reader = match (reader_boot.clone(), ack_seed) {
-                        (Some(binding), Some(seed)) => crate::mailbox_reader::start(binding, seed),
+                        (Some(binding), Some(seed)) if !selected => {
+                            crate::mailbox_reader::start(binding, seed, None)
+                        }
                         _ => None,
                     };
                     accept_loop(fd, reader, reader_boot);
@@ -255,7 +255,7 @@ fn logs_refusal(refused: u32) -> bool {
 /// One host connection at a time, each answered from the outbox.
 fn accept_loop(
     listener_fd: RawFd,
-    reader: Option<std::sync::mpsc::Receiver<crate::mailbox_reader::PendingReader>>,
+    mut reader: Option<std::sync::mpsc::Receiver<crate::mailbox_reader::PendingReader>>,
     reader_boot: Option<MailboxReaderBootBinding>,
 ) {
     let mut refused = 0u32;
@@ -272,6 +272,18 @@ fn accept_loop(
             continue;
         }
         let mut deadline = MailboxDeadline::new(&mut stream);
+        if reader.is_none()
+            && let Some(boot) = reader_boot
+                .as_ref()
+                .filter(|b| b.durable_object_pair_sha256_v1.is_some())
+        {
+            if let Ok(role) = crate::mailbox_reader::object_submit::fetch_role(&mut deadline, boot)
+                && let Some(seed) = ACK_SEED.get()
+            {
+                reader = crate::mailbox_reader::start(boot.clone(), seed, Some(role));
+            }
+            continue;
+        }
         let result = wait_for_operation(
             &mut deadline,
             &mut attempts,
@@ -301,6 +313,21 @@ fn wait_for_operation(
     outbox: &Path,
 ) -> Result<(), Refusal> {
     let until = Instant::now() + MAILBOX_HOLD;
+    if reader_boot.is_some_and(|b| b.durable_object_pair_sha256_v1.is_some()) {
+        let rx = reader.ok_or(Refusal::NotAuthorized)?;
+        loop {
+            if let Ok(pending) = rx.try_recv() {
+                return crate::mailbox_reader::exchange(stream, pending);
+            }
+            if peer_gone(stream.as_raw_fd())
+                || SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                || Instant::now() >= until
+            {
+                return Err(Refusal::Unavailable);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     let directed = reader_boot
         .filter(|b| b.outbound_journal_v1.is_some())
         .map(|b| {
