@@ -251,6 +251,14 @@ impl<'a> InstalledParticipant<'a> {
     }
 }
 
+fn check_hvf_reader(
+    plan: &mvm_core::plan::ExecutionPlan,
+    _minted: &MailboxReaderBootBinding,
+    presented: &MailboxReaderBootBinding,
+) -> Result<()> {
+    presented.check_plan(plan)
+}
+
 fn check_original_native(participant: &InstalledParticipant<'_>) -> Result<()> {
     let original = match participant.original {
         #[cfg(target_os = "linux")]

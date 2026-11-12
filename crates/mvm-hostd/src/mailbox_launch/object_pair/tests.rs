@@ -1101,3 +1101,31 @@ fn original_sdk_pair_wait_is_bounded_and_one_failed_start_wakes_its_peer() {
     });
     assert!(now.elapsed() < Duration::from_secs(5) && callee.require_open().is_err());
 }
+
+#[test]
+fn original_hvf_reader_rejects_another_boot_or_ack_key_under_identical_admission()
+-> anyhow::Result<()> {
+    let f = Originals::new();
+    let prepared = f.prepare(f.credentials.clone())?;
+    let (grant, _) = prepared.selected_grants();
+    let a = BootFixture::new(f.dir.path(), grant, 1, f.now);
+    let signer = host_keypair::load_or_init_at(f.dir.path())?;
+    let id = host_keypair::host_signer_id();
+    let plan = verify_plan(&a.signed, &[(id.as_str(), &signer.verifying)])?;
+    let mut other = a.boot.clone();
+    other.boot = BootId::from_bytes([24; 32]);
+    other.check_plan(&plan)?;
+    assert!(
+        check_hvf_reader(&plan, &a.boot, &other).is_err(),
+        "accepted a sibling cold boot"
+    );
+    other = a.boot.clone();
+    other.ack_public_key = SigningKey::from_bytes(&[89; 32]).verifying_key().to_bytes();
+    other.check_plan(&plan)?;
+    assert!(
+        check_hvf_reader(&plan, &a.boot, &other).is_err(),
+        "accepted a different workload ACK key"
+    );
+    check_hvf_reader(&plan, &a.boot, &a.boot)?;
+    Ok(())
+}
