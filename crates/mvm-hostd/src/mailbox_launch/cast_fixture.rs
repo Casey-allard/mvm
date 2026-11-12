@@ -76,6 +76,7 @@ fn bounded(
 /// with the earlier of the plans' validity, original admissions, and 3 minutes.
 pub fn prepare(
     home: &Path,
+    claim: &std::fs::File,
     a: ReservedFixture<'_>,
     b: ReservedFixture<'_>,
     deadline: Instant,
@@ -94,6 +95,18 @@ pub fn prepare(
     ensure!(
         file.is_dir() && mvm_core::private_fs::mode_bits(home, &file)? == 0o700,
         "private fixture home required"
+    );
+    use std::os::unix::fs::MetadataExt;
+    let marker = home.join(".spiralcore-canonical-witness-owner");
+    let entry = std::fs::symlink_metadata(&marker)?;
+    let held = claim.metadata()?;
+    mvm_core::private_fs::require_current_owner(&entry)?;
+    ensure!(
+        entry.is_file()
+            && entry.nlink() == 1
+            && mvm_core::private_fs::mode_bits(&marker, &entry)? == 0o600
+            && (entry.dev(), entry.ino()) == (held.dev(), held.ino()),
+        "original isolated witness claim unavailable"
     );
     let ra = a.original.worker.acquire_request();
     let rb = b.original.worker.acquire_request();
@@ -208,7 +221,7 @@ pub fn prepare(
             worker: r.original.worker,
         }
     }
-    let prepared = development::prepare(
+    let prepared = development::prepare_immutable_generation(
         Participant {
             installed: part(&a),
             current: &pa,
