@@ -301,11 +301,20 @@ pub struct InstalledObjectPair<'a> {
 }
 struct PairMaterial {
     plan_verifier: ed25519_dalek::VerifyingKey,
-    caller: EndpointMaterial,
-    callee: EndpointMaterial,
+    caller: InstalledEndpointMaterial,
+    callee: InstalledEndpointMaterial,
+}
+struct InstalledEndpointMaterial {
+    custody: crate::mailbox_custody::RetainedMailboxKeys,
+    local: EndpointMaterial,
+}
+impl std::ops::Deref for InstalledEndpointMaterial {
+    type Target = EndpointMaterial;
+    fn deref(&self) -> &Self::Target {
+        &self.local
+    }
 }
 pub(crate) struct EndpointMaterial {
-    custody: crate::mailbox_custody::RetainedMailboxKeys,
     pub(crate) routing: MailboxRoutingFrame,
     pub(crate) public_role: mvm_core::mailbox::object_pair::role::SignedObjectRoleV1,
     pub(crate) reader: GuestReaderAuthority,
@@ -545,7 +554,7 @@ impl PreparedObjectPair {
                         revoked: &[RevocationId],
                         incoming: &[u8; 32],
                         outgoing: &[u8; 32]|
-         -> Result<EndpointMaterial> {
+         -> Result<InstalledEndpointMaterial> {
             let d = super::derived_keys(keys, &g.mailbox, g.epoch)?;
             let reader = enroll_object_reader(
                 role.state,
@@ -605,19 +614,21 @@ impl PreparedObjectPair {
                 &public_role,
                 now,
             )?;
-            Ok(EndpointMaterial {
+            Ok(InstalledEndpointMaterial {
                 custody,
-                routing: routes[if g.mailbox == self.caller.mailbox {
-                    1
-                } else {
-                    0
-                }]
-                .clone(),
-                public_role,
-                reader,
-                sender: d.sender,
-                inbound_key: Key::from_bytes(*incoming),
-                outbound_key: Key::from_bytes(*outgoing),
+                local: EndpointMaterial {
+                    routing: routes[if g.mailbox == self.caller.mailbox {
+                        1
+                    } else {
+                        0
+                    }]
+                    .clone(),
+                    public_role,
+                    reader,
+                    sender: d.sender,
+                    inbound_key: Key::from_bytes(*incoming),
+                    outbound_key: Key::from_bytes(*outgoing),
+                },
             })
         };
         Ok(PairMaterial {
@@ -664,7 +675,7 @@ fn load_private_root(keys: &Path) -> Result<Key> {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod bootstrap;
-mod operations;
+pub(crate) mod operations;
 mod pending;
 pub use operations::{OriginalObjectCallLease, SealedObjectTurn};
 

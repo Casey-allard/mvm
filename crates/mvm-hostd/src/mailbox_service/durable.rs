@@ -624,7 +624,7 @@ pub(crate) fn reader_revocations(path: &Path) -> Result<Vec<RevocationId>, Refus
     Ok(revoked)
 }
 
-fn guest_scope<'a>(
+pub(crate) fn guest_scope<'a>(
     reader: &'a GuestReaderAuthority,
     context: &OpenContext,
 ) -> MailboxGuestReaderScope<'a> {

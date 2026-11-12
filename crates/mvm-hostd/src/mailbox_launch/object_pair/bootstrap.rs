@@ -368,3 +368,33 @@ impl ObjectWorkerBootstrapV1 {
         })
     }
 }
+
+impl ObjectWorkerBootstrapV1 {
+    /// Role-local source/destination material. The remote receipt signer and
+    /// host private plan signer are never part of this worker handoff.
+    pub(crate) fn endpoint_material(&self) -> Result<EndpointMaterial> {
+        let a = self.validate_current()?;
+        let role = &self.role.role;
+        let recv = match role.role {
+            ObjectParticipantRole::Caller => &self.caller_receive,
+            ObjectParticipantRole::Callee => &self.callee_receive,
+        };
+        Ok(EndpointMaterial {
+            routing: self.routing.clone(),
+            public_role: self.role.clone(),
+            sender: ed25519_dalek::SigningKey::from_bytes(&self.secrets.local_sender),
+            inbound_key: Key::from_bytes(self.secrets.inbound),
+            outbound_key: Key::from_bytes(self.secrets.outbound),
+            reader: GuestReaderAuthority {
+                grant: a.local_plan.mailbox.context("original grant missing")?,
+                boot: role.local().clone(),
+                capability: recv.clone(),
+                enrollment: self.reader_enrollment.clone(),
+                revocations_path: revocations_path(&a.local_state),
+            },
+        })
+    }
+}
+
+#[path = "worker_journal.rs"]
+mod journal;

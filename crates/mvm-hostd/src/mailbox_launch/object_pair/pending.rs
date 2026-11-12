@@ -71,7 +71,7 @@ impl InstalledObjectPair<'_> {
     }
 }
 
-pub(super) fn recover(
+pub(crate) fn recover(
     local: &EndpointMaterial,
     dir: &Path,
     pair: &ObjectPairV1<'_>,
