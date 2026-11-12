@@ -343,6 +343,23 @@ fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers(
         observed_at_unix_ms: now,
         ciphertext_commitment: [68; 32],
     };
+    let original_seal = mvm_core::mailbox::reader_wire::OriginalObjectSealV1 {
+        pair,
+        sender_boot: original.boot,
+        intent_sha256: mvm_core::mailbox::reader_wire::original_object_intent_digest(&submission)
+            .unwrap(),
+        delivery_id: DeliveryId::from_bytes([67; 32]),
+        ciphertext_commitment: [68; 32],
+    };
+    let host_reply = |r| ReaderResponse::ObjectSealAcceptedV1 {
+        original: original_seal.clone(),
+        receipt: Box::new(r),
+    };
+    let valid = host_reply(sign_receipt(body.clone(), &b).unwrap());
+    let mut other_seal = body.clone();
+    other_seal.ciphertext_commitment = [72; 32];
+    other_seal.delivery_id = DeliveryId::from_bytes([73; 32]);
+    let other = host_reply(sign_receipt(other_seal, &b).unwrap());
     let accepted = ReaderResponse::ObjectAcceptedV1 {
         receipt: Box::new(sign_receipt(body.clone(), &b).unwrap()),
     };
@@ -375,9 +392,19 @@ fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers(
         attempt(&reader, None),
         ReaderResponse::ObjectPendingV1 { pair, message_id }
     );
-    let wrong = ReaderResponse::ObjectAcceptedV1 {
-        receipt: Box::new(sign_receipt(body, &a).unwrap()),
-    };
+    let wrong = host_reply(sign_receipt(body, &a).unwrap());
+    assert_eq!(
+        attempt(&reader, Some(&other)),
+        ReaderResponse::Refused {
+            reason: Refusal::NotAuthorized
+        }
+    );
+    assert_eq!(
+        attempt(&reader, Some(&accepted)),
+        ReaderResponse::Refused {
+            reason: Refusal::NotAuthorized
+        }
+    );
     assert_eq!(
         attempt(&reader, Some(&wrong)),
         ReaderResponse::Refused {
@@ -393,12 +420,12 @@ fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers(
         submission: Box::new(next),
     };
     assert_eq!(local(&reader, &next), Err(Refusal::QueueFull(1)));
-    assert_eq!(attempt(&reader, Some(&accepted)), accepted);
+    assert_eq!(attempt(&reader, Some(&valid)), accepted);
     assert_eq!(local(&reader, &status), Ok(accepted.clone()));
     drop(reader);
     let reopened = new_reader();
     assert_eq!(local(&reopened, &next), Err(Refusal::QueueFull(1)));
-    assert_eq!(attempt(&reopened, Some(&accepted)), accepted);
+    assert_eq!(attempt(&reopened, Some(&valid)), accepted);
     assert_eq!(
         local(&reopened, &next),
         Ok(ReaderResponse::ObjectStagedV1 {

@@ -205,9 +205,18 @@ pub(super) fn settle(
     if matches!(response, ReaderResponse::Refused { .. }) {
         return Ok(response);
     }
-    let ReaderResponse::ObjectAcceptedV1 { receipt } = &response else {
+    let ReaderResponse::ObjectSealAcceptedV1 { original, receipt } = &response else {
         return Err(Refusal::NotAuthorized);
     };
+    if original.pair != pair
+        || original.sender_boot != reader.boot.boot
+        || original.intent_sha256
+            != mvm_core::mailbox::reader_wire::original_object_intent_digest(submission)?
+        || original.delivery_id != receipt.receipt.delivery_id
+        || original.ciphertext_commitment != receipt.receipt.ciphertext_commitment
+    {
+        return Err(Refusal::NotAuthorized);
+    }
     let role = current_role(reader, pair)?;
     check_submission(role, submission)?;
     check_receipt(role, msg, receipt)?;
@@ -222,5 +231,7 @@ pub(super) fn settle(
         return Err(Refusal::NotAuthorized);
     }
     *guard = Some((submission.clone(), (**receipt).clone()));
-    Ok(response)
+    Ok(ReaderResponse::ObjectAcceptedV1 {
+        receipt: receipt.clone(),
+    })
 }
