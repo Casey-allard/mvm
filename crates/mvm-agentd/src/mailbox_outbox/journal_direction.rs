@@ -492,4 +492,65 @@ mod tests {
         assert!(peer.sent.is_empty());
         assert!(original_slot.exists());
     }
+
+    #[test]
+    fn original_directed_file_moves_identical_bytes_across_two_real_socket_turns() {
+        use std::{
+            os::unix::net::UnixStream,
+            time::{Duration, Instant},
+        };
+        let (boot, msg, receipt, b) = fixture();
+        let signed = sign_receipt(receipt, &b).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join(slot_name(&boot).unwrap());
+        write_single_outbox(&slot, &msg).unwrap();
+        let mut attempts = JournalAttempts::default();
+        for reply in [false, true] {
+            let (mut guest, mut host) = UnixStream::pair().unwrap();
+            for socket in [&host, &guest] {
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+            }
+            let original = msg.clone();
+            let verdict = serde_json::to_vec(&Ok::<_, Refusal>(&signed)).unwrap();
+            let t = std::thread::spawn(move || {
+                let mut header = [0; 4];
+                host.read_exact(&mut header).unwrap();
+                assert_eq!(u32::from_be_bytes(header) as usize, original.encode().len());
+                let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+                host.read_exact(&mut bytes).unwrap();
+                assert_eq!(OutboxMessage::decode(&bytes).unwrap(), original);
+                if reply {
+                    host.write_all(&verdict).unwrap();
+                }
+                (
+                    header.len() + bytes.len(),
+                    if reply { verdict.len() } else { 0 },
+                )
+            });
+            let started = Instant::now();
+            let result =
+                forward_for_original_boot(&mut guest, &slot, &boot, &mut attempts, || Ok(150));
+            let wall = started.elapsed();
+            let (to_peer, from_peer) = t.join().unwrap();
+            assert_eq!(slot.exists(), !reply);
+            if reply {
+                assert_eq!(result.unwrap(), signed);
+            } else {
+                assert_eq!(result, Err(Refusal::Unavailable));
+            }
+            println!(
+                "original-directed-uds reply={} app_bytes={} to_peer_bytes={} from_peer_bytes={} host_component_wall_ns={}",
+                reply,
+                msg.body.len(),
+                to_peer,
+                from_peer,
+                wall.as_nanos()
+            );
+        }
+    }
 }
