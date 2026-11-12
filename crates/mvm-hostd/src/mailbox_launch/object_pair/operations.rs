@@ -174,7 +174,7 @@ impl InstalledObjectPair<'_> {
 }
 
 impl PairMaterial {
-    fn seal_turn(
+    pub(super) fn seal_turn(
         &self,
         role: ObjectParticipantRole,
         message: MessageId,
@@ -331,7 +331,7 @@ impl PairMaterial {
         };
         Ok(fields)
     }
-    fn reopen(
+    pub(super) fn reopen(
         &self,
         role: ObjectParticipantRole,
         cap: &SignedMailboxCapability,
@@ -407,7 +407,7 @@ impl PairMaterial {
         })
     }
 
-    fn verify_accepted(
+    pub(super) fn verify_accepted(
         &self,
         role: ObjectParticipantRole,
         turn: &SealedObjectTurn,
