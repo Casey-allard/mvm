@@ -87,6 +87,17 @@ impl MailboxWorkers {
     /// Bind original slots directly in the coordinator that owns them. The
     /// release source's signed context commitment includes the VM, backend,
     /// grant, tenant, workload and the exact admitted plan digest.
+    pub(crate) fn claim_original_cast_turn(&self, source: (&str, &MailboxWorkerOwner), destination: (&str, &MailboxWorkerOwner), direction: [u8;32], nonce: [u8;32]) -> io::Result<()> {
+        use crate::mailbox_process::owned_wire::ReadyIngress;
+        self.with_cast_participants(source, destination, |a,b| {
+            if nonce == [0;32] || direction == [0;32] || a.ingress != ReadyIngress::CastSource(direction)
+                || b.ingress != ReadyIngress::CastDestination(direction) || a.cast_control_nonce.is_some() {
+                return Err(refused("original Cast control refused or already attempted"));
+            }
+            a.cast_control_nonce = Some(nonce);
+            Ok(())
+        })
+    }
     pub(crate) fn original_cast_pair(
         &self,
         source: (&str, &MailboxWorkerOwner),

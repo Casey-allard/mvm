@@ -691,6 +691,7 @@ pub struct SpawnedMailboxWorker {
 struct Worker {
     ingress: crate::mailbox_process::owned_wire::ReadyIngress,
     cast_workspace: Option<Arc<cast_credit::HandoffWorkspace>>,
+    cast_control_nonce: Option<[u8; 32]>,
     source_workspace: Option<Arc<cast_credit::HandoffWorkspace>>,
     parent_lease: Option<mvm_vmm::host::installed_owner::HolderLease>,
     child: Child,
@@ -1404,6 +1405,9 @@ impl MailboxWorkers {
         &self,
         request: &MailboxWorkerRequest,
     ) -> io::Result<(MailboxWorkerResult, Option<OwnedFd>)> {
+        if matches!(request.operation, MailboxWorkerOperation::ForwardCastV1 { .. }) {
+            return Err(refused("Cast control requires original lifecycle and approved plan signer"));
+        }
         let provision = matches!(request.operation, MailboxWorkerOperation::ProvisionAdmittedV1 { .. });
         if provision && !self.factory.requires_signed_provision() {
             return Err(refused("installed mailbox provisioning disabled"));
@@ -1540,6 +1544,7 @@ impl MailboxWorkers {
             };
             let mut slot = lock(&slot)?;
             let supplied = match &request.operation {
+                MailboxWorkerOperation::ForwardCastV1 { .. } => return Err(refused("unexpected Cast worker operation")),
                 MailboxWorkerOperation::DelegateConfig { owner }
                 | MailboxWorkerOperation::Query { owner }
                 | MailboxWorkerOperation::Stop { owner }
@@ -1658,6 +1663,7 @@ impl MailboxWorkers {
                     ingress: crate::mailbox_process::owned_wire::ReadyIngress::Legacy,
                     cast_workspace: None,
                     source_workspace: None,
+                    cast_control_nonce: None,
                     parent_lease: spawned.parent_lease,
                     child: spawned.child,
                     control: spawned.control,

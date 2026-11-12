@@ -6,7 +6,7 @@ use mvm_core::plan::{PlanId, signing::SignedExecutionPlan};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Policy {
+pub(super) struct Policy {
     tenant: mvm_contract::protocol::mailbox::TenantId,
     domain: mvm_contract::protocol::mailbox::AuthorizationDomainId,
     mailbox: mvm_contract::protocol::mailbox::MailboxId,
@@ -41,7 +41,7 @@ impl Policy {
             revoked: p.revoked_capabilities.clone(),
         })
     }
-    fn current(&self, now: i64) -> OpenContext {
+    pub(super) fn current(&self, now: i64) -> OpenContext {
         OpenContext {
             expected_tenant: self.tenant,
             expected_authorization_domain: self.domain,
@@ -77,6 +77,9 @@ pub(crate) struct PrivateDestination {
     policies: [Policy; 2],
 }
 impl PrivateDestination {
+    pub(super) fn public_control(&self) -> super::control::PublicCastControl {
+        super::control::PublicCastControl::new(self.fields.clone(), self.plans.clone(), self.scopes.clone(), self.policies.clone())
+    }
     pub(super) fn for_source(&self, capsule: &Capsule) -> Self {
         let mut source = self.clone();
         source.capsule = capsule.0.to_vec();
