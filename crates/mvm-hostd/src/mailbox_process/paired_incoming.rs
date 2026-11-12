@@ -244,6 +244,7 @@ pub(super) struct EnrolledIncoming {
     key: Key,
     encryption: EncryptionContext,
     original_receive: SignedMailboxCapability,
+    source_claim: PathBuf,
 }
 impl EnrolledIncoming {
     pub(super) fn open(
@@ -293,8 +294,44 @@ impl EnrolledIncoming {
             key: Key::from_bytes(*raw),
             encryption,
             original_receive: reader.capability.clone(),
+            source_claim: retained
+                .storage_paths(config_keys)?
+                .journal
+                .with_extension("original-source-v1"),
         }))
     }
+    fn bind_original_source(&self, commitment: [u8; 32]) -> Result<()> {
+        // The first final A plan+boot wins for this retained B journal.
+        // A launcher loss does not permit a replacement generation to reuse its DEK.
+        match mvm_core::util::atomic_io::atomic_write_new(&self.source_claim, &commitment) {
+            Ok(()) => (),
+            Err(e) if mvm_core::util::atomic_io::is_already_exists(&e) => (),
+            Err(e) => return Err(e),
+        }
+        let mut f = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&self.source_claim)?;
+        let meta = f.metadata()?;
+        ensure!(
+            meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o077 == 0 && meta.len() == 32,
+            "invalid original A claim"
+        );
+        let mut held = [0; 32];
+        f.read_exact(&mut held)?;
+        ensure!(
+            held == commitment,
+            "this retained journal belongs to a different original A"
+        );
+        File::open(
+            self.source_claim
+                .parent()
+                .context("missing journal directory")?,
+        )?
+        .sync_all()?;
+        Ok(())
+    }
+
     pub(super) fn apply(&self, policy: &mut MailboxPolicy) -> Result<()> {
         let sender = self.policy.source_scope.grant.subject;
         policy.context.expected_sender = sender;
@@ -357,11 +394,197 @@ impl OriginalJournalDestination {
             enrolled.agrees(grants),
             "original A or B signed grants changed"
         );
+        let commitment = journal_direction_commitment(boot)?;
+        enrolled.bind_original_source(commitment)?;
         Ok(PairedSourceMaterial::from_enrollment(
-            journal_direction_commitment(boot)?,
+            commitment,
             Key::from_bytes(*enrolled.key.expose_bytes()),
             enrolled.encryption.clone(),
             enrolled.policy.destination_template.routing.clone(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mailbox_launch::derive_launch_keys;
+    use ed25519_dalek::SigningKey;
+    use mvm_core::mailbox::{
+        InMemoryReplayProtector, SealRequest, open_envelope, seal_envelope, sign_capability,
+    };
+    use mvm_core::plan::{compute_plan_id, test_support::PlanFixture};
+
+    fn setup(dir: &Path) -> (MailboxGrant, IncomingJournalPolicy, SigningKey) {
+        crate::audit::host_keypair::load_or_init_at(dir).unwrap();
+        let grant = |id| {
+            let mailbox = MailboxId::from_bytes([id; 32]);
+            let epoch = ExecutionEpoch::new(1).unwrap();
+            MailboxGrant {
+                mailbox,
+                epoch,
+                authority_key: authority_key_for(dir, &mailbox, epoch).unwrap().to_bytes(),
+                incoming_journal_policy_sha256_v1: None,
+                outbound_journal_v1: None,
+                report: None,
+                retention: Some(MailboxRetentionPolicy::new(60000).unwrap()),
+            }
+        };
+        let a = grant(4);
+        let mut b = grant(5);
+        let (_, sa) = derive_launch_keys(dir, &a, &Key::random()).unwrap().trust();
+        let (_, sb) = derive_launch_keys(dir, &b, &Key::random()).unwrap().trust();
+        let mut a_cap = sa.capability.clone();
+        a_cap.message_kinds = vec![MailboxMessageKind::Cast];
+        let mut template = MailboxTemplate {
+            header: sb.header,
+            routing: sb.routing,
+            capability: sb.capability,
+        };
+        template.header.tenant = a_cap.address.tenant;
+        template.header.authorization_domain = a_cap.address.authorization_domain;
+        template.capability.address.tenant = a_cap.address.tenant;
+        template.capability.address.authorization_domain = a_cap.address.authorization_domain;
+        template.capability.message_kinds = vec![MailboxMessageKind::Cast];
+        template.routing.hop_limit = 1;
+        let mut external = template.capability.clone();
+        external.subject = sa.header.sender;
+        external.capability_id = CapabilityId::from_bytes([71; 32]);
+        external.revocation_id = RevocationId::from_bytes([72; 32]);
+        let incoming = IncomingJournalPolicy {
+            source_mailbox: a.mailbox,
+            source_epoch: a.epoch,
+            source_scope: sign_capability(a_cap, &sa.authority_key).unwrap(),
+            destination_send: sign_capability(external, &sb.authority_key).unwrap(),
+            destination_template: template,
+        };
+        b.incoming_journal_policy_sha256_v1 = Some(incoming.commitment().unwrap());
+        (b, incoming, sa.sender_key)
+    }
+
+    #[test]
+    fn refuses_missing_unknown_or_swapped_original_credentials() {
+        let keys = tempfile::tempdir().unwrap();
+        let (grant, policy, _) = setup(keys.path());
+        let digest = policy.commitment().unwrap();
+        assert!(IncomingJournalPolicy::load(keys.path(), digest).is_err());
+        let mut missing = grant;
+        missing.incoming_journal_policy_sha256_v1 = None;
+        assert!(IncomingJournalAdmission::install_at(keys.path(), &missing, &policy).is_err());
+        let mut wrong = policy.clone();
+        wrong.destination_send.signature[0] ^= 1;
+        let mut substituted = grant;
+        substituted.incoming_journal_policy_sha256_v1 = Some(wrong.commitment().unwrap());
+        assert!(IncomingJournalAdmission::install_at(keys.path(), &substituted, &wrong).is_err());
+        assert!(IncomingJournalPolicy::load(keys.path(), wrong.commitment().unwrap()).is_err());
+        IncomingJournalAdmission::install_at(keys.path(), &grant, &policy).unwrap();
+        assert_eq!(
+            policy.commitment().unwrap(),
+            IncomingJournalPolicy::load(keys.path(), digest)
+                .unwrap()
+                .commitment()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn retained_original_b_reads_exact_a_bytes_after_helper_reopen() {
+        let keys = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (grant, policy, a_signer) = setup(keys.path());
+        IncomingJournalAdmission::install_at(keys.path(), &grant, &policy).unwrap();
+        let mut plan = PlanFixture::new().build();
+        plan.mailbox = Some(grant);
+        plan.plan_id = compute_plan_id(&plan);
+        let posture = MailboxLaunchPosture::for_test(&plan, Variant::Prod);
+        let boot = MailboxReaderBootBinding::mint(
+            &plan,
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes(),
+        )
+        .unwrap();
+        boot.persist(state.path()).unwrap();
+        let address = policy.destination_send.grant.address;
+        RetainedMailboxKeys::provision_or_open(
+            keys.path(),
+            &plan,
+            &plan.image.name,
+            &posture,
+            Some(boot.boot),
+            address,
+        )
+        .unwrap();
+        let reopen = || {
+            let retained = RetainedMailboxKeys::open_existing(
+                keys.path(),
+                &plan,
+                &plan.image.name,
+                &posture.handoff(Some(boot.boot)),
+                Some(boot.boot),
+                address,
+            )
+            .unwrap();
+            let mut derived = derive_launch_keys(keys.path(), &grant, &Key::random()).unwrap();
+            derived = derived.with_retained(&retained).unwrap();
+            let (mut inbound, sealer) = derived.trust();
+            let reader = super::super::reader::load_or_enroll(
+                state.path(),
+                &grant,
+                boot.clone(),
+                &sealer.capability,
+                &sealer.authority_key,
+            )
+            .unwrap();
+            let incoming = EnrolledIncoming::open(keys.path(), &grant, &retained, &boot, &reader)
+                .unwrap()
+                .unwrap();
+            assert_ne!(incoming.encryption.key_id, retained.payload_key_id());
+            incoming.apply(&mut inbound).unwrap();
+            assert_eq!(inbound.authority_key, sealer.authority_key.verifying_key());
+            assert_eq!(inbound.sender_key, a_signer.verifying_key());
+            (incoming, inbound)
+        };
+        let (first, _) = reopen();
+        first.bind_original_source([31; 32]).unwrap();
+        let mut header = policy.destination_template.header.clone();
+        header.sender = policy.source_scope.grant.subject;
+        header.kind = MailboxMessageKind::Cast;
+        header.reply_to = None;
+        header.capability_id = policy.destination_send.grant.capability_id;
+        header.issued_at_unix_ms = policy.destination_send.grant.not_before_unix_ms;
+        header.expires_at_unix_ms = policy.destination_send.grant.expires_at_unix_ms;
+        header.encryption = first.encryption.clone();
+        header.message_id = MessageId::from_bytes([31; 32]);
+        let bytes: Vec<u8> = (0u8..=255).chain(std::iter::once(0)).collect();
+        header.plaintext_len = bytes.len() as u32;
+        let mut routing = policy.destination_template.routing.clone();
+        routing.expires_at_unix_ms = header.expires_at_unix_ms;
+        let sealed = seal_envelope(
+            SealRequest {
+                header,
+                routing,
+                plaintext: &bytes,
+            },
+            &first.key,
+            &a_signer,
+        )
+        .unwrap();
+        let original_receive = first.original_receive.clone();
+        drop(first);
+        let (second, b) = reopen();
+        assert_eq!(second.original_receive, original_receive);
+        second.bind_original_source([31; 32]).unwrap();
+        assert!(second.bind_original_source([32; 32]).is_err());
+        let recovered = open_envelope(
+            &sealed,
+            &policy.destination_send,
+            &b.context,
+            &b.encryption_key,
+            &b.sender_key,
+            &b.authority_key,
+            &mut InMemoryReplayProtector::default(),
+        )
+        .unwrap();
+        assert_eq!(recovered, bytes);
     }
 }
