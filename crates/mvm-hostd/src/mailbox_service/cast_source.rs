@@ -29,6 +29,33 @@ impl GuestSealer {
         role: OriginalSourceRole<'a>,
         slot: &'a mut SourceCastSlot<C>,
     ) -> Result<CastSource<'a, C>, Refusal> {
+        if grants.source_scope.grant.address.tenant != self.header.tenant
+            || grants.source_scope.grant.address.authorization_domain
+                != self.header.authorization_domain
+        {
+            return Err(Refusal::Mailbox(
+                "original source tenant or domain changed".into(),
+            ));
+        }
+        self.source_from_verified_role(channel, grants, role, slot)
+    }
+    pub(crate) fn enrolled_addressed_source<'a, C>(
+        &'a mut self,
+        source: crate::mailbox_launch::cast_pair::development::VerifiedSourceRole<'a>,
+        slot: &'a mut SourceCastSlot<C>,
+    ) -> Result<CastSource<'a, C>, Refusal> {
+        let (channel, grants, role) = source
+            .for_original_sealer(&self.header)
+            .map_err(|_| Refusal::Mailbox("unverified development source enrollment".into()))?;
+        self.source_from_verified_role(channel, grants, role, slot)
+    }
+    fn source_from_verified_role<'a, C>(
+        &'a mut self,
+        channel: &'a CastChannel,
+        grants: AddressedCastGrants<'a>,
+        role: OriginalSourceRole<'a>,
+        slot: &'a mut SourceCastSlot<C>,
+    ) -> Result<CastSource<'a, C>, Refusal> {
         let h = &self.header;
         let scope = &grants.source_scope.grant;
         if !channel.matches_original_source(
@@ -36,8 +63,6 @@ impl GuestSealer {
             h.execution_epoch,
             self.authority_key.verifying_key().as_bytes(),
         ) || scope.address.mailbox != h.mailbox
-            || scope.address.tenant != h.tenant
-            || scope.address.authorization_domain != h.authorization_domain
             || scope.address.recipient != h.recipient
             || scope.subject != h.sender
             || h.sender.as_bytes() != self.sender_key.verifying_key().as_bytes()

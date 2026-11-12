@@ -189,6 +189,32 @@ impl CastChannel {
         replay: &mut impl ReplayProtector,
         sequence: NonZeroU64,
     ) -> Result<AddressedVerifiedCast, Refusal> {
+        self.open_addressed_if(
+            envelope,
+            grants,
+            source_current,
+            current,
+            key,
+            replay,
+            sequence,
+            |_| true,
+        )
+    }
+
+    /// Apply an original endpoint's additional bound predicate to the signed,
+    /// decrypted header before consuming its replay identity. A predicate can
+    /// only narrow canonical admission.
+    pub fn open_addressed_if(
+        &self,
+        envelope: MailboxEnvelope,
+        grants: AddressedCastGrants<'_>,
+        source_current: &OpenContext,
+        current: &OpenContext,
+        key: &crate::crypto::aead::Key,
+        replay: &mut impl ReplayProtector,
+        sequence: NonZeroU64,
+        accepts: impl FnOnce(&mvm_contract::protocol::mailbox::MailboxEnvelopeHeader) -> bool,
+    ) -> Result<AddressedVerifiedCast, Refusal> {
         self.authorize_addressed(grants, source_current, current)?;
         if envelope.ciphertext.len() > self.limits.max_frame_bytes as usize {
             return Err(deny());
@@ -205,7 +231,8 @@ impl CastChannel {
             &authority,
             replay,
             |header| {
-                if header.kind != MailboxMessageKind::Cast
+                if !accepts(header)
+                    || header.kind != MailboxMessageKind::Cast
                     || header.reply_to.is_some()
                     || !recv.content_types.contains(&header.content_type)
                     || header.plaintext_len > recv.max_payload_bytes

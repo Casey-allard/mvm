@@ -96,6 +96,24 @@ impl InstalledMailboxProfile {
     }
 }
 
+/// Development-only A→B capacity proposal. The full 8 KiB worker frame still
+/// covers a capped envelope plus the peer's signed credential and prefix.
+/// A two-entry queue per worker frees one 32 KiB source generation reservation
+/// inside the same 1 MiB aggregate. No installed CLI selects this profile.
+pub struct DevelopmentCastCapacity {
+    pub worker: WorkerLimits,
+    pub queue: MailboxLimits,
+}
+pub fn development_cast_capacity(pair: &MailboxPair) -> DevelopmentCastCapacity {
+    let mut worker = InstalledMailboxProfile::Pair(pair.clone()).worker_limits();
+    let queue = MailboxLimits {
+        max_depth: 2,
+        max_frame_bytes: PAIR_FRAME_BYTES,
+    };
+    worker.bytes_per_worker -= PAIR_FRAME_BYTES * (PAIR_DEPTH - queue.max_depth);
+    DevelopmentCastCapacity { worker, queue }
+}
+
 pub fn pair_queue_limits() -> MailboxLimits {
     MailboxLimits {
         max_depth: PAIR_DEPTH,

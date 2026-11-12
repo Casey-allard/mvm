@@ -26,6 +26,7 @@ mod terminal_acceptance;
 pub struct InstalledMailboxPeer {
     observer: Mutex<Option<ProcessExitObserver>>,
     pid: u32,
+    prepared_direction: Mutex<Option<[u8; 32]>>,
     issuer: [u8; 16],
     admitted_vm: Option<String>,
     native_start: native_start::NativeStartCustody,
@@ -50,8 +51,10 @@ impl InstalledMailboxPeer {
     }
 
     fn require_vm(&self, vm: &str) -> Result<()> {
-        ensure!(self.admitted_vm.as_deref().is_none_or(|named| named == vm),
-                "VM differs from original mailbox issuer lane");
+        ensure!(
+            self.admitted_vm.as_deref().is_none_or(|named| named == vm),
+            "VM differs from original mailbox issuer lane"
+        );
         Ok(())
     }
 
@@ -74,6 +77,7 @@ impl InstalledMailboxPeer {
             admitted_vm: None,
             native_start: Default::default(),
             terminal_acceptance: Default::default(),
+            prepared_direction: Default::default(),
         })
     }
 
@@ -362,6 +366,45 @@ impl InstalledMailboxClient {
         Ok(())
     }
 
+    /// One assignment per original paired issuer lane. Both marks change
+    /// together after successful preflight, without holding a mutex over I/O.
+    /// A new source generation requires a newly bound original acquisition.
+    pub(crate) fn bind_development_pair(&self, other: &Self, context: [u8; 32]) -> Result<()> {
+        let pa = self.development_peer()?;
+        let pb = other.development_peer()?;
+        ensure!(
+            !std::ptr::eq(pa, pb),
+            "development direction needs distinct issuer lanes"
+        );
+        let mut a = pa
+            .prepared_direction
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("original source lane busy"))?;
+        let mut b = pb
+            .prepared_direction
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("original destination lane busy"))?;
+        ensure!(
+            a.is_none() && b.is_none(),
+            "original development direction already prepared"
+        );
+        *a = Some(context);
+        *b = Some(context);
+        Ok(())
+    }
+    fn development_peer(&self) -> Result<&InstalledMailboxPeer> {
+        ensure!(
+            self.authority == Authority::Admitted,
+            "a locator cannot provision"
+        );
+        let p = self.peer.as_deref().context("original peer absent")?;
+        ensure!(
+            p.admitted_vm.as_deref() == Some(self.acquire.vm_id.as_str())
+                && p.issued_nonce(&self.acquire.request_nonce),
+            "development role requires original named issuer"
+        );
+        Ok(p)
+    }
     pub fn acquire_request(&self) -> &MailboxWorkerRequest {
         &self.acquire
     }
@@ -471,25 +514,48 @@ impl InstalledMailboxClient {
     /// Enter the native backend under the exact same owner as the durable
     /// mailbox locator. Capture the original typed error for stop/recovery.
     pub fn start_native<T>(&self, start: impl FnOnce() -> Result<T>) -> Result<T> {
-        ensure!(self.authority == Authority::Admitted, "cleanup locator cannot start a VM");
-        let peer = self.peer.as_ref().context("missing original mailbox peer")?;
-        peer.terminal_acceptance.while_vacant(|| peer.native_start.run(&self.original()?, start))
+        ensure!(
+            self.authority == Authority::Admitted,
+            "cleanup locator cannot start a VM"
+        );
+        let peer = self
+            .peer
+            .as_ref()
+            .context("missing original mailbox peer")?;
+        peer.terminal_acceptance
+            .while_vacant(|| peer.native_start.run(&self.original()?, start))
     }
 
     /// Resolve any retained *native* start before allowing mailbox/VM cleanup.
     pub fn settle_native_start(&self) -> Result<()> {
-        self.peer.as_ref().context("missing original mailbox peer")?
-            .native_start.settle(&self.original()?)
+        self.peer
+            .as_ref()
+            .context("missing original mailbox peer")?
+            .native_start
+            .settle(&self.original()?)
     }
 
     /// Recover the same terminal helper and paired broker while the original
     /// installed controller survives. Retain one fixed-size acceptance token
     /// until the caller durably commits its local cleanup under the VM claim.
-    pub fn finish_installed_cleanup(&self, retiring: bool, cleanup: impl FnOnce() -> Result<()>, acknowledge: impl FnOnce() -> Result<()>) -> Result<()> {
-        let peer = self.peer.as_ref().context("missing original mailbox peer")?;
-        ensure!(peer.issued_nonce(&self.acquire.request_nonce), "original cleanup issuer differs");
+    pub fn finish_installed_cleanup(
+        &self,
+        retiring: bool,
+        cleanup: impl FnOnce() -> Result<()>,
+        acknowledge: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let peer = self
+            .peer
+            .as_ref()
+            .context("missing original mailbox peer")?;
+        ensure!(
+            peer.issued_nonce(&self.acquire.request_nonce),
+            "original cleanup issuer differs"
+        );
         peer.terminal_acceptance.finish(
-            self.original()?, self.acquire.request_nonce, retiring,
+            self.original()?,
+            self.acquire.request_nonce,
+            retiring,
             || {
                 peer.check_original_alive()?;
                 self.settle_native_start()
@@ -512,8 +578,10 @@ impl InstalledMailboxClient {
         match self.stop(until)? {
             MailboxWorkerState::Collected { .. } => Ok(()),
             MailboxWorkerState::Reserved | MailboxWorkerState::Unresolved => {
-                ensure!(self.release_unstarted(until)? == MailboxWorkerState::ReleasedBeforeSpawn,
-                    "original mailbox reservation release is unresolved");
+                ensure!(
+                    self.release_unstarted(until)? == MailboxWorkerState::ReleasedBeforeSpawn,
+                    "original mailbox reservation release is unresolved"
+                );
                 Ok(())
             }
             _ => bail!("original mailbox worker collection is unresolved"),
@@ -565,6 +633,34 @@ impl InstalledMailboxClient {
     /// that finds the helper starting just queries its state, keeping all
     /// derived bytes and epoch state out of the host-agent control connection.
     pub fn configure_and_wait(&self, backend: &AnyBackend, deadline: Instant) -> Result<()> {
+        self.configure_with(backend, deadline, |_| Ok(()))?;
+        Ok(())
+    }
+
+    /// An explicitly selected development helper gets its wrapping material only
+    /// on the authenticated, once-delegated launcher-to-helper descriptor.
+    pub fn configure_development_cast(
+        &self,
+        backend: &AnyBackend,
+        deadline: Instant,
+        prepared: crate::mailbox_launch::cast_pair::development::PreparedRole,
+    ) -> Result<()> {
+        let owner = self.original()?;
+        let context = *self
+            .development_peer()?
+            .prepared_direction
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("original development lane busy"))?;
+        prepared.check_recipient(&owner, context)?;
+        self.configure_with(backend, deadline, |config| prepared.install(config, &owner))?
+            .context("original config pipe already delegated: cannot change its enrollment")
+    }
+    fn configure_with<T>(
+        &self,
+        backend: &AnyBackend,
+        deadline: Instant,
+        prepare: impl FnOnce(&mut super::MailboxProcessConfig) -> Result<T>,
+    ) -> Result<Option<T>> {
         ensure!(
             self.authority == Authority::Admitted,
             "stop locator cannot delegate configuration"
@@ -583,13 +679,15 @@ impl InstalledMailboxClient {
             },
             deadline,
         )?;
+        let mut installed = None;
         if let Some(fd) = writer {
-            let config = build_config(
+            let mut config = build_config(
                 &mvm_core::config::mvm_keys_dir(),
                 &self.acquire.mailbox_grant,
                 &dir,
                 route,
             )?;
+            installed = Some(prepare(&mut config)?);
             write_delegated_config(fd, &config, deadline)?;
         }
         let mut state = result.state;
@@ -604,7 +702,7 @@ impl InstalledMailboxClient {
             state == MailboxWorkerState::Serving,
             "mailbox worker did not reach Serving"
         );
-        Ok(())
+        Ok(installed)
     }
 }
 

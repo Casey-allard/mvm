@@ -1,5 +1,7 @@
 //! Same-host endpoint mapping from two original installed leases. A mapping
 //! is an observation; it cannot enable ReliableV1 or issue a routing grant.
+pub mod development;
+
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use mvm_contract::protocol::{
@@ -26,6 +28,14 @@ impl InstalledCastParticipant<'_> {
         expected_backend: MailboxWorkerBackend,
         deadline: Instant,
     ) -> Result<&MailboxWorkerOwner> {
+        self.owner_in_state(expected_backend, deadline, MailboxWorkerState::Serving)
+    }
+    fn owner_in_state(
+        &self,
+        expected_backend: MailboxWorkerBackend,
+        deadline: Instant,
+        state: MailboxWorkerState,
+    ) -> Result<&MailboxWorkerOwner> {
         use mvm_core::protocol::mailbox_worker_control::context_commitment;
         let a = self.worker.acquire_request();
         let signed = self.plan.plan();
@@ -44,8 +54,8 @@ impl InstalledCastParticipant<'_> {
             "installed Cast participant differs from the admitted plan"
         );
         ensure!(
-            self.worker.query(deadline)? == MailboxWorkerState::Serving,
-            "original Cast participant is not serving"
+            self.worker.query(deadline)? == state,
+            "original Cast participant state changed"
         );
         Ok(owner)
     }
@@ -72,6 +82,7 @@ pub struct ServingCastMapping {
     destination_owner: MailboxWorkerOwner,
     destination_sender: PrincipalId,
     destination_epoch: mvm_contract::protocol::mailbox::ExecutionEpoch,
+    destination_greeting: LocalGreeting,
 }
 
 pub fn map_installed_cast_pair(
@@ -214,6 +225,7 @@ pub fn map_serving_cast_pair(
         destination_owner: destination.owner.clone(),
         destination_sender: destination.current.expected_sender,
         destination_epoch: requests[1].mailbox_grant.epoch,
+        destination_greeting,
     };
     grants.check_compact_policy(source.current, destination.current)?;
     let (a, b) = mapping.current_policies(workers, source.current, destination.current)?;
@@ -369,6 +381,7 @@ impl super::DerivedMailboxKeys {
         channel: &CastChannel,
         envelope: MailboxEnvelope,
         grants: AddressedCastGrants<'_>,
+        key: &development::InstalledDirection,
         source: &OpenContext,
         destination: &OpenContext,
         replay: &mut impl mvm_core::mailbox::ReplayProtector,
@@ -377,10 +390,12 @@ impl super::DerivedMailboxKeys {
         let original = &self.template.header;
         if destination.expected_mailbox != original.mailbox
             || destination.expected_recipient != original.recipient
-            || destination.expected_authorization_domain != original.authorization_domain
-            || destination.expected_tenant != original.tenant
+            || destination.expected_authorization_domain
+                != key.scope().grant.address.authorization_domain
+            || destination.expected_tenant != key.scope().grant.address.tenant
             || destination.expected_capability_issuer != self.template.capability.issuer
-            || envelope.encryption.key_id != original.encryption.key_id
+            || &envelope.encryption != key.context()
+            || !key.admits_routing(&envelope.routing)
             || destination.current_policy_epoch != original.policy_epoch
             || envelope.ciphertext.capacity() > CAST_BODY_LIMIT
         {
@@ -397,16 +412,16 @@ impl super::DerivedMailboxKeys {
         source.now_unix_ms = now;
         let mut destination = destination.clone();
         destination.now_unix_ms = now;
-        let key = mvm_core::crypto::aead::Key::from_bytes(self.encryption);
         channel
-            .open_addressed(
+            .open_addressed_if(
                 envelope,
                 grants,
                 &source,
                 &destination,
-                &key,
+                key.key(),
                 replay,
                 sequence,
+                |h| h.sender_boot == key.sender_boot(),
             )
             .map_err(std::io::Error::other)
     }
