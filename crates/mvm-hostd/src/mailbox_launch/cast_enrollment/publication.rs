@@ -160,3 +160,55 @@ impl ExpectedCastPublication {
         Ok(self.validity)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn expected(dir: &std::path::Path, bytes: &[u8], number: u8) -> Side {
+        Side {
+            name: format!("fixture-{number}"),
+            directory: dir.to_owned(),
+            owner: MailboxWorkerOwner {
+                daemon_boot_nonce: [1; 32],
+                lease: [number; 32],
+                generation: u64::from(number),
+                context_commitment: [number; 32],
+            },
+            plan: [number; 32],
+            sha256: Sha256::digest(bytes).into(),
+            size: bytes.len(),
+        }
+    }
+
+    #[test]
+    fn pair_publication_rejects_missing_stale_and_replaced_original_sidecars() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let a_bytes = b"prepared original alpha";
+        let b_bytes = b"prepared original bravo";
+        let sides = [
+            expected(a.path(), a_bytes, 1),
+            expected(b.path(), b_bytes, 2),
+        ];
+        let verify = || sides.iter().try_for_each(Side::confirm);
+        let pa = a.path().join("verb-grant.json");
+        let pb = b.path().join("verb-grant.json");
+        let write = mvm_core::atomic_io::write_private_ephemeral;
+        assert!(verify().is_err());
+        write(&pa, a_bytes).unwrap();
+        assert!(verify().is_err(), "one original cannot enable the pair");
+        write(&pb, a_bytes).unwrap();
+        assert!(verify().is_err(), "equal-size substituted content");
+        write(&pb, b_bytes).unwrap();
+        verify().unwrap();
+        let relocated = b.path().join("moved.json");
+        std::fs::rename(&pb, &relocated).unwrap();
+        symlink(&relocated, &pb).unwrap();
+        assert!(verify().is_err(), "symbolic alias to exact bytes");
+        std::fs::remove_file(&pb).unwrap();
+        std::fs::hard_link(&relocated, &pb).unwrap();
+        assert!(verify().is_err(), "linked replacement");
+    }
+}
