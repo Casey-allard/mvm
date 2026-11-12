@@ -399,12 +399,25 @@ fn active_worker_turn<T>(
 fn dispatch_worker_control(
     workers: &super::mailbox_workers::MailboxWorkers,
     lifecycle: Option<&DaemonLifecycleAdmission>,
+    verifier: &VerifyingKey,
     request: &mvm_core::protocol::mailbox_worker_control::MailboxWorkerRequest,
     stream: &mut std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
 ) -> Result<()> {
     use mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation;
+    if let MailboxWorkerOperation::ForwardCastV1 { owner, resource_epoch, .. } = &request.operation {
+        let original=lifecycle.context("installed lifecycle required")?;
+        anyhow::ensure!(original.generation.resource_epoch()==*resource_epoch,"Cast resource epoch changed");
+        let _admitted=active_worker_turn(Some(original),deadline,||Ok(workers.try_activation()?))?;
+        crate::mailbox_launch::cast_pair::development::control::execute(workers,request,verifier,&original.home,deadline)?;
+        let result=mvm_contract::protocol::mailbox_worker::MailboxWorkerResult{request_nonce:request.request_nonce,
+            owner:owner.clone(),state:mvm_contract::protocol::mailbox_worker::MailboxWorkerState::Serving,delegates_config:false};
+        // A partial success response is ambiguous. Never append an error frame.
+        let _ = mvm_vmm::host::mailbox_worker_transport::send_response(stream,&result,None,deadline);
+        return Ok(());
+    }
     let _admission = match request.operation {
+        MailboxWorkerOperation::ForwardCastV1 { .. } => anyhow::bail!("unexpected Cast dispatch"),
         MailboxWorkerOperation::Acquire
         | MailboxWorkerOperation::ProvisionAdmittedV1 { .. }
         | MailboxWorkerOperation::DelegateConfig { .. } => {
@@ -2783,7 +2796,7 @@ impl HostAgentDaemon {
                                 return;
                             };
                             if let Err(error) = dispatch_worker_control(
-                                &workers, lifecycle.as_ref(), &request, &mut stream, deadline,
+                                &workers, lifecycle.as_ref(), &key, &request, &mut stream, deadline,
                             ) {
                                 let _ = super::mailbox_workers::write_error(&mut stream, &error.to_string());
                             }

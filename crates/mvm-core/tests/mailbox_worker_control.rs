@@ -171,7 +171,8 @@ fn acquire_commitment_changes_with_any_immutable_admission_context() {
 fn bind_context(r: &mut MailboxWorkerRequest) {
     let context = context_commitment(r).unwrap();
     match &mut r.operation {
-        MailboxWorkerOperation::DelegateConfig { owner }
+        MailboxWorkerOperation::ForwardCastV1 { owner, .. }
+        | MailboxWorkerOperation::DelegateConfig { owner }
         | MailboxWorkerOperation::Query { owner }
         | MailboxWorkerOperation::Stop { owner }
         | MailboxWorkerOperation::ReleaseUnstartedV1 { owner } => {
@@ -298,4 +299,24 @@ fn lookup_requires_original_nonce_and_context_without_delegating_or_extending_ad
     assert!(verify_request(&sign(r.clone()), &key(), 10_000).is_ok());
     r.operation = MailboxWorkerOperation::ProvisionAdmittedV1 { resource_epoch: 0 };
     assert!(verify_request(&sign(r), &key(), 10_000).is_err());
+}
+
+#[test]
+fn cast_turn_requires_two_bound_owners_live_deadline_and_terminal_serving_verdict() {
+    let mut r=request();
+    let mut a=owner();a.context_commitment=context_commitment(&r).unwrap();
+    let mut b=a.clone();b.lease=[22;32];b.context_commitment=[23;32];b.generation=2;
+    let op=|b:MailboxWorkerOwner,epoch|MailboxWorkerOperation::ForwardCastV1{owner:a.clone(),destination_vm:"vm-2".into(),destination_owner:b,resource_epoch:epoch,projection:"{}".into()};
+    r.operation=op(b.clone(),1);
+    let sign=|r:&MailboxWorkerRequest|broker_control::sign(ControlRequest::MailboxWorkerV1(Box::new(r.clone())),&[7;32]).unwrap();
+    assert!(verify_request(&sign(&r),&key(),10_000).is_ok());
+    assert!(verify_request(&sign(&r),&key(),12_000).is_err());
+    let mut reply=MailboxWorkerResult{request_nonce:r.request_nonce,owner:a.clone(),state:MailboxWorkerState::Serving,delegates_config:false};
+    assert!(verify_result(&r,&reply).is_ok());
+    reply.state=MailboxWorkerState::Starting;
+    assert!(verify_result(&r,&reply).is_err());
+    r.operation=op(b,0);
+    assert!(verify_request(&sign(&r),&key(),10_000).is_err());
+    r.operation=op(a.clone(),1);
+    assert!(verify_request(&sign(&r),&key(),10_000).is_err());
 }

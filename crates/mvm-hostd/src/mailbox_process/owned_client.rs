@@ -146,6 +146,26 @@ pub struct InstalledMailboxClient {
     peer: Option<Arc<InstalledMailboxPeer>>,
 }
 
+/// A single helper pull, held by the original synthetic development launcher.
+pub struct InstalledCastTurn {
+    original:InstalledMailboxClient,
+    destination_vm:String,
+    destination_owner:MailboxWorkerOwner,
+    public:crate::mailbox_launch::cast_pair::development::control::PublicCastControl,
+}
+impl InstalledCastTurn {
+    /// Returns only B's ephemeral ingress acceptance, after forwarding the same
+    /// verdict back to A. Receipt identity and application bytes stay private.
+    pub fn forward_once(self, until:Instant)->Result<()> {
+        let deadline=until.min(worker_deadline());
+        let gate=mvm_core::tenant_lifecycle::TenantLifecycleGate::new(mvm_core::config::mvm_home_strict()?,&self.original.acquire.tenant)?;
+        let resource_epoch=gate.active_resource_epoch(deadline)?;
+        self.original.call(MailboxWorkerOperation::ForwardCastV1{owner:self.original.original()?,destination_vm:self.destination_vm,
+            destination_owner:self.destination_owner,resource_epoch,projection:serde_json::to_string(&self.public)?},deadline)?;
+        Ok(())
+    }
+}
+
 fn worker_deadline() -> Instant {
     Instant::now() + Duration::from_millis(MAX_WORKER_OPERATION_MS)
 }
@@ -600,6 +620,24 @@ impl InstalledMailboxClient {
         self.owner
             .clone()
             .context("mailbox worker has not been acquired")
+    }
+    /// Bind a narrow route handle while the two actual admitted clients are
+    /// borrowed by the SDK. Retaining it does not retain an SDK launch handle
+    /// or turn a recovered Stop locator into an active data capability.
+    pub fn prepare_cast_turn(&self,destination:&Self,public:crate::mailbox_launch::cast_pair::development::control::PublicCastControl)->Result<InstalledCastTurn>{
+        ensure!(self.authority==Authority::Admitted && destination.authority==Authority::Admitted &&
+            self.acquire.tenant==destination.acquire.tenant && self.acquire.backend==destination.acquire.backend,
+            "two original admitted clients required");
+        let owner=self.original()?;let destination_owner=destination.original()?;
+        public.binds(&owner,&destination_owner)?;
+        let commitment=public.commitment()?;
+        for client in [self,destination] {
+            let peer=client.peer.as_ref().context("original peer absent")?;
+            ensure!(*peer.prepared_direction.lock().map_err(|_|anyhow::anyhow!("original pair unavailable"))?==Some(commitment),
+                "original peer did not admit this direction");
+        }
+        let original=InstalledMailboxClient {acquire:self.acquire.clone(),owner:Some(owner),authority:Authority::Admitted,peer:self.peer.clone()};
+        Ok(InstalledCastTurn{original,destination_vm:destination.acquire.vm_id.clone(),destination_owner,public})
     }
     pub fn query(&self, deadline: Instant) -> Result<MailboxWorkerState> {
         Ok(self

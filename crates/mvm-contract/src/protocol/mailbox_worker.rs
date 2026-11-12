@@ -33,6 +33,15 @@ pub enum MailboxWorkerOperation {
     /// Host launcher's signed attestation of an already admitted local plan.
     /// An explicitly enabled worker reserves the original nonce and context.
     ProvisionAdmittedV1 { resource_epoch: u64 },
+    /// Explicit same-host signed Cast turn between two original Serving helpers.
+    ForwardCastV1 {
+        owner: MailboxWorkerOwner,
+        destination_vm: String,
+        destination_owner: MailboxWorkerOwner,
+        resource_epoch: u64,
+        /// Bounded JSON of the public direction, signed plans, grants and policies.
+        projection: String,
+    },
     DelegateConfig {
         owner: MailboxWorkerOwner,
     },
