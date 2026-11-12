@@ -68,6 +68,11 @@ impl JournalAnchor for FileJournalAnchor {
     }
 }
 
+pub(crate) struct JournalSocket<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) exclusive: bool,
+}
+
 struct State {
     policy: MailboxPolicy,
     journal: MailboxJournal,
@@ -167,14 +172,16 @@ impl DurableMailboxService {
         anchor: impl JournalAnchor + 'static,
     ) -> std::io::Result<Self> {
         Self::bind_with(
-            path,
+            JournalSocket {
+                path,
+                exclusive: false,
+            },
             limits,
             State { policy, journal },
             signer,
             Box::new(anchor),
             None,
             None,
-            false,
         )
     }
 
@@ -189,18 +196,28 @@ impl DurableMailboxService {
         journal: MailboxJournal,
         anchor: FileJournalAnchor,
     ) -> std::io::Result<Self> {
-        Self::bind_local_incoming(path, limits, policy, signer, journal, anchor, None, false)
+        Self::bind_local_incoming(
+            JournalSocket {
+                path,
+                exclusive: false,
+            },
+            limits,
+            policy,
+            signer,
+            journal,
+            anchor,
+            None,
+        )
     }
 
     pub(crate) fn bind_local_incoming(
-        path: &Path,
+        socket: JournalSocket<'_>,
         limits: MailboxLimits,
         policy: MailboxPolicy,
         signer: SigningKey,
         journal: MailboxJournal,
         anchor: FileJournalAnchor,
         incoming: Option<IncomingSendGuard>,
-        exclusive_bind: bool,
     ) -> std::io::Result<Self> {
         journal
             .local_ready(&anchor, &signer.verifying_key())
@@ -211,26 +228,24 @@ impl DurableMailboxService {
             move |tip| anchor.advance(tip)
         };
         Self::bind_with(
-            path,
+            socket,
             limits,
             State { policy, journal },
             signer,
             Box::new(commit),
             Some(anchor),
             incoming,
-            exclusive_bind,
         )
     }
 
     fn bind_with(
-        path: &Path,
+        socket: JournalSocket<'_>,
         limits: MailboxLimits,
         state: State,
         signer: SigningKey,
         anchor: Box<dyn JournalAnchor>,
         local_anchor: Option<Arc<FileJournalAnchor>>,
         incoming: Option<IncomingSendGuard>,
-        exclusive_bind: bool,
     ) -> std::io::Result<Self> {
         if signer.verifying_key() != state.policy.authority_key {
             return Err(std::io::Error::new(
@@ -244,11 +259,12 @@ impl DurableMailboxService {
                 "mailbox limits must be nonzero",
             ));
         }
-        if !exclusive_bind {
+        let JournalSocket { path, exclusive } = socket;
+        if !exclusive {
             let _ = std::fs::remove_file(path);
         }
         let listener = UnixListener::bind(path)?;
-        let original_socket = if exclusive_bind {
+        let original_socket = if exclusive {
             let m = std::fs::symlink_metadata(path)?;
             Some((m.dev(), m.ino()))
         } else {

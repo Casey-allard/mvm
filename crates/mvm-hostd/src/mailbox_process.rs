@@ -409,14 +409,16 @@ fn serve_local(
         None
     };
     let service = DurableMailboxService::bind_local_incoming(
-        &socket,
+        crate::mailbox_service::durable::JournalSocket {
+            path: &socket,
+            exclusive: original.is_some(),
+        },
         LAUNCH_LIMITS,
         policy,
         signer,
         journal,
         anchor,
         inbound,
-        original.is_some(),
     )?;
     #[cfg(feature = "durable-guest-io-witness")]
     let service = service.with_guest_meter(&vm_state_dir)?;

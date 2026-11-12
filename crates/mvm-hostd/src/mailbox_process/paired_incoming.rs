@@ -605,7 +605,10 @@ pub(super) mod tests {
             )
             .unwrap();
             crate::mailbox_service::durable::DurableMailboxService::bind_local_incoming(
-                &socket,
+                crate::mailbox_service::durable::JournalSocket {
+                    path: &socket,
+                    exclusive: false,
+                },
                 crate::mailbox_launch::LAUNCH_LIMITS,
                 policy,
                 signer,
@@ -616,7 +619,6 @@ pub(super) mod tests {
                         .send_guard(super::super::reader::revocations_path(state.path()))
                         .unwrap(),
                 ),
-                false,
             )
             .unwrap()
         };
