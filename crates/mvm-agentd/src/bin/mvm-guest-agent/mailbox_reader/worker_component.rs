@@ -34,7 +34,12 @@ fn worker_holds_computed_reply_across_indeterminate_submission() {
                 "--exact",
                 "object_exchange::tests::emit_first_object_call_for_guest_component",
             ])
-            .env("SC_TEST_ORIGINAL_PAIR", hex::encode(pair))
+            .env(
+                "SC_TEST_ORIGINAL_PAIR",
+                pair.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            )
             .env("SC_TEST_CALL_FIXTURE", &path)
             .status()
             .unwrap();
