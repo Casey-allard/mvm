@@ -625,11 +625,9 @@ impl InstalledMailboxClient {
 
     /// An explicitly selected development helper gets its wrapping material only
     /// on the authenticated, once-delegated launcher-to-helper descriptor.
-    pub fn configure_development_cast(
+    pub fn check_prepared_development_role(
         &self,
-        backend: &AnyBackend,
-        deadline: Instant,
-        prepared: crate::mailbox_launch::cast_pair::development::PreparedRole,
+        prepared: &crate::mailbox_launch::cast_pair::development::PreparedRole,
     ) -> Result<()> {
         let owner = self.original()?;
         let context = *self
@@ -637,7 +635,16 @@ impl InstalledMailboxClient {
             .prepared_direction
             .try_lock()
             .map_err(|_| anyhow::anyhow!("original development lane busy"))?;
-        prepared.check_recipient(&owner, context)?;
+        prepared.check_recipient(&owner, context)
+    }
+    pub fn configure_development_cast(
+        &self,
+        backend: &AnyBackend,
+        deadline: Instant,
+        prepared: crate::mailbox_launch::cast_pair::development::PreparedRole,
+    ) -> Result<()> {
+        self.check_prepared_development_role(&prepared)?;
+        let owner = self.original()?;
         self.configure_with(backend, deadline, |config| prepared.install(config, &owner))?
             .context("original config pipe already delegated: cannot change its enrollment")
     }

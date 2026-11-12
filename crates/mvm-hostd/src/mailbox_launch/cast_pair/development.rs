@@ -1,6 +1,7 @@
 //! Development-only, one-direction enrollment under two original worker leases.
 //! The launcher uses each worker's once-delegated private config descriptor.
 //! The relay sees only a public direction and fixed-size, separately wrapped keys.
+pub(crate) mod destination;
 use super::{InstalledCastParticipant, RoutedCast};
 use crate::mailbox_process::MailboxProcessConfig;
 use anyhow::{Result, ensure};
@@ -103,6 +104,8 @@ fn credentials(g: AddressedCastGrants<'_>) -> Result<[u8; 32]> {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PrivateLaunch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination: Option<Box<destination::PrivateDestination>>,
     direction: Option<[u8; 32]>,
     end: End,
     wrapping: [u8; 32],
@@ -138,6 +141,7 @@ impl LaunchCustody {
         let end = End::new(owner, role, scope_hash(scope)?)?;
         let wrapping = Key::random();
         let setup = PrivateLaunch {
+            destination: None,
             direction: None,
             end: end.clone(),
             wrapping: *wrapping.expose_bytes(),
@@ -269,8 +273,11 @@ fn check_policy(original: &OpenContext, current: &OpenContext) -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DirectionFields {
+    immutable_policy: Option<[u8; 32]>,
+    plans: (mvm_core::plan::PlanId, mvm_core::plan::PlanId),
     authorities: [[u8; 32]; 2],
     source: End,
     destination: End,
@@ -468,6 +475,45 @@ pub fn prepare(
     grants: AddressedCastGrants<'_>,
     deadline: Instant,
 ) -> Result<PreparedDevelopment> {
+    prepare_profile(
+        source,
+        destination,
+        backend,
+        signers,
+        grants,
+        deadline,
+        false,
+    )
+}
+/// The development policy is fixed for the original helper generation. A
+/// policy change requires stopping this owner and starting a new generation.
+pub fn prepare_immutable_generation(
+    source: Participant<'_>,
+    destination: Participant<'_>,
+    backend: MailboxWorkerBackend,
+    signers: &[(&str, &VerifyingKey)],
+    grants: AddressedCastGrants<'_>,
+    deadline: Instant,
+) -> Result<PreparedDevelopment> {
+    prepare_profile(
+        source,
+        destination,
+        backend,
+        signers,
+        grants,
+        deadline,
+        true,
+    )
+}
+fn prepare_profile(
+    source: Participant<'_>,
+    destination: Participant<'_>,
+    backend: MailboxWorkerBackend,
+    signers: &[(&str, &VerifyingKey)],
+    grants: AddressedCastGrants<'_>,
+    deadline: Instant,
+    immutable: bool,
+) -> Result<PreparedDevelopment> {
     grants.check_compact_policy(source.current, destination.current)?;
     let a = source
         .installed
@@ -505,7 +551,7 @@ pub fn prepare(
         dst.original.expected_recipient,
         now,
     )?;
-    let delivery = issue_scoped(
+    let delivery = issue_with_policy(
         &channel,
         src,
         dst,
@@ -513,7 +559,21 @@ pub fn prepare(
         source.current,
         destination.current,
         now,
+        immutable
+            .then(|| destination::policy_digest(source.current, destination.current))
+            .transpose()?,
     )?;
+    if immutable {
+        destination_setup.setup.destination = Some(Box::new(destination::PrivateDestination::new(
+            &delivery,
+            source.installed.plan.signed(),
+            destination.installed.plan.signed(),
+            signers,
+            grants,
+            source.current,
+            destination.current,
+        )?));
+    }
     source
         .installed
         .owner_in_state(backend, deadline, MailboxWorkerState::Reserved)?;
@@ -540,6 +600,27 @@ fn issue_scoped(
     source_policy: &OpenContext,
     destination_policy: &OpenContext,
     now: i64,
+) -> Result<DirectionDelivery> {
+    issue_with_policy(
+        channel,
+        source,
+        destination,
+        grants,
+        source_policy,
+        destination_policy,
+        now,
+        None,
+    )
+}
+fn issue_with_policy(
+    channel: &CastChannel,
+    source: LaunchCustody,
+    destination: LaunchCustody,
+    grants: AddressedCastGrants<'_>,
+    source_policy: &OpenContext,
+    destination_policy: &OpenContext,
+    now: i64,
+    immutable_policy: Option<[u8; 32]>,
 ) -> Result<DirectionDelivery> {
     ensure!(
         source.end.role == EndpointRole::Source
@@ -569,7 +650,10 @@ fn issue_scoped(
         valid.end.min(destination.routing.expires_at_unix_ms),
         |v, c| v.min(c.grant.expires_at_unix_ms),
     );
+    let plans = channel.original_plan_pair();
     let fields = DirectionFields {
+        immutable_policy,
+        plans: (plans.0.clone(), plans.1.clone()),
         authorities: [source.grant.authority_key, destination.grant.authority_key],
         source: source.end,
         destination: destination.end,
@@ -860,6 +944,12 @@ impl DevelopmentDirection {
         source: &OpenContext,
         dest: &OpenContext,
     ) -> Result<()> {
+        if let Some(expected) = self.fields.immutable_policy {
+            ensure!(
+                expected == destination::policy_digest(source, dest)?,
+                "immutable generation policy changed; original worker must stop"
+            );
+        }
         self.live(super::now_unix_ms())?;
         self.fields.source.original(&m.source_owner)?;
         self.fields.destination.original(&m.destination_owner)?;

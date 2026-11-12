@@ -135,7 +135,7 @@ pub fn shred_epoch_secret(state_dir: &Path) -> Result<()> {
     mvm_core::atomic_io::shred_file(&mvm_core::config::vm_mailbox_secret_at(state_dir))
 }
 
-fn now_unix_ms() -> i64 {
+pub(crate) fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
