@@ -19,11 +19,14 @@ use super::{build_config, write_delegated_config};
 use crate::audit::host_keypair::{PUBLIC_FILENAME, SECRET_FILENAME};
 use crate::plan_admission::AdmittedPlan;
 
+mod native_start;
+
 /// Kernel identity anchored while the installation controller holds its original Child.
 pub struct InstalledMailboxPeer {
     observer: Mutex<Option<ProcessExitObserver>>,
     pid: u32,
     issuer: [u8; 16],
+    native_start: native_start::NativeStartCustody,
 }
 
 impl InstalledMailboxPeer {
@@ -50,6 +53,7 @@ impl InstalledMailboxPeer {
             observer: Mutex::new(Some(observer)),
             pid,
             issuer: rand::random(),
+            native_start: Default::default(),
         })
     }
 
@@ -402,6 +406,20 @@ impl InstalledMailboxClient {
             self.owner = Some(receipt.owner);
         }
         self.owner.as_ref().context("missing mailbox owner")
+    }
+
+    /// Enter the native backend under the exact same owner as the durable
+    /// mailbox locator. Capture the original typed error for stop/recovery.
+    pub fn start_native<T>(&self, start: impl FnOnce() -> Result<T>) -> Result<T> {
+        ensure!(self.authority == Authority::Admitted, "cleanup locator cannot start a VM");
+        self.peer.as_ref().context("missing original mailbox peer")?
+            .native_start.run(&self.original()?, start)
+    }
+
+    /// Resolve any retained *native* start before allowing mailbox/VM cleanup.
+    pub fn settle_native_start(&self) -> Result<()> {
+        self.peer.as_ref().context("missing original mailbox peer")?
+            .native_start.settle(&self.original()?)
     }
 
     fn original(&self) -> Result<MailboxWorkerOwner> {
