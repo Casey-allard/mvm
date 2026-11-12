@@ -56,6 +56,7 @@ pub struct WorkerUsage {
 }
 #[derive(Default)]
 struct Ledger {
+    control_released: Arc<tokio::sync::Notify>,
     host: WorkerUsage,
     tenants: HashMap<String, WorkerUsage>,
     registrations: HashMap<(String, String), usize>,
@@ -69,7 +70,7 @@ pub struct MailboxWorkerBudget {
     ledger: Arc<Mutex<Ledger>>,
     origin: Instant,
     unix_origin_ms: u64,
-    control_released: tokio::sync::Notify,
+    control_released: Arc<tokio::sync::Notify>,
     clock_high_water: Mutex<u64>,
     cleanup: Arc<CleanupState>,
     sender: Mutex<Option<mpsc::SyncSender<CleanupCell>>>,
@@ -120,7 +121,9 @@ impl MailboxWorkerBudget {
             .as_millis()
             .try_into()
             .map_err(|_| refused("host clock overflow"))?;
+        let control_released = Arc::new(tokio::sync::Notify::new());
         let ledger = Arc::new(Mutex::new(Ledger {
+            control_released: control_released.clone(),
             host: WorkerUsage {
                 workers: 0,
                 bytes: actor_charge,
@@ -170,7 +173,7 @@ impl MailboxWorkerBudget {
             origin: Instant::now(),
             unix_origin_ms,
             clock_high_water: Mutex::new(unix_origin_ms),
-            control_released: tokio::sync::Notify::new(),
+            control_released,
             cleanup,
             sender: Mutex::new(Some(sender)),
             wake: Mutex::new(Some(wake_writer)),
@@ -221,17 +224,19 @@ impl MailboxWorkerBudget {
         } else {
             CONTROL_WORKSPACE_BYTES
         };
-        let host_headroom = if worker {
-            CONTROL_WORKSPACE_BYTES.saturating_sub(ledger.host_controls)
-        } else {
-            0
-        };
-        let tenant_headroom = if worker {
-            CONTROL_WORKSPACE_BYTES
-                .saturating_sub(ledger.tenant_controls.get(tenant).copied().unwrap_or(0))
-        } else {
-            0
-        };
+        // The first control can always use the original reserved headroom.
+        // Additional ingress must leave space for an in-flight admission to
+        // allocate one eligible worker. Otherwise a competing Query can take
+        // back the previous frame's refund before the next reservation runs.
+        let tenant_controls = ledger.tenant_controls.get(tenant).copied().unwrap_or(0);
+        let eligible = ledger.host.workers < self.limits.host_workers && old.workers < self.limits.tenant_workers;
+        let headroom = |controls| if worker {
+            CONTROL_WORKSPACE_BYTES.saturating_sub(controls)
+        } else if eligible && controls > 0 {
+            self.limits.bytes_per_worker
+        } else {0};
+        let host_headroom = headroom(ledger.host_controls);
+        let tenant_headroom = headroom(tenant_controls);
         let host_bytes = ledger
             .host
             .bytes
@@ -454,6 +459,7 @@ fn refund_bytes(ledger: &mut Ledger, tenant: &str, bytes: usize) -> io::Result<(
     if usage.workers == 0 && usage.bytes == 0 {
         ledger.tenants.remove(tenant);
     }
+    ledger.control_released.notify_waiters();
     Ok(())
 }
 fn collect_child(worker: &mut Worker) -> io::Result<Option<ExitStatus>> {
@@ -571,6 +577,7 @@ fn cleanup_loop(
                 return Err(refused("unresolved worker reservation on final disconnect"));
             }
             ledger.host.bytes -= state.actor_charge;
+            ledger.control_released.notify_waiters();
             return Ok(());
         }
         if !observed_exits.is_empty() {
