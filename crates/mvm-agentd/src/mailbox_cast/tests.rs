@@ -455,8 +455,6 @@ fn original_boot_grant_binds_delivery_to_workload_owner_direction_and_root() {
     let mut projection = endpoint
         .channel
         .guest_enrollment(
-            [1; 32],
-            [2; 32],
             [3; 32],
             [4; 32],
             [5; 32],

@@ -39,8 +39,6 @@ impl CastChannel {
     /// A caller holding this projection still needs the original signed boot grant.
     pub fn guest_enrollment(
         &self,
-        source_plan: [u8; 32],
-        destination_plan: [u8; 32],
         destination_owner: [u8; 32],
         pair_commitment: [u8; 32],
         image_sha256: [u8; 32],
@@ -48,6 +46,17 @@ impl CastChannel {
         verity_root: Option<[u8; 32]>,
         workload: String,
     ) -> Result<DeliverEnrollmentV1, Refusal> {
+        let plan_digest = |plan: &crate::plan::PlanId| -> Result<[u8; 32], Refusal> {
+            let mut result = [0; 32];
+            hex::decode_to_slice(
+                plan.0.strip_prefix("sha256:").ok_or_else(deny)?,
+                &mut result,
+            )
+            .map_err(|_| deny())?;
+            Ok(result)
+        };
+        let source_plan = plan_digest(&self.original_plans.0)?;
+        let destination_plan = plan_digest(&self.original_plans.1)?;
         let value = DeliverEnrollmentV1 {
             source_plan,
             destination_plan,
@@ -135,6 +144,10 @@ impl DeliverEnrollmentV1 {
             return Err(deny());
         }
         Ok(CastChannel {
+            original_plans: (
+                crate::plan::PlanId(format!("sha256:{}", hex::encode(self.source_plan))),
+                crate::plan::PlanId(format!("sha256:{}", hex::encode(self.destination_plan))),
+            ),
             greeting: LocalGreeting {
                 role: LocalRole::Deliver,
                 binding: self.binding,

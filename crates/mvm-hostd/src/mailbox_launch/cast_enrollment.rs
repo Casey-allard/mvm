@@ -201,8 +201,6 @@ impl OriginalCastBoot<'_> {
         hash_owner.update(right.lease);
         hash_owner.update(right.context_commitment);
         let mut projection = channel.guest_enrollment(
-            self.source.worker.acquire_request().plan_commitment,
-            self.destination.worker.acquire_request().plan_commitment,
             hash_owner.finalize().into(),
             direction_commitment,
             hex::decode(hash)?
