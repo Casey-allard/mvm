@@ -104,16 +104,29 @@ fn original_mailbox_opens_only_5257_and_rejects_generation_change_with_same_pid(
     std::fs::create_dir_all(&controls).unwrap();
     std::fs::create_dir_all(port.parent().unwrap()).unwrap();
     let record = state.join(wire::INSTANCE_FILE);
-    std::fs::write(&record, serde_json::to_vec(&id.instance).unwrap()).unwrap();
+    mvm_core::atomic_io::atomic_write_new(&record, &serde_json::to_vec(&id.instance).unwrap())
+        .unwrap();
     let control = UnixListener::bind(controls.join(wire::SOCKET_FILE)).unwrap();
+    control.set_nonblocking(true).unwrap();
     let mailbox = UnixListener::bind(port).unwrap();
+    mailbox.set_nonblocking(true).unwrap();
     let until = Instant::now() + Duration::from_secs(2);
     std::thread::scope(|scope| {
         let instance = id.instance.clone();
         let server = scope.spawn(move || {
-            let (mut s, _) = control.accept().unwrap();
+            let mut s = loop {
+                match control.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < until =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(e) => panic!("original fixture control connection did not arrive: {e}"),
+                }
+            };
             let mut nonce = [0; 32];
-            s.read_exact(&mut nonce).unwrap();
+            wire::read_exact(&mut s, &mut nonce, until).unwrap();
             let response = broker_control::sign(
                 ControlRequest::HvfInstanceV1(HvfInstanceControl::Challenge {
                     instance,
