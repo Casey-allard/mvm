@@ -3,6 +3,7 @@
 //! retains the original Child until collection. A pidfile cannot recreate it.
 
 pub mod authorization;
+pub(crate) mod object_registration;
 #[cfg(test)]
 mod paired_process_tests;
 pub mod relay;

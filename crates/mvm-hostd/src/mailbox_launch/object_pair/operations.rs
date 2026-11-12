@@ -29,6 +29,7 @@ use mvm_core::mailbox::reader_wire::ObjectSubmissionV1;
 
 impl InstalledObjectPair<'_> {
     pub(super) fn check_current(&self) -> Result<i64> {
+        self.registration.require_originals()?;
         check_original_native(&self.caller)?;
         check_original_native(&self.callee)?;
         let k = mvm_core::config::mvm_keys_dir();

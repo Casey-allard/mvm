@@ -265,6 +265,7 @@ pub struct InstalledObjectPair<'a> {
     caller: InstalledParticipant<'a>,
     callee: InstalledParticipant<'a>,
     prepared: PreparedObjectPair,
+    registration: crate::mailbox_process::original_journal::object_registration::Registration,
     material: PairMaterial,
 }
 struct PairMaterial {
@@ -347,8 +348,22 @@ impl PreparedObjectPair {
                 mvm_core::plan::synthesis::current_local_epoch(name)?,
             )?)
         };
+        let keys = mvm_core::config::mvm_keys_dir();
+        ensure!(
+            caller.admitted.plan().mailbox == Some(self.caller)
+                && callee.admitted.plan().mailbox == Some(self.callee)
+                && caller.admitted.plan().nonce == self.caller_nonce
+                && callee.admitted.plan().nonce == self.callee_nonce,
+            "original admissions differ from prepared object pair"
+        );
+        let registration =
+            crate::mailbox_process::original_journal::object_registration::Registration::claim(
+                &keys,
+                (name_a, &ad),
+                (name_b, &bd),
+            )?;
         let material = self.bind_at(
-            &mvm_core::config::mvm_keys_dir(),
+            &keys,
             BootInput {
                 plan: caller.admitted.signed(),
                 posture: &ap,
@@ -367,7 +382,9 @@ impl PreparedObjectPair {
         )?;
         check_original_native(&caller)?;
         check_original_native(&callee)?;
+        registration.require_originals()?;
         Ok(InstalledObjectPair {
+            registration,
             caller,
             callee,
             prepared: self.clone(),
