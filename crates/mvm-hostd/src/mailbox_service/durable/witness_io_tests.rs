@@ -64,3 +64,32 @@ fn only_clean_recorder_shutdown_closes_the_session() {
         Some("finish 1")
     );
 }
+
+#[test]
+fn selected_guest_records_512_exchanges_and_marks_the_next_as_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    for turns in [512, 513] {
+        let path = dir.path().join(turns.to_string());
+        let recorder = Recorder::selected_guest(&path).unwrap();
+        for _ in 0..turns {
+            recorder
+                .observe(Cursor::new(Vec::new()), |io, _| io.write_all(b"x"))
+                .unwrap();
+        }
+        drop(recorder);
+        let rows = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            rows.lines().next(),
+            Some("mvm/owned-mailbox/selected-object/guest-5257/post-mux-host-stream/v1")
+        );
+        assert!(rows.lines().any(|r| r == "end 512 0 1 0 0 false"));
+        assert_eq!(
+            rows.lines().last(),
+            Some(if turns == 512 {
+                "finish 512"
+            } else {
+                "overflow"
+            })
+        );
+    }
+}

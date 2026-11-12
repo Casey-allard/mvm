@@ -268,8 +268,8 @@ pub(super) fn run(owner: WorkerLaunch, [out, incoming]: [UnixStream; 2]) -> Resu
     };
     #[cfg(feature = "durable-guest-io-witness")]
     let meter = {
-        use crate::mailbox_service::durable::witness_io::{FILE_NAME, Recorder};
-        Recorder::create(&owner.config.validate_current()?.local_state.join(FILE_NAME))?
+        use crate::mailbox_service::durable::witness_io::Recorder;
+        Recorder::selected_guest(&state.join("object-guest-stream-v1.counts"))?
     };
     std::thread::scope(|scope| -> Result<()> {
         let peer = std::thread::Builder::new()

@@ -86,6 +86,7 @@ impl<S: Write> Write for Measured<'_, S> {
 struct Sink {
     file: File,
     exchanges: usize,
+    max_exchanges: usize,
 }
 pub(crate) struct Recorder(Mutex<Option<Sink>>);
 
@@ -97,14 +98,30 @@ impl Recorder {
         )
     }
 
+    pub(crate) fn selected_guest(path: &Path) -> io::Result<Self> {
+        Self::with_limit(
+            path,
+            b"mvm/owned-mailbox/selected-object/guest-5257/post-mux-host-stream/v1\n",
+            512,
+        )
+    }
+
     pub(crate) fn create_scoped(path: &Path, header: &[u8]) -> io::Result<Self> {
+        Self::with_limit(path, header, MAX_EXCHANGES)
+    }
+
+    fn with_limit(path: &Path, header: &[u8], max_exchanges: usize) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)?;
         file.write_all(header)?;
-        Ok(Self(Mutex::new(Some(Sink { file, exchanges: 0 }))))
+        Ok(Self(Mutex::new(Some(Sink {
+            file,
+            exchanges: 0,
+            max_exchanges,
+        }))))
     }
 
     // Measurements must never change the protocol result. If measurement
@@ -118,7 +135,7 @@ impl Recorder {
         let mut counts = GuestStreamCounts::default();
         let mut output = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sink) = output.as_mut() {
-            if sink.exchanges == MAX_EXCHANGES {
+            if sink.exchanges == sink.max_exchanges {
                 let _ = sink.file.write_all(b"overflow\n");
                 *output = None;
             } else {
