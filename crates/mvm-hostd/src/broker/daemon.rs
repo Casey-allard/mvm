@@ -402,7 +402,9 @@ async fn worker_reservation_lane(
     request: &mvm_core::protocol::mailbox_worker_control::MailboxWorkerRequest,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let ms = request.deadline_unix_ms.min(request.admission_expires_at_unix_ms)
+    let ms = request
+        .deadline_unix_ms
+        .min(request.admission_expires_at_unix_ms)
         .checked_sub(workers.now_unix_ms().ok()?)?;
     let until = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
     tokio::time::timeout_at(until, async {
@@ -413,18 +415,33 @@ async fn worker_reservation_lane(
             result = lane.acquire_owned() => result.ok()?,
         };
         let original = daemon.lock().await;
-        if *stop.borrow() || stop.has_changed().is_err() || original.mailbox_retired
-            || !original.mailbox_workers.as_ref().is_some_and(|live| Arc::ptr_eq(live, workers))
-        {return None;}
+        if *stop.borrow()
+            || stop.has_changed().is_err()
+            || original.mailbox_retired
+            || !original
+                .mailbox_workers
+                .as_ref()
+                .is_some_and(|live| Arc::ptr_eq(live, workers))
+        {
+            return None;
+        }
         mvm_core::protocol::mailbox_worker_control::verify_request(
-            signed, &original.verifying_key, workers.now_unix_ms().ok()?,
-        ).ok()?;
+            signed,
+            &original.verifying_key,
+            workers.now_unix_ms().ok()?,
+        )
+        .ok()?;
         if let Some(existing) = original.registrations.get(&request.vm_id) {
-            let (owner,active) = workers.try_service_owner(&request.vm_id).ok()??;
-            if !active || existing.mailbox_owner_v1.as_ref() != Some(&owner) { return None; }
+            let (owner, active) = workers.try_service_owner(&request.vm_id).ok()??;
+            if !active || existing.mailbox_owner_v1.as_ref() != Some(&owner) {
+                return None;
+            }
         }
         Some(permit)
-    }).await.ok().flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Called after canonical verification. No durable or in-memory gate is held
@@ -2818,15 +2835,17 @@ impl HostAgentDaemon {
                         // Share the mutation lane with original broker registration. A
                         // mailbox cannot appear between the latter's collision check
                         // and publication. Keep the lane through worker slot admission.
-                        let needs_lane = verified.as_ref().is_some_and(|req| matches!(
-                            req.operation,
-                            mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Acquire
-                            | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::ProvisionAdmittedV1 { .. }
-                        ));
-                        let reservation_lane = if needs_lane {
-                            worker_reservation_lane(&daemon,&workers,&signed,verified.as_ref().expect("matched request"),&mut control_stop).await
-                        } else {None};
-                        let verified = verified.filter(|_| !needs_lane || reservation_lane.is_some());
+                        let (verified, reservation_lane) = match verified {
+                            Some(request) if matches!(request.operation,
+                                mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::Acquire
+                                | mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation::ProvisionAdmittedV1 { .. }) => {
+                                let lane = worker_reservation_lane(
+                                    &daemon, &workers, &signed, &request, &mut control_stop,
+                                ).await;
+                                (lane.as_ref().map(|_| request), lane)
+                            }
+                            verified => (verified, None),
+                        };
                         let Ok(mut stream) = stream.into_std() else {
                             return Ok(());
                         };

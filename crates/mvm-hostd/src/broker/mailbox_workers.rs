@@ -229,12 +229,17 @@ impl MailboxWorkerBudget {
         // allocate one eligible worker. Otherwise a competing Query can take
         // back the previous frame's refund before the next reservation runs.
         let tenant_controls = ledger.tenant_controls.get(tenant).copied().unwrap_or(0);
-        let eligible = ledger.host.workers < self.limits.host_workers && old.workers < self.limits.tenant_workers;
-        let headroom = |controls| if worker {
-            CONTROL_WORKSPACE_BYTES.saturating_sub(controls)
-        } else if eligible && controls > 0 {
-            self.limits.bytes_per_worker
-        } else {0};
+        let eligible = ledger.host.workers < self.limits.host_workers
+            && old.workers < self.limits.tenant_workers;
+        let headroom = |controls| {
+            if worker {
+                CONTROL_WORKSPACE_BYTES.saturating_sub(controls)
+            } else if eligible && controls > 0 {
+                self.limits.bytes_per_worker
+            } else {
+                0
+            }
+        };
         let host_headroom = headroom(ledger.host_controls);
         let tenant_headroom = headroom(tenant_controls);
         let host_bytes = ledger

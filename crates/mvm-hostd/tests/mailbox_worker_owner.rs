@@ -963,93 +963,135 @@ async fn signed_initial_worker_waits_for_held_mutation_lane_and_rechecks_expiry(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     let budget = MailboxWorkerBudget::new(WorkerLimits {
-        host_workers: 3, tenant_workers: 3,
-        host_bytes: 1_048_576, tenant_bytes: 1_048_576, bytes_per_worker: 65_536,
-    }).unwrap();
-    let workers = Arc::new(MailboxWorkers::new("tenant", budget.clone(), Arc::new(FixtureHelper)).unwrap());
-    let daemon = HostAgentDaemon::new("tenant", SigningKey::from_bytes(&[7;32]).verifying_key(),65_536)
-        .with_mailbox_workers(workers).unwrap();
+        host_workers: 3,
+        tenant_workers: 3,
+        host_bytes: 1_048_576,
+        tenant_bytes: 1_048_576,
+        bytes_per_worker: 65_536,
+    })
+    .unwrap();
+    let workers =
+        Arc::new(MailboxWorkers::new("tenant", budget.clone(), Arc::new(FixtureHelper)).unwrap());
+    let daemon = HostAgentDaemon::new(
+        "tenant",
+        SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        65_536,
+    )
+    .with_mailbox_workers(workers)
+    .unwrap();
     let lane = daemon.mutation_lane();
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
-    let server=tokio::spawn(HostAgentDaemon::run_shared_on_listener(Arc::new(tokio::sync::Mutex::new(daemon)),listener));
-    let invoke=|r:MailboxWorkerRequest| {
-        let socket=path.clone();
-        tokio::task::spawn_blocking(move || call(&socket,&r).map(|p|p.0))
+    let server = tokio::spawn(HostAgentDaemon::run_shared_on_listener(
+        Arc::new(tokio::sync::Mutex::new(daemon)),
+        listener,
+    ));
+    let invoke = |r: MailboxWorkerRequest| {
+        let socket = path.clone();
+        tokio::task::spawn_blocking(move || call(&socket, &r).map(|p| p.0))
     };
-    let first=request("tenant","alpha");
-    let owner=invoke(first.clone()).await.unwrap().unwrap().owner;
-    let held=lane.clone().acquire_owned().await.unwrap();
-    let mut second=request("tenant","beta");
-    second.request_nonce=[6;32];
-    let mut pending=invoke(second.clone());
-    let early=tokio::time::timeout(Duration::from_millis(100), &mut pending).await;
-    assert!(early.is_err(),"contended signed Acquire returned before its deadline: {early:?}");
-    let mut query=first;
-    query.operation=MailboxWorkerOperation::Query {owner};
-    assert_eq!(invoke(query).await.unwrap().unwrap().state,MailboxWorkerState::Reserved);
-    assert_eq!(budget.usage().unwrap().workers,1);
+    let first = request("tenant", "alpha");
+    let owner = invoke(first.clone()).await.unwrap().unwrap().owner;
+    let held = lane.clone().acquire_owned().await.unwrap();
+    let mut second = request("tenant", "beta");
+    second.request_nonce = [6; 32];
+    let mut pending = invoke(second.clone());
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut pending).await;
+    assert!(
+        early.is_err(),
+        "contended signed Acquire returned before its deadline: {early:?}"
+    );
+    let mut query = first;
+    query.operation = MailboxWorkerOperation::Query { owner };
+    assert_eq!(
+        invoke(query).await.unwrap().unwrap().state,
+        MailboxWorkerState::Reserved
+    );
+    assert_eq!(budget.usage().unwrap().workers, 1);
     drop(held);
-    assert_eq!(pending.await.unwrap().unwrap().state,MailboxWorkerState::Reserved);
-    assert_eq!(budget.usage().unwrap().workers,2);
-    let held=lane.acquire_owned().await.unwrap();
-    let mut expired=request("tenant","never-admitted");
-    expired.admission_expires_at_unix_ms=now()+300;
-    let mut denied=invoke(expired);
-    let early=tokio::time::timeout(Duration::from_millis(60), &mut denied).await;
-    assert!(early.is_err(),"request did not enter bounded wait: {early:?}");
+    assert_eq!(
+        pending.await.unwrap().unwrap().state,
+        MailboxWorkerState::Reserved
+    );
+    assert_eq!(budget.usage().unwrap().workers, 2);
+    let held = lane.acquire_owned().await.unwrap();
+    let mut expired = request("tenant", "never-admitted");
+    expired.admission_expires_at_unix_ms = now() + 300;
+    let mut denied = invoke(expired);
+    let early = tokio::time::timeout(Duration::from_millis(60), &mut denied).await;
+    assert!(
+        early.is_err(),
+        "request did not enter bounded wait: {early:?}"
+    );
     tokio::time::sleep(Duration::from_millis(325)).await;
     drop(held);
     assert!(denied.await.unwrap().is_err());
-    assert_eq!(budget.usage().unwrap().workers,2);
+    assert_eq!(budget.usage().unwrap().workers, 2);
     server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_pair_reuses_single_control_workspace_for_signed_query() {
     use mvm_hostd::mailbox_process::installed_profile::{InstalledMailboxProfile, MailboxPair};
-    let profile=InstalledMailboxProfile::OriginalCast(MailboxPair::new(["alpha","beta"]).unwrap());
-    let budget=MailboxWorkerBudget::new(profile.worker_limits()).unwrap();
-    let fixed=budget.usage().unwrap().bytes;
-    let per_worker=profile.worker_limits().bytes_per_worker;
-    let (_dir,path,server)=serve("tenant",budget.clone()).await;
-    let alpha=request("tenant","alpha");
-    let beta=request("tenant","beta");
-    let invoke=|r:MailboxWorkerRequest| {
-        let socket=path.clone();
-        tokio::task::spawn_blocking(move ||call(&socket,&r).map(|v|v.0))
+    let profile =
+        InstalledMailboxProfile::OriginalCast(MailboxPair::new(["alpha", "beta"]).unwrap());
+    let budget = MailboxWorkerBudget::new(profile.worker_limits()).unwrap();
+    let fixed = budget.usage().unwrap().bytes;
+    let per_worker = profile.worker_limits().bytes_per_worker;
+    let (_dir, path, server) = serve("tenant", budget.clone()).await;
+    let alpha = request("tenant", "alpha");
+    let beta = request("tenant", "beta");
+    let invoke = |r: MailboxWorkerRequest| {
+        let socket = path.clone();
+        tokio::task::spawn_blocking(move || call(&socket, &r).map(|v| v.0))
     };
-    let owner=invoke(alpha.clone()).await.unwrap().unwrap().owner;
+    let owner = invoke(alpha.clone()).await.unwrap().unwrap().owner;
     // An additional control must not take the bytes required to mint beta.
-    let idle=UnixStream::connect(&path).unwrap();
-    let until=Instant::now()+Duration::from_secs(2);
-    while budget.usage().unwrap().bytes != fixed + per_worker + 5*MAX_WORKER_CONTROL_BYTES {
-        assert!(Instant::now()<until);
+    let idle = UnixStream::connect(&path).unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while budget.usage().unwrap().bytes != fixed + per_worker + 5 * MAX_WORKER_CONTROL_BYTES {
+        assert!(Instant::now() < until);
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    let mut second=invoke(beta);
-    let early=tokio::time::timeout(Duration::from_millis(100),&mut second).await;
-    assert!(early.is_err(),"signed second worker lost capacity to competing control: {early:?}");
+    let mut second = invoke(beta);
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut second).await;
+    assert!(
+        early.is_err(),
+        "signed second worker lost capacity to competing control: {early:?}"
+    );
     drop(idle);
-    assert_eq!(second.await.unwrap().unwrap().state,MailboxWorkerState::Reserved);
-    let baseline=fixed+2*per_worker;
-    let idle=UnixStream::connect(&path).unwrap();
-    let until=Instant::now()+Duration::from_secs(2);
+    assert_eq!(
+        second.await.unwrap().unwrap().state,
+        MailboxWorkerState::Reserved
+    );
+    let baseline = fixed + 2 * per_worker;
+    let idle = UnixStream::connect(&path).unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
     loop {
-        if budget.usage().unwrap().bytes == baseline+5*MAX_WORKER_CONTROL_BYTES {break}
-        assert!(Instant::now()<until,"original workspace was not reserved");
+        if budget.usage().unwrap().bytes == baseline + 5 * MAX_WORKER_CONTROL_BYTES {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "original workspace was not reserved"
+        );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    let peak=budget.usage().unwrap();
-    let mut query=alpha;
-    query.operation=MailboxWorkerOperation::Query {owner:owner.clone()};
-    let mut pending=invoke(query);
-    let early=tokio::time::timeout(Duration::from_millis(100),&mut pending).await;
-    assert!(early.is_err(),"full-pair signed Query returned before workspace release: {early:?}");
-    assert_eq!(budget.usage().unwrap(),peak);
+    let peak = budget.usage().unwrap();
+    let mut query = alpha;
+    query.operation = MailboxWorkerOperation::Query {
+        owner: owner.clone(),
+    };
+    let mut pending = invoke(query);
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut pending).await;
+    assert!(
+        early.is_err(),
+        "full-pair signed Query returned before workspace release: {early:?}"
+    );
+    assert_eq!(budget.usage().unwrap(), peak);
     drop(idle);
-    let reply=pending.await.unwrap().unwrap();
-    assert_eq!(reply.owner,owner);
-    assert_eq!(reply.state,MailboxWorkerState::Reserved);
-    assert!(peak.bytes<=1_048_576);
+    let reply = pending.await.unwrap().unwrap();
+    assert_eq!(reply.owner, owner);
+    assert_eq!(reply.state, MailboxWorkerState::Reserved);
+    assert!(peak.bytes <= 1_048_576);
     server.abort();
 }
