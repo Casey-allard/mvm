@@ -122,7 +122,9 @@ impl MailboxLocalServiceGrant {
         service.limits.queued_messages = 1;
         service.limits.active_calls = 1;
         service.limits.retained_guest_bytes = 8192;
-        service.limits.retained_host_bytes = 16384;
+        // Both signed participants cover source preparation and the routed
+        // turn. The installed coordinator debits one shared ledger for both.
+        service.limits.retained_host_bytes = 65_536;
         service
     }
 

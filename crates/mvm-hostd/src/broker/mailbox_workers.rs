@@ -2280,7 +2280,14 @@ mod tests {
         r.vm_id="alpha".into(); r.workload_id=r.vm_id.clone();
         let usage=budget.usage().unwrap();
         assert!(profile.check_grant(&r).is_err());
-        r.mailbox_grant.local_service=Some(MailboxLocalServiceGrant::original_cast_v1());
+        let source=MailboxLocalServiceGrant::original_cast_v1();
+        let destination=MailboxLocalServiceGrant::original_cast_v1();
+        let joint=2*cast_credit::CAST_WORK_BYTES as u64;
+        for original in [source,destination] {
+            original.validate().unwrap();
+            assert_eq!(original.limits.retained_host_bytes,joint);
+        }
+        r.mailbox_grant.local_service=Some(source);
         assert!(old.check_grant(&r).is_err());
         assert!(InstalledMailboxProfile::Single.check_grant(&r).is_err());
         assert!(profile.check_grant(&r).is_ok());
