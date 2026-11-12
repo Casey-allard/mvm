@@ -1,4 +1,7 @@
 //! Exclusive, nonblocking registration of both installed object mailbox originals.
+//! The canonical host installation owns and protects the MVM home/keys
+//! ancestry. Keep independent file descriptors for the concrete directories
+//! used below; a same-name replacement cannot inherit their registration.
 use super::{LaunchClaim, claim_launch, owner_dir};
 use anyhow::{Result, ensure};
 use std::{
@@ -141,6 +144,26 @@ mod tests {
         private(&b);
         assert!(owned.require_originals().is_err());
         drop(owned);
+        hold().unwrap();
+    }
+
+    #[test]
+    fn current_directory_must_remain_private_for_its_original_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let keys = root.path().join("keys");
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        for d in [&keys, &a, &b] {
+            private(d);
+        }
+        let hold = || Registration::claim(&keys, ("a", &a), ("b", &b));
+        let owned = hold().unwrap();
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(owned.require_originals().is_err());
+        drop(owned);
+        assert!(hold().is_err());
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o700)).unwrap();
         hold().unwrap();
     }
 
