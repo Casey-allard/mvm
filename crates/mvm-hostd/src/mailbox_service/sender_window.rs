@@ -40,13 +40,25 @@ pub(super) enum Original {
     Send(Vec<u8>),
     Accepted(Vec<u8>, SignedDestinationReceipt),
 }
+#[cfg(test)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(super) enum CrashPoint {
+    BeforeRename,
+    AfterDirectorySync,
+}
+
 pub(crate) struct SenderWindow {
+    #[cfg(test)]
+    pub(super) crash_at: Option<CrashPoint>,
+
     path: PathBuf,
     direction: [u8; 32],
 }
 impl SenderWindow {
     fn at(root: &Path, direction: [u8; 32]) -> Self {
         Self {
+            #[cfg(test)]
+            crash_at: None,
             path: root.join(NAME),
             direction,
         }
@@ -196,9 +208,18 @@ impl SenderWindow {
         file.set_len(0)
             .and_then(|_| file.write_all(&bytes))
             .and_then(|_| file.sync_all())
-            .and_then(|_| fs::rename(&stage, self.path.join("state")))
             .map_err(|_| Refusal::Unavailable)?;
-        sync_dir(&self.path).map_err(|_| Refusal::Unavailable)
+        #[cfg(test)]
+        if self.crash_at == Some(CrashPoint::BeforeRename) {
+            std::process::exit(81);
+        }
+        fs::rename(&stage, self.path.join("state")).map_err(|_| Refusal::Unavailable)?;
+        sync_dir(&self.path).map_err(|_| Refusal::Unavailable)?;
+        #[cfg(test)]
+        if self.crash_at == Some(CrashPoint::AfterDirectorySync) {
+            std::process::exit(82);
+        }
+        Ok(())
     }
     fn index(&self, state: &State, h: SenderOrdinalV1) -> Result<usize, Refusal> {
         if h.direction != self.direction || h.ordinal == 0 {
