@@ -49,6 +49,7 @@ pub(crate) mod directed_journal;
 /// Separate destination path that returns a signed, journal-backed verdict.
 pub mod durable;
 pub(crate) mod object_intent;
+pub(crate) mod sender_window;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SOURCE_INTENTS: usize = 64;
@@ -231,7 +232,16 @@ impl GuestSealer {
         if bytes.len() > MAX_SOURCE_INTENT_BYTES {
             return Err(Refusal::Oversized(MAX_SOURCE_INTENT_BYTES));
         }
-        let (capability, envelope) = decode_frame(&bytes)?;
+        self.open_intent(&bytes, message, external)
+    }
+
+    fn open_intent(
+        &self,
+        bytes: &[u8],
+        message: &OutboxMessage,
+        external: Option<OriginalSend<'_>>,
+    ) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal> {
+        let (capability, envelope) = decode_frame(bytes)?;
         if external.is_some_and(|role| role.signed != &capability) {
             return Err(Refusal::NotAuthorized);
         }
@@ -285,8 +295,17 @@ impl GuestSealer {
         message: &OutboxMessage,
         external_send: Option<&SignedMailboxCapability>,
     ) -> Result<(SignedMailboxCapability, MailboxEnvelope, u64), Refusal> {
-        let gate = |e: mvm_core::mailbox::MailboxError| Refusal::Mailbox(e.to_string());
         let n = self.sent.checked_add(1).ok_or(Refusal::Malformed)?;
+        self.seal_at(message, external_send, n)
+    }
+
+    fn seal_at(
+        &self,
+        message: &OutboxMessage,
+        external_send: Option<&SignedMailboxCapability>,
+        n: u64,
+    ) -> Result<(SignedMailboxCapability, MailboxEnvelope, u64), Refusal> {
+        let gate = |e: mvm_core::mailbox::MailboxError| Refusal::Mailbox(e.to_string());
         let counter = |width: usize| {
             let mut bytes = vec![0; width];
             bytes[width - 8..].copy_from_slice(&n.to_be_bytes());
