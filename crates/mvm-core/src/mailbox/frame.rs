@@ -8,7 +8,7 @@
 //! Frame: `u32 BE length`, then `u32 BE capability length`, the capability as
 //! JSON, and the envelope in its canonical `encode_envelope` form.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 
 use mvm_contract::protocol::mailbox::{
     MAX_MAILBOX_PAYLOAD_BYTES, MailboxEnvelope, PrincipalId, SignedMailboxCapability,
@@ -101,7 +101,7 @@ pub fn send_frame<S: Read + Write>(
     capability: &SignedMailboxCapability,
     envelope: &MailboxEnvelope,
 ) -> Result<(), Refusal> {
-    exchange(stream, &encode_frame(capability, envelope)?)
+    exchange(stream, &encode_frame(capability, envelope)?).map_err(|_| Refusal::Malformed)?
 }
 
 /// Guest side: write one plaintext message and read the host's verdict.
@@ -109,20 +109,42 @@ pub fn send_outbox_message<S: Read + Write>(
     stream: &mut S,
     message: &OutboxMessage,
 ) -> Result<(), Refusal> {
+    outbox_verdict(stream, message).map_err(|_| Refusal::Malformed)?
+}
+
+/// Receive a complete host admission verdict separately from indeterminate
+/// transport failure. A guest retaining the original must distinguish the two.
+pub fn outbox_verdict<S: Read + Write>(
+    stream: &mut S,
+    message: &OutboxMessage,
+) -> io::Result<Result<(), Refusal>> {
     exchange(stream, &message.encode())
 }
 
-fn exchange<S: Read + Write>(stream: &mut S, body: &[u8]) -> Result<(), Refusal> {
-    // A service that refuses on length alone closes early; the verdict is
-    // still readable, so a failed write is not itself the answer.
-    let _ = stream
-        .write_all(&(body.len() as u32).to_be_bytes())
-        .and_then(|()| stream.write_all(body));
+/// Bound the full JSON verdict including any diagnostic text. Admission data
+/// travels in the request, never in the verdict.
+const MAX_VERDICT_BYTES: usize = 4096;
+
+fn exchange<S: Read + Write>(stream: &mut S, body: &[u8]) -> io::Result<Result<(), Refusal>> {
+    let len = u32::try_from(body.len()).map_err(io::Error::other)?;
+    let sent = stream.write_all(&len.to_be_bytes())
+        .and_then(|()| stream.write_all(body))
+        .and_then(|()| stream.flush());
     let mut reply = Vec::new();
-    stream
-        .read_to_end(&mut reply)
-        .map_err(|_| Refusal::Malformed)?;
-    serde_json::from_slice::<Result<(), Refusal>>(&reply).map_err(|_| Refusal::Malformed)?
+    let received = stream.take((MAX_VERDICT_BYTES + 1) as u64).read_to_end(&mut reply);
+    if reply.len() > MAX_VERDICT_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "oversized mailbox verdict"));
+    }
+    let verdict: Result<(), Refusal> = serde_json::from_slice(&reply)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "incomplete or invalid mailbox verdict"))?;
+    // A host may refuse declared length before reading the body. A complete
+    // capacity refusal only retains the original, including on a reset.
+    if matches!(verdict, Err(Refusal::Oversized(_) | Refusal::QueueFull(_))) {
+        return Ok(verdict);
+    }
+    sent?;
+    received?;
+    Ok(verdict)
 }
 
 #[cfg(test)]

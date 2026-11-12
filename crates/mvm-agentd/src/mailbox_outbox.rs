@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mvm_contract::protocol::mailbox::MAX_MAILBOX_PAYLOAD_BYTES;
-use mvm_core::mailbox::frame::{OutboxMessage, Refusal, send_outbox_message};
+use mvm_core::mailbox::frame::{OutboxMessage, Refusal, outbox_verdict};
 
 /// The spool directory the workload writes and the agent drains. It lives
 /// inside the directory [`provision_outbox_dir`] creates.
@@ -134,9 +134,8 @@ fn spooled(spool: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
-/// Forward the oldest spooled message over `stream` and consume it, whatever
-/// the verdict, so a bad frame cannot wedge the spool and the next dial sees
-/// the next message. An empty spool, or an oversized or malformed message, is
+/// Forward the oldest spooled message over `stream` and consume it after a complete
+/// acceptance or terminal refusal. Ambiguous transport results keep the item. An empty spool, or an oversized or malformed message, is
 /// refused here, before a byte is sent to the host.
 ///
 /// The host capacity verdicts [`Refusal::Oversized`] and [`Refusal::QueueFull`]
@@ -151,16 +150,14 @@ pub fn forward_outbox<S: Read + Write>(stream: &mut S, spool: &Path) -> Result<(
         .next()
         .ok_or(Refusal::Malformed)?;
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(&oldest)
-        .and_then(|file| file.take(MAX_OUTBOX_BYTES + 1).read_to_end(&mut bytes));
-    let message = read
-        .map_err(|_| Refusal::Malformed)
-        .and_then(|_| OutboxMessage::decode(&bytes));
-    let verdict = match message {
+    std::fs::File::open(&oldest)
+        .and_then(|file| file.take(MAX_OUTBOX_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(|_| Refusal::Mailbox("unable to read original guest outbox item".into()))?;
+    let verdict = match OutboxMessage::decode(&bytes) {
         Ok(message) => {
-            let reply = send_outbox_message(stream, &message);
-            // A valid local item can exceed a narrower installed host profile.
-            // Preserve it for explicit cancellation or a compatible admission.
+            // A valid local item survives an ambiguous exchange. The host may
+            // already have accepted it; legacy retries are at least once.
+            let reply = outbox_verdict(stream, &message).map_err(|_| Refusal::Malformed)?;
             if matches!(reply, Err(Refusal::QueueFull(_) | Refusal::Oversized(_))) {
                 return reply;
             }
@@ -168,7 +165,8 @@ pub fn forward_outbox<S: Read + Write>(stream: &mut S, spool: &Path) -> Result<(
         }
         Err(local_refusal) => Err(local_refusal),
     };
-    let _ = std::fs::remove_file(&oldest);
+    std::fs::remove_file(&oldest)
+        .map_err(|_| Refusal::Mailbox("unable to remove original guest outbox item".into()))?;
     verdict
 }
 
