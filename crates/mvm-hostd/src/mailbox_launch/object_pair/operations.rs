@@ -9,18 +9,23 @@ use mvm_core::mailbox::{
 };
 
 pub struct SealedObjectTurn {
-    pub header: MailboxEnvelopeHeader,
-    pub envelope: MailboxEnvelope,
-    pub capability: SignedMailboxCapability,
+    header: MailboxEnvelopeHeader,
+    envelope: MailboxEnvelope,
+    capability: SignedMailboxCapability,
 }
-/// The retained original Call and the canonical current lease from B's own
-/// journal. The application submission cannot supply substitute Call bytes.
-pub struct OriginalObjectCallLease<'a> {
-    pub original: &'a MailboxEnvelope,
-    pub original_header: &'a MailboxEnvelopeHeader,
-    pub original_body: &'a [u8],
-    pub lease: &'a SignedMailboxDeliveryLease,
+impl SealedObjectTurn {
+    pub fn header(&self) -> &MailboxEnvelopeHeader {
+        &self.header
+    }
+    pub fn envelope(&self) -> &MailboxEnvelope {
+        &self.envelope
+    }
+    pub fn capability(&self) -> &SignedMailboxCapability {
+        &self.capability
+    }
 }
+pub use mvm_core::mailbox::journal::RetainedObjectCall as OriginalObjectCallLease;
+use mvm_core::mailbox::reader_wire::ObjectSubmissionV1;
 
 impl InstalledObjectPair<'_> {
     pub(super) fn check_current(&self) -> Result<i64> {
@@ -102,12 +107,14 @@ impl InstalledObjectPair<'_> {
     pub fn seal_call(
         &self,
         message: MessageId,
+        correlation: CorrelationId,
         sequence: SequenceNumber,
         body: &[u8],
     ) -> Result<SealedObjectTurn> {
         self.material.seal_turn(
             ObjectParticipantRole::Caller,
             message,
+            Some(correlation),
             sequence,
             body,
             None,
@@ -125,9 +132,31 @@ impl InstalledObjectPair<'_> {
         self.material.seal_turn(
             ObjectParticipantRole::Callee,
             message,
+            None,
             sequence,
             body,
-            Some(original),
+            Some(&original),
+            self.check_current()?,
+        )
+    }
+    /// Reopen only an already bound outbound intent. The returned turn keeps
+    /// the original ciphertext/nonce/delivery ID rather than generating a retry.
+    pub fn reopen_turn(
+        &self,
+        role: ObjectParticipantRole,
+        cap: &SignedMailboxCapability,
+        envelope: MailboxEnvelope,
+        sequence: SequenceNumber,
+        submission: &ObjectSubmissionV1,
+        original: Option<&OriginalObjectCallLease<'_>>,
+    ) -> Result<SealedObjectTurn> {
+        self.material.reopen(
+            role,
+            cap,
+            envelope,
+            sequence,
+            submission,
+            original,
             self.check_current()?,
         )
     }
@@ -149,9 +178,10 @@ impl PairMaterial {
         &self,
         role: ObjectParticipantRole,
         message: MessageId,
+        correlation_id: Option<CorrelationId>,
         sequence: SequenceNumber,
         body: &[u8],
-        original: Option<OriginalObjectCallLease<'_>>,
+        original: Option<&OriginalObjectCallLease<'_>>,
         now: i64,
     ) -> Result<SealedObjectTurn> {
         use rand::Rng as _;
@@ -165,62 +195,8 @@ impl PairMaterial {
             message.as_bytes() != &[0; 32] && body.len() <= g.max_payload_bytes as usize,
             "invalid original message or frame length"
         );
-        let (kind, correlation, causation, reply_to, expires) = match (role, original) {
-            (ObjectParticipantRole::Caller, None) => (
-                MailboxMessageKind::Call,
-                CorrelationId::from_bytes(*message.as_bytes()),
-                CausationId::from_bytes([0; 32]),
-                Some(ReplyRoute {
-                    address: d.reply.grant.address,
-                    capability_id: d.reply.grant.capability_id,
-                }),
-                d.expires_at_unix_ms,
-            ),
-            (ObjectParticipantRole::Callee, Some(call)) => {
-                let lease = &call.lease.lease;
-                let h = call.original_header;
-                verify_object_delivery_projection(
-                    &d.local()
-                        .durable_object_pair_sha256_v1
-                        .context("missing pair selection")?,
-                    h,
-                    call.original_body,
-                    call.lease,
-                    &ed25519_dalek::VerifyingKey::from_bytes(&local.reader.grant.authority_key)?,
-                )?;
-                ensure!(
-                    call.original.ciphertext_commitment == lease.ciphertext_commitment
-                        && call.original.routing.delivery_id == lease.delivery_id
-                        && lease.consumer == local.reader.capability.grant.subject
-                        && lease.receive_capability_id
-                            == local.reader.capability.grant.capability_id
-                        && lease.consumer_session
-                            == local.reader.enrollment.enrollment.consumer_session
-                        && lease.policy_epoch == g.policy_epoch
-                        && (lease.issued_at_unix_ms..lease.expires_at_unix_ms).contains(&now)
-                        && h.kind == MailboxMessageKind::Call
-                        && h.sender_boot == d.caller.boot
-                        && h.capability_id == d.call.grant.capability_id
-                        && h.sender == d.call.grant.subject
-                        && h.reply_to
-                            == Some(ReplyRoute {
-                                address: g.address,
-                                capability_id: g.capability_id
-                            })
-                        && h.message_id != message
-                        && (h.issued_at_unix_ms..h.expires_at_unix_ms).contains(&now),
-                    "Reply requires the authenticated retained Call and original current lease"
-                );
-                (
-                    MailboxMessageKind::Reply,
-                    h.correlation_id,
-                    CausationId::from_bytes(*h.message_id.as_bytes()),
-                    None,
-                    d.expires_at_unix_ms.min(h.expires_at_unix_ms),
-                )
-            }
-            _ => anyhow::bail!("original direction mismatch"),
-        };
+        let (kind, correlation, causation, reply_to, expires) =
+            self.original_fields(role, local, d, message, correlation_id, original, now)?;
         let header = MailboxEnvelopeHeader {
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
@@ -267,6 +243,170 @@ impl PairMaterial {
             capability: d.outbound().clone(),
         })
     }
+    fn original_fields(
+        &self,
+        role: ObjectParticipantRole,
+        local: &EndpointMaterial,
+        d: &mvm_core::mailbox::object_pair::role::ObjectRoleV1,
+        message: MessageId,
+        correlation_id: Option<CorrelationId>,
+        original: Option<&OriginalObjectCallLease<'_>>,
+        now: i64,
+    ) -> Result<(
+        MailboxMessageKind,
+        CorrelationId,
+        CausationId,
+        Option<ReplyRoute>,
+        i64,
+    )> {
+        let g = &d.outbound().grant;
+        let fields = match (role, original) {
+            (ObjectParticipantRole::Caller, None) => (
+                MailboxMessageKind::Call,
+                correlation_id
+                    .filter(|id| id.as_bytes() != &[0; 32])
+                    .context("Call needs original correlation")?,
+                CausationId::from_bytes([0; 32]),
+                Some(ReplyRoute {
+                    address: d.reply.grant.address,
+                    capability_id: d.reply.grant.capability_id,
+                }),
+                d.expires_at_unix_ms,
+            ),
+            (ObjectParticipantRole::Callee, Some(call)) => {
+                ensure!(
+                    call.capability() == &d.call,
+                    "retained row has different Call grant"
+                );
+                let opened = open_original(
+                    &d.call,
+                    MailboxOperation::Send,
+                    call.envelope(),
+                    &local.inbound_key,
+                    now,
+                )?;
+                let h = opened.header();
+                let lease = &call.lease().lease;
+                verify_object_delivery_projection(
+                    &d.local()
+                        .durable_object_pair_sha256_v1
+                        .context("missing pair selection")?,
+                    h,
+                    opened.payload(),
+                    call.lease(),
+                    &ed25519_dalek::VerifyingKey::from_bytes(&local.reader.grant.authority_key)?,
+                )?;
+                ensure!(
+                    call.envelope().ciphertext_commitment == lease.ciphertext_commitment
+                        && call.envelope().routing.delivery_id == lease.delivery_id
+                        && lease.consumer == local.reader.capability.grant.subject
+                        && lease.receive_capability_id
+                            == local.reader.capability.grant.capability_id
+                        && lease.consumer_session
+                            == local.reader.enrollment.enrollment.consumer_session
+                        && lease.policy_epoch == g.policy_epoch
+                        && (lease.issued_at_unix_ms..lease.expires_at_unix_ms).contains(&now)
+                        && h.kind == MailboxMessageKind::Call
+                        && h.sender_boot == d.caller.boot
+                        && h.capability_id == d.call.grant.capability_id
+                        && h.sender == d.call.grant.subject
+                        && h.reply_to
+                            == Some(ReplyRoute {
+                                address: g.address,
+                                capability_id: g.capability_id
+                            })
+                        && h.message_id != message
+                        && (h.issued_at_unix_ms..h.expires_at_unix_ms).contains(&now),
+                    "Reply requires the authenticated retained Call and original current lease"
+                );
+                (
+                    MailboxMessageKind::Reply,
+                    h.correlation_id,
+                    CausationId::from_bytes(*h.message_id.as_bytes()),
+                    None,
+                    d.expires_at_unix_ms.min(h.expires_at_unix_ms),
+                )
+            }
+            _ => anyhow::bail!("original direction mismatch"),
+        };
+        Ok(fields)
+    }
+    fn reopen(
+        &self,
+        role: ObjectParticipantRole,
+        cap: &SignedMailboxCapability,
+        envelope: MailboxEnvelope,
+        sequence: SequenceNumber,
+        submission: &ObjectSubmissionV1,
+        original: Option<&OriginalObjectCallLease<'_>>,
+        now: i64,
+    ) -> Result<SealedObjectTurn> {
+        let local = match role {
+            ObjectParticipantRole::Caller => &self.caller,
+            ObjectParticipantRole::Callee => &self.callee,
+        };
+        let d = local.public_role.verify(&local.reader.boot, now)?;
+        ensure!(
+            cap == d.outbound(),
+            "retained turn has different credential"
+        );
+        let (message, correlation, op, body) = match (role, submission) {
+            (
+                ObjectParticipantRole::Caller,
+                ObjectSubmissionV1::Call {
+                    message_id,
+                    correlation_id,
+                    payload,
+                },
+            ) => (
+                *message_id,
+                Some(*correlation_id),
+                MailboxOperation::Send,
+                payload,
+            ),
+            (
+                ObjectParticipantRole::Callee,
+                ObjectSubmissionV1::Reply {
+                    message_id,
+                    original_call,
+                    payload,
+                },
+            ) => {
+                ensure!(
+                    original.is_some_and(|row| row.lease() == original_call.as_ref()),
+                    "different current Call lease"
+                );
+                (*message_id, None, MailboxOperation::Reply, payload)
+            }
+            _ => anyhow::bail!("wrong original submission role"),
+        };
+        let opened = open_original(cap, op, &envelope, &local.outbound_key, now)?;
+        let h = opened.header();
+        let (kind, correlation, cause, route, expires) =
+            self.original_fields(role, local, d, message, correlation, original, now)?;
+        ensure!(
+            message.as_bytes() != &[0; 32]
+                && h.message_id == message
+                && h.sequence == sequence
+                && opened.payload() == body
+                && h.correlation_id == correlation
+                && h.causation_id == cause
+                && h.reply_to == route
+                && h.kind == kind
+                && h.sender_boot == local.reader.boot.boot
+                && h.issued_at_unix_ms >= d.not_before_unix_ms
+                && h.expires_at_unix_ms == expires
+                && h.encryption.key_id
+                    == <[u8; 32]>::from(Sha256::digest(local.outbound_key.expose_bytes())),
+            "retained intent differs from original submission"
+        );
+        Ok(SealedObjectTurn {
+            header: h.clone(),
+            envelope,
+            capability: cap.clone(),
+        })
+    }
+
     fn verify_accepted(
         &self,
         role: ObjectParticipantRole,
@@ -300,4 +440,43 @@ impl PairMaterial {
         );
         Ok(())
     }
+}
+
+/// Verification of a previously retained immutable row. The source intent or
+/// active journal lease owns durable replay accounting. This local inspection
+/// is never used to admit a new delivery.
+fn open_original(
+    cap: &SignedMailboxCapability,
+    op: MailboxOperation,
+    envelope: &MailboxEnvelope,
+    key: &Key,
+    now: i64,
+) -> Result<mvm_core::mailbox::OpenedMailboxEnvelope> {
+    use mvm_core::mailbox::{InMemoryReplayProtector, OpenContext, open_verified_envelope};
+    let g = &cap.grant;
+    let a = g.address;
+    let context = OpenContext {
+        expected_tenant: a.tenant,
+        expected_authorization_domain: a.authorization_domain,
+        expected_mailbox: a.mailbox,
+        expected_sender: g.subject,
+        expected_recipient: a.recipient,
+        acting_principal: g.subject,
+        expected_capability_issuer: g.issuer,
+        current_execution_epoch: g.minimum_execution_epoch,
+        current_policy_epoch: g.policy_epoch,
+        required_operation: op,
+        now_unix_ms: now,
+        accepted_content_types: g.content_types.clone(),
+        revoked_capabilities: Vec::new(),
+    };
+    Ok(open_verified_envelope(
+        envelope,
+        cap,
+        &context,
+        key,
+        &ed25519_dalek::VerifyingKey::from_bytes(g.subject.as_bytes())?,
+        &ed25519_dalek::VerifyingKey::from_bytes(g.issuer.as_bytes())?,
+        &mut InMemoryReplayProtector::default(),
+    )?)
 }

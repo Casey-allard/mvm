@@ -335,6 +335,24 @@ impl ReplayProtector for Probe {
     }
 }
 
+/// Borrowed ciphertext and exact signed lease for an active original journal
+/// row. Cannot be constructed from a guest-supplied receipt or header.
+pub struct RetainedObjectCall<'a> {
+    entry: &'a Seen,
+    active: &'a LeaseState,
+}
+impl RetainedObjectCall<'_> {
+    pub fn envelope(&self) -> &MailboxEnvelope {
+        &self.entry.envelope
+    }
+    pub fn capability(&self) -> &SignedMailboxCapability {
+        &self.entry.capability
+    }
+    pub fn lease(&self) -> &SignedMailboxDeliveryLease {
+        &self.active.signed
+    }
+}
+
 /// An exclusive writer. Records contain only canonical ciphertext, capability
 /// and signed metadata; plaintext never enters the journal.
 pub struct MailboxJournal {
@@ -1145,6 +1163,42 @@ impl MailboxJournal {
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
         self.lease_next_inner(request, None, anchor)
+    }
+
+    /// A Reply must be anchored to the current lease of the exact original
+    /// unacknowledged row. The borrow keeps this journal generation locked.
+    pub fn original_object_call(
+        &self,
+        signed: &SignedMailboxDeliveryLease,
+        now: i64,
+    ) -> Result<RetainedObjectCall<'_>, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Uncertain);
+        }
+        let l = &signed.lease;
+        if l.address != self.address
+            || l.object_projection_v1.is_none()
+            || !(l.issued_at_unix_ms..l.expires_at_unix_ms).contains(&now)
+        {
+            return Err(JournalError::NoActiveLease);
+        }
+        let id = ReplayIdentity {
+            sender: l.sender,
+            sender_boot: l.sender_boot,
+            execution_epoch: l.execution_epoch,
+            message_id: l.message_id,
+        };
+        let entry = self.seen.get(&id).ok_or(JournalError::NoActiveLease)?;
+        let active = entry.lease.as_ref().ok_or(JournalError::NoActiveLease)?;
+        if entry.acknowledged
+            || entry.expired_at_unix_ms.is_some()
+            || active.signed != *signed
+            || entry.envelope.ciphertext_commitment != l.ciphertext_commitment
+            || entry.envelope.routing.delivery_id != l.delivery_id
+        {
+            return Err(JournalError::NoActiveLease);
+        }
+        Ok(RetainedObjectCall { entry, active })
     }
 
     /// Lease the next original record for the opted-in pair. The independent
