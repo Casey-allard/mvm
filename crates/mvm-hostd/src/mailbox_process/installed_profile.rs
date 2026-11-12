@@ -1,0 +1,128 @@
+//! Trusted installation configuration. The pair names restrict provisioning;
+//! each VM still requires its own canonical signed plan and fresh reservation.
+use crate::broker::mailbox_workers::WorkerLimits;
+use crate::mailbox_service::MailboxLimits;
+use std::{ffi::OsString, io};
+
+#[derive(Clone, Debug)]
+pub struct MailboxPair([String; 2]);
+
+impl MailboxPair {
+    pub fn new(names: [&str; 2]) -> io::Result<Self> {
+        for name in names {
+            mvm_core::naming::validate_vm_name(name)
+                .map_err(|_| io::Error::other("invalid installed mailbox VM name"))?;
+        }
+        if names[0] == names[1] {
+            return Err(io::Error::other("paired mailbox requires distinct VMs"));
+        }
+        Ok(Self(names.map(str::to_owned)))
+    }
+
+    pub fn index(&self, vm: &str) -> io::Result<usize> {
+        self.0
+            .iter()
+            .position(|name| name == vm)
+            .ok_or_else(|| io::Error::other("VM outside installed mailbox pair"))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum InstalledMailboxProfile {
+    Single,
+    Pair(MailboxPair),
+}
+
+pub const PAIR_HELPER_FLAG: &str = "--owned-pair-slot-v1";
+const SINGLE_FLAG: &str = "--owned-mailbox-v1";
+const PAIR_FLAG: &str = "--owned-mailbox-pair-v1";
+
+// Per original, pre-reserved in the one coordinator ledger. Two paths (guest
+// dial and host consumer) each process one frame synchronously. Workspace
+// covers their framing/encoding buffers; these are protocol credits, not RSS.
+pub const PAIR_FRAME_BYTES: usize = 8 * 1024;
+pub const PAIR_DEPTH: usize = 4;
+pub const PAIR_REPLAY_ENTRIES: u64 = 64;
+const WORKER_CONTROL_BYTES: usize =
+    mvm_contract::protocol::mailbox_worker::MAX_WORKER_CONTROL_BYTES;
+const PAIR_QUEUE_BYTES: usize = PAIR_FRAME_BYTES * PAIR_DEPTH;
+const PAIR_FRAME_WORKSPACE: usize = 2 * 8 * PAIR_FRAME_BYTES;
+const PAIR_REPLAY_RESERVATION: usize = PAIR_REPLAY_ENTRIES as usize * 512;
+const SHARED_BYTES: usize = 1024 * 1024;
+
+impl InstalledMailboxProfile {
+    pub fn parse(args: &[OsString]) -> io::Result<Option<Self>> {
+        match args {
+            [] => Ok(None),
+            [mode] if mode == SINGLE_FLAG => Ok(Some(Self::Single)),
+            [mode, a, b] if mode == PAIR_FLAG => {
+                let a = a
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("invalid mailbox VM name"))?;
+                let b = b
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("invalid mailbox VM name"))?;
+                Ok(Some(Self::Pair(MailboxPair::new([a, b])?)))
+            }
+            _ => Err(io::Error::other("unknown host-agent startup mode")),
+        }
+    }
+
+    pub fn arguments(&self) -> Vec<&str> {
+        match self {
+            Self::Single => vec![SINGLE_FLAG],
+            Self::Pair(pair) => vec![PAIR_FLAG, &pair.0[0], &pair.0[1]],
+        }
+    }
+
+    pub fn worker_limits(&self) -> WorkerLimits {
+        let (workers, bytes_per_worker) = match self {
+            Self::Single => (1, WORKER_CONTROL_BYTES),
+            Self::Pair(_) => (
+                2,
+                WORKER_CONTROL_BYTES
+                    + PAIR_QUEUE_BYTES
+                    + PAIR_FRAME_WORKSPACE
+                    + PAIR_REPLAY_RESERVATION,
+            ),
+        };
+        WorkerLimits {
+            host_workers: workers,
+            tenant_workers: workers,
+            host_bytes: SHARED_BYTES,
+            tenant_bytes: SHARED_BYTES,
+            bytes_per_worker,
+        }
+    }
+}
+
+pub fn pair_queue_limits() -> MailboxLimits {
+    MailboxLimits {
+        max_depth: PAIR_DEPTH,
+        max_frame_bytes: PAIR_FRAME_BYTES,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pair_names_and_launch_arguments_are_explicit_and_roundtrip() {
+        assert!(MailboxPair::new(["alpha", "alpha"]).is_err());
+        assert!(MailboxPair::new(["alpha", "../beta"]).is_err());
+        let profile = InstalledMailboxProfile::Pair(MailboxPair::new(["alpha", "beta"]).unwrap());
+        let args: Vec<OsString> = profile.arguments().into_iter().map(Into::into).collect();
+        let recovered = InstalledMailboxProfile::parse(&args).unwrap().unwrap();
+        assert_eq!(recovered.arguments(), profile.arguments());
+        assert!(InstalledMailboxProfile::parse(&args[..2]).is_err());
+        assert!(InstalledMailboxProfile::parse(&[]).unwrap().is_none());
+        assert_eq!(
+            InstalledMailboxProfile::Single.worker_limits().host_workers,
+            1
+        );
+        assert_eq!(
+            recovered.worker_limits().host_bytes,
+            InstalledMailboxProfile::Single.worker_limits().host_bytes
+        );
+    }
+}

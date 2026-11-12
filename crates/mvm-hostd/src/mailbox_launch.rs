@@ -533,7 +533,7 @@ pub fn serve_derived_owned(
     paths: ServePaths,
     limits: MailboxLimits,
 ) -> Result<OwnedMailboxLaunch> {
-    serve_owned_with_counts(grant, keys, paths, limits, false)
+    serve_owned_with_counts(grant, keys, paths, limits, false, None)
 }
 pub(crate) fn serve_owned_with_counts(
     grant: MailboxGrant,
@@ -541,9 +541,10 @@ pub(crate) fn serve_owned_with_counts(
     paths: ServePaths,
     limits: MailboxLimits,
     measured: bool,
+    lifetime_admissions: Option<u64>,
 ) -> Result<OwnedMailboxLaunch> {
     let (trust, sealer) = keys.trust();
-    let (bound, mut sealer) = bind_grant(&grant, trust, sealer, limits, &paths.socket)?;
+    let (bound, mut sealer) = crate::mailbox_service::bind_grant_with_admission_limit(&grant, trust, sealer, limits, &paths.socket, lifetime_admissions)?;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let dial = std::thread::Builder::new()

@@ -1,5 +1,6 @@
 //! Trusted per-VM provisioning for the canonical mailbox binary.
 use super::*;
+use crate::mailbox_process::installed_profile::{InstalledMailboxProfile, PAIR_HELPER_FLAG};
 use crate::mailbox_process::{
     MAILBOX_BIN,
     owned_wire::{PrepareOwnedV1, write_prepare},
@@ -25,6 +26,7 @@ pub struct OwnedMailboxWorkerFactory {
     context: [u8; 32],
     state_dir: PathBuf,
     route: HostDialRoute,
+    paired: bool,
 }
 impl OwnedMailboxWorkerFactory {
     pub fn new(
@@ -63,6 +65,7 @@ impl OwnedMailboxWorkerFactory {
                 .map_err(|_| refused("invalid admitted mailbox context"))?,
             state_dir: state_dir.to_owned(),
             route,
+            paired: false,
         })
     }
     pub fn route(&self) -> &HostDialRoute {
@@ -121,7 +124,7 @@ impl MailboxWorkerFactory for OwnedMailboxWorkerFactory {
         let image = Path::new(fd_dir).join(self.binary.as_raw_fd().to_string());
         let mut cmd = mvm_core::env_hygiene::helper_command(image);
         cmd.env_clear()
-            .arg("--owned-v1")
+            .arg(if self.paired { PAIR_HELPER_FLAG } else { "--owned-v1" })
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -171,10 +174,17 @@ pub struct InstalledMailboxWorkerFactory {
     binary: Arc<File>,
     binding: Arc<InstallationBinding>,
     home: PathBuf,
+    profile: InstalledMailboxProfile,
 }
 impl InstalledMailboxWorkerFactory {
     pub fn new(binary: &Path, binding: Arc<InstallationBinding>, home: &Path) -> io::Result<Self> {
-        Ok(Self { binary: open_image(binary)?, binding, home: home.to_owned() })
+        Self::with_profile(binary, binding, home, InstalledMailboxProfile::Single)
+    }
+    pub fn with_profile(binary: &Path, binding: Arc<InstallationBinding>, home: &Path, profile: InstalledMailboxProfile) -> io::Result<Self> {
+        if matches!(profile, InstalledMailboxProfile::Pair(_)) && std::env::var_os(crate::mailbox_service::guest_io::ENABLE_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            return Err(refused("single-original byte witness channel cannot serve a pair"));
+        }
+        Ok(Self { binary: open_image(binary)?, binding, home: home.to_owned(), profile })
     }
 }
 impl MailboxWorkerFactory for InstalledMailboxWorkerFactory {
@@ -194,13 +204,15 @@ impl MailboxWorkerFactory for InstalledMailboxWorkerFactory {
             || mvm_core::naming::validate_vm_name(&request.vm_id).is_err() {
             return Err(refused("invalid installed local workload"));
         }
+        if let InstalledMailboxProfile::Pair(pair) = &self.profile { pair.index(&request.vm_id)?; }
         request.mailbox_grant.require_implemented_local_service()
             .map_err(|_| refused("unsupported installed mailbox service"))
     }
     fn spawn(&self, request: &MailboxWorkerRequest, owner: &MailboxWorkerOwner) -> io::Result<SpawnedMailboxWorker> {
         self.admit(request)?;
         let state = mvm_core::config::vm_state_dir_at(&self.home, &request.vm_id);
-        let admitted = OwnedMailboxWorkerFactory::from_image(self.binary.clone(), self.binding.clone(), request, &state)?;
+        let mut admitted = OwnedMailboxWorkerFactory::from_image(self.binary.clone(), self.binding.clone(), request, &state)?;
+        admitted.paired = matches!(self.profile, InstalledMailboxProfile::Pair(_));
         admitted.spawn(request, owner)
     }
 }

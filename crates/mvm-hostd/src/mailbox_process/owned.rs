@@ -128,7 +128,10 @@ fn config_input(
 
 /// Serve a canonical mailbox under its original parent's exclusive control.
 /// EOF is the lifetime fence, including while config is still being written.
-pub fn run(_lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()> {
+pub fn run(lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()> {
+    run_profile(lease, false)
+}
+pub fn run_profile(_lease: mvm_vmm::host::installed_owner::HolderLease, paired: bool) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut control = inherited_control()?;
     let prepare = read_prepare(&control, deadline)?;
@@ -147,8 +150,9 @@ pub fn run(_lease: mvm_vmm::host::installed_owner::HolderLease) -> io::Result<()
                 socket: config.socket,
                 route: config.route,
             },
-            LAUNCH_LIMITS,
+            if paired { super::installed_profile::pair_queue_limits() } else { LAUNCH_LIMITS },
             report.is_some(),
+            paired.then_some(super::installed_profile::PAIR_REPLAY_ENTRIES),
         )
     };
     let launch = match start() {

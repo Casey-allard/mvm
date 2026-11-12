@@ -9,6 +9,7 @@ use mvm_core::protocol::{
         MAX_WORKER_OPERATION_MS, MailboxWorkerOperation, MailboxWorkerRequest,
     },
 };
+use mvm_hostd::mailbox_process::installed_profile::MailboxPair;
 use mvm_hostd::{
     mailbox_process::owned_client::{InstalledMailboxClient, InstalledMailboxPeer},
     plan_admission::AdmittedPlan,
@@ -28,8 +29,25 @@ use std::{
 pub struct HostAgentMailboxProvisioner {
     home: File,
     original: Arc<Mutex<Child>>,
-    peer: Arc<InstalledMailboxPeer>,
+    peers: InstallationPeers,
     boot: Mutex<Option<[u8; 32]>>,
+}
+
+enum InstallationPeers {
+    Single(Arc<InstalledMailboxPeer>),
+    Pair {
+        names: MailboxPair,
+        peers: [Arc<InstalledMailboxPeer>; 2],
+    },
+}
+
+impl InstallationPeers {
+    fn select(&self, vm: &str) -> Result<Arc<InstalledMailboxPeer>> {
+        match self {
+            Self::Single(peer) => Ok(peer.clone()),
+            Self::Pair { names, peers } => Ok(peers[names.index(vm)?].clone()),
+        }
+    }
 }
 
 fn open_home(home: &Path) -> Result<File> {
@@ -50,9 +68,38 @@ impl HostAgentMailboxProvisioner {
     /// Use the original worker which owns the tenant control listener. A
     /// supervisor Child that launched a separate worker cannot authenticate.
     pub fn from_original_worker(home: &Path, original: Arc<Mutex<Child>>) -> Result<Self> {
+        let peer = Arc::new(InstalledMailboxPeer::from_original(original.clone())?);
+        Self::with_peers(home, original, InstallationPeers::Single(peer))
+    }
+
+    /// Pin two independent acquisition issuers and original-cleanup lanes to
+    /// the same daemon Child. The daemon must carry the identical name allowlist.
+    pub fn from_original_worker_pair(
+        home: &Path,
+        original: Arc<Mutex<Child>>,
+        names: [&str; 2],
+    ) -> Result<Self> {
+        let names = MailboxPair::new(names)?;
+        let first = Arc::new(InstalledMailboxPeer::from_original(original.clone())?);
+        let second = Arc::new(InstalledMailboxPeer::from_original(original.clone())?);
+        Self::with_peers(
+            home,
+            original,
+            InstallationPeers::Pair {
+                names,
+                peers: [first, second],
+            },
+        )
+    }
+
+    fn with_peers(
+        home: &Path,
+        original: Arc<Mutex<Child>>,
+        peers: InstallationPeers,
+    ) -> Result<Self> {
         let value = Self {
             home: open_home(home)?,
-            peer: Arc::new(InstalledMailboxPeer::from_original(original.clone())?),
+            peers,
             original,
             boot: Mutex::new(None),
         };
@@ -112,7 +159,7 @@ impl InstalledMailboxProvisioner for HostAgentMailboxProvisioner {
         request: &MailboxWorkerRequest,
     ) -> Result<Arc<InstalledMailboxPeer>> {
         self.admitted_client(plan, backend, request)?;
-        Ok(self.peer.clone())
+        self.peers.select(&request.vm_id)
     }
 
     fn provision(
@@ -122,7 +169,8 @@ impl InstalledMailboxProvisioner for HostAgentMailboxProvisioner {
         request: &MailboxWorkerRequest,
     ) -> Result<Arc<InstalledMailboxPeer>> {
         let mut client = self.admitted_client(plan, backend, request)?;
-        client.bind_peer(self.peer.clone())?;
+        let peer = self.peers.select(&request.vm_id)?;
+        client.bind_peer(peer.clone())?;
         let owner = client.provision_admitted_slot(
             Instant::now() + Duration::from_millis(MAX_WORKER_OPERATION_MS),
         )?;
@@ -134,7 +182,7 @@ impl InstalledMailboxProvisioner for HostAgentMailboxProvisioner {
             *boot.get_or_insert(owner.daemon_boot_nonce) == owner.daemon_boot_nonce,
             "mailbox daemon generation changed"
         );
-        Ok(self.peer.clone())
+        Ok(peer)
     }
 
     fn resolve_original(&self, signed: &SignedControl) -> Result<Arc<InstalledMailboxPeer>> {
@@ -151,12 +199,12 @@ impl InstalledMailboxProvisioner for HostAgentMailboxProvisioner {
             }
             _ => anyhow::bail!("expected stored mailbox acquisition or stop"),
         };
+        let peer = self.peers.select(&request.vm_id)?;
         ensure!(
-            client.acquire_request().tenant == "local"
-                && self.peer.issued_nonce(&request.request_nonce),
+            client.acquire_request().tenant == "local" && peer.issued_nonce(&request.request_nonce),
             "locator belongs to another installed mailbox worker"
         );
-        client.bind_peer(self.peer.clone())?;
+        client.bind_peer(peer.clone())?;
         if let Some(owner) = client.owner() {
             let boot = self
                 .boot
@@ -169,6 +217,33 @@ impl InstalledMailboxProvisioner for HostAgentMailboxProvisioner {
                 "mailbox locator belongs to another daemon generation"
             );
         }
-        Ok(self.peer.clone())
+        Ok(peer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn paired_installed_sdk_selects_stable_distinct_original_lanes() -> Result<()> {
+        let mut child = Command::new("sleep").arg("20").spawn()?;
+        let result = (|| -> Result<()> {
+            let a = Arc::new(InstalledMailboxPeer::from_child(&mut child)?);
+            let b = Arc::new(InstalledMailboxPeer::from_child(&mut child)?);
+            let peers = InstallationPeers::Pair {
+                names: MailboxPair::new(["alpha", "beta"])?,
+                peers: [a.clone(), b.clone()],
+            };
+            assert!(Arc::ptr_eq(&peers.select("alpha")?, &a));
+            assert!(Arc::ptr_eq(&peers.select("beta")?, &b));
+            assert!(!Arc::ptr_eq(&a, &b));
+            assert!(peers.select("other").is_err());
+            Ok(())
+        })();
+        let _ = child.kill();
+        child.wait()?;
+        result
     }
 }

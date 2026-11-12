@@ -119,10 +119,12 @@ async fn wait_for_worker_ready(
     )
 }
 
-async fn spawn_worker(raw_cfg: &[u8], owned_mailbox: bool) -> Result<Child> {
+use mvm_hostd::mailbox_process::installed_profile::InstalledMailboxProfile;
+
+async fn spawn_worker(raw_cfg: &[u8], owned_mailbox: Option<&InstalledMailboxProfile>) -> Result<Child> {
     let bin = std::env::current_exe().context("resolve mvm-host-agent current_exe")?;
     let mut command = Command::from(mvm_core::env_hygiene::helper_command(&bin));
-    if owned_mailbox { command.arg("--owned-mailbox-v1"); }
+    if let Some(profile) = owned_mailbox { command.args(profile.arguments()); }
     command
         .env(HOST_AGENT_WORKER_ENV, "1")
         .stdin(Stdio::piped())
@@ -1276,9 +1278,9 @@ impl WorkerCoordinator {
     }
 
     #[cfg(test)]
-    fn open(cfg: HostAgentConfig) -> Result<Self> { Self::open_profile(cfg, false) }
-    fn open_profile(cfg: HostAgentConfig, owned_mailbox: bool) -> Result<Self> {
-        anyhow::ensure!(!owned_mailbox || cfg.tenant_id == "local", "installed mailbox v1 requires the local SDK tenant");
+    fn open(cfg: HostAgentConfig) -> Result<Self> { Self::open_profile(cfg, None) }
+    fn open_profile(cfg: HostAgentConfig, owned_mailbox: Option<&InstalledMailboxProfile>) -> Result<Self> {
+        anyhow::ensure!(owned_mailbox.is_none() || cfg.tenant_id == "local", "installed mailbox v1 requires the local SDK tenant");
         use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecycleGeneration};
         let verifying_key = cfg.load_verifying_key()?;
         let mut resources = WorkerResources::open(&cfg)?;
@@ -1304,14 +1306,11 @@ impl WorkerCoordinator {
                 .with_registration_journal(cfg.registration_journal_path()?)
                 .with_resource_binding(resources.binding.clone())
                 .with_lifecycle_coordination(&resources.home, generation.clone())?;
-        let daemon = if owned_mailbox {
-            use mvm_hostd::broker::mailbox_workers::{InstalledMailboxWorkerFactory, MailboxWorkerBudget, WorkerLimits};
+        let daemon = if let Some(profile) = owned_mailbox {
+            use mvm_hostd::broker::mailbox_workers::{InstalledMailboxWorkerFactory, MailboxWorkerBudget};
             let binary = std::env::current_exe()?.with_file_name("mvm-mailbox");
-            let factory = InstalledMailboxWorkerFactory::new(&binary, resources.binding.clone(), &resources.home)?;
-            let budget = MailboxWorkerBudget::new(WorkerLimits {
-                host_workers: 1, tenant_workers: 1, host_bytes: 1_048_576,
-                tenant_bytes: 1_048_576, bytes_per_worker: 65_536,
-            })?;
+            let factory = InstalledMailboxWorkerFactory::with_profile(&binary, resources.binding.clone(), &resources.home, profile.clone())?;
+            let budget = MailboxWorkerBudget::new(profile.worker_limits())?;
             daemon.with_mailbox_workers(Arc::new(MailboxWorkers::new(&cfg.tenant_id, budget, Arc::new(factory))?))?
         } else { daemon };
         // No async task or Child exists yet. The original resource EX owner
@@ -1751,14 +1750,14 @@ impl WorkerCoordinator {
     }
 }
 
-async fn run_worker_once(cfg: HostAgentConfig, owned_mailbox: bool) -> Result<WorkerExit> {
+async fn run_worker_once(cfg: HostAgentConfig, owned_mailbox: Option<&InstalledMailboxProfile>) -> Result<WorkerExit> {
     let mut coordinator = WorkerCoordinator::open_profile(cfg, owned_mailbox)?;
     // The owner is outside every cancellation-prone grace/operation future.
     // Returning is possible only after the coordinator's actual drain path.
     coordinator.run().await
 }
 
-async fn supervise_worker(cfg: HostAgentConfig, raw_cfg: Vec<u8>, owned_mailbox: bool) -> Result<()> {
+async fn supervise_worker(cfg: HostAgentConfig, raw_cfg: Vec<u8>, owned_mailbox: Option<&InstalledMailboxProfile>) -> Result<()> {
     let worker_pid_path = worker_pid_path(&cfg);
     reap_stale_worker_group(&worker_pid_path);
     let mut startup_failures = 0u32;
@@ -1850,12 +1849,9 @@ fn main() -> Result<()> {
         .thread_name("mvm-host-agent")
         .build()
         .context("mvm-host-agent supervisor tokio runtime build failed")?;
-    let mut args = std::env::args_os().skip(1);
-    let owned_mailbox = match args.next() {
-        None => false,
-        Some(mode) if mode == "--owned-mailbox-v1" && args.next().is_none() => true,
-        _ => anyhow::bail!("unknown host-agent startup mode"),
-    };
+    let args: Vec<_> = std::env::args_os().skip(1).take(4).collect();
+    let profile = InstalledMailboxProfile::parse(&args)?;
+    let owned_mailbox = profile.as_ref();
     if is_worker_mode() {
         match runtime.block_on(run_worker_once(cfg, owned_mailbox))? {
             WorkerExit::Idle => {

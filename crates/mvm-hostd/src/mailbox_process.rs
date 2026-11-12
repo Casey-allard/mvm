@@ -19,6 +19,7 @@
 //! declares the capability. A grant on one that does not refuses the launch
 //! rather than boot a guest that asserts a mailbox nobody serves.
 
+pub mod installed_profile;
 pub mod owned;
 pub mod owned_client;
 pub mod owned_wire;

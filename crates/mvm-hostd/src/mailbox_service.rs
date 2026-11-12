@@ -196,11 +196,18 @@ pub fn bind_grant(
     limits: MailboxLimits,
     socket: &Path,
 ) -> std::io::Result<(MailboxService, GuestSealer)> {
+    bind_grant_with_admission_limit(grant, trust, sealer, limits, socket, None)
+}
+
+pub(crate) fn bind_grant_with_admission_limit(
+    grant: &MailboxGrant, trust: MailboxPolicy, sealer: GuestSealer, limits: MailboxLimits,
+    socket: &Path, lifetime_admissions: Option<u64>,
+) -> std::io::Result<(MailboxService, GuestSealer)> {
     grant
         .require_implemented_local_service()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::Unsupported, error))?;
     let sealer = sealer.with_grant(grant)?;
-    let service = MailboxService::bind(socket, limits, trust.with_grant(grant)?)?;
+    let service = MailboxService::bind_with_admission_limit(socket, limits, trust.with_grant(grant)?, lifetime_admissions)?;
     Ok((service, sealer))
 }
 
@@ -214,6 +221,7 @@ struct State {
 
 struct Shared {
     limits: MailboxLimits,
+    lifetime_admissions: Option<u64>,
     state: Mutex<State>,
 }
 
@@ -302,6 +310,10 @@ impl MailboxService {
         limits: MailboxLimits,
         policy: MailboxPolicy,
     ) -> std::io::Result<Self> {
+        Self::bind_with_admission_limit(path, limits, policy, None)
+    }
+
+    fn bind_with_admission_limit(path: &Path, limits: MailboxLimits, policy: MailboxPolicy, lifetime_admissions: Option<u64>) -> std::io::Result<Self> {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -312,6 +324,7 @@ impl MailboxService {
         let wakeups = Arc::new(AtomicU64::new(0));
         let shared = Arc::new(Shared {
             limits,
+            lifetime_admissions,
             state: Mutex::new(State {
                 queue: VecDeque::new(),
                 accepted: 0,
@@ -643,6 +656,11 @@ fn admit(
     if state.queue.len() >= shared.limits.max_depth {
         return Err(Refusal::QueueFull(shared.limits.max_depth));
     }
+    // The original replay set is never evicted while a grant is live. Stop
+    // admission when its reserved entries are consumed, even after queue reads.
+    if shared.lifetime_admissions.is_some_and(|max| state.accepted >= max) {
+        return Err(Refusal::Mailbox("installed mailbox replay reservation exhausted".into()));
+    }
     let p = &state.policy;
     let plaintext = open_envelope(
         envelope,
@@ -689,6 +707,39 @@ mod accept_loop_tests {
             max_frame_bytes: 1024,
         };
         MailboxService::bind(&dir.join("m.sock"), limits, trust).unwrap()
+    }
+
+    #[test]
+    fn paired_installed_queue_and_replay_reservations_survive_plaintext_drain() {
+        use crate::mailbox_process::installed_profile::pair_queue_limits;
+        let dir = tempfile::tempdir().unwrap();
+        crate::audit::host_keypair::load_or_init_at(dir.path()).unwrap();
+        let mailbox = mvm_contract::protocol::mailbox::MailboxId::from_bytes([5; 32]);
+        let epoch = ExecutionEpoch::new(1).unwrap();
+        let grant = MailboxGrant {
+            local_service: None, mailbox, epoch,
+            authority_key: crate::mailbox_launch::authority_key_for(dir.path(), &mailbox, epoch).unwrap().to_bytes(),
+        };
+        let (policy, sealer) = crate::mailbox_launch::host_trust(dir.path(), &grant, &test_secret()).unwrap();
+        let limits = pair_queue_limits();
+        let (svc, mut sealer) = bind_grant_with_admission_limit(
+            &grant, policy, sealer, limits, &dir.path().join("m.sock"), Some(5),
+        ).unwrap();
+        let make = |sealer: &mut GuestSealer, n| sealer.seal(OutboxMessage {
+            recipient: PrincipalId::from_bytes(OWN_MAILBOX_RECIPIENT), body: vec![0, n, 0],
+        }).unwrap();
+        for n in 0..4 {
+            let (cap, envelope) = make(&mut sealer, n);
+            admit(&svc.shared, &cap, &envelope).unwrap();
+        }
+        let (cap, envelope) = make(&mut sealer, 4);
+        assert!(matches!(admit(&svc.shared, &cap, &envelope), Err(Refusal::QueueFull(4))));
+        for n in 0..4 { assert_eq!(svc.shared.take().0, Some(vec![0,n,0])); }
+        admit(&svc.shared, &cap, &envelope).unwrap();
+        assert_eq!(svc.shared.take().0, Some(vec![0,4,0]));
+        let (cap, envelope) = make(&mut sealer, 5);
+        assert!(matches!(admit(&svc.shared, &cap, &envelope), Err(Refusal::Mailbox(_))));
+        assert_eq!(svc.shared.take(), (None, 5, 5));
     }
 
     #[test]
