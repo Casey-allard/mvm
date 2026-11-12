@@ -188,6 +188,8 @@ pub fn authority_key_for(
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivedMailboxKeys {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) development_cast: Option<cast_pair::development::PrivateLaunch>,
     sender: [u8; 32],
     authority: [u8; 32],
     encryption: [u8; 32],
@@ -211,6 +213,27 @@ impl Drop for DerivedMailboxKeys {
     }
 }
 
+impl MailboxTemplate {
+    fn launch_context(&self) -> OpenContext {
+        let h = &self.header;
+        OpenContext {
+            expected_tenant: h.tenant,
+            expected_authorization_domain: h.authorization_domain,
+            expected_mailbox: h.mailbox,
+            expected_sender: h.sender,
+            expected_recipient: h.recipient,
+            acting_principal: self.capability.subject,
+            expected_capability_issuer: self.capability.issuer,
+            current_execution_epoch: h.execution_epoch,
+            current_policy_epoch: h.policy_epoch,
+            required_operation: MailboxOperation::Send,
+            now_unix_ms: now_unix_ms(),
+            accepted_content_types: vec![h.content_type.clone()],
+            revoked_capabilities: vec![],
+        }
+    }
+}
+
 impl DerivedMailboxKeys {
     /// The host trust and sealer these keys stand for. Pure: no file is read,
     /// so it can be rebuilt on every dial attempt.
@@ -218,23 +241,8 @@ impl DerivedMailboxKeys {
         let sender_key = SigningKey::from_bytes(&self.sender);
         let authority_key = SigningKey::from_bytes(&self.authority);
         let template = self.template.clone();
-        let h = &template.header;
         let policy = MailboxPolicy {
-            context: OpenContext {
-                expected_tenant: h.tenant,
-                expected_authorization_domain: h.authorization_domain,
-                expected_mailbox: h.mailbox,
-                expected_sender: h.sender,
-                expected_recipient: h.recipient,
-                acting_principal: template.capability.subject,
-                expected_capability_issuer: template.capability.issuer,
-                current_execution_epoch: h.execution_epoch,
-                current_policy_epoch: h.policy_epoch,
-                required_operation: MailboxOperation::Send,
-                now_unix_ms: now_unix_ms(),
-                accepted_content_types: vec![h.content_type.clone()],
-                revoked_capabilities: vec![],
-            },
+            context: template.launch_context(),
             encryption_key: Key::from_bytes(self.encryption),
             sender_key: sender_key.verifying_key(),
             authority_key: authority_key.verifying_key(),
@@ -285,6 +293,7 @@ pub fn derive_launch_keys(
     }
     let template = template_for(keys_dir, &derived, grant, now_unix_ms())?;
     Ok(DerivedMailboxKeys {
+        development_cast: None,
         sender: derived.sender.to_bytes(),
         authority: derived.authority.to_bytes(),
         encryption: *encryption,
@@ -547,7 +556,14 @@ pub(crate) fn serve_owned_with_counts(
     lifetime_admissions: Option<u64>,
 ) -> Result<OwnedMailboxLaunch> {
     let (trust, sealer) = keys.trust();
-    let (bound, mut sealer) = crate::mailbox_service::bind_grant_with_admission_limit(&grant, trust, sealer, limits, &paths.socket, lifetime_admissions)?;
+    let (bound, mut sealer) = crate::mailbox_service::bind_grant_with_admission_limit(
+        &grant,
+        trust,
+        sealer,
+        limits,
+        &paths.socket,
+        lifetime_admissions,
+    )?;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let dial = std::thread::Builder::new()

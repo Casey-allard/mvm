@@ -2,6 +2,10 @@
 // explicitly and exercise the production local frame codecs in both directions.
 mod canonical {
     include!("mailbox_crypto.rs");
+    #[cfg(all(unix, feature = "test-support"))]
+    mod source_transfer {
+        include!("mailbox_cast_source/check.rs");
+    }
 
     #[cfg(all(unix, feature = "test-support"))]
     struct Meter<S> {
@@ -179,6 +183,32 @@ mod canonical {
             send: &cap,
             receive: &recv_cap,
         };
+        assert!(addressed.matches_original_source(
+            src_grant.mailbox, src_grant.epoch, &src_grant.authority_key
+        ));
+        assert!(!addressed.matches_original_source(
+            dest.mailbox, src_grant.epoch, &src_grant.authority_key
+        ));
+        assert!(!addressed.matches_original_source(
+            src_grant.mailbox, src_grant.epoch, &dest.authority_key
+        ));
+        let mut replacement_plan = dst.clone();
+        replacement_plan.valid_until = chrono::DateTime::from_timestamp_millis(2499).unwrap();
+        let replacement = sign_plan(&replacement_plan, &plan_key, "pinned");
+        let replacement_id = verify_plan(&replacement, &trusted).unwrap().plan_id;
+        let make_channel = |plan, id, limit| {
+            let mut channel = CastChannel::from_signed_pair(
+                &a, plan, &trusted, (&aid, id), greeting, sender(), recipient(), 1500
+            ).unwrap();
+            channel.restrict_frame_budget(limit).unwrap();
+            channel
+        };
+        let narrow = make_channel(&signed_dst, &did, 2048);
+        let other_plan = make_channel(&replacement, &replacement_id, 4096);
+        source_transfer::check(
+            &addressed, [&narrow, &other_plan], grants, &a_policy, &live, &h, &sender_key, &authority_key,
+            &encryption_key, input,
+        );
         let mut unbounded = a_policy.clone();
         unbounded.revoked_capabilities = vec![a_witness.grant.revocation_id; 33];
         assert!(grants.check_compact_policy(&unbounded, &live).is_err());

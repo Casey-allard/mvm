@@ -8,6 +8,7 @@ pub(crate) const CAST_WORK_BYTES: usize = 8 * CAST_BODY_LIMIT;
 #[derive(Default)]
 pub(super) struct CastLane {
     active: bool,
+    source_active: bool,
     last_admission: Option<Instant>,
 }
 
@@ -116,6 +117,41 @@ impl MailboxWorkers {
     }
 }
 
+/// Distinct from the short forwarding credit: the original A helper must
+/// retain its exact sealed request across reconnects without blocking the
+/// A→B forwarding lane. Both draw from the same real tenant/host ledger.
+pub(crate) struct SourceCredit<'a>(&'a MailboxWorkers);
+impl MailboxWorkers {
+    pub(crate) fn reserve_cast_source<'a>(
+        &'a self,
+        source: (&str, &MailboxWorkerOwner),
+        destination: (&str, &MailboxWorkerOwner),
+    ) -> io::Result<SourceCredit<'a>> {
+        let _activation = self.try_activation()?;
+        self.check_cast_participants(source, destination)?;
+        let mut lane = lock(&self.cast_lane)?;
+        if lane.source_active {
+            return Err(refused("original source slot is already retained"));
+        }
+        self.budget.charge_cast_space(&self.tenant)?;
+        lane.source_active = true;
+        Ok(SourceCredit(self))
+    }
+}
+impl Drop for SourceCredit<'_> {
+    fn drop(&mut self) {
+        let result = lock(&self.0.cast_lane).and_then(|mut lane| {
+            let mut ledger = lock(&self.0.budget.ledger)?;
+            refund_bytes(&mut ledger, &self.0.tenant, CAST_WORK_BYTES)?;
+            lane.source_active = false;
+            Ok(())
+        });
+        if result.is_err() {
+            self.0.budget.cleanup.failed.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl MailboxWorkerBudget {
     fn charge_cast_space(&self, tenant_name: &str) -> io::Result<()> {
         let mut ledger = lock(&self.ledger)?;
@@ -199,6 +235,38 @@ mod tests {
     use super::*;
     use crate::mailbox_process::installed_profile::{InstalledMailboxProfile, MailboxPair};
 
+    #[test]
+    fn development_source_and_routed_turn_share_the_unchanged_host_budget() {
+        let p = crate::mailbox_process::installed_profile::development_cast_capacity(
+            &MailboxPair::new(["a", "b"]).unwrap(),
+        );
+        assert_eq!(p.queue.max_frame_bytes, 8192);
+        assert_eq!(p.queue.max_depth, 2);
+        assert_eq!(p.worker.host_bytes, 1024 * 1024);
+        assert_eq!(p.worker.tenant_bytes, 1024 * 1024);
+        let budget = MailboxWorkerBudget::new(p.worker).unwrap();
+        let a = budget.charge("local", Some("a")).unwrap();
+        let b = budget.charge("local", Some("b")).unwrap();
+        let base = budget.usage().unwrap();
+        budget.charge_cast_space("local").unwrap();
+        budget.charge_cast_space("local").unwrap();
+        assert_eq!(
+            budget.usage().unwrap().bytes,
+            base.bytes + 2 * CAST_WORK_BYTES
+        );
+        assert!(budget.charge_cast_space("local").is_err());
+        budget.charge("local", None).unwrap();
+        budget.release_control("local");
+        for _ in 0..2 {
+            refund_bytes(&mut budget.ledger.lock().unwrap(), "local", CAST_WORK_BYTES).unwrap();
+        }
+        assert_eq!(budget.usage().unwrap(), base);
+        for (name, cell) in [("a", a), ("b", b)] {
+            budget.collected("local").unwrap();
+            budget.retire("local", name).unwrap();
+            budget.return_cell(cell.unwrap());
+        }
+    }
     #[test]
     fn addressed_cast_shares_the_two_workers_and_preserves_control_headroom() {
         let limits =

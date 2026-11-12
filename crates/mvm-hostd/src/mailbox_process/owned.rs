@@ -147,6 +147,15 @@ pub fn run_profile(
         // Acquire only from the original helper's inherited Prepare and the
         // approved, delegated configuration. Legacy launch consumes its keys.
         let original = BoundCastEndpoint::from_original(&prepare, config, &_lease)?;
+        if !matches!(
+            original.direction,
+            crate::mailbox_launch::cast_pair::development::PrivateSlot::Disabled
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "original addressed role transport is not installed",
+            ));
+        }
         let config = original.config;
         serve_owned_with_counts(
             config.grant,
@@ -266,20 +275,38 @@ pub struct BoundCastEndpoint<'lease> {
     owner: mvm_contract::protocol::mailbox_worker::MailboxWorkerOwner,
     config: super::MailboxProcessConfig,
     _lease: &'lease mvm_vmm::host::installed_owner::HolderLease,
+    direction: crate::mailbox_launch::cast_pair::development::PrivateSlot,
 }
 impl<'lease> BoundCastEndpoint<'lease> {
     fn from_original(
         prepare: &super::owned_wire::PrepareOwnedV1,
-        config: super::MailboxProcessConfig,
+        mut config: super::MailboxProcessConfig,
         lease: &'lease mvm_vmm::host::installed_owner::HolderLease,
     ) -> io::Result<Self> {
         // SAFETY: getppid has no preconditions.
         prepare.validate(&config, unsafe { libc::getppid() } as u32)?;
+        let direction = crate::mailbox_launch::cast_pair::development::PrivateSlot::new(
+            &mut config,
+            &prepare.owner,
+        )
+        .map_err(io::Error::other)?;
         Ok(Self {
+            direction,
             owner: prepare.owner.clone(),
             config,
             _lease: lease,
         })
+    }
+
+    pub fn install_development_direction(
+        &mut self,
+        turn: &crate::mailbox_launch::cast_pair::development::DirectionTurn<'_>,
+        role: crate::mailbox_launch::cast_pair::development::EndpointRole,
+        capsule: &crate::mailbox_launch::cast_pair::development::Capsule,
+    ) -> io::Result<()> {
+        self.direction
+            .accept_turn(turn, role, &self.owner, capsule)
+            .map_err(io::Error::other)
     }
 
     /// Open only under the receiver's retained original keys. This is a
@@ -289,12 +316,24 @@ impl<'lease> BoundCastEndpoint<'lease> {
     /// installation gate in PrepareOwnedV1::validate.
     pub fn open_addressed<'turn>(
         &'turn self,
+        direction: &'turn crate::mailbox_launch::cast_pair::development::DevelopmentDirection,
         routed: &'turn crate::mailbox_launch::cast_pair::RoutedCast<'turn>,
         source: &mvm_core::mailbox::OpenContext,
         destination: &mvm_core::mailbox::OpenContext,
         replay: &mut impl mvm_core::mailbox::ReplayProtector,
         sequence: std::num::NonZeroU64,
     ) -> io::Result<BoundOpenedCast<'turn>> {
+        routed
+            .check_direction(direction, source, destination)
+            .map_err(io::Error::other)?;
+        let key = self
+            .direction
+            .installed(
+                direction,
+                crate::mailbox_launch::cast_pair::development::EndpointRole::Destination,
+                &self.owner,
+            )
+            .map_err(io::Error::other)?;
         let channel = routed.channel();
         if self.config.grant.local_service.is_none()
             || !channel.is_bounded_destination(
@@ -317,6 +356,7 @@ impl<'lease> BoundCastEndpoint<'lease> {
             channel,
             input.envelope.clone(),
             input.grants,
+            key,
             &a,
             &b,
             replay,
@@ -324,6 +364,7 @@ impl<'lease> BoundCastEndpoint<'lease> {
         )?;
         Ok(BoundOpenedCast {
             proof,
+            direction,
             routed,
             endpoint: self,
         })
@@ -335,6 +376,7 @@ impl<'lease> BoundCastEndpoint<'lease> {
 /// Crossing processes requires a protected original-credit protocol; one
 /// cannot serialize this in-process object or release its credit early.
 pub struct BoundOpenedCast<'turn> {
+    direction: &'turn crate::mailbox_launch::cast_pair::development::DevelopmentDirection,
     proof: mvm_core::mailbox::frame::cast::route::AddressedVerifiedCast,
     routed: &'turn crate::mailbox_launch::cast_pair::RoutedCast<'turn>,
     endpoint: &'turn BoundCastEndpoint<'turn>,
@@ -355,6 +397,9 @@ impl BoundOpenedCast<'_> {
         self.proof.dispatch_on(self.routed.channel(), stream, || {
             let (source, dest) = policy()?;
             self.routed
+                .check_direction(self.direction, source, dest)
+                .map_err(io::Error::other)?;
+            self.routed
                 .for_original_destination(&self.endpoint.owner, source, dest)
                 .map_err(io::Error::other)?;
             let (a, b) = self
@@ -364,5 +409,76 @@ impl BoundOpenedCast<'_> {
             let current = sample.get_or_init(|| (a, b));
             Ok((&current.0, &current.1))
         })
+    }
+}
+
+/// Owns the sole admitted source sealer/sequence through physical redials.
+/// Constructing this consumes the original lease token and charges its ledger.
+/// The same helper cannot revive a cleared request by reopening a fresh slot.
+pub struct BoundSourceGeneration<'lease, 'budget> {
+    endpoint: BoundCastEndpoint<'lease>,
+    sealer: crate::mailbox_service::GuestSealer,
+    slot: mvm_core::mailbox::frame::cast::source::SourceCastSlot<
+        crate::broker::mailbox_workers::cast_credit::SourceCredit<'budget>,
+    >,
+}
+impl<'lease> BoundCastEndpoint<'lease> {
+    pub fn into_development_source<'budget>(
+        self,
+        turn: &crate::mailbox_launch::cast_pair::development::DirectionTurn<'budget>,
+    ) -> io::Result<BoundSourceGeneration<'lease, 'budget>> {
+        use crate::mailbox_launch::cast_pair::development::EndpointRole;
+        self.direction
+            .installed(turn.direction(), EndpointRole::Source, &self.owner)
+            .map_err(io::Error::other)?;
+        let credit = turn.source_credit().map_err(io::Error::other)?;
+        let slot = mvm_core::mailbox::frame::cast::source::SourceCastSlot::new(
+            credit,
+            crate::broker::mailbox_workers::cast_credit::CAST_WORK_BYTES,
+        );
+        let sealer = self.config.keys.trust().1;
+        Ok(BoundSourceGeneration {
+            endpoint: self,
+            sealer,
+            slot,
+        })
+    }
+}
+impl BoundSourceGeneration<'_, '_> {
+    pub fn prepare(
+        &mut self,
+        turn: &crate::mailbox_launch::cast_pair::development::DirectionTurn<'_>,
+        original: &[u8],
+    ) -> io::Result<mvm_contract::protocol::mailbox::MailboxEnvelope> {
+        use crate::mailbox_launch::cast_pair::development::EndpointRole;
+        let key = self
+            .endpoint
+            .direction
+            .installed(turn.direction(), EndpointRole::Source, &self.endpoint.owner)
+            .map_err(io::Error::other)?;
+        let (a, b) = turn.policies().map_err(io::Error::other)?;
+        let mut source = turn
+            .source_view(&mut self.sealer, key, &mut self.slot)
+            .map_err(io::Error::other)?;
+        Ok(source
+            .prepare(original, &a, &b)
+            .map_err(io::Error::other)?
+            .clone())
+    }
+    pub fn retire_after(
+        &mut self,
+        turn: &crate::mailbox_launch::cast_pair::development::DirectionTurn<'_>,
+        original: &[u8],
+        record: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        use crate::mailbox_launch::cast_pair::development::EndpointRole;
+        let key = self
+            .endpoint
+            .direction
+            .installed(turn.direction(), EndpointRole::Source, &self.endpoint.owner)
+            .map_err(io::Error::other)?;
+        turn.source_view(&mut self.sealer, key, &mut self.slot)
+            .map_err(io::Error::other)?
+            .retire_after(original, record)
     }
 }

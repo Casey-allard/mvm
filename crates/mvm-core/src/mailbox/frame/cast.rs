@@ -1,8 +1,9 @@
 //! The Deliver-role handoff for one Cast. The destination owner presents the
 //! original verified admission and its current policy while holding admission.
 //! This path never submits ciphertext to a relay, signs receipts, or activates a guest.
-pub mod route;
 pub mod enrollment;
+pub mod route;
+pub mod source;
 
 use super::Refusal;
 use super::local::{decode_local_frame, encode_local_frame, encode_local_greeting};
@@ -48,6 +49,7 @@ pub struct CastChannel {
     valid_from: i64,
     valid_until: i64,
     source: MailboxGrant,
+    original_plans: (crate::plan::PlanId, crate::plan::PlanId),
 }
 
 impl CastChannel {
@@ -117,6 +119,7 @@ impl CastChannel {
             valid_from: start,
             valid_until: until,
             source: origin,
+            original_plans: (source.plan_id.clone(), target.plan_id.clone()),
         })
     }
 
