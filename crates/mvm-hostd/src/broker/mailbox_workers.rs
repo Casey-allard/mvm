@@ -1405,8 +1405,13 @@ impl MailboxWorkers {
         &self,
         request: &MailboxWorkerRequest,
     ) -> io::Result<(MailboxWorkerResult, Option<OwnedFd>)> {
-        if matches!(request.operation, MailboxWorkerOperation::ForwardCastV1 { .. }) {
-            return Err(refused("Cast control requires original lifecycle and approved plan signer"));
+        if matches!(
+            request.operation,
+            MailboxWorkerOperation::ForwardCastV1 { .. }
+        ) {
+            return Err(refused(
+                "Cast control requires original lifecycle and approved plan signer",
+            ));
         }
         let provision = matches!(request.operation, MailboxWorkerOperation::ProvisionAdmittedV1 { .. });
         if provision && !self.factory.requires_signed_provision() {
@@ -1544,7 +1549,9 @@ impl MailboxWorkers {
             };
             let mut slot = lock(&slot)?;
             let supplied = match &request.operation {
-                MailboxWorkerOperation::ForwardCastV1 { .. } => return Err(refused("unexpected Cast worker operation")),
+                MailboxWorkerOperation::ForwardCastV1 { .. } => {
+                    return Err(refused("unexpected Cast worker operation"));
+                }
                 MailboxWorkerOperation::DelegateConfig { owner }
                 | MailboxWorkerOperation::Query { owner }
                 | MailboxWorkerOperation::Stop { owner }
@@ -1968,8 +1975,25 @@ mod tests {
         assert!(!provider.try_idle().unwrap());
         // A same-thread try proves the short gate is not held across the turn.
         assert!(provider.fence.state.try_lock().is_ok());
-        drop(activation);
-        let receipt = provider.retire_originals().unwrap();
+        let receipt = std::thread::scope(|threads| {
+            let (finished, received) = std::sync::mpsc::sync_channel(1);
+            let original = &provider;
+            let collector = threads.spawn(move || {
+                let receipt = original.retire_originals().unwrap();
+                finished.send(()).unwrap();
+                receipt
+            });
+            // The original collector acquired the fence. The outer activation
+            // still owns its bounded control turn, so no receipt is available.
+            let timeout = Instant::now() + std::time::Duration::from_secs(3);
+            while !provider.fence.state.lock().unwrap().running {
+                assert!(Instant::now() < timeout);
+                std::thread::yield_now();
+            }
+            assert!(matches!(received.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+            drop(activation);
+            collector.join().unwrap()
+        });
         assert_eq!(receipt.deadline(), first);
         provider.validate_retirement(&receipt).unwrap();
         assert_eq!(receipt.never_spawned_released(), 0);

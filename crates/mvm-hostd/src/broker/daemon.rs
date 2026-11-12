@@ -405,15 +405,35 @@ fn dispatch_worker_control(
     deadline: std::time::Instant,
 ) -> Result<()> {
     use mvm_core::protocol::mailbox_worker_control::MailboxWorkerOperation;
-    if let MailboxWorkerOperation::ForwardCastV1 { owner, resource_epoch, .. } = &request.operation {
-        let original=lifecycle.context("installed lifecycle required")?;
-        anyhow::ensure!(original.generation.resource_epoch()==*resource_epoch,"Cast resource epoch changed");
-        let _admitted=active_worker_turn(Some(original),deadline,||Ok(workers.try_activation()?))?;
-        crate::mailbox_launch::cast_pair::development::control::execute(workers,request,verifier,&original.home,deadline)?;
-        let result=mvm_contract::protocol::mailbox_worker::MailboxWorkerResult{request_nonce:request.request_nonce,
-            owner:owner.clone(),state:mvm_contract::protocol::mailbox_worker::MailboxWorkerState::Serving,delegates_config:false};
+    if let MailboxWorkerOperation::ForwardCastV1 {
+        owner,
+        resource_epoch,
+        ..
+    } = &request.operation
+    {
+        let original = lifecycle.context("installed lifecycle required")?;
+        anyhow::ensure!(
+            original.generation.resource_epoch() == *resource_epoch,
+            "Cast resource epoch changed"
+        );
+        let _admitted =
+            active_worker_turn(Some(original), deadline, || Ok(workers.try_activation()?))?;
+        crate::mailbox_launch::cast_pair::development::control::execute(
+            workers,
+            request,
+            verifier,
+            &original.home,
+            deadline,
+        )?;
+        let result = mvm_contract::protocol::mailbox_worker::MailboxWorkerResult {
+            request_nonce: request.request_nonce,
+            owner: owner.clone(),
+            state: mvm_contract::protocol::mailbox_worker::MailboxWorkerState::Serving,
+            delegates_config: false,
+        };
         // A partial success response is ambiguous. Never append an error frame.
-        let _ = mvm_vmm::host::mailbox_worker_transport::send_response(stream,&result,None,deadline);
+        let _ =
+            mvm_vmm::host::mailbox_worker_transport::send_response(stream, &result, None, deadline);
         return Ok(());
     }
     let _admission = match request.operation {

@@ -75,6 +75,13 @@ pub(crate) fn execute(
     else {
         anyhow::bail!("expected addressed Cast control")
     };
+    use mvm_contract::protocol::mailbox::local_service::MailboxLocalServiceGrant;
+    ensure!(
+        request.backend == MailboxWorkerBackend::Firecracker
+            && request.mailbox_grant.local_service
+                == Some(MailboxLocalServiceGrant::original_cast_v1()),
+        "named Firecracker Cast profile required"
+    );
     let p: PublicCastControl = serde_json::from_str(projection)?;
     p.binds(owner, destination_owner)?;
     let direction = DevelopmentDirection {
@@ -98,6 +105,11 @@ pub(crate) fn execute(
     let right = verify_plan(&p.plans[1], &anchors)?;
     verify_plan_id(&left)?;
     verify_plan_id(&right)?;
+    ensure!(
+        right.mailbox.as_ref().and_then(|g| g.local_service)
+            == Some(MailboxLocalServiceGrant::original_cast_v1()),
+        "destination plan lacks compact original Cast grant"
+    );
     ensure!(
         left.plan_id == direction.fields.plans.0
             && right.plan_id == direction.fields.plans.1
