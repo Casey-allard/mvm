@@ -139,6 +139,57 @@ mod tests {
     }
 
     #[test]
+    fn launch_volume_special_file_dangling_link_never_creates_target() {
+        let _home = TestVolumeHome::new();
+        let lock_name = LocalVolumeCatalog::path().with_extension("lock");
+        fs::create_dir_all(lock_name.parent().unwrap()).unwrap();
+        let absent = lock_name.with_extension("absent");
+        std::os::unix::fs::symlink(&absent, &lock_name).unwrap();
+        assert!(service().acquire_launch_lease(&jit_launch("vm-2")).is_err());
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn launch_volume_special_file_fifo_refuses_before_reader_opens() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let _home = TestVolumeHome::new();
+        let lock_name = LocalVolumeCatalog::path().with_extension("lock");
+        fs::create_dir_all(lock_name.parent().unwrap()).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&lock_name)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (started, ready) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                started.send(()).unwrap();
+                finished
+                    .send(service().acquire_launch_lease(&jit_launch("vm-2")).is_err())
+                    .unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let before_reader = result.recv_timeout(Duration::from_millis(500));
+            // Release a regressed blocking open before joining that thread.
+            let _reader = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&lock_name)
+                .unwrap();
+            if before_reader.is_err() {
+                result.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            assert_eq!(before_reader, Ok(true));
+        });
+    }
+
+    #[test]
     fn launch_volume_contention_waits_and_reads_committed_catalog() {
         use std::sync::mpsc::{self, RecvTimeoutError};
         use std::time::Duration;
