@@ -362,6 +362,7 @@ pub fn verify_guest_reader_enrollment(
 pub fn object_call_challenge(
     pair: &[u8; 32],
     lease: &SignedMailboxDeliveryLease,
+    role: &super::object_pair::role::SignedObjectRoleV1,
     nonce: &[u8; 32],
 ) -> AnyResult<[u8; 32]> {
     use sha2::{Digest, Sha256};
@@ -374,6 +375,8 @@ pub fn object_call_challenge(
     h.update(pair);
     h.update(nonce);
     h.update(lease.encode()?);
+    anyhow::ensure!(role.signature.len() == 64, "invalid signed object role");
+    h.update(&role.signature);
     Ok(h.finalize().into())
 }
 
@@ -401,6 +404,7 @@ pub fn verify_object_call_authority(
     else {
         anyhow::bail!("missing original Call authorization")
     };
+    let bound_challenge = object_call_challenge(pair, lease, role, nonce)?;
     let role = role.verify(boot, now)?;
     let l = &lease.lease;
     let authority = VerifyingKey::from_bytes(&boot.authority_key)?;
@@ -451,12 +455,7 @@ pub fn verify_object_call_authority(
     let ack = verify_guest_reader_enrollment(enrollment, capability, &scope, &authority, &[])?;
     l.check_scope(&grant, &capability.grant, l.consumer_session, now)?;
     verify_object_delivery_projection(pair, header, payload, lease, &authority)?;
-    verify_reader_possession(
-        enrollment,
-        &object_call_challenge(pair, lease, nonce)?,
-        signature,
-        &ack,
-    )?;
+    verify_reader_possession(enrollment, &bound_challenge, signature, &ack)?;
     Ok(())
 }
 

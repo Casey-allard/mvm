@@ -85,7 +85,19 @@ fn fixture(
 #[test]
 fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_possession() {
     let now = now_unix_ms().unwrap();
-    let (authority, guest, plan, _, _, receive, enrollment) = fixture(now);
+    let (authority, guest, mut plan, _, _, mut receive, mut enrollment) = fixture(now);
+    let (issued, _, b) = signed_source(now);
+    let mut body = issued.role;
+    body.role = mvm_core::mailbox::object_pair::role::ObjectParticipantRole::Callee;
+    let role = SignedObjectRoleV1::issue(body, &b, now).unwrap();
+    let boot = role.role.callee.clone();
+    let pair = boot.durable_object_pair_sha256_v1.unwrap();
+    plan.durable_object_pair_sha256_v1 = Some(pair);
+    enrollment.plan_id = boot.plan_id.clone();
+    enrollment.plan_nonce = boot.plan_nonce.clone();
+    enrollment.consumer_boot = boot.boot;
+    receive.capability_id = CapabilityId::from_bytes([87; 32]);
+    enrollment.receive_capability_id = receive.capability_id;
     let receive_cap = sign_capability(receive.clone(), &authority).unwrap();
     let signed_enrollment = sign_guest_reader_enrollment(enrollment.clone(), &authority).unwrap();
     let header = MailboxEnvelopeHeader {
@@ -93,18 +105,18 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
         signature_algorithm: SignatureAlgorithm::ED25519,
         tenant: receive.address.tenant,
         authorization_domain: receive.address.authorization_domain,
-        sender: PrincipalId::from_bytes([30; 32]),
+        sender: role.role.call.grant.subject,
         recipient: receive.address.recipient,
         mailbox: plan.mailbox,
-        sender_boot: BootId::from_bytes([31; 32]),
+        sender_boot: role.role.caller.boot,
         execution_epoch: plan.epoch,
         message_id: MessageId::from_bytes([32; 32]),
         correlation_id: CorrelationId::from_bytes([33; 32]),
         causation_id: mvm_contract::protocol::mailbox::CausationId::from_bytes([34; 32]),
         kind: MailboxMessageKind::Call,
         reply_to: Some(ReplyRoute {
-            address: receive.address,
-            capability_id: CapabilityId::from_bytes([77; 32]),
+            address: role.role.reply.grant.address,
+            capability_id: role.role.reply.grant.capability_id,
         }),
         ordering_scope: OrderingScope::parse("report").unwrap(),
         sequence: SequenceNumber::new(1).unwrap(),
@@ -112,7 +124,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
         expires_at_unix_ms: now + 5000,
         nonce: ReplayNonce::from_bytes([35; 16]),
         content_type: receive.content_types[0].clone(),
-        capability_id: CapabilityId::from_bytes([36; 32]),
+        capability_id: role.role.call.grant.capability_id,
         policy_epoch: receive.policy_epoch,
         encryption: EncryptionContext {
             algorithm: EncryptionAlgorithm::AES_256_GCM,
@@ -123,7 +135,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
     let lease = sign_delivery_lease(
         MailboxDeliveryLease {
             object_projection_v1: Some(
-                object_delivery_commitment(&[71; 32], &header, b"hello").unwrap(),
+                object_delivery_commitment(&pair, &header, b"hello").unwrap(),
             ),
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
@@ -148,21 +160,10 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
 
     let seed = Box::leak(Box::new(Zeroizing::new(guest.to_bytes())));
     let reader = Arc::new(GuestReader {
-        role: None,
+        role: Some(role.clone()),
         settlement: Default::default(),
         outbox: Default::default(),
-        boot: MailboxReaderBootBinding {
-            durable_object_pair_sha256_v1: Some([71; 32]),
-            outbound_journal_v1: None,
-            plan_id: enrollment.plan_id.clone(),
-            plan_nonce: enrollment.plan_nonce.clone(),
-            mailbox: plan.mailbox,
-            authority_key: plan.authority_key,
-            execution_epoch: plan.epoch,
-            boot: enrollment.consumer_boot,
-            guest_identity_key: [32; 32],
-            ack_public_key: enrollment.ack_public_key,
-        },
+        boot: boot.clone(),
         ack_seed: seed,
         active: Mutex::new(None),
     });
@@ -174,7 +175,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
             let app = scope.spawn(move || application_request(&mut server, &tx, &state));
             write_application_request(
                 &mut client,
-                &ApplicationReaderRequest::ReceiveObjectPairV1 { pair: [71; 32] },
+                &ApplicationReaderRequest::ReceiveObjectPairV1 { pair },
             )
             .unwrap();
             let pending = rx.recv_timeout(LOCAL_TIMEOUT).unwrap();
@@ -182,7 +183,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
             let engine = scope.spawn(move || exchange(&mut original_guest, pending));
             assert_eq!(
                 read_request(&mut host).unwrap(),
-                ReaderRequest::ReceiveObjectPairV1 { pair: [71; 32] }
+                ReaderRequest::ReceiveObjectPairV1 { pair }
             );
             let challenge = [49 + variant; 32];
             write_response(
@@ -234,6 +235,47 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
                     }
                 );
             }
+        });
+    }
+    let challenge = [63; 32];
+    let request = ApplicationReaderRequest::AuthorizeObjectCallV1 {
+        pair,
+        lease: Box::new(lease.clone()),
+        challenge,
+    };
+    for deny in [false, true] {
+        let (mut client, mut local) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let r = reader.clone();
+            let app = scope.spawn(move || application_request(&mut local, &tx, &r));
+            write_application_request(&mut client, &request).unwrap();
+            let pending = rx.recv().unwrap();
+            let (mut original, mut host) = UnixStream::pair().unwrap();
+            let service = scope.spawn(move || exchange(&mut original, pending));
+            assert!(
+                matches!(read_request(&mut host).unwrap(),ReaderRequest::AuthorizeObjectCallV1{lease:l,..} if *l==lease)
+            );
+            let verdict = if deny {
+                ReaderResponse::Refused {
+                    reason: Refusal::NotAuthorized,
+                }
+            } else {
+                ReaderResponse::ObjectRoleV1 {
+                    signed: Box::new(role.clone()),
+                }
+            };
+            write_response(&mut host, &verdict).unwrap();
+            service.join().unwrap().unwrap();
+            let response = app.join().unwrap().unwrap();
+            let verify = |challenge, body| {
+                mvm_core::mailbox::reader::verify_object_call_authority(
+                    &boot, &pair, &lease, &header, body, challenge, &response, now,
+                )
+            };
+            assert_eq!(verify(&challenge, b"hello").is_ok(), !deny);
+            assert!(verify(&[99; 32], b"hello").is_err());
+            assert!(verify(&challenge, b"HELLO").is_err());
         });
     }
 }

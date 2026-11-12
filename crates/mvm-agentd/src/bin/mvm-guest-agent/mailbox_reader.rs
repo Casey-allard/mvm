@@ -439,8 +439,9 @@ fn perform_exchange(
             }
             let (enrollment, capability) =
                 check_active_call(&pending.reader, *pair, lease, challenge)?;
-            let bound = mvm_core::mailbox::reader::object_call_challenge(pair, lease, challenge)
-                .map_err(|_| Refusal::NotAuthorized)?;
+            let bound =
+                mvm_core::mailbox::reader::object_call_challenge(pair, lease, &signed, challenge)
+                    .map_err(|_| Refusal::NotAuthorized)?;
             let signature = sign_reader_possession(
                 &enrollment,
                 &bound,
