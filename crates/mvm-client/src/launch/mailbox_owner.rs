@@ -296,6 +296,12 @@ impl OwnedLaunch {
             peer: self.original_peer.clone(),
         })
     }
+    pub(crate) fn start_native<T>(&self, start: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.client.start_native(start)
+    }
+    pub(crate) fn settle_native_start(&self) -> Result<()> {
+        self.client.settle_native_start()
+    }
     pub(crate) fn configure_and_wait(&self, backend: &AnyBackend) -> Result<()> {
         self.client.configure_and_wait(backend, deadline())
     }
@@ -326,6 +332,7 @@ impl Drop for OwnedLaunch {
     }
 }
 fn collect(client: &InstalledMailboxClient) -> Result<()> {
+    client.settle_native_start()?;
     let until = deadline();
     match client.stop(until)? {
         MailboxWorkerState::Collected { .. } => Ok(()),

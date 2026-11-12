@@ -203,11 +203,20 @@ pub fn start_prepared_custodied(
             reason: format!("{e:#}"),
         }
     })?;
-    let vm_id = backend
-        .start_custodied(config, images)
-        .map_err(|e| MvmError::Backend {
-            reason: format!("{e:#}"),
-        })?;
+    enter_prepared_native(backend, config, images).map_err(|e| MvmError::Backend {
+        reason: format!("{e:#}"),
+    })
+}
+
+/// The caller checked workload support before entering. Preserve the actual
+/// typed backend error for original native custody and retry.
+#[cfg(unix)]
+pub(crate) fn enter_prepared_native(
+    backend: mvm_runtime::backend::AnyBackend,
+    config: &mvm_core::vm_backend::VmStartConfig,
+    images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+) -> anyhow::Result<StartedVm> {
+    let vm_id = backend.start_custodied(config, images)?;
     Ok(StartedVm { backend, vm_id })
 }
 

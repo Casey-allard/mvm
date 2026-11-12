@@ -517,20 +517,29 @@ fn finish_persistent(
     // VMM selection + workload-support check + start move behind the facade; the
     // admission gate (above) and the launched/failed emits stay here.
     #[cfg(unix)]
-    let started = match (|| -> Result<_> {
-        let mut images = prepared_volumes.take_writable_images();
-        complete_writable_images(&start_config, &mut images)?;
-        Ok(crate::boot::start_prepared_custodied(
-            backend,
-            &start_config,
-            images,
-        )?)
-    })() {
-        Ok(started) => started,
-        Err(err) => {
-            let err = anyhow::anyhow!("{err}");
-            emit_failed(&admission, "backend-start", &err);
-            return Err(err);
+    let started = {
+        let prepared = (|| -> Result<_> {
+            let mut images = prepared_volumes.take_writable_images();
+            complete_writable_images(&start_config, &mut images)?;
+            mvm_runtime::workload_backend::require_workload_backend(&backend)?;
+            Ok(images)
+        })();
+        let result = match (owned.as_ref(), prepared) {
+            (Some(worker), Ok(images)) => worker.start_native(|| crate::boot::enter_prepared_native(backend, &start_config, images)),
+            (None, Ok(images)) => crate::boot::enter_prepared_native(backend, &start_config, images),
+            (_, Err(error)) => Err(error),
+        };
+        match result {
+            Ok(started) => started,
+            Err(cause) => {
+                if let Some(worker) = owned.as_mut() {
+                    let settled = worker.settle_native_start();
+                    return Err(settle_mailbox_failure(&admission, name, "backend-start", cause,
+                        worker, &mut prepared_volumes, settled));
+                }
+                emit_failed(&admission, "backend-start", &cause);
+                return Err(cause);
+            }
         }
     };
     #[cfg(not(unix))]
