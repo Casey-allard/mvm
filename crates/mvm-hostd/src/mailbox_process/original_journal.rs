@@ -162,6 +162,13 @@ impl OriginalJournalDestination {
         self.marker.collect(&mut self.child)
     }
 
+    /// Request termination through the retained original Child. The caller
+    /// must first confirm VM stop and separately report assisted teardown.
+    /// Only try_collect can clear this helper's persistent ownership record.
+    pub fn request_original_exit_after_vm_stop(&mut self) -> std::io::Result<()> {
+        request_original_exit(&mut self.child)
+    }
+
     pub fn binding(&self) -> &MailboxReaderBootBinding {
         &self.boot
     }
@@ -233,6 +240,13 @@ pub(super) fn claim_launch(
         _guard: guard,
         owner_dir: owner_dir.to_path_buf(),
     }))
+}
+
+fn request_original_exit(child: &mut std::process::Child) -> std::io::Result<()> {
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+    }
+    Ok(())
 }
 
 pub(super) const MARKER: &str = "mailbox-paired-original-v1";
@@ -386,6 +400,35 @@ mod tests {
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
         assert!(claim_launch(dir.path(), dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn assisted_stop_targets_only_the_held_child_and_still_requires_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut marker = OriginalMarker::claim(directory.path()).unwrap();
+        let mut first = std::process::Command::new("sleep")
+            .arg("15")
+            .spawn()
+            .unwrap();
+        let mut second = std::process::Command::new("sleep")
+            .arg("15")
+            .spawn()
+            .unwrap();
+        request_original_exit(&mut first).unwrap();
+        assert!(marker.path.exists());
+        assert!(second.try_wait().unwrap().is_none());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = marker.collect(&mut first).unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(!status.success());
+        assert!(!marker.path.exists());
+        second.kill().unwrap();
+        second.wait().unwrap();
     }
 
     #[test]
