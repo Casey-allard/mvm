@@ -67,8 +67,32 @@ impl OriginalMailboxTarget {
         Ok(observer)
     }
     fn check_current(&self, state: &Path) -> Result<()> {
+        use std::{
+            io::Read,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        let f = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(state.join(wire::INSTANCE_FILE))?;
+        let meta = f.metadata()?;
+        mvm_core::private_fs::require_current_owner(&meta)?;
         ensure!(
-            wire::read_record::<HvfInstance>(&state.join(wire::INSTANCE_FILE))? == self.instance,
+            meta.is_file()
+                && meta.nlink() == 1
+                && meta.mode() & 0o022 == 0
+                && meta.len() <= wire::MAX_FRAME_BYTES as u64,
+            "invalid original HVF instance record"
+        );
+        let mut bytes = Vec::new();
+        f.take(wire::MAX_FRAME_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= wire::MAX_FRAME_BYTES,
+            "oversized original HVF instance record"
+        );
+        ensure!(
+            serde_json::from_slice::<HvfInstance>(&bytes)? == self.instance,
             "HVF mailbox generation changed"
         );
         Ok(())

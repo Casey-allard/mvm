@@ -320,7 +320,7 @@ impl WorkerLaunch {
         let config = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("invalid original object worker bootstrap"))?;
         #[cfg(target_os = "macos")]
-        let originals = Originals::observe(&config, until)?;
+        let originals = Originals::observe(&config, until, || controller.require_live(&channel))?;
         let launch = Self {
             config,
             originals,

@@ -111,7 +111,12 @@ pub(super) fn read_body(
 
 pub(super) struct Originals([OriginalMailboxObservation; 2]);
 impl Originals {
-    pub(super) fn observe(config: &ObjectWorkerBootstrapV1, until: Instant) -> Result<Self> {
+    pub(super) fn observe(
+        config: &ObjectWorkerBootstrapV1,
+        until: Instant,
+        controller: impl Fn() -> Result<()>,
+    ) -> Result<Self> {
+        controller()?;
         let authority = config.validate_current()?;
         let targets = config
             .hvf
@@ -135,10 +140,12 @@ impl Originals {
                 "original HVF target differs"
             );
         }
-        Ok(Self([
-            targets[0].observe_at(&config.home, until)?,
-            targets[1].observe_at(&config.home, until)?,
-        ]))
+        controller()?;
+        let caller = targets[0].observe_at(&config.home, until)?;
+        controller()?;
+        let callee = targets[1].observe_at(&config.home, until)?;
+        controller()?;
+        Ok(Self([caller, callee]))
     }
     pub(super) fn require_live(&self, ids: [EndpointPid; 2]) -> Result<()> {
         for (original, id) in self.0.iter().zip(ids) {
