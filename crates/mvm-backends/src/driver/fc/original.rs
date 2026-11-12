@@ -1,6 +1,6 @@
 //! Observer for the UNIX stream used to configure and start the original VMM.
 use anyhow::{Result, ensure};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 /// Two single-assignment observations shared only within one cold launch.
@@ -19,6 +19,15 @@ impl LaunchObservation {
         self.peer
             .set(peer)
             .map_err(|_| anyhow::anyhow!("original Firecracker config stream already bound"))
+    }
+    /// Borrow the Linux pidfd of the connected peer which accepted InstanceStart.
+    pub fn original_peer(&self) -> Result<(u32, BorrowedFd<'_>)> {
+        let owner = self
+            .peer
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("original config peer absent"))?;
+        owner.require_live()?;
+        Ok((owner.pid, owner.descriptor.as_fd()))
     }
     pub fn require_live(&self) -> Result<()> {
         self.peer

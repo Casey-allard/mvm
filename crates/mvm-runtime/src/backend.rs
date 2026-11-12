@@ -117,6 +117,9 @@ impl OriginalObjectFirecracker {
             .get()
             .ok_or_else(|| anyhow::anyhow!("original guest reader absent"))
     }
+    pub fn original_peer(&self) -> Result<(u32, std::os::fd::BorrowedFd<'_>)> {
+        self.observation.original_peer()
+    }
     pub fn require_live(&self) -> Result<()> {
         self.observation.require_live()
     }
@@ -852,6 +855,14 @@ impl AnyBackend {
         &self,
         config: &VmStartConfig,
     ) -> Result<(VmId, OriginalObjectFirecracker)> {
+        self.start_original_object_firecracker_custodied(config, Vec::new())
+    }
+    #[cfg(target_os = "linux")]
+    pub fn start_original_object_firecracker_custodied(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+    ) -> Result<(VmId, OriginalObjectFirecracker)> {
         let Self::Firecracker(runner) = self else {
             anyhow::bail!("requires Linux Firecracker")
         };
@@ -871,7 +882,7 @@ impl AnyBackend {
         let observation = mvm_backends::driver::fc::original::LaunchObservation::default();
         let id = runner
             .with_original_object_observation(observation.clone())
-            .start(config)?;
+            .start_custodied(config, images)?;
         Ok((id, OriginalObjectFirecracker { observation }))
     }
 

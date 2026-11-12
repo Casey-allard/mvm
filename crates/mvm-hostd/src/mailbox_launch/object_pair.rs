@@ -646,6 +646,8 @@ fn load_private_root(keys: &Path) -> Result<Key> {
     Ok(Key::from_bytes(*buf))
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) mod bootstrap;
 mod operations;
 mod pending;
 pub use operations::{OriginalObjectCallLease, SealedObjectTurn};
