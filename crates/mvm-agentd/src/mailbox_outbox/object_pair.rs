@@ -63,3 +63,67 @@ pub fn stage(
         Err(_) => Err(Refusal::Unavailable),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mvm_contract::{
+        plan::{Nonce, PlanId},
+        protocol::mailbox::*,
+    };
+    fn boot() -> MailboxReaderBootBinding {
+        MailboxReaderBootBinding {
+            durable_object_pair_sha256_v1: Some([12; 32]),
+            outbound_journal_v1: None,
+            plan_id: PlanId("original".into()),
+            plan_nonce: Nonce::from_bytes([13; 16]),
+            mailbox: MailboxId::from_bytes([14; 32]),
+            authority_key: [15; 32],
+            execution_epoch: ExecutionEpoch::new(1).unwrap(),
+            boot: BootId::from_bytes([16; 32]),
+            guest_identity_key: [20; 32],
+            ack_public_key: [21; 32],
+        }
+    }
+    #[test]
+    fn staged_intent_is_exact_bounded_and_fenced_to_its_original_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = boot();
+        let pending = ObjectSubmissionV1::Call {
+            message_id: MessageId::from_bytes([23; 32]),
+            correlation_id: CorrelationId::from_bytes([24; 32]),
+            payload: vec![0, 1, 0],
+        };
+        stage(dir.path(), &original, [12; 32], &pending).unwrap();
+        let before = std::fs::read(slot(dir.path())).unwrap();
+        stage(dir.path(), &original, [12; 32], &pending).unwrap();
+        assert_eq!(
+            stage(dir.path(), &original, [13; 32], &pending),
+            Err(Refusal::NotAuthorized)
+        );
+        let mut conflicting = pending.clone();
+        if let ObjectSubmissionV1::Call { payload, .. } = &mut conflicting {
+            payload[1] = 2;
+        }
+        assert_eq!(
+            stage(dir.path(), &original, [12; 32], &conflicting),
+            Err(Refusal::QueueFull(1))
+        );
+        original.boot = BootId::from_bytes([22; 32]);
+        assert_eq!(
+            stage(dir.path(), &original, [12; 32], &pending),
+            Err(Refusal::QueueFull(1))
+        );
+        assert_eq!(std::fs::read(slot(dir.path())).unwrap(), before);
+        let huge = ObjectSubmissionV1::Call {
+            message_id: MessageId::from_bytes([25; 32]),
+            correlation_id: CorrelationId::from_bytes([26; 32]),
+            payload: vec![7; MAX_STAGED + 1],
+        };
+        assert_eq!(
+            stage(dir.path(), &original, [12; 32], &huge),
+            Err(Refusal::Oversized(MAX_STAGED))
+        );
+        assert_eq!(std::fs::read(slot(dir.path())).unwrap(), before);
+    }
+}
