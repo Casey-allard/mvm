@@ -992,7 +992,7 @@ fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_c
         pair: p.stamp,
         boot: b.boot.boot,
         submission: &reply,
-        original: Some(&original),
+        original: Some(original),
     }
     .forward(
         &cb.endpoint_material()?,
@@ -1008,7 +1008,7 @@ fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_c
                 protocol_version: ProtocolVersion::V1,
                 signature_algorithm: SignatureAlgorithm::ED25519,
                 lease,
-                ack_nonce: DeliveryAckNonce::from_bytes([31; 32]),
+                ack_nonce: DeliveryAckNonce::from_bytes([31; 16]),
                 acknowledged_at_unix_ms: now(),
             },
             guest,
