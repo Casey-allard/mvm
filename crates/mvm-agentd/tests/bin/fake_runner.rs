@@ -43,6 +43,7 @@ enum Behavior {
     Ok,
     UserFault,
     CrashAfter(u64),
+    ExitWithPipeHolder,
     CrashDuringCallN(u64),
     MalformedFrameOnN(u64),
     Leak50MibPerCall,
@@ -67,6 +68,9 @@ impl Behavior {
         let raw = raw.trim();
         if raw == "graceful_retirement" || raw == "ok" {
             return Behavior::Ok;
+        }
+        if raw == "exit_with_pipe_holder" {
+            return Behavior::ExitWithPipeHolder;
         }
         if raw == "user_fault" {
             return Behavior::UserFault;
@@ -141,6 +145,12 @@ fn main() -> ExitCode {
                     eprintln!("fake_runner: write frame error: {e}");
                     return ExitCode::from(2);
                 }
+            }
+            Behavior::ExitWithPipeHolder => {
+                // An ordinary same-group helper inherits stdout. Its fixed lifetime
+                // bounds this fixture even if supervisor cleanup fails.
+                let _holder = std::process::Command::new("/bin/sleep").arg("4").spawn().unwrap();
+                return ExitCode::from(0);
             }
             Behavior::CrashAfter(after) => {
                 if call_no > *after {
