@@ -269,6 +269,7 @@ pub struct InstalledObjectPair<'a> {
     material: PairMaterial,
 }
 struct PairMaterial {
+    plan_verifier: ed25519_dalek::VerifyingKey,
     caller: EndpointMaterial,
     callee: EndpointMaterial,
 }
@@ -604,6 +605,7 @@ impl PreparedObjectPair {
             })
         };
         Ok(PairMaterial {
+            plan_verifier: host,
             caller: endpoint(
                 &a,
                 &self.caller,

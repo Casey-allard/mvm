@@ -18,13 +18,8 @@ impl InstalledObjectPair<'_> {
         envelope: &MailboxEnvelope,
     ) -> Result<PendingObjectCall> {
         let now = self.check_current()?;
-        let keys = mvm_core::config::mvm_keys_dir();
-        let (_, verifier) = mvm_core::crypto::ed25519_keypair::load_existing(
-            &keys.join(super::super::SIGNER_SECRET),
-            &keys.join(super::super::SIGNER_PUBLIC),
-        )?;
         let signer = crate::audit::host_keypair::host_signer_id();
-        let trust = [(signer.as_str(), &verifier)];
+        let trust = [(signer.as_str(), &self.material.plan_verifier)];
         let (a, b) = (&self.caller, &self.callee);
         let ar = reader_revocations(&self.material.caller.reader.revocations_path)
             .map_err(|_| anyhow::anyhow!("current caller revocations unavailable"))?;
@@ -96,7 +91,10 @@ pub(super) fn recover(
     )?;
     let h = opened.header();
     ensure!(
-        h.kind == MailboxMessageKind::Reply && h.sender_boot == role.callee.boot,
+        h.kind == MailboxMessageKind::Reply
+            && h.sender_boot == role.callee.boot
+            && h.encryption.key_id
+                == <[u8; 32]>::from(Sha256::digest(local.inbound_key.expose_bytes())),
         "unexpected Reply source"
     );
     let id = MessageId::from_bytes(*h.causation_id.as_bytes());
