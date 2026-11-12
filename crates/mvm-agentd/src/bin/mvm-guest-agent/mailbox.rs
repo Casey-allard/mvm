@@ -12,11 +12,11 @@ use std::path::Path;
 use std::sync::{OnceLock, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use mvm_agentd::flowmux_drive::{MAILBOX_ACK_SIGNING_KEY_FILE, RUN_MVM_DIR};
 use mvm_agentd::mailbox_outbox::{
     LOCAL_OUTBOX_PATH, MAILBOX_CMDLINE_TOKEN, MAILBOX_HOLD, MAILBOX_IO_TIMEOUT, OUTBOX_PATH,
-    forward_outbox,
+    forward_local_outbox, forward_outbox,
     journal_direction::{JournalAttempts, forward_for_original_boot},
     peer_gone, wait_for_outbox,
 };
@@ -288,18 +288,40 @@ fn wait_for_operation(
     outbox: &Path,
 ) -> Result<(), Refusal> {
     let until = Instant::now() + MAILBOX_HOLD;
+    let directed = reader_boot
+        .filter(|b| b.outbound_journal_v1.is_some())
+        .map(|b| {
+            mvm_agentd::mailbox_outbox::journal_direction::slot_name(b)
+                .map(|name| (local_outbox.with_file_name(name), b))
+        })
+        .transpose()?;
     loop {
+        if let Some((path, boot)) = &directed
+            && path.exists()
+        {
+            return forward_for_original_boot(
+                stream,
+                path,
+                boot,
+                attempts,
+                crate::mailbox_reader::now_unix_ms,
+            )
+            .map(|_| ());
+        }
+
         // A local-durable request cannot be downgraded to the older unit
         // verdict even when both requests share the guest mailbox port.
         if local_outbox.exists()
             && let Some(binding) = reader_boot
         {
-            return forward_for_original_boot(
+            let authority =
+                VerifyingKey::from_bytes(&binding.authority_key).map_err(|_| Refusal::Malformed)?;
+            return forward_local_outbox(
                 stream,
                 local_outbox,
-                binding,
-                attempts,
-                crate::mailbox_reader::now_unix_ms,
+                &authority,
+                binding.mailbox,
+                binding.execution_epoch,
             )
             .map(|_| ());
         }

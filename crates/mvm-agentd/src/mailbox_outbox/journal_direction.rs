@@ -1,10 +1,10 @@
 //! One retained directed operation on the original guest's local-durable slot.
-use super::{forward_with, send_local_outbox_message};
+use super::{forward_with, send_local_outbox_message, write_single_outbox};
 use ed25519_dalek::VerifyingKey;
 use mvm_contract::protocol::mailbox::{MessageId, SignedDestinationReceipt};
-use mvm_core::mailbox::outbound::journal_intent_digest;
+use mvm_core::mailbox::outbound::{journal_intent_digest, journal_slot_name};
 use mvm_core::mailbox::{
-    frame::{OWN_MAILBOX_RECIPIENT, Refusal},
+    frame::{OutboxMessage, Refusal},
     reader::MailboxReaderBootBinding,
 };
 use std::{
@@ -17,6 +17,85 @@ use std::{
 #[derive(Default)]
 pub struct JournalAttempts(Option<(MessageId, [u8; 32], u8)>);
 
+/// Only the original generation is eligible. Old agents read their fixed
+/// outbox-local path and a replacement generation computes a different name.
+pub fn slot_name(boot: &MailboxReaderBootBinding) -> Result<String, Refusal> {
+    let digest = mvm_core::mailbox::outbound::journal_direction_commitment(boot)
+        .map_err(|_| Refusal::NotAuthorized)?;
+    Ok(journal_slot_name(&digest))
+}
+
+pub fn check_available(
+    boot: &MailboxReaderBootBinding,
+    commitment: [u8; 32],
+    recipient: mvm_contract::protocol::mailbox::PrincipalId,
+    len: u32,
+    now: i64,
+) -> Result<(), Refusal> {
+    let d = boot
+        .outbound_journal_v1
+        .as_ref()
+        .ok_or(Refusal::NotAuthorized)?;
+    if mvm_core::mailbox::outbound::journal_direction_commitment(boot)
+        .map_err(|_| Refusal::NotAuthorized)?
+        != commitment
+        || recipient != d.address.recipient
+    {
+        return Err(Refusal::NotAuthorized);
+    }
+    if len == 0 || len > d.max_payload_bytes {
+        return Err(Refusal::Oversized(d.max_payload_bytes as usize));
+    }
+    if !(d.not_before_unix_ms..d.expires_at_unix_ms).contains(&now) {
+        return Err(Refusal::Expired);
+    }
+    Ok(())
+}
+
+/// Public guest-writer operation. The caller supplies the original
+/// generation's public commitment and a bounded connection to the canonical
+/// agent socket. An old or unavailable agent cannot stage a directed request.
+pub fn stage_on_original_reader<S: Read + Write>(
+    stream: &mut S,
+    expected: [u8; 32],
+    message: &OutboxMessage,
+) -> Result<(), Refusal> {
+    let dir = Path::new(super::LOCAL_OUTBOX_PATH)
+        .parent()
+        .ok_or(Refusal::Malformed)?;
+    stage_in(stream, expected, message, dir)
+}
+
+fn stage_in<S: Read + Write>(
+    stream: &mut S,
+    expected: [u8; 32],
+    message: &OutboxMessage,
+    dir: &Path,
+) -> Result<(), Refusal> {
+    use mvm_core::mailbox::reader_wire::{
+        ApplicationReaderRequest, ReaderResponse, read_response, write_application_request,
+    };
+    let len = u32::try_from(message.body.len()).map_err(|_| Refusal::Malformed)?;
+    if len == 0 || len > 32 * 1024 {
+        return Err(Refusal::Oversized(32 * 1024));
+    }
+    write_application_request(
+        stream,
+        &ApplicationReaderRequest::CheckOutboundJournalV1 {
+            commitment: expected,
+            recipient: message.recipient,
+            payload_bytes: len,
+        },
+    )?;
+    match read_response(stream)? {
+        ReaderResponse::OutboundJournalAvailableV1 { commitment } if commitment == expected => {
+            write_single_outbox(&dir.join(journal_slot_name(&expected)), message)
+        }
+        ReaderResponse::Refused { reason } => Err(reason),
+        _ => Err(Refusal::Unavailable),
+    }
+}
+
 pub fn forward_for_original_boot<S: Read + Write>(
     stream: &mut S,
     outbox: &Path,
@@ -24,22 +103,14 @@ pub fn forward_for_original_boot<S: Read + Write>(
     attempts: &mut JournalAttempts,
     now: impl Fn() -> Result<i64, Refusal>,
 ) -> Result<SignedDestinationReceipt, Refusal> {
+    if outbox.file_name().and_then(|n| n.to_str()) != Some(slot_name(boot)?.as_str()) {
+        return Err(Refusal::NotAuthorized);
+    }
+    let remote = boot
+        .outbound_journal_v1
+        .as_ref()
+        .ok_or(Refusal::NotAuthorized)?;
     forward_with(stream, outbox, |stream, message| {
-        let remote = boot.outbound_journal_v1.as_ref().filter(|_| {
-            message.recipient.as_bytes() != &OWN_MAILBOX_RECIPIENT
-                && message.recipient.as_bytes() != boot.mailbox.as_bytes()
-        });
-        let Some(remote) = remote else {
-            let key =
-                VerifyingKey::from_bytes(&boot.authority_key).map_err(|_| Refusal::Malformed)?;
-            return send_local_outbox_message(
-                stream,
-                message,
-                &key,
-                boot.mailbox,
-                boot.execution_epoch,
-            );
-        };
         if message.recipient != remote.address.recipient {
             return Err(Refusal::NotAuthorized);
         }
@@ -87,7 +158,7 @@ pub fn forward_for_original_boot<S: Read + Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox_outbox::write_outbox;
+    use crate::mailbox_outbox::write_single_outbox;
     use ed25519_dalek::SigningKey;
     use mvm_contract::protocol::mailbox::*;
     use mvm_core::{
@@ -184,8 +255,8 @@ mod tests {
     fn original_remote_intent_survives_lost_reply_and_wrong_domain_before_exact_b_receipt() {
         let (boot, msg, receipt, b) = fixture();
         let dir = tempfile::tempdir().unwrap();
-        let slot = dir.path().join("local");
-        write_outbox(&slot, &msg).unwrap();
+        let slot = dir.path().join(slot_name(&boot).unwrap());
+        write_single_outbox(&slot, &msg).unwrap();
         let mut attempts = JournalAttempts::default();
         let mut lost = Peer::new(None);
         assert_eq!(
@@ -215,8 +286,8 @@ mod tests {
     fn own_authority_cannot_retire_remote_intent_and_retry_credit_ends_without_dispatch() {
         let (boot, msg, receipt, _) = fixture();
         let dir = tempfile::tempdir().unwrap();
-        let slot = dir.path().join("local");
-        write_outbox(&slot, &msg).unwrap();
+        let slot = dir.path().join(slot_name(&boot).unwrap());
+        write_single_outbox(&slot, &msg).unwrap();
         let wrong = sign_receipt(receipt, &SigningKey::from_bytes(&[8; 32])).unwrap();
         let mut attempts = JournalAttempts::default();
         for _ in 0..3 {
@@ -314,8 +385,8 @@ mod tests {
         use std::cell::Cell;
         let (boot, msg, receipt, b) = fixture();
         let dir = tempfile::tempdir().unwrap();
-        let slot = dir.path().join("local");
-        write_outbox(&slot, &msg).unwrap();
+        let slot = dir.path().join(slot_name(&boot).unwrap());
+        write_single_outbox(&slot, &msg).unwrap();
         let mut attempts = JournalAttempts::default();
         let mut peer = Peer::new(Some(sign_receipt(receipt, &b).unwrap()));
         let time = Cell::new(150);
@@ -345,5 +416,59 @@ mod tests {
                 .starts_with("uncertain-")
         );
         assert_eq!(std::fs::read(stored.path()).unwrap(), msg.encode());
+    }
+
+    #[test]
+    fn legacy_or_unenrolled_agent_cannot_stage_and_new_boot_cannot_rebind_original_slot() {
+        use mvm_core::mailbox::outbound::journal_direction_commitment;
+        use mvm_core::mailbox::reader_wire::{ReaderResponse, write_response};
+        let (boot, msg, _, _) = fixture();
+        let commitment = journal_direction_commitment(&boot).unwrap();
+        let mut legacy = boot.clone();
+        legacy.outbound_journal_v1 = None;
+        assert_eq!(
+            check_available(&legacy, commitment, msg.recipient, 257, 150),
+            Err(Refusal::NotAuthorized)
+        );
+        assert!(check_available(&boot, commitment, msg.recipient, 257, 150).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let mut peer = Peer::new(None);
+        let mut frame = Vec::new();
+        write_response(
+            &mut frame,
+            &ReaderResponse::Refused {
+                reason: Refusal::Malformed,
+            },
+        )
+        .unwrap();
+        peer.response = Cursor::new(frame);
+        assert!(stage_in(&mut peer, commitment, &msg, dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let mut good = Vec::new();
+        write_response(
+            &mut good,
+            &ReaderResponse::OutboundJournalAvailableV1 { commitment },
+        )
+        .unwrap();
+        peer.response = Cursor::new(good);
+        stage_in(&mut peer, commitment, &msg, dir.path()).unwrap();
+        let original_slot = dir.path().join(slot_name(&boot).unwrap());
+        assert_eq!(std::fs::read(&original_slot).unwrap(), msg.encode());
+        assert!(!dir.path().join("outbox-local").exists());
+        let mut rotated = boot.clone();
+        rotated.boot = BootId::from_bytes([88; 32]);
+        let mut peer = Peer::new(None);
+        assert_eq!(
+            forward_for_original_boot(
+                &mut peer,
+                &original_slot,
+                &rotated,
+                &mut JournalAttempts::default(),
+                || Ok(150)
+            ),
+            Err(Refusal::NotAuthorized)
+        );
+        assert!(peer.sent.is_empty());
+        assert!(original_slot.exists());
     }
 }

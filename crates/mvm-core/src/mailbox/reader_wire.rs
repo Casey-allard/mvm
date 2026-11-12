@@ -44,6 +44,12 @@ pub enum ReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApplicationReaderRequest {
+    /// Feature availability only. The guest verifies the same boot again on dispatch.
+    CheckOutboundJournalV1 {
+        commitment: [u8; 32],
+        recipient: mvm_contract::protocol::mailbox::PrincipalId,
+        payload_bytes: u32,
+    },
     Receive,
     Ack {
         lease: Box<SignedMailboxDeliveryLease>,
@@ -54,6 +60,10 @@ pub enum ApplicationReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderResponse {
+    /// Returned only on the original local reader socket; never a delivery receipt.
+    OutboundJournalAvailableV1 {
+        commitment: [u8; 32],
+    },
     Challenge {
         enrollment: Box<SignedMailboxGuestReaderEnrollment>,
         capability: Box<SignedMailboxCapability>,

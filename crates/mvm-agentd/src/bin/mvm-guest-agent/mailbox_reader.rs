@@ -106,6 +106,20 @@ fn application_request(
     reader: &Arc<GuestReader>,
 ) -> Result<ReaderResponse, Refusal> {
     let request = match read_application_request(stream)? {
+        ApplicationReaderRequest::CheckOutboundJournalV1 {
+            commitment,
+            recipient,
+            payload_bytes,
+        } => {
+            mvm_agentd::mailbox_outbox::journal_direction::check_available(
+                &reader.boot,
+                commitment,
+                recipient,
+                payload_bytes,
+                now_unix_ms()?,
+            )?;
+            return Ok(ReaderResponse::OutboundJournalAvailableV1 { commitment });
+        }
         ApplicationReaderRequest::Receive => ReaderRequest::Receive,
         ApplicationReaderRequest::Ack { lease } => {
             let mut active = reader.active.lock().expect("mailbox reader lock poisoned");

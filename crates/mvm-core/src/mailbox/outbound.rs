@@ -67,3 +67,9 @@ pub fn journal_direction_commitment(boot: &MailboxReaderBootBinding) -> Result<[
     digest.update(serde_jcs::to_vec(boot)?);
     Ok(digest.finalize().into())
 }
+
+/// A single operation slot per original cold guest direction. Stale slots
+/// are never discovered or reinterpreted under another generation.
+pub fn journal_slot_name(commitment: &[u8; 32]) -> String {
+    format!("outbox-directed-v1-{}", hex::encode(commitment))
+}
