@@ -1373,17 +1373,17 @@ impl MailboxWorkers {
         Ok(())
     }
     pub(crate) fn handoff_uncertain(&self, request: &MailboxWorkerRequest) -> io::Result<()> {
-        if !matches!(
-            request.operation,
-            MailboxWorkerOperation::DelegateConfig { .. }
-        ) {
+        let MailboxWorkerOperation::DelegateConfig { owner } = &request.operation else {
             return Ok(());
-        }
+        };
         let slots = lock(&self.slots)?;
         let slot = slots
             .get(&request.vm_id)
             .ok_or_else(|| refused("unknown worker handoff"))?;
         let mut slot = lock(slot)?;
+        if owner != &slot.owner || slot.reservation_released || !slot.delegated {
+            return Err(refused("uncertain handoff does not match original delegated worker"));
+        }
         if !matches!(slot.state, MailboxWorkerState::Collected { .. }) {
             slot.state = MailboxWorkerState::Unresolved;
         }
@@ -2274,11 +2274,22 @@ mod tests {
             r
         };
         let baseline = budget.usage().unwrap();
-        assert!(call(&request_for("foreign", 9)).is_err());
+        let deny_foreign = || {
+            let usage = budget.usage().unwrap();
+            let mut third = request_for("foreign", 9);
+            assert!(call(&third).is_err());
+            third.operation = MailboxWorkerOperation::Acquire;
+            assert!(call(&third).is_err());
+            assert_eq!(budget.usage().unwrap(), usage);
+        };
+        deny_foreign();
         let mut a = request_for("alpha", 4);
         let mut b = request_for("beta", 5);
-        let oa = call(&a).unwrap().0.owner;
-        let ob = call(&b).unwrap().0.owner;
+        let (oa, ob) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| call(&a).unwrap().0.owner);
+            let b = scope.spawn(|| call(&b).unwrap().0.owner);
+            (a.join().unwrap(), b.join().unwrap())
+        });
         assert_ne!(oa, ob);
         assert_eq!(budget.usage().unwrap().bytes, baseline.bytes + 2 * limits.bytes_per_worker);
         assert_eq!(budget.usage().unwrap().workers, 2);
@@ -2287,14 +2298,30 @@ mod tests {
         assert!(workers.reserve_control().is_err());
         drop(workspace);
         assert!(call(&request_for("alpha", 8)).is_err());
+        b.operation = MailboxWorkerOperation::DelegateConfig { owner: oa.clone() };
+        assert!(workers.handoff_uncertain(&b).is_err());
         b.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: oa.clone() };
         assert!(call(&b).is_err());
-        a.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: oa };
+        a.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: oa.clone() };
         assert_eq!(call(&a).unwrap().0.state, MailboxWorkerState::ReleasedBeforeSpawn);
         assert_eq!(budget.usage().unwrap().workers, 1);
-        assert!(call(&request_for("foreign", 9)).is_err());
-        b.operation = MailboxWorkerOperation::Query { owner: ob };
+        deny_foreign();
+        b.operation = MailboxWorkerOperation::Query { owner: ob.clone() };
         assert_eq!(call(&b).unwrap().0.state, MailboxWorkerState::Reserved);
+        assert!(call(&request_for("alpha", 6)).is_err());
+        b.operation = MailboxWorkerOperation::ReleaseUnstartedV1 { owner: ob };
+        assert_eq!(call(&b).unwrap().0.state, MailboxWorkerState::ReleasedBeforeSpawn);
+        lock(&lock(&workers.slots).unwrap()["alpha"]).unwrap().terminal_at =
+            Some(Instant::now() - TERMINAL_RETENTION);
+        let replacement = call(&request_for("alpha", 6)).unwrap().0.owner;
+        assert_ne!(replacement, oa);
+        a.operation = MailboxWorkerOperation::DelegateConfig { owner: oa };
+        assert!(workers.handoff_uncertain(&a).is_err());
+        a = request_for("alpha", 6);
+        a.operation = MailboxWorkerOperation::Query { owner: replacement };
+        assert_eq!(call(&a).unwrap().0.state, MailboxWorkerState::Reserved);
+        assert!(call(&request_for("beta", 7)).is_err());
+        assert_eq!(call(&b).unwrap().0.state, MailboxWorkerState::ReleasedBeforeSpawn);
     }
 
     #[test]
