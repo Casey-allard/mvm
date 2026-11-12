@@ -251,13 +251,17 @@ pub fn start_machine_spec(
         super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
         Ok(())
     };
-    if let Some(pair) = host.installed_mailbox().and_then(|p| p.original_cast_pair()) {
+    #[cfg(unix)]
+    let fresh_state = if let Some(pair) = host.installed_mailbox().and_then(|p| p.original_cast_pair()) {
         pair.index(&spec.name)?;
-        #[cfg(unix)]
-        super::cast_state::prepare(&mvm_core::config::mvm_home_strict()?, &spec.name, discard)?;
-        #[cfg(not(unix))]
-        anyhow::bail!("original Cast requires an installed Unix host");
+        Some(super::cast_state::prepare(&mvm_core::config::mvm_home_strict()?, &spec.name, discard)?)
     } else {
+        discard()?;
+        None
+    };
+    #[cfg(not(unix))]
+    {
+        anyhow::ensure!(host.installed_mailbox().and_then(|p|p.original_cast_pair()).is_none(),"original Cast requires a Unix host");
         discard()?;
     }
     validate_registry_pack_source(spec)?;
@@ -322,6 +326,8 @@ pub fn start_machine_spec(
         host.installed_mailbox(),
         vacant,
     )?;
+    #[cfg(unix)]
+    if let Some(fresh)=fresh_state {fresh.commit();}
     Ok(MachineStart {
         resolved_digest: boot.digest,
         admitted,
