@@ -1,5 +1,5 @@
 //! Optional original VMM lifetime on the launcher's private configuration pipe.
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Result};
 use std::time::Instant;
 
@@ -45,7 +45,7 @@ impl OriginalVmm {
         check()?;
         Ok(Lifetime {
             observer,
-            terminal: Cell::new(None),
+            terminal: RefCell::new(None),
         })
     }
 }
@@ -54,30 +54,33 @@ pub(super) struct Lifetime {
     observer: ProcessExitObserver,
     // kqueue consumes an exit note. Retain the first terminal outcome so the
     // guest-read predicate and the outer service loop observe the same exit.
-    terminal: Cell<Option<std::result::Result<(), ProcessExitError>>>,
+    terminal: RefCell<Option<std::result::Result<(), ProcessExitError>>>,
 }
 
 impl Lifetime {
     pub(super) fn alive_until(&self, until: Instant) -> bool {
-        if self.terminal.get().is_some() {
+        if self.terminal.borrow().is_some() {
             return false;
         }
         match self.observer.wait_event(until) {
             Ok(ProcessExitWait::TimedOut) => true,
             Ok(ProcessExitWait::Exited) => {
-                self.terminal.set(Some(Ok(())));
+                *self.terminal.borrow_mut() = Some(Ok(()));
                 false
             }
-            Err(ProcessExitError::Io(kind)) if kind == ErrorKind::Interrupted => true,
+            Err(ProcessExitError::Io(err)) if err.kind() == ErrorKind::Interrupted => true,
             Err(error) => {
-                self.terminal.set(Some(Err(error)));
+                *self.terminal.borrow_mut() = Some(Err(error));
                 false
             }
         }
     }
 
     pub(super) fn finish(self) -> Result<()> {
-        self.terminal.get().unwrap_or(Ok(())).map_err(Error::other)
+        self.terminal
+            .into_inner()
+            .unwrap_or(Ok(()))
+            .map_err(Error::other)
     }
 }
 
