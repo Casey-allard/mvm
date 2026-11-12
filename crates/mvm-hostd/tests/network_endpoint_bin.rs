@@ -27,6 +27,47 @@ use secrecy::SecretBox;
 const BIN: &str = env!("CARGO_BIN_EXE_mvm-network-endpoint");
 
 #[test]
+fn a_selected_direct_profile_needs_original_resources_before_binding() {
+    use mvm_contract::policy::network_policy::{
+        CooperatingPayloadPolicy, CooperatingTcpPeer, PayloadMappingProfile,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("endpoint.sock");
+    let mut config = test_config(EndpointTransport::Uds {
+        path: socket.clone(),
+    });
+    let policy = mvm_core::policy::network_policy::NetworkPolicy::deny_all();
+    let selected = CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+        host: "peer.example".into(),
+        port: 443,
+        server_name: "peer.example".into(),
+        spki_sha256: [7; 32],
+        profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
+    }])
+    .unwrap();
+    config.network_policy = Some(policy.with_payload_mapping(Some(selected)));
+    let mut child = Command::new(BIN)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(child.stdin.take().unwrap(), &config).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        result.stdout.is_empty(),
+        "unfunded endpoint announced ready"
+    );
+    assert!(!socket.exists());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("selected direct TCP payload mapping requires original launcher resources")
+    );
+}
+
+#[test]
 fn endpoint_bin_refuses_legacy_tool_rules_before_binding() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("endpoint.sock");

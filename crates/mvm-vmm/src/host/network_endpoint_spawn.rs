@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use crate::host::helper_exit::{HelperExit, await_child_exit, peek_child_exit};
 
+mod direct_plan;
+pub use direct_plan::AdmittedNetworkPlan;
 mod egress_tls;
 pub use egress_tls::{
     EGRESS_CA_STATE_FILE, EgressTlsDelivery, build_egress_tls_delivery, forget_egress_tls_delivery,

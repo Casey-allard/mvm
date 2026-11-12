@@ -259,6 +259,13 @@ fn run_telemetry_only(only: mvm_hostd::telemetry_collector::TelemetryOnlyConfig)
 }
 
 fn validate_flowmux_limits(cfg: &EndpointConfig) -> Result<()> {
+    if cfg
+        .network_policy
+        .as_ref()
+        .is_some_and(|p| p.payload_mapping().is_some())
+    {
+        anyhow::bail!("selected direct TCP payload mapping requires original launcher resources");
+    }
     if cfg.egress_mode == EgressMode::FlowMux {
         cfg.network_limits
             .validate()

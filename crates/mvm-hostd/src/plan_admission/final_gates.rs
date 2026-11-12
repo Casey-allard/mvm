@@ -14,6 +14,20 @@ pub(super) fn run_post_admission_gates(
     (VmStartConfig, Option<PreparedBuiltPackRuntime>),
     (&'static str, anyhow::Error),
 > {
+    if config.network_policy.payload_mapping().is_some() {
+        mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan::from_plan(
+            admitted.plan(),
+            &config.name,
+            &config.network_policy,
+        )
+        .map_err(|error| ("direct-network-policy", error))?;
+        return Err((
+            "direct-network-resources",
+            anyhow::anyhow!(
+                "selected direct TCP payload mapping requires original launcher resources"
+            ),
+        ));
+    }
     if let Err(error) = populate_audit_substrate(&mut config, admitted, policy_bundle) {
         return Err(("audit-substrate", error));
     }
@@ -42,6 +56,63 @@ pub(super) fn run_post_admission_gates(
     let runtime = prepare_built_pack_start(admitted, &mut config, backend)
         .map_err(|error| ("registry-pack-boot", error))?;
     Ok((config, runtime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mvm_contract::policy::network_policy::{
+        CooperatingPayloadPolicy, CooperatingTcpPeer, NetworkPolicy, PayloadMappingProfile,
+    };
+
+    #[test]
+    fn selected_direct_policy_requires_signed_binding_and_owned_resources_before_start() {
+        let policy = |pin| {
+            NetworkPolicy::deny_all().with_payload_mapping(Some(
+                CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                    host: "peer.example".into(),
+                    port: 443,
+                    server_name: "peer.example".into(),
+                    spki_sha256: pin,
+                    profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
+                }])
+                .unwrap(),
+            ))
+        };
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.asset_identities.push(
+            mvm_core::plan::AssetIdentity::new(
+                mvm_core::plan::AssetKind::Policy,
+                "direct-tcp",
+                mvm_core::policy::network_policy::content_sha256(&policy([7; 32])),
+            )
+            .unwrap(),
+        );
+        plan.bundle = Some(mvm_core::plan::bundle::PlanArtifact::new(
+            "a".repeat(64),
+            &[0; 64],
+            mvm_core::plan::bundle::KeyId("fixture".into()),
+        ));
+        plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let signed = mvm_core::plan::sign_plan(&plan, &signer, "fixture");
+        let admitted = AdmittedPlan::for_test(plan, "fixture".into(), signed);
+        for (pin, expected) in [
+            ([8; 32], "direct-network-policy"),
+            ([7; 32], "direct-network-resources"),
+        ] {
+            let cfg = VmStartConfig {
+                name: "direct-original".into(),
+                network_policy: policy(pin),
+                ..VmStartConfig::default()
+            };
+            let (stage, _) =
+                run_post_admission_gates(cfg, &admitted, BackendKind::Firecracker, None)
+                    .err()
+                    .expect("no resources supplied");
+            assert_eq!(stage, expected);
+        }
+    }
 }
 
 pub(super) fn attach_admitted_extensions(

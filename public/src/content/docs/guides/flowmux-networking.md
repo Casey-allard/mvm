@@ -13,6 +13,15 @@ service available; omitting it leaves networking closed. Retired raw-stack
 fields and packet-tunnel plan values are rejected with migration guidance
 instead of silently selecting another path.
 
+In this contributor build, an optional `payload_mapping` on the network policy
+identifies a cooperating TCP peer by host, port, TLS name, public-key pin and
+mapping profile. Admission binds the complete policy to the signed plan. Every
+connection still requires an ordinary egress grant. The current launcher
+refuses a required mapping before VM startup because it cannot hand the
+endpoint an original reservation for the codec workers and cache. Configuring
+the endpoint subprocess directly also refuses the selection before it binds a
+socket. Ordinary FlowMux networking uses a policy with the field omitted.
+
 ```sh
 mvmctl machine run \
   --allow-host api.example.com:443 \
