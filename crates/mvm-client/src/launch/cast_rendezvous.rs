@@ -225,7 +225,19 @@ impl OriginalCastPair {
             .unwrap_or_default();
         let deadline = Instant::now() + expiry.min(self.wait);
         let role = self.admitted.meet(index, launch, deadline, |a, b, limit| {
-            (self.prepare)(a, b, limit)
+            use mvm_hostd::mailbox_launch::cast_pair::development::EndpointRole;
+            let roles = (self.prepare)(a, b, limit)?;
+            let source = roles[0]
+                .boot
+                .role_commitment(&roles[0].role, EndpointRole::Source)?;
+            let destination = roles[1]
+                .boot
+                .role_commitment(&roles[1].role, EndpointRole::Destination)?;
+            ensure!(
+                source == destination,
+                "original SDK launches have different Cast directions"
+            );
+            Ok(roles)
         })?;
         Ok((role, deadline))
     }

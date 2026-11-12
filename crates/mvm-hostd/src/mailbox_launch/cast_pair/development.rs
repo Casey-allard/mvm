@@ -373,6 +373,10 @@ pub struct PreparedRole {
     grant: MailboxGrant,
 }
 impl PreparedRole {
+    pub(crate) fn binds_boot(&self, commitment: [u8; 32], endpoint: EndpointRole) -> bool {
+        self.setup.direction == Some(commitment) && self.setup.end.role == endpoint
+    }
+
     fn bind(&mut self, d: &DevelopmentDirection) -> Result<()> {
         ensure!(
             self.setup.direction.is_none() && &self.setup.end == d.end(self.setup.end.role),

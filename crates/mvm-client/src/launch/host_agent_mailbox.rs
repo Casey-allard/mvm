@@ -118,10 +118,23 @@ impl HostAgentMailboxProvisioner {
     /// Rendezvous the two normal SDK reservations before either VMM starts.
     /// The callback receives original A then original B regardless of which
     /// launch arrived first, and returns one private setup for each role.
-    pub fn with_original_cast_pair(mut self,source:&str,destination:&str,wait:Duration,prepare:Arc<super::cast_rendezvous::PrepareBoth>)->Result<Self>{
-        let InstallationPeers::Pair{names,..}=&self.peers else {anyhow::bail!("Cast requires an installed pair")};
-        names.index(source)?;names.index(destination)?;
-        self.cast=Some(super::cast_rendezvous::OriginalCastPair::new([source.into(),destination.into()],wait,prepare)?);
+    pub fn with_original_cast_pair(
+        mut self,
+        source: &str,
+        destination: &str,
+        wait: Duration,
+        prepare: Arc<super::cast_rendezvous::PrepareBoth>,
+    ) -> Result<Self> {
+        let InstallationPeers::Pair { names, .. } = &self.peers else {
+            anyhow::bail!("Cast requires an installed pair")
+        };
+        names.index(source)?;
+        names.index(destination)?;
+        self.cast = Some(super::cast_rendezvous::OriginalCastPair::new(
+            [source.into(), destination.into()],
+            wait,
+            prepare,
+        )?);
         Ok(self)
     }
     fn check_installation(&self) -> Result<()> {
@@ -169,7 +182,7 @@ impl HostAgentMailboxProvisioner {
 }
 
 impl InstalledMailboxProvisioner for HostAgentMailboxProvisioner {
-    fn original_cast_pair(&self)->Option<&super::cast_rendezvous::OriginalCastPair>{
+    fn original_cast_pair(&self) -> Option<&super::cast_rendezvous::OriginalCastPair> {
         self.cast.as_ref()
     }
     fn original_peer(

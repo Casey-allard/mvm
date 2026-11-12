@@ -35,6 +35,30 @@ pub struct PreparedOriginalCastBoot {
 }
 
 impl PreparedOriginalCastBoot {
+    /// Check the signed public projection against the actual private role which
+    /// will be delegated to this original helper. Return only the public digest.
+    pub fn role_commitment(
+        &self,
+        prepared: &super::cast_pair::development::PreparedRole,
+        endpoint: super::cast_pair::development::EndpointRole,
+    ) -> Result<[u8; 32]> {
+        use super::cast_pair::development::EndpointRole;
+        let commitment = match (
+            &self.boot.cast_submit_v1,
+            &self.boot.cast_delivery_v1,
+            endpoint,
+        ) {
+            (Some(a), None, EndpointRole::Source) => a.pair_commitment,
+            (None, Some(b), EndpointRole::Destination) => b.pair_commitment,
+            _ => anyhow::bail!("original boot projection has the wrong role"),
+        };
+        ensure!(
+            prepared.binds_boot(commitment, endpoint),
+            "original boot and private Cast direction differ"
+        );
+        Ok(commitment)
+    }
+
     /// Called inside the original SDK per-name lock, before starting the VMM.
     /// The projection and its signed digest replace one existing file atomically.
     pub fn into_bytes_for_original(

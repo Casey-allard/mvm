@@ -207,6 +207,10 @@ fn independent_original_development_keys_carry_exact_bytes_and_refuse_swaps() {
     original_a.bind(d).unwrap();
     original_b.bind(d).unwrap();
     assert!(original_a.bind(d).is_err());
+    assert!(original_a.binds_boot(d.commitment(), EndpointRole::Source));
+    assert!(original_b.binds_boot(d.commitment(), EndpointRole::Destination));
+    assert!(!original_a.binds_boot(d.commitment(), EndpointRole::Destination));
+    assert!(!original_b.binds_boot([37; 32], EndpointRole::Destination));
     assert!(
         original_a
             .check_recipient(&bowner, Some(d.commitment()))
