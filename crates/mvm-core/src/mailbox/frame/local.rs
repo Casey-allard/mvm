@@ -526,15 +526,24 @@ pub fn local_request_digest(
     encoded: &[u8],
     limits: &MailboxLocalLimits,
 ) -> Result<[u8; 32], Refusal> {
+    Ok(decode_submit_with_digest(encoded, limits)?.1)
+}
+
+pub(super) fn decode_submit_with_digest(
+    encoded: &[u8],
+    limits: &MailboxLocalLimits,
+) -> Result<(Box<LocalSubmit>, [u8; 32]), Refusal> {
     let frame = decode_local_frame(
         encoded,
         LocalRole::Submit,
         LocalDirection::GuestToHost,
         limits,
     )?;
-    require(matches!(frame, LocalFrame::Submit(_)))?;
+    let LocalFrame::Submit(request) = frame else {
+        return Err(Refusal::Malformed);
+    };
     let mut hash = Sha256::new();
     hash.update(b"mvm.mailbox.local.request.v1\0");
     hash.update(&encoded[4..]);
-    Ok(hash.finalize().into())
+    Ok((request, hash.finalize().into()))
 }
