@@ -1,6 +1,7 @@
 //! Same-host endpoint mapping from two original installed leases. A mapping
 //! is an observation; it cannot enable ReliableV1 or issue a routing grant.
 pub mod development;
+pub(crate) mod source_pull;
 
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
@@ -77,6 +78,7 @@ pub struct ServingCastMapping {
     channel: CastChannel,
     destination_route: HostDialRoute,
     destination_socket: std::path::PathBuf,
+    source_socket: std::path::PathBuf,
     source_vm: String,
     destination_vm: String,
     source_owner: MailboxWorkerOwner,
@@ -221,6 +223,7 @@ pub fn map_serving_cast_pair(
         channel,
         destination_route: route,
         destination_socket: mvm_core::config::vm_mailbox_socket_at(&state),
+        source_socket: mvm_core::config::vm_mailbox_socket_at(&mvm_core::config::vm_state_dir(a)),
         source_vm: a.to_owned(),
         destination_vm: b.to_owned(),
         source_owner: source.owner.clone(),
@@ -287,6 +290,24 @@ impl ServingCastMapping {
         source_policy: &OpenContext,
         destination_policy: &OpenContext,
     ) -> Result<RoutedCast<'a>> {
+        let credit = workers.reserve_cast(
+            (&self.source_vm, &self.source_owner),
+            (&self.destination_vm, &self.destination_owner),
+        )?;
+        let routed = self.route_reserved(credit, envelope, grants, source_policy, destination_policy)?;
+        routed.credit.admitted()?;
+        Ok(routed)
+    }
+
+    fn route_reserved<'a>(
+        &'a self,
+        credit: CastCredit<'a>,
+        envelope: MailboxEnvelope,
+        grants: AddressedCastGrants<'a>,
+        source_policy: &OpenContext,
+        destination_policy: &OpenContext,
+    ) -> Result<RoutedCast<'a>> {
+        let workers = credit.workers();
         ensure!(
             self.channel.admits_workspace(
                 crate::broker::mailbox_workers::cast_credit::CAST_WORK_BYTES as u64
@@ -299,10 +320,6 @@ impl ServingCastMapping {
                 && envelope.ciphertext.capacity() <= CAST_BODY_LIMIT,
             "ciphertext outside installed workspace"
         );
-        let credit = workers.reserve_cast(
-            (&self.source_vm, &self.source_owner),
-            (&self.destination_vm, &self.destination_owner),
-        )?;
         grants.check_compact_policy(source_policy, destination_policy)?;
         let (a, b) = self.current_policies(workers, source_policy, destination_policy)?;
         self.channel.authorize_addressed(grants, &a, &b)?;
@@ -314,7 +331,6 @@ impl ServingCastMapping {
                 && grants.admits_encoded_contribution(canonical.len()),
             "canonical envelope exceeds addressed queue or frame bound"
         );
-        credit.admitted()?;
         Ok(RoutedCast {
             canonical,
             envelope,
@@ -335,16 +351,25 @@ impl RoutedCast<'_> {
     /// immediate peer verdict is an ingress result, never a journal receipt
     /// or evidence of guest workload delivery. Source and destination policy
     /// must be resampled after connecting, immediately before transmission.
-    pub fn forward_to_original_helper<'p>(
+    pub fn forward_to_original_helper<S: std::borrow::Borrow<OpenContext>, D: std::borrow::Borrow<OpenContext>>(
         self,
         direction: &development::DevelopmentDirection,
         deadline: Instant,
-        current: impl FnOnce() -> Result<(&'p OpenContext, &'p OpenContext)>,
+        current: impl FnOnce() -> Result<(S, D)>,
+    ) -> Result<Result<(), mvm_core::mailbox::frame::Refusal>> {
+        self.exchange_at_destination(direction, deadline, current)
+    }
+
+    fn exchange_at_destination<S: std::borrow::Borrow<OpenContext>, D: std::borrow::Borrow<OpenContext>>(
+        &self,
+        direction: &development::DevelopmentDirection,
+        deadline: Instant,
+        current: impl FnOnce() -> Result<(S, D)>,
     ) -> Result<Result<(), mvm_core::mailbox::frame::Refusal>> {
         let deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(5));
         let mut socket = mvm_agentd::vsock::connect_unix_before(&self.mapping.destination_socket, deadline)?;
         let (source, destination) = current()?;
-        self.check_direction(direction, source, destination)?;
+        self.check_direction(direction, source.borrow(), destination.borrow())?;
         let body = mvm_core::mailbox::frame::encode_frame_from_canonical(self.grants.send, &self.canonical)?;
         self.credit.exchange_with_original(&mut socket, &body, direction.commitment(), deadline)
     }
