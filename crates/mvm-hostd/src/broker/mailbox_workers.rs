@@ -463,6 +463,7 @@ fn collect_child(worker: &mut Worker) -> io::Result<Option<ExitStatus>> {
     match worker.child.try_wait() {
         Ok(status) => {
             if status.is_some() {
+                drop(worker.cast_workspace.take());
                 drop(worker.parent_lease.take());
             }
             worker.status = status;
@@ -687,6 +688,8 @@ pub struct SpawnedMailboxWorker {
     pub parent_lease: Option<mvm_vmm::host::installed_owner::HolderLease>,
 }
 struct Worker {
+    ingress: crate::mailbox_process::owned_wire::ReadyIngress,
+    cast_workspace: Option<Arc<cast_credit::HandoffWorkspace>>,
     parent_lease: Option<mvm_vmm::host::installed_owner::HolderLease>,
     child: Child,
     control: UnixStream,
@@ -1650,6 +1653,8 @@ impl MailboxWorkers {
                     Err(MailboxSpawnFailure::Uncertain(error)) => return Err(error),
                 };
                 *worker = Some(Worker {
+                    ingress: crate::mailbox_process::owned_wire::ReadyIngress::Legacy,
+                    cast_workspace: None,
                     parent_lease: spawned.parent_lease,
                     child: spawned.child,
                     control: spawned.control,
@@ -1719,11 +1724,16 @@ impl MailboxWorkers {
                     && fd.is_none()
                     && child.parent_lease.is_some()
                 {
-                    if crate::mailbox_process::owned_wire::poll_ready(
+                    if let Some(ingress) = crate::mailbox_process::owned_wire::poll_ready(
                         &mut child.control,
                         &mut child.ready,
                         &owner,
                     )? {
+                        if !matches!(ingress, crate::mailbox_process::owned_wire::ReadyIngress::Legacy)
+                            && request.mailbox_grant.local_service.is_none() {
+                            return Err(refused("addressed readiness on legacy grant"));
+                        }
+                        child.ingress = ingress;
                         state = MailboxWorkerState::Serving;
                     }
                 } else if matches!(state, MailboxWorkerState::Starting) && fd.is_none() {
@@ -1882,6 +1892,7 @@ pub(crate) fn write_error(stream: &mut UnixStream, message: &str) -> io::Result<
 
 #[cfg(test)]
 mod tests {
+    include!("mailbox_workers/cast_handoff_tests.rs");
     use super::*;
     use crate::broker::daemon::HostAgentDaemon;
     use ed25519_dalek::SigningKey;

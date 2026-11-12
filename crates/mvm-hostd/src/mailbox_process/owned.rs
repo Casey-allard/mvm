@@ -139,14 +139,52 @@ pub fn run_profile(
     let mut control = inherited_control()?;
     let prepare = read_prepare(&control, deadline)?;
     let report = crate::mailbox_service::guest_io::inherited_report_socket()?;
-    let start = || -> io::Result<_> {
+    let prepare_original = || -> io::Result<_> {
         let raw = config_input(&mut std::io::stdin().lock(), &control, deadline)?;
         let config = super::parse(&raw)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid mailbox config"))?;
         drop(raw);
         // Acquire only from the original helper's inherited Prepare and the
         // approved, delegated configuration. Legacy launch consumes its keys.
-        let original = BoundCastEndpoint::from_original(&prepare, config, &_lease)?;
+        BoundCastEndpoint::from_original(&prepare, config, &_lease)
+    };
+    let mut original = match prepare_original() {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = write_status(
+                &control,
+                &OwnedStatusV1::Failed {
+                    owner: prepare.owner.clone(),
+                },
+                deadline,
+            );
+            return Err(e);
+        }
+    };
+    let role = original
+        .direction
+        .open_immutable_destination(&original.owner, &original.config.grant)
+        .map_err(io::Error::other)?;
+    if let Some(role) = role {
+        if !paired {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "addressed destination requires explicitly paired installation",
+            ));
+        }
+        let counts = super::destination_ingress::run(
+            original,
+            role,
+            &control,
+            prepare.expected_parent,
+            deadline,
+        )?;
+        if let Some(socket) = report {
+            crate::mailbox_service::guest_io::send_original(&socket, &prepare.owner, counts)?;
+        }
+        return Ok(());
+    }
+    let start = || -> io::Result<_> {
         if !matches!(
             original.direction,
             crate::mailbox_launch::cast_pair::development::PrivateSlot::Disabled
@@ -272,10 +310,10 @@ mod tests {
 /// validated inherited-control launch path. It cannot be manufactured by the
 /// control-plane router, and its plaintext never leaves this endpoint module.
 pub struct BoundCastEndpoint<'lease> {
-    owner: mvm_contract::protocol::mailbox_worker::MailboxWorkerOwner,
-    config: super::MailboxProcessConfig,
+    pub(super) owner: mvm_contract::protocol::mailbox_worker::MailboxWorkerOwner,
+    pub(super) config: super::MailboxProcessConfig,
     _lease: &'lease mvm_vmm::host::installed_owner::HolderLease,
-    direction: crate::mailbox_launch::cast_pair::development::PrivateSlot,
+    pub(super) direction: crate::mailbox_launch::cast_pair::development::PrivateSlot,
 }
 impl<'lease> BoundCastEndpoint<'lease> {
     fn from_original(

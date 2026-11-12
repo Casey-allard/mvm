@@ -54,6 +54,9 @@ pub struct CastChannel {
 }
 
 impl CastChannel {
+    pub fn original_plan_pair(&self) -> (&crate::plan::PlanId, &crate::plan::PlanId) {
+        (&self.original_plans.0, &self.original_plans.1)
+    }
     /// The two plan IDs and greeting come from the original installed service
     /// owner. Verifying portable plans does not acquire either VM, turn on this
     /// mode, or mint the cross-principal Send and Receive grants.

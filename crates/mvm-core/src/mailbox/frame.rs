@@ -40,11 +40,21 @@ pub fn encode_frame(
     capability: &SignedMailboxCapability,
     envelope: &MailboxEnvelope,
 ) -> Result<Vec<u8>, Refusal> {
-    let cap = serde_json::to_vec(capability).map_err(|_| Refusal::Malformed)?;
     let env = encode_envelope(envelope).map_err(|e| Refusal::Mailbox(e.to_string()))?;
+    encode_frame_from_canonical(capability, &env)
+}
+
+/// Frame the original canonical envelope retained by an admitted route.
+/// Receiver signature, scope and ciphertext verification still take place
+/// when opening the envelope. Framing does not assert any of those results.
+pub fn encode_frame_from_canonical(
+    capability: &SignedMailboxCapability,
+    env: &[u8],
+) -> Result<Vec<u8>, Refusal> {
+    let cap = serde_json::to_vec(capability).map_err(|_| Refusal::Malformed)?;
     let mut body = (cap.len() as u32).to_be_bytes().to_vec();
     body.extend_from_slice(&cap);
-    body.extend_from_slice(&env);
+    body.extend_from_slice(env);
     Ok(body)
 }
 
@@ -128,6 +138,24 @@ pub fn outbox_verdict<S: Read + Write>(
 const MAX_VERDICT_BYTES: usize = 4096;
 
 fn exchange<S: Read + Write>(stream: &mut S, body: &[u8]) -> io::Result<Result<(), Refusal>> {
+    exchange_body(stream, body, true)
+}
+
+/// Exchange an already encoded canonical peer frame on one authenticated
+/// connection. A verdict is terminal only after complete EOF, even for an
+/// early capacity refusal. A read or write failure leaves custody unknown.
+pub fn strict_peer_verdict<S: Read + Write>(
+    stream: &mut S,
+    body: &[u8],
+) -> io::Result<Result<(), Refusal>> {
+    exchange_body(stream, body, false)
+}
+
+fn exchange_body<S: Read + Write>(
+    stream: &mut S,
+    body: &[u8],
+    allow_early_capacity: bool,
+) -> io::Result<Result<(), Refusal>> {
     let len = u32::try_from(body.len()).map_err(io::Error::other)?;
     let sent = stream.write_all(&len.to_be_bytes())
         .and_then(|()| stream.write_all(body))
@@ -141,7 +169,7 @@ fn exchange<S: Read + Write>(stream: &mut S, body: &[u8]) -> io::Result<Result<(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "incomplete or invalid mailbox verdict"))?;
     // A host may refuse declared length before reading the body. A complete
     // capacity refusal only retains the original, including on a reset.
-    if matches!(verdict, Err(Refusal::Oversized(_) | Refusal::QueueFull(_))) {
+    if allow_early_capacity && matches!(verdict, Err(Refusal::Oversized(_) | Refusal::QueueFull(_))) {
         return Ok(verdict);
     }
     sent?;
