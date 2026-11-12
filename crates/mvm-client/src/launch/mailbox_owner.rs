@@ -287,6 +287,7 @@ impl OwnedLaunch {
     }
     pub(crate) fn broker_binding(&self) -> Result<mvm_core::vm_backend::InstalledBrokerBinding> {
         Ok(mvm_core::vm_backend::InstalledBrokerBinding {
+            plan_commitment: self.client.acquire_request().plan_commitment,
             owner: self
                 .client
                 .owner()

@@ -311,6 +311,7 @@ pub trait InstalledBrokerPeer: Send + Sync {
 }
 #[derive(Clone)]
 pub struct InstalledBrokerBinding {
+    pub plan_commitment: [u8; 32],
     pub owner: mvm_contract::protocol::mailbox_worker::MailboxWorkerOwner,
     pub peer: std::sync::Arc<dyn InstalledBrokerPeer>,
 }

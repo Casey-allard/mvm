@@ -723,6 +723,20 @@ fn send_signed_control(
     signed: &broker_control::SignedControl,
     peer: Option<&dyn mvm_core::vm_backend::InstalledBrokerPeer>,
 ) -> Result<()> {
+    if let Some(original) = peer {
+        // Bound connection + both directional frames by the same monotonic
+        // deadline. Every paired reply rejects ancillary file descriptors.
+        use crate::host::mailbox_worker_transport::{deregister_companion, register_companion};
+        use mvm_core::protocol::mailbox_worker_control::MAX_WORKER_OPERATION_MS;
+        let deadline = std::time::Instant::now() + Duration::from_millis(MAX_WORKER_OPERATION_MS);
+        let stream = mvm_agentd::vsock::connect_unix_before(control_socket, deadline)?;
+        original.authenticate(&stream)?;
+        return match &signed.request {
+            ControlRequest::Register(_) => Ok(register_companion(&stream, signed, deadline)?),
+            ControlRequest::Deregister(_) => Ok(deregister_companion(&stream, signed, deadline)?),
+            _ => bail!("expected an original broker service operation"),
+        };
+    }
     let mut last_err = None;
     for attempt in 0..CONTROL_RETRIES {
         let result = (|| -> Result<()> {
@@ -738,9 +752,6 @@ fn send_signed_control(
             stream
                 .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
                 .context("set host-agent control write timeout")?;
-            if let Some(original) = peer {
-                original.authenticate(&stream)?;
-            }
             write_framed(&mut stream, signed)?;
             match read_framed::<ControlResponse>(&mut stream)? {
                 ControlResponse::Ok => Ok(()),

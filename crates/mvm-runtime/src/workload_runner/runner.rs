@@ -631,8 +631,13 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         socks: &sockets::StandingSockets,
     ) -> Result<(BrokerGuard, Vec<ServiceId>)> {
         let state_dir = vm_state_dir(&config.name);
-        let (services, capability_bindings) =
-            admitted_broker_bindings(config.plan_json.as_deref())?;
+        let (services, capability_bindings) = admitted_broker_bindings(
+            config.plan_json.as_deref(),
+            config
+                .installed_mailbox_owner
+                .as_ref()
+                .map(|binding| &binding.plan_commitment),
+        )?;
         let guard = self.broker.register(&BrokerRegisterRequest {
             mailbox_owner: config.installed_mailbox_owner.as_ref(),
             vm_name: &config.name,
@@ -1399,27 +1404,52 @@ fn claim_plan(claim: &StandbyClaim) -> std::result::Result<ExecutionPlan, Standb
 
 fn admitted_broker_bindings(
     plan_json: Option<&str>,
+    mailbox_plan: Option<&[u8; 32]>,
 ) -> Result<(
     Vec<ServiceId>,
     Vec<mvm_contract::protocol::agent_capability::CapabilityBinding>,
 )> {
-    plan_json
+    let plan = plan_json
         .map(mvm_core::plan::plan_from_admitted_json)
         .transpose()
-        .context("parse admitted plan host services")
-        .map(|plan| {
-            plan.map_or_else(
-                || (Vec::new(), Vec::new()),
-                |plan| {
-                    let capabilities = plan
-                        .extensions
-                        .iter()
-                        .flat_map(|extension| extension.capabilities.iter().cloned())
-                        .collect();
-                    (plan.services, capabilities)
-                },
-            )
-        })
+        .context("parse admitted plan host services")?;
+    if let Some(digest) = mailbox_plan {
+        let admitted = plan
+            .as_ref()
+            .context("paired broker needs the original execution plan")?;
+        mvm_core::plan::verify_plan_id(admitted)?;
+        anyhow::ensure!(
+            admitted.plan_id.0.strip_prefix("sha256:") == Some(hex::encode(digest).as_str()),
+            "broker plan differs from installed mailbox admission"
+        );
+    }
+    let Some(plan) = plan else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let capabilities = plan
+        .extensions
+        .iter()
+        .flat_map(|extension| extension.capabilities.iter().cloned())
+        .collect();
+    Ok((plan.services, capabilities))
+}
+
+#[cfg(test)]
+#[test]
+fn paired_broker_rejects_a_different_or_modified_admitted_plan() {
+    let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+    plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+    let digest: [u8; 32] = hex::decode(plan.plan_id.0.strip_prefix("sha256:").unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let json = serde_json::to_string(&plan).unwrap();
+    assert!(admitted_broker_bindings(Some(&json), Some(&digest)).is_ok());
+    assert!(admitted_broker_bindings(Some(&json), Some(&[0xaa; 32])).is_err());
+    plan.workload.0.push_str("-replaced");
+    let edited = serde_json::to_string(&plan).unwrap();
+    assert!(admitted_broker_bindings(Some(&edited), Some(&digest)).is_err());
+    assert!(admitted_broker_bindings(None, Some(&digest)).is_err());
 }
 
 /// How many times to redraw a fresh child name before giving up. A collision is

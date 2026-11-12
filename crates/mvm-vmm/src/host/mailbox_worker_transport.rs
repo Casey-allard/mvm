@@ -500,15 +500,39 @@ pub fn deregister_companion(
     {
         return Err(invalid("owner-bound deregistration required"));
     }
+    companion_turn(stream, signed, deadline)
+}
+
+/// Register separately admitted broker services for the matching installed
+/// mailbox owner, expecting the ordinary canonical response and zero FDs.
+pub fn register_companion(
+    stream: &UnixStream,
+    signed: &SignedControl,
+    deadline: Instant,
+) -> io::Result<()> {
+    peer(stream)?;
+    remaining(deadline)?;
+    if !matches!(&signed.request, ControlRequest::Register(request) if request.mailbox_owner_v1.is_some())
+    {
+        return Err(invalid("owner-bound registration required"));
+    }
+    companion_turn(stream, signed, deadline)
+}
+
+fn companion_turn(
+    stream: &UnixStream,
+    signed: &SignedControl,
+    deadline: Instant,
+) -> io::Result<()> {
     send_signed_frame(stream, signed, deadline)?;
     match read_control_response(stream, deadline)? {
         ControlResponse::Ok => Ok(()),
         ControlResponse::Err { .. } => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "companion deregistration refused",
+            "companion control refused",
         )),
         ControlResponse::MailboxWorkerV1(_) => {
-            Err(invalid("unexpected worker response to deregistration"))
+            Err(invalid("unexpected worker response to companion control"))
         }
     }
 }
