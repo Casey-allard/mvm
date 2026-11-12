@@ -80,7 +80,26 @@ impl ConnectedInstance {
         let (signing, root) = wire::existing_operator()?;
         let deadline = Instant::now() + wire::CONNECTION_BUDGET;
         let mut stream = wire::connect(vm, deadline)?;
-        let pid = super::uds_peer::connected_peer_pid(&stream)?;
+        let (observer, connection_nonce) =
+            Self::prove_connected(&mut stream, &instance, owned_pid, &root, deadline)?;
+        Ok(Self {
+            stream,
+            observer,
+            instance,
+            connection_nonce,
+            signing,
+            root,
+        })
+    }
+
+    fn prove_connected(
+        stream: &mut UnixStream,
+        instance: &HvfInstance,
+        owned_pid: Option<u32>,
+        root: &VerifyingKey,
+        deadline: Instant,
+    ) -> Result<(ProcessExitObserver, [u8; 32])> {
+        let pid = super::uds_peer::connected_peer_pid(stream)?;
         if let Some(expected) = owned_pid {
             ensure!(
                 u32::try_from(pid)? == expected,
@@ -97,17 +116,10 @@ impl ConnectedInstance {
         // a connected socket, so its response closes the PID-to-observer race.
         let mut client_nonce = [0; 32];
         rand::rng().fill_bytes(&mut client_nonce);
-        wire::write_all(&mut stream, &client_nonce, deadline)?;
-        let challenge: SignedControl = wire::read_frame(&mut stream, deadline)?;
-        let connection_nonce = verify_challenge(&challenge, &root, &instance, &client_nonce)?;
-        Ok(Self {
-            stream,
-            observer,
-            instance,
-            connection_nonce,
-            signing,
-            root,
-        })
+        wire::write_all(stream, &client_nonce, deadline)?;
+        let challenge: SignedControl = wire::read_frame(stream, deadline)?;
+        let connection_nonce = verify_challenge(&challenge, root, instance, &client_nonce)?;
+        Ok((observer, connection_nonce))
     }
 
     pub fn stop(mut self) -> Result<ConfirmedExit> {

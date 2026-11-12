@@ -209,6 +209,28 @@ impl ColdHvfChannel {
             .context("no selected original HVF reader")
     }
 
+    /// The recipient worker receives only public, original process verification material.
+    pub fn original_mailbox_target(
+        &self,
+    ) -> Result<mvm_vmm::host::hvf_stop::mailbox::OriginalMailboxTarget> {
+        let c = self
+            .custody
+            .as_ref()
+            .context("original runtime custody released")?;
+        anyhow::ensure!(
+            c.original_reader.is_some()
+                && matches!(
+                    c.phase,
+                    Phase::Activated | Phase::Dispatched(_) | Phase::Finalized(_)
+                ),
+            "no active original reader"
+        );
+        c.native
+            .as_ref()
+            .context("original native owner missing")?
+            .original_mailbox_target()
+    }
+
     pub fn validate_live(&self) -> Result<()> {
         let custody = self
             .custody

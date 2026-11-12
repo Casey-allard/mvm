@@ -712,7 +712,7 @@ fn load_private_root(keys: &Path) -> Result<Key> {
     Ok(Key::from_bytes(*buf))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod bootstrap;
 pub(crate) mod operations;
 mod pending;

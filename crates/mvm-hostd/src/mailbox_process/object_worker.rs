@@ -19,7 +19,21 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(target_os = "linux")]
 const TAG: [u8; 1] = [1];
+
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: SendFlags = SendFlags::DONTWAIT.union(SendFlags::NOSIGNAL);
+#[cfg(target_os = "macos")]
+const SEND_FLAGS: SendFlags = SendFlags::DONTWAIT;
+#[cfg(target_os = "linux")]
+const RECV_ANCILLARY: RecvFlags = RecvFlags::DONTWAIT.union(RecvFlags::CMSG_CLOEXEC);
+#[cfg(target_os = "macos")]
+const RECV_ANCILLARY: RecvFlags = RecvFlags::DONTWAIT;
+#[cfg(target_os = "macos")]
+mod hvf;
+#[cfg(target_os = "macos")]
+use hvf::{Controller, Originals};
 
 fn before_deadline<T>(until: Instant, mut io: impl FnMut() -> rustix::io::Result<T>) -> Result<T> {
     loop {
@@ -48,17 +62,13 @@ fn send_rights(
         "object worker rights buffer"
     );
     let n = before_deadline(until, || {
-        sendmsg(
-            channel,
-            &[IoSlice::new(&[tag])],
-            &mut control,
-            SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
-        )
+        sendmsg(channel, &[IoSlice::new(&[tag])], &mut control, SEND_FLAGS)
     })?;
-    ensure!(n == TAG.len(), "incomplete original handle handoff");
+    ensure!(n == 1, "incomplete original handle handoff");
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct Originals([OwnedFd; 2]);
 
 fn receive_rights(channel: &UnixStream, expected: u8, until: Instant) -> Result<[OwnedFd; 2]> {
@@ -70,7 +80,7 @@ fn receive_rights(channel: &UnixStream, expected: u8, until: Instant) -> Result<
             channel,
             &mut [IoSliceMut::new(&mut tag)],
             &mut control,
-            RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
+            RECV_ANCILLARY,
         )
     })?;
     ensure!(
@@ -93,26 +103,45 @@ fn receive_rights(channel: &UnixStream, expected: u8, until: Instant) -> Result<
         fds.next().is_none() && messages.next().is_none(),
         "extra original worker control data"
     );
+    #[cfg(target_os = "macos")]
+    for fd in &pair {
+        // Darwin has no MSG_CMSG_CLOEXEC. This is the initial, single-thread
+        // phase of the dedicated child; it does not fork or launch a process.
+        rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)?;
+    }
     Ok(pair)
 }
 
+#[cfg(target_os = "linux")]
 fn receive_originals(channel: &UnixStream, until: Instant) -> Result<Originals> {
     Ok(Originals(receive_rights(channel, TAG[0], until)?))
 }
 
 fn receive_links(channel: &UnixStream, until: Instant) -> Result<[UnixStream; 2]> {
     let streams = receive_rights(channel, 2, until)?.map(UnixStream::from);
+    #[cfg(target_os = "linux")]
     let controller = rustix::net::sockopt::socket_peercred(channel)?;
+    #[cfg(target_os = "macos")]
+    let controller = hvf::peer(channel)?;
     let own = rustix::fs::fstat(channel)?;
     let mut identities = vec![(own.st_dev, own.st_ino)];
     for stream in &streams {
         ensure!(
             rustix::net::sockopt::socket_type(stream)? == rustix::net::SocketType::STREAM
-                && rustix::net::sockopt::socket_domain(stream)? == rustix::net::AddressFamily::UNIX
                 && stream.local_addr()?.is_unnamed()
-                && stream.peer_addr()?.is_unnamed()
-                && rustix::net::sockopt::socket_peercred(stream)? == controller,
+                && stream.peer_addr()?.is_unnamed(),
             "wrong original worker data socket"
+        );
+        #[cfg(target_os = "linux")]
+        ensure!(
+            rustix::net::sockopt::socket_domain(stream)? == rustix::net::AddressFamily::UNIX
+                && rustix::net::sockopt::socket_peercred(stream)? == controller,
+            "different worker socket peer"
+        );
+        #[cfg(target_os = "macos")]
+        ensure!(
+            hvf::peer(stream)? == controller,
+            "different worker socket peer"
         );
         let stat = rustix::fs::fstat(stream)?;
         let identity = (stat.st_dev, stat.st_ino);
@@ -125,6 +154,7 @@ fn receive_links(channel: &UnixStream, until: Instant) -> Result<[UnixStream; 2]
     Ok(streams)
 }
 
+#[cfg(target_os = "linux")]
 impl Originals {
     pub(crate) fn require_live(&self, originals: [EndpointPid; 2]) -> Result<()> {
         ensure!(
@@ -167,6 +197,7 @@ impl Originals {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn require_running(fd: &OwnedFd) -> Result<()> {
     let mut watched = [PollFd::new(fd, PollFlags::IN)];
     ensure!(
@@ -179,6 +210,7 @@ fn require_running(fd: &OwnedFd) -> Result<()> {
 // Two separately signed plans (1 MiB apiece), role, enrollment and local credentials.
 const MAX_CONFIG: usize = 3 * 1024 * 1024;
 
+#[cfg(target_os = "linux")]
 fn read_body(channel: &UnixStream, cap: usize, until: Instant) -> Result<Zeroizing<Vec<u8>>> {
     // Allocate once so old copies of secret bytes cannot survive a reallocation.
     let mut bytes = Zeroizing::new(vec![0; cap + 1]);
@@ -201,7 +233,7 @@ fn read_body(channel: &UnixStream, cap: usize, until: Instant) -> Result<Zeroizi
 pub(crate) fn send_launch(
     channel: &UnixStream,
     config: &ObjectWorkerBootstrapV1,
-    originals: [BorrowedFd<'_>; 2],
+    originals: crate::mailbox_launch::object_pair::bootstrap::WorkerOriginals<'_>,
     links: [&UnixStream; 2],
     until: Instant,
 ) -> Result<()> {
@@ -210,26 +242,31 @@ pub(crate) fn send_launch(
     serde_json::to_writer(&mut cursor, config)
         .context("object worker config exceeds launch buffer or cannot be serialized")?;
     let len = cursor.position() as usize;
+    #[cfg(target_os = "linux")]
     send_rights(channel, TAG[0], originals, until)?;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = originals;
+        rustix::net::sockopt::set_socket_nosigpipe(channel, true)?;
+    }
     send_rights(channel, 2, links.map(AsFd::as_fd), until)?;
+    #[cfg(target_os = "macos")]
+    hvf::write_length(channel, len, until)?;
     let mut remaining = &storage[..len];
     while !remaining.is_empty() {
-        let n = before_deadline(until, || {
-            rustix::net::send(
-                channel,
-                remaining,
-                SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
-            )
-        })?;
+        let n = before_deadline(until, || rustix::net::send(channel, remaining, SEND_FLAGS))?;
         ensure!(n > 0, "original child did not receive launch config");
         remaining = &remaining[n..];
     }
+    #[cfg(target_os = "linux")]
     channel.shutdown(std::net::Shutdown::Write)?;
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct Controller(OwnedFd);
 
+#[cfg(target_os = "linux")]
 impl Controller {
     fn capture(channel: &UnixStream) -> Result<Self> {
         // The socketpair was created by the actual parent before spawning this helper.
@@ -272,12 +309,18 @@ pub(crate) struct WorkerLaunch {
 impl WorkerLaunch {
     pub(crate) fn receive(channel: UnixStream, until: Instant) -> Result<(Self, [UnixStream; 2])> {
         let controller = Controller::capture(&channel)?;
+        #[cfg(target_os = "linux")]
         let originals = receive_originals(&channel, until)?;
         let links = receive_links(&channel, until)?;
+        #[cfg(target_os = "macos")]
+        let body = hvf::read_body(&channel, MAX_CONFIG, until)?;
+        #[cfg(target_os = "linux")]
         let body = read_body(&channel, MAX_CONFIG, until)?;
         // Deserializer messages can quote private input; only report the structural failure.
         let config = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("invalid original object worker bootstrap"))?;
+        #[cfg(target_os = "macos")]
+        let originals = Originals::observe(&config, until)?;
         let launch = Self {
             config,
             originals,
@@ -304,7 +347,7 @@ impl WorkerLaunch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[path = "object_worker/handoff_tests.rs"]
 mod tests;
 

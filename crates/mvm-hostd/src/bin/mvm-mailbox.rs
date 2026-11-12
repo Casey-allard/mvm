@@ -23,10 +23,10 @@ fn main() -> Result<()> {
             std::env::args_os().len() == 2,
             "unexpected object worker arguments"
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         return mvm_hostd::mailbox_process::serve_original_object();
-        #[cfg(not(target_os = "linux"))]
-        anyhow::bail!("original Firecracker object worker requires Linux");
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("original object worker unavailable on this platform");
     }
     let raw = mvm_hostd::read_launch_config("mvm-mailbox")?;
     if std::env::args_os().nth(1).as_deref()

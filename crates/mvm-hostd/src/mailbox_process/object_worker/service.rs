@@ -195,10 +195,15 @@ impl Local<'_> {
         meter: &crate::mailbox_service::durable::witness_io::Recorder,
     ) -> Result<()> {
         while self.active() {
-            let stream = match crate::telemetry_collector::dial_route(
-                &self.owner.config.route,
-                MAILBOX_PORT,
-            ) {
+            #[cfg(target_os = "linux")]
+            let dial =
+                crate::telemetry_collector::dial_route(&self.owner.config.route, MAILBOX_PORT);
+            #[cfg(target_os = "macos")]
+            let dial = self.owner.originals.open_mailbox(
+                self.owner.config.role.role.role,
+                Instant::now() + Duration::from_secs(2),
+            );
+            let stream = match dial {
                 Ok(stream) => stream,
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(50));

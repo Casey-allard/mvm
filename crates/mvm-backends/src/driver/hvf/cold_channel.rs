@@ -443,6 +443,13 @@ impl ColdHvfOwner {
         )
     }
 
+    pub fn original_mailbox_target(
+        &self,
+    ) -> Result<mvm_vmm::host::hvf_stop::mailbox::OriginalMailboxTarget> {
+        self.validate_live()?;
+        self.inner().owned()?.mailbox_target()
+    }
+
     pub fn call_unary(
         &mut self,
         request: &mvm_agentd::vsock::GuestRequest,

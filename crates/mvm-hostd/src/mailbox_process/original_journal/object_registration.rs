@@ -165,7 +165,7 @@ impl Registration {
         Ok(registration)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn original_claim(
         &self,
         role: mvm_core::mailbox::object_pair::role::ObjectParticipantRole,

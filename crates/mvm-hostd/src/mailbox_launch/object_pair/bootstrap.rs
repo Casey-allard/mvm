@@ -9,7 +9,10 @@ use mvm_core::mailbox::journal::{HistoryKeyCustody, HistoryKeyRef};
 use mvm_core::mailbox::object_pair::role::{ObjectParticipantRole, SignedObjectRoleV1};
 use mvm_core::vm_backend::{BackendKind, HostDialRoute};
 use mvm_runtime::AnyBackend;
+#[cfg(target_os = "macos")]
+use mvm_vmm::host::hvf_stop::mailbox::OriginalMailboxTarget;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
 
@@ -31,6 +34,8 @@ pub(crate) struct ObjectWorkerBootstrapV1 {
     pub(crate) callee_receive: SignedMailboxCapability,
     pub(crate) reader_enrollment: SignedMailboxGuestReaderEnrollment,
     pub(crate) directories: [OriginalPathPins; 2],
+    #[cfg(target_os = "macos")]
+    pub(crate) hvf: Option<[OriginalMailboxTarget; 2]>,
     pub(crate) caller_vmm: OriginalVmmId,
     pub(crate) callee_vmm: OriginalVmmId,
     pub(crate) home: PathBuf,
@@ -56,6 +61,7 @@ pub(crate) struct ObjectWorkerSecrets {
     pub(crate) anchor: [u8; 32],
 }
 
+#[cfg(target_os = "linux")]
 impl InstalledParticipant<'_> {
     fn worker_pidfd(&self) -> Result<(OriginalVmmId, BorrowedFd<'_>)> {
         let OriginalNative::Firecracker(native) = self.original else {
@@ -75,19 +81,46 @@ impl InstalledParticipant<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) type WorkerOriginals<'a> = [BorrowedFd<'a>; 2];
+#[cfg(target_os = "macos")]
+pub(crate) type WorkerOriginals<'a> = ();
+
+#[cfg(target_os = "macos")]
+impl InstalledParticipant<'_> {
+    fn worker_target(&self) -> Result<(OriginalVmmId, OriginalMailboxTarget)> {
+        let OriginalNative::Hvf(native) = self.original;
+        let target = native.original_mailbox_target()?;
+        let pid = target.child_pid();
+        let identity = mvm_vmm::host::network_endpoint_spawn::EndpointPid::of_child(pid);
+        let birth = identity
+            .started
+            .context("original HVF process birth unavailable")?;
+        ensure!(identity.is_live_and_ours(), "original HVF process changed");
+        native.validate_live()?;
+        Ok((OriginalVmmId { pid, birth }, target))
+    }
+}
 impl InstalledObjectPair<'_> {
     pub(crate) fn original_worker_bootstrap(
         &self,
         local_role: ObjectParticipantRole,
         backend: &AnyBackend,
-    ) -> Result<(ObjectWorkerBootstrapV1, [BorrowedFd<'_>; 2])> {
+    ) -> Result<(ObjectWorkerBootstrapV1, WorkerOriginals<'_>)> {
         self.check_current()?;
-        ensure!(
-            backend.kind() == BackendKind::Firecracker,
-            "wrong mailbox backend"
-        );
-        let (a, afd) = self.caller.worker_pidfd()?;
-        let (b, bfd) = self.callee.worker_pidfd()?;
+        #[cfg(target_os = "linux")]
+        let ((a, afd), (b, bfd)) = {
+            ensure!(
+                backend.kind() == BackendKind::Firecracker,
+                "wrong mailbox backend"
+            );
+            (self.caller.worker_pidfd()?, self.callee.worker_pidfd()?)
+        };
+        #[cfg(target_os = "macos")]
+        let ((a, at), (b, bt)) = {
+            ensure!(backend.kind() == BackendKind::Hvf, "wrong mailbox backend");
+            (self.caller.worker_target()?, self.callee.worker_target()?)
+        };
         ensure!(a.pid != b.pid, "two object endpoints selected the same VMM");
         let (source, local) = match local_role {
             ObjectParticipantRole::Caller => (&self.caller, &self.material.caller),
@@ -106,7 +139,16 @@ impl InstalledObjectPair<'_> {
             route,
         )?;
         self.check_current()?;
-        Ok((config, [afd, bfd]))
+        #[cfg(target_os = "linux")]
+        {
+            Ok((config, [afd, bfd]))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut config = config;
+            config.hvf = Some([at, bt]);
+            Ok((config, ()))
+        }
     }
 }
 
@@ -143,6 +185,8 @@ impl PairMaterial {
             callee_receive: creds.receive_at_callee.clone(),
             reader_enrollment: local.reader.enrollment.clone(),
             directories,
+            #[cfg(target_os = "macos")]
+            hvf: None,
             caller_vmm: a,
             callee_vmm: b,
             home: mvm_core::config::mvm_home_strict()?,
@@ -403,10 +447,7 @@ impl ObjectWorkerBootstrapV1 {
             self.local_journal == paths.journal
                 && self.local_anchor == paths.anchor
                 && self.local_intents == paths.source_intents
-                && self.route
-                    == HostDialRoute::Mux(PathBuf::from(mvm_agentd::vsock::vsock_uds_path(
-                        &local_state.to_string_lossy()
-                    )))
+                && self.route == original_mailbox_route(&local_state)
                 && self.history_ref.address() == address
                 && self.history_ref.execution_epoch() == role.local().execution_epoch
                 && self.history_ref.key_id()
@@ -469,3 +510,19 @@ impl ObjectWorkerBootstrapV1 {
 
 #[path = "worker_journal.rs"]
 mod journal;
+
+fn original_mailbox_route(state: &Path) -> HostDialRoute {
+    #[cfg(target_os = "linux")]
+    {
+        HostDialRoute::Mux(PathBuf::from(mvm_agentd::vsock::vsock_uds_path(
+            &state.to_string_lossy(),
+        )))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        HostDialRoute::PortSocket(mvm_core::config::vm_hvf_vsock_port_socket_at(
+            state,
+            MAILBOX_PORT,
+        ))
+    }
+}
