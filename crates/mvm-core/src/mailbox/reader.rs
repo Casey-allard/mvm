@@ -380,83 +380,123 @@ pub fn object_call_challenge(
     Ok(h.finalize().into())
 }
 
-/// Authenticate this one sampled application operation. Both original grants
-/// and the independent Receive, possession key, signed header/body projection
-/// and return route must all describe the same still-live original Call.
-pub fn verify_object_call_authority(
-    boot: &MailboxReaderBootBinding,
-    pair: &[u8; 32],
-    lease: &SignedMailboxDeliveryLease,
-    header: &MailboxEnvelopeHeader,
-    payload: &[u8],
-    nonce: &[u8; 32],
-    response: &super::reader_wire::ReaderResponse,
-    now: i64,
-) -> AnyResult<()> {
-    use super::{object_pair::role::ObjectParticipantRole, reader_wire::ReaderResponse};
-    use mvm_contract::protocol::mailbox::*;
-    let ReaderResponse::ObjectCallAuthorityV1 {
-        role,
-        enrollment,
-        capability,
-        signature,
-    } = response
-    else {
-        anyhow::bail!("missing original Call authorization")
-    };
-    let bound_challenge = object_call_challenge(pair, lease, role, nonce)?;
-    let role = role.verify(boot, now)?;
-    let l = &lease.lease;
-    let authority = VerifyingKey::from_bytes(&boot.authority_key)?;
-    anyhow::ensure!(
-        role.role == ObjectParticipantRole::Callee
-            && boot.durable_object_pair_sha256_v1 == Some(*pair)
-            && enrollment.enrollment.ack_public_key == boot.ack_public_key
-            && l.consumer_session == enrollment.enrollment.consumer_session
-            && header.kind == MailboxMessageKind::Call
-            && header.sender_boot == role.caller.boot
-            && header.sender == role.call.grant.subject
-            && header.capability_id == role.call.grant.capability_id
-            && l.address == role.call.grant.address
-            && header.policy_epoch == role.call.grant.policy_epoch
-            && header.content_type == role.call.grant.content_types[0]
-            && header.reply_to
-                == Some(ReplyRoute {
-                    address: role.reply.grant.address,
-                    capability_id: role.reply.grant.capability_id
-                })
-            && (header.issued_at_unix_ms..header.expires_at_unix_ms).contains(&now)
-            && payload.len() <= capability.grant.max_payload_bytes as usize
-            && capability
-                .grant
-                .content_types
-                .contains(&header.content_type),
-        "unexpected original Call authority"
-    );
-    let grant = MailboxGrant {
-        durable_object_pair_sha256_v1: Some(*pair),
-        outbound_journal_v1: None,
-        incoming_journal_policy_sha256_v1: None,
-        mailbox: boot.mailbox,
-        authority_key: boot.authority_key,
-        epoch: boot.execution_epoch,
-        report: None,
-        retention: None,
-    };
-    let scope = MailboxGuestReaderScope {
-        plan: &grant,
-        plan_id: &boot.plan_id,
-        plan_nonce: &boot.plan_nonce,
-        receive: &capability.grant,
-        current_boot: boot.boot,
-        current_session: l.consumer_session,
-        now_unix_ms: now,
-    };
-    let ack = verify_guest_reader_enrollment(enrollment, capability, &scope, &authority, &[])?;
-    l.check_scope(&grant, &capability.grant, l.consumer_session, now)?;
-    verify_object_delivery_projection(pair, header, payload, lease, &authority)?;
-    verify_reader_possession(enrollment, &bound_challenge, signature, &ack)?;
-    Ok(())
+/// Original guest and pair selected by the application before checking a delivery.
+pub struct ObjectCallAuthorityBuilder<'a> {
+    boot: &'a MailboxReaderBootBinding,
+    pair: &'a [u8; 32],
+}
+
+/// Borrowed evidence for one delivered Call. Construction alone grants no authority.
+pub struct ObjectCallAuthority<'a> {
+    original: ObjectCallAuthorityBuilder<'a>,
+    lease: &'a SignedMailboxDeliveryLease,
+    header: &'a MailboxEnvelopeHeader,
+    payload: &'a [u8],
+}
+
+impl<'a> ObjectCallAuthorityBuilder<'a> {
+    pub fn with_delivery(
+        self,
+        lease: &'a SignedMailboxDeliveryLease,
+        header: &'a MailboxEnvelopeHeader,
+        payload: &'a [u8],
+    ) -> ObjectCallAuthority<'a> {
+        ObjectCallAuthority {
+            original: self,
+            lease,
+            header,
+            payload,
+        }
+    }
+}
+
+impl<'a> ObjectCallAuthority<'a> {
+    pub fn builder(
+        boot: &'a MailboxReaderBootBinding,
+        pair: &'a [u8; 32],
+    ) -> ObjectCallAuthorityBuilder<'a> {
+        ObjectCallAuthorityBuilder { boot, pair }
+    }
+
+    /// Verify both original grants, the independent Receive, possession key,
+    /// signed header and body, and return route for the same still-live Call.
+    pub fn verify(
+        self,
+        nonce: &[u8; 32],
+        response: &super::reader_wire::ReaderResponse,
+        now: i64,
+    ) -> AnyResult<()> {
+        let Self {
+            original: ObjectCallAuthorityBuilder { boot, pair },
+            lease,
+            header,
+            payload,
+        } = self;
+        use super::{object_pair::role::ObjectParticipantRole, reader_wire::ReaderResponse};
+        use mvm_contract::protocol::mailbox::*;
+        let ReaderResponse::ObjectCallAuthorityV1 {
+            role,
+            enrollment,
+            capability,
+            signature,
+        } = response
+        else {
+            anyhow::bail!("missing original Call authorization")
+        };
+        let bound_challenge = object_call_challenge(pair, lease, role, nonce)?;
+        let role = role.verify(boot, now)?;
+        let l = &lease.lease;
+        let authority = VerifyingKey::from_bytes(&boot.authority_key)?;
+        anyhow::ensure!(
+            role.role == ObjectParticipantRole::Callee
+                && boot.durable_object_pair_sha256_v1 == Some(*pair)
+                && enrollment.enrollment.ack_public_key == boot.ack_public_key
+                && l.consumer_session == enrollment.enrollment.consumer_session
+                && header.kind == MailboxMessageKind::Call
+                && header.sender_boot == role.caller.boot
+                && header.sender == role.call.grant.subject
+                && header.capability_id == role.call.grant.capability_id
+                && l.address == role.call.grant.address
+                && header.policy_epoch == role.call.grant.policy_epoch
+                && header.content_type == role.call.grant.content_types[0]
+                && header.reply_to
+                    == Some(ReplyRoute {
+                        address: role.reply.grant.address,
+                        capability_id: role.reply.grant.capability_id
+                    })
+                && (header.issued_at_unix_ms..header.expires_at_unix_ms).contains(&now)
+                && payload.len() <= capability.grant.max_payload_bytes as usize
+                && capability
+                    .grant
+                    .content_types
+                    .contains(&header.content_type),
+            "unexpected original Call authority"
+        );
+        let grant = MailboxGrant {
+            durable_object_pair_sha256_v1: Some(*pair),
+            outbound_journal_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            mailbox: boot.mailbox,
+            authority_key: boot.authority_key,
+            epoch: boot.execution_epoch,
+            report: None,
+            retention: None,
+        };
+        let scope = MailboxGuestReaderScope {
+            plan: &grant,
+            plan_id: &boot.plan_id,
+            plan_nonce: &boot.plan_nonce,
+            receive: &capability.grant,
+            current_boot: boot.boot,
+            current_session: l.consumer_session,
+            now_unix_ms: now,
+        };
+        let ack = verify_guest_reader_enrollment(enrollment, capability, &scope, &authority, &[])?;
+        l.check_scope(&grant, &capability.grant, l.consumer_session, now)?;
+        verify_object_delivery_projection(pair, header, payload, lease, &authority)?;
+        verify_reader_possession(enrollment, &bound_challenge, signature, &ack)?;
+        Ok(())
+    }
 }
 
 fn possession_bytes(

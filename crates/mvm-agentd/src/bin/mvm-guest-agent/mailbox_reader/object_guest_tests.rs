@@ -319,9 +319,9 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
             service.join().unwrap().unwrap();
             let response = app.join().unwrap().unwrap();
             let verify = |challenge, body| {
-                mvm_core::mailbox::reader::verify_object_call_authority(
-                    &boot, &pair, &lease, &header, body, challenge, &response, now,
-                )
+                mvm_core::mailbox::reader::ObjectCallAuthority::builder(&boot, &pair)
+                    .with_delivery(&lease, &header, body)
+                    .verify(challenge, &response, now)
             };
             assert_eq!(verify(&challenge, b"hello").is_ok(), !deny);
             assert!(verify(&[99; 32], b"hello").is_err());
