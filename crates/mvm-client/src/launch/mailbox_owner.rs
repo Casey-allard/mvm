@@ -687,6 +687,7 @@ mod tests {
         let mut env = mvm_core::util::test_env::TestEnv::new();
         let home = tempfile::tempdir_in("/tmp")?;
         env.set("MVM_HOME", home.path());
+        mvm_hostd::audit::host_keypair::load_or_init_at(&home.path().join("keys"))?;
         let rootfs = home.path().join("rootfs.ext4");
         std::fs::write(&rootfs, b"synthetic mailbox fixture")?;
         let ledger = InMemoryNonceLedger::new();
