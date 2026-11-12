@@ -963,7 +963,7 @@ async fn signed_initial_worker_waits_for_held_mutation_lane_and_rechecks_expiry(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     let budget = MailboxWorkerBudget::new(WorkerLimits {
-        host_workers: 2, tenant_workers: 2,
+        host_workers: 3, tenant_workers: 3,
         host_bytes: 1_048_576, tenant_bytes: 1_048_576, bytes_per_worker: 65_536,
     }).unwrap();
     let workers = Arc::new(MailboxWorkers::new("tenant", budget.clone(), Arc::new(FixtureHelper)).unwrap());
