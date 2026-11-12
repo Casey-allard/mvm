@@ -294,7 +294,9 @@ impl ServingCastMapping {
             (&self.source_vm, &self.source_owner),
             (&self.destination_vm, &self.destination_owner),
         )?;
-        self.route_reserved(credit, envelope, grants, source_policy, destination_policy)
+        let routed = self.route_reserved(credit, envelope, grants, source_policy, destination_policy)?;
+        routed.credit.admitted()?;
+        Ok(routed)
     }
 
     fn route_reserved<'a>(
@@ -329,7 +331,6 @@ impl ServingCastMapping {
                 && grants.admits_encoded_contribution(canonical.len()),
             "canonical envelope exceeds addressed queue or frame bound"
         );
-        credit.admitted()?;
         Ok(RoutedCast {
             canonical,
             envelope,

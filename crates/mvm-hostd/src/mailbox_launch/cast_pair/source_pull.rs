@@ -9,7 +9,7 @@ use crate::{
     mailbox_process::{installed_profile::pair_queue_limits, owned_wire::DeadlineStream},
 };
 use anyhow::ensure;
-use mvm_core::mailbox::frame::{Refusal, decode_frame};
+use mvm_core::mailbox::{decode_envelope, frame::Refusal};
 use std::{
     io::{Read, Write},
     net::Shutdown,
@@ -66,21 +66,25 @@ impl ServingCastMapping {
         body: &[u8],
         (source, dest): (OpenContext, OpenContext),
     ) -> Result<super::RoutedCast<'a>> {
-        let (send, envelope) = decode_frame(body)?;
-        ensure!(
-            &send == grants.send,
-            "source returned another Send credential"
-        );
+        let send_bytes = serde_json::to_vec(grants.send)?;
+        let original = source_envelope(body, &send_bytes)?;
+        let envelope = decode_envelope(original)?;
         let routed = self.route_reserved(credit, envelope, grants, &source, &dest)?;
-        // decode_frame validated both subfields. Require the exact original
-        // canonical envelope, including its outer route and ciphertext bytes.
-        let n = u32::from_be_bytes(body[..4].try_into()?) as usize;
-        ensure!(
-            body[4 + n..] == routed.canonical,
-            "noncanonical source envelope"
-        );
+        ensure!(original == routed.canonical, "noncanonical source envelope");
+        routed.credit.admitted()?;
         Ok(routed)
     }
+}
+
+fn source_envelope<'a>(body: &'a [u8], expected_send: &[u8]) -> Result<&'a [u8]> {
+    // Compare the length and the exact installed credential encoding before
+    // decoding the envelope. Equivalent JSON must not change the peer bytes.
+    let prefix = u32::try_from(expected_send.len())?.to_be_bytes();
+    let rest = body
+        .strip_prefix(&prefix[..])
+        .and_then(|rest| rest.strip_prefix(expected_send));
+    rest.filter(|env| !env.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("source Send framing differs from the enrolled credential"))
 }
 
 fn pull_frame(stream: &mut (impl Read + Write), limit: usize) -> Result<Vec<u8>> {
@@ -101,6 +105,22 @@ fn pull_frame(stream: &mut (impl Read + Write), limit: usize) -> Result<Vec<u8>>
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+    #[test]
+    fn original_pull_requires_byte_identical_credential_before_admission() {
+        let cap = br#"{"ok":1}"#;
+        let payload = b"\0env\xff";
+        for candidate in [cap.as_slice(), br#"{ "ok":1 }"#, br#"{"ok":2}"#] {
+            let mut body = (candidate.len() as u32).to_be_bytes().to_vec();
+            body.extend_from_slice(candidate);
+            body.extend_from_slice(payload);
+            if candidate == cap {
+                assert_eq!(source_envelope(&body, cap).unwrap(), payload);
+            } else {
+                assert!(source_envelope(&body, cap).is_err());
+            }
+        }
+        assert!(source_envelope(&[0; 3], cap).is_err());
+    }
     #[test]
     fn original_pull_is_binary_exact_and_checks_length_before_reading_body() {
         for (size, bytes, accepted) in [
