@@ -44,42 +44,8 @@ const MAX_EXPIRY_RECORDS_PER_REQUEST: usize = 8;
 #[cfg(feature = "durable-guest-io-witness")]
 mod witness_io;
 
-pub(crate) struct GuestDeadline<'a> {
-    pub(crate) stream: &'a mut UnixStream,
-    pub(crate) until: Instant,
-}
-
-impl GuestDeadline<'_> {
-    fn remaining(&self) -> std::io::Result<Duration> {
-        let remaining = self.until.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "mailbox guest exchange deadline",
-            ))
-        } else {
-            Ok(remaining)
-        }
-    }
-}
-
-impl Read for GuestDeadline<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buf)
-    }
-}
-
-impl Write for GuestDeadline<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
-    }
-}
+mod guest_deadline;
+pub(crate) use guest_deadline::GuestDeadline;
 
 /// Commit delivery-state events; this callback alone cannot authorize a
 /// strong `accepted_durable` receipt.
