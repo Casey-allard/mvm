@@ -317,10 +317,11 @@ fn serve_local(
         anchor,
     )?;
     service.install_guest_reader(reader)?;
+    let mut turn = crate::mailbox_service::directed_journal::SourceTurn::from_boot(&binding);
     std::io::stdout().write_all(READY_MARKER)?;
     while keep_serving(launcher, &vm_state_dir) {
         if service
-            .serve_guest_while(&route, &mut sealer, || {
+            .serve_guest_while(&route, &mut sealer, &mut turn, || {
                 keep_serving(launcher, &vm_state_dir)
             })
             .is_err()

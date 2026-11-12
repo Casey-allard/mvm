@@ -202,3 +202,80 @@ impl DirectedJournalSource {
         Ok(receipt)
     }
 }
+
+/// The selection is made from the original boot, before A's own seal/admit.
+/// Missing delegated data transport is an indeterminate directed operation,
+/// and never authorizes a retry through the local journal.
+pub(crate) struct SourceTurn<'a> {
+    original_recipient: Option<PrincipalId>,
+    transport: Option<(
+        &'a mut DirectedJournalSource,
+        &'a mut dyn FnMut(Instant) -> Result<UnixStream, Refusal>,
+    )>,
+}
+
+impl<'a> SourceTurn<'a> {
+    pub(crate) fn from_boot(boot: &MailboxReaderBootBinding) -> Self {
+        Self {
+            original_recipient: boot.outbound_journal_v1.map(|d| d.address.recipient),
+            transport: None,
+        }
+    }
+    pub(super) fn own() -> Self {
+        Self {
+            original_recipient: None,
+            transport: None,
+        }
+    }
+    pub(crate) fn attach(
+        mut self,
+        endpoint: &'a mut DirectedJournalSource,
+        connect: &'a mut dyn FnMut(Instant) -> Result<UnixStream, Refusal>,
+    ) -> Result<Self, Refusal> {
+        if self.original_recipient != Some(endpoint.recipient()) {
+            return Err(Refusal::NotAuthorized);
+        }
+        self.transport = Some((endpoint, connect));
+        Ok(self)
+    }
+    pub(super) fn send(
+        &mut self,
+        message: OutboxMessage,
+        deadline: Instant,
+        local: impl FnOnce(OutboxMessage) -> Result<SignedDestinationReceipt, Refusal>,
+    ) -> Result<SignedDestinationReceipt, Refusal> {
+        if Some(message.recipient) != self.original_recipient {
+            return local(message);
+        }
+        let (endpoint, connect) = self.transport.as_mut().ok_or(Refusal::Unavailable)?;
+        endpoint.forward(message, deadline, connect)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn signed_remote_recipient_never_falls_back_to_source_local_admit() {
+        let b = PrincipalId::from_bytes([11; 32]);
+        let mut routed = SourceTurn {
+            original_recipient: Some(b),
+            transport: None,
+        };
+        let mut local = 0;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = routed.send(OutboxMessage::new(b, vec![0, 7, 0]), deadline, |_| {
+            local += 1;
+            Err(Refusal::StorageFull)
+        });
+        assert!(matches!(result, Err(Refusal::Unavailable)));
+        assert_eq!(local, 0);
+        let own = PrincipalId::from_bytes(mvm_core::mailbox::frame::OWN_MAILBOX_RECIPIENT);
+        let result = routed.send(OutboxMessage::new(own, vec![7]), deadline, |_| {
+            local += 1;
+            Err(Refusal::StorageFull)
+        });
+        assert!(matches!(result, Err(Refusal::StorageFull)));
+        assert_eq!(local, 1);
+    }
+}

@@ -301,7 +301,13 @@ impl DurableMailboxService {
         route: &HostDialRoute,
         sealer: &mut GuestSealer,
     ) -> std::io::Result<bool> {
-        self.serve_guest_waiting(route, sealer, GUEST_EXCHANGE_TIMEOUT, || true)
+        self.serve_guest_waiting(
+            route,
+            sealer,
+            &mut super::directed_journal::SourceTurn::own(),
+            GUEST_EXCHANGE_TIMEOUT,
+            || true,
+        )
     }
 
     /// Keep one idle production connection open without redialing until this
@@ -310,15 +316,17 @@ impl DurableMailboxService {
         &self,
         route: &HostDialRoute,
         sealer: &mut GuestSealer,
+        turn: &mut super::directed_journal::SourceTurn<'_>,
         active: impl Fn() -> bool,
     ) -> std::io::Result<bool> {
-        self.serve_guest_waiting(route, sealer, GUEST_HOLD_TIMEOUT, active)
+        self.serve_guest_waiting(route, sealer, turn, GUEST_HOLD_TIMEOUT, active)
     }
 
     fn serve_guest_waiting(
         &self,
         route: &HostDialRoute,
         sealer: &mut GuestSealer,
+        turn: &mut super::directed_journal::SourceTurn<'_>,
         hold: Duration,
         active: impl Fn() -> bool,
     ) -> std::io::Result<bool> {
@@ -344,8 +352,12 @@ impl DurableMailboxService {
         };
         let verdict: Result<SignedDestinationReceipt, Refusal> = body
             .and_then(|body| OutboxMessage::decode(&body))
-            .and_then(|message| sealer.seal(message))
-            .and_then(|(capability, envelope)| admit(&self.shared, &capability, &envelope));
+            .and_then(|message| {
+                turn.send(message, stream.until, |message| {
+                    let (capability, envelope) = sealer.seal(message)?;
+                    admit(&self.shared, &capability, &envelope)
+                })
+            });
         let reply = if self.shared.local_anchor.is_some() {
             serde_json::to_vec(&verdict)
         } else {
