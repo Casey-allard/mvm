@@ -1064,7 +1064,8 @@ mod tests {
     #[test]
     fn directed_intents_preserve_original_sequence_and_retry_when_full() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut sealer, verifier, send) = external_fixture(dir.path());
+        let (mut sealer, destination, send) = external_fixture(dir.path());
+        let verifier = destination.authority_key;
         let role = Some(OriginalSend {
             signed: &send,
             verifier: &verifier,
@@ -1077,8 +1078,29 @@ mod tests {
             body: vec![0, n, 0],
         };
         let first = sealer.seal_using(message(1), role).unwrap();
-        for n in 2..=MAX_SOURCE_INTENTS {
-            sealer.seal_using(message(n as u8), role).unwrap();
+        let mut replay = InMemoryReplayProtector::default();
+        for n in 1..=MAX_SOURCE_INTENTS {
+            if n == MAX_SOURCE_INTENTS / 2 {
+                sealer.sent = 0; // Same enrolled context after volatile cursor loss.
+            }
+            let (capability, envelope) = if n == 1 {
+                first.clone()
+            } else {
+                sealer.seal_using(message(n as u8), role).unwrap()
+            };
+            let opened = open_authenticated_envelope(
+                &envelope,
+                &capability,
+                &destination.context,
+                &destination.encryption_key,
+                &destination.sender_key,
+                &verifier,
+                &mut replay,
+            )
+            .unwrap();
+            assert_eq!(opened.header().sequence.get(), n as u64);
+            assert_eq!(opened.header().message_id, message(n as u8).message_id);
+            assert_eq!(opened.payload(), message(n as u8).body);
             assert_eq!(sealer.sent, n as u64);
         }
         // The directed helper starts with sent=0 and recovers its floor from the
@@ -1107,10 +1129,10 @@ mod tests {
         );
     }
 
-    fn external_fixture(dir: &Path) -> (GuestSealer, VerifyingKey, SignedMailboxCapability) {
+    fn external_fixture(dir: &Path) -> (GuestSealer, MailboxPolicy, SignedMailboxCapability) {
         crate::audit::host_keypair::load_or_init_at(dir).unwrap();
         let keys = derive_launch_keys(dir, &grant_at(dir, 1), &test_secret()).unwrap();
-        let (_, mut sealer) = keys.trust();
+        let (mut destination, mut sealer) = keys.trust();
         let b = SigningKey::from_bytes(&[79; 32]);
         let verifier = b.verifying_key();
         assert_ne!(sealer.authority_key.verifying_key(), verifier);
@@ -1120,13 +1142,16 @@ mod tests {
         sealer.capability.message_kinds = vec![sealer.header.kind];
         let send = sign_capability(sealer.capability.clone(), &b).unwrap();
         sealer.intent_dir = Some(dir.join("original-direction"));
-        (sealer, verifier, send)
+        destination.authority_key = verifier;
+        destination.context.expected_capability_issuer = send.grant.issuer;
+        (sealer, destination, send)
     }
 
     #[test]
     fn original_external_send_and_sealed_bytes_survive_an_ambiguous_turn() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut sealer, verifier, send) = external_fixture(dir.path());
+        let (mut sealer, destination, send) = external_fixture(dir.path());
+        let verifier = destination.authority_key;
         let message = OutboxMessage::new(sealer.header.recipient, vec![0, 7, 0]);
         let wrong = sign_capability(send.grant.clone(), &sealer.authority_key).unwrap();
         assert!(
