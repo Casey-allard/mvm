@@ -127,9 +127,17 @@ impl<'a, C> CastSource<'a, C> {
         digest.update(channel.greeting.binding);
         digest.update(enrollment.sender_boot.as_bytes());
         digest.update(enrollment.encryption.key_id);
-        let public_route = serde_jcs::to_vec(&(&enrollment.routing, &enrollment.ordering_scope))
-            .map_err(|_| deny())?;
-        digest.update(public_route);
+        // A socket may reconnect to the same logical binding. A replacement
+        // signed plan or tighter admitted frame/payload budget cannot inherit
+        // ciphertext prepared under the prior decision.
+        let public_context = serde_jcs::to_vec(&(
+            &channel.original_plans,
+            channel.limits,
+            &enrollment.routing,
+            &enrollment.ordering_scope,
+        ))
+        .map_err(|_| deny())?;
+        digest.update(public_context);
         let scope: [u8; 32] = digest.finalize().into();
         if *sequence < slot.last_sequence || slot.scope.is_some_and(|original| original != scope) {
             return Err(deny());

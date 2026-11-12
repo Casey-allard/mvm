@@ -192,8 +192,21 @@ mod canonical {
         assert!(!addressed.matches_original_source(
             src_grant.mailbox, src_grant.epoch, &dest.authority_key
         ));
+        let mut replacement_plan = dst.clone();
+        replacement_plan.valid_until = chrono::DateTime::from_timestamp_millis(2499).unwrap();
+        let replacement = sign_plan(&replacement_plan, &plan_key, "pinned");
+        let replacement_id = verify_plan(&replacement, &trusted).unwrap().plan_id;
+        let make_channel = |plan, id, limit| {
+            let mut channel = CastChannel::from_signed_pair(
+                &a, plan, &trusted, (&aid, id), greeting, sender(), recipient(), 1500
+            ).unwrap();
+            channel.restrict_frame_budget(limit).unwrap();
+            channel
+        };
+        let narrow = make_channel(&signed_dst, &did, 2048);
+        let other_plan = make_channel(&replacement, &replacement_id, 4096);
         source_transfer::check(
-            &addressed, grants, &a_policy, &live, &h, &sender_key, &authority_key,
+            &addressed, [&narrow, &other_plan], grants, &a_policy, &live, &h, &sender_key, &authority_key,
             &encryption_key, input,
         );
         let mut unbounded = a_policy.clone();

@@ -8,6 +8,7 @@ use std::os::unix::net::UnixStream;
 
 pub(super) fn check(
     addressed: &CastChannel,
+    other_channels: [&CastChannel; 2],
     grants: AddressedCastGrants<'_>,
     a_policy: &OpenContext,
     live: &OpenContext,
@@ -70,6 +71,12 @@ pub(super) fn check(
         input,
     );
     drop(lane);
+    for other in other_channels {
+        assert!(
+            CastSource::new(other, grants, enrollment(), &mut counter, &mut slot).is_err(),
+            "reconnect accepted an altered frame limit or replaced signed destination plan"
+        );
+    }
     let mut stale_sequence = 0;
     assert!(
         CastSource::new(

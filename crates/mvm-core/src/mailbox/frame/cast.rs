@@ -48,6 +48,7 @@ pub struct CastChannel {
     valid_from: i64,
     valid_until: i64,
     source: MailboxGrant,
+    original_plans: (crate::plan::PlanId, crate::plan::PlanId),
 }
 
 impl CastChannel {
@@ -117,6 +118,7 @@ impl CastChannel {
             valid_from: start,
             valid_until: until,
             source: origin,
+            original_plans: (source.plan_id.clone(), target.plan_id.clone()),
         })
     }
 
