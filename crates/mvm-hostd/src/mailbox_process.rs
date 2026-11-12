@@ -338,7 +338,7 @@ fn serve_local(
                 private.grants.clone(),
                 private.material(),
                 &vm_state_dir,
-                &mvm_core::config::vm_state_dir(&private.destination_name),
+                &vm_state_dir.with_file_name(&private.destination_name),
             )
             .map_err(Error::other)?;
         Some(source)

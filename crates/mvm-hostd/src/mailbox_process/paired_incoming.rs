@@ -410,7 +410,7 @@ impl OriginalJournalDestination {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::mailbox_launch::derive_launch_keys;
     use ed25519_dalek::SigningKey;
@@ -419,7 +419,7 @@ mod tests {
     };
     use mvm_core::plan::{compute_plan_id, test_support::PlanFixture};
 
-    fn setup(dir: &Path) -> (MailboxGrant, IncomingJournalPolicy, SigningKey) {
+    pub(crate) fn setup(dir: &Path) -> (MailboxGrant, IncomingJournalPolicy, SigningKey) {
         crate::audit::host_keypair::load_or_init_at(dir).unwrap();
         let grant = |id| {
             let mailbox = MailboxId::from_bytes([id; 32]);

@@ -3,6 +3,8 @@
 //! retains the original Child until collection. A pidfile cannot recreate it.
 
 pub mod authorization;
+#[cfg(test)]
+mod paired_process_tests;
 pub mod relay;
 
 use super::{MailboxLaunchPosture, MailboxProcessConfig, spawn_serving, spawn_with_original};
