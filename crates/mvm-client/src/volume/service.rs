@@ -397,7 +397,7 @@ impl VolumeService for LocalVolumeService {
     }
 
     fn acquire_launch_lease(&self, request: &LaunchLeaseRequest) -> Result<LaunchPreparation> {
-        let _lock = lifecycle::acquire_volume_lifecycle_lock()?;
+        let _lock = lifecycle::acquire_launch_volume_lifecycle_lock()?;
         self.acquire_launch_lease_locked(request)
     }
 
