@@ -281,9 +281,11 @@ fn run() -> Result<()> {
     let mut a = admission.launch_original_source(&ap, &backend, "journal-a", &posture_a)?;
     let message = OutboxMessage::new(direction.address.recipient, (0..=255).chain([0]).collect());
     let mut receipt = None;
+    let transaction = Instant::now();
     for turn in 0..3 {
         let mut socket = guest_stream(&guest, deadline)?;
         let encoded = message.encode();
+        let send_start = Instant::now();
         socket.write_all(&u32::try_from(encoded.len())?.to_be_bytes())?;
         socket.write_all(&encoded)?;
         let mut socket = Some(socket);
@@ -331,6 +333,10 @@ fn run() -> Result<()> {
             }
             receipt = Some(received);
             eprintln!(
+                "ORIGINAL_ACCEPT turn={turn} guest_submit_to_verified_v2_ns={}",
+                send_start.elapsed().as_nanos()
+            );
+            eprintln!(
                 "ORIGINAL_PAIRED_HELPERS turn={turn} plaintext_bytes={} guest_submit_bytes={} guest_receipt_bytes={}",
                 message.body.len(),
                 encoded.len() + 4,
@@ -347,6 +353,10 @@ fn run() -> Result<()> {
         &message,
         receipt.as_ref().unwrap(),
     )?;
+    eprintln!(
+        "ORIGINAL_TRANSACTION first_connection_through_b_ack_ns={}",
+        transaction.elapsed().as_nanos()
+    );
     drop(guest);
     drop(b_guest);
 

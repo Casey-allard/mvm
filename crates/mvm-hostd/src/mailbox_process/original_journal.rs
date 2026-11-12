@@ -142,6 +142,15 @@ impl OriginalJournalDestination {
         })
     }
 
+    pub(crate) fn peer_state(&self, name: &str) -> Result<PathBuf> {
+        mvm_core::naming::validate_vm_name(name)?;
+        let state = self
+            .revocations_path
+            .parent()
+            .context("missing original VM state")?;
+        Ok(state.with_file_name(name))
+    }
+
     /// Before sending any credential or ciphertext, authenticate the connected
     /// kernel peer against the exclusively owned, still-live original Child.
     pub fn connect(&mut self, deadline: Instant) -> Result<UnixStream> {
