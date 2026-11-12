@@ -48,6 +48,7 @@ use mvm_core::util::atomic_io::{FileLock, atomic_write_durable, atomic_write_new
 pub(crate) mod directed_journal;
 /// Separate destination path that returns a signed, journal-backed verdict.
 pub mod durable;
+mod object_intent;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SOURCE_INTENTS: usize = 64;
@@ -189,18 +190,7 @@ impl GuestSealer {
             charge_source_attempt(&dir, &name)?;
             return Ok(reused);
         }
-        let mut count = 0;
-        for entry in std::fs::read_dir(&dir).map_err(|_| Refusal::Unavailable)? {
-            let entry = entry.map_err(|_| Refusal::Unavailable)?;
-            let name = entry.file_name();
-            if name == "intent.lock" || name.to_string_lossy().ends_with(".attempts") {
-                continue;
-            }
-            count += 1;
-            if count >= MAX_SOURCE_INTENTS {
-                return Err(Refusal::QueueFull(MAX_SOURCE_INTENTS));
-            }
-        }
+        let count = reserved_intents(&dir)?;
         // Directed records and local records share one cursor, lock and cap.
         // Existing immutable records recover the lower bound after restart.
         if external.is_some() {
@@ -331,6 +321,23 @@ impl GuestSealer {
         .map_err(gate)?;
         Ok((capability, envelope, n))
     }
+}
+
+/// Called under the original per-custody intent lock, only for a new ID.
+fn reserved_intents(dir: &Path) -> Result<usize, Refusal> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).map_err(|_| Refusal::Unavailable)? {
+        let entry = entry.map_err(|_| Refusal::Unavailable)?;
+        let name = entry.file_name();
+        if name == "intent.lock" || name.to_string_lossy().ends_with(".attempts") {
+            continue;
+        }
+        count += 1;
+        if count >= MAX_SOURCE_INTENTS {
+            return Err(Refusal::QueueFull(MAX_SOURCE_INTENTS));
+        }
+    }
+    Ok(count)
 }
 
 fn charge_source_attempt(dir: &Path, name: &str) -> Result<(), Refusal> {
@@ -1336,5 +1343,34 @@ mod tests {
 
         // Positive control: the host's own seed and root open its own frame.
         assert!(open_under(host.path(), &secret, "c.sock", &sealed).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod object_intent_slot_tests {
+    use super::object_intent::ObjectIntentSlot;
+    use super::*;
+    #[test]
+    fn original_slot_restart_retains_sequence_and_enforces_shared_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "object-test";
+        let slot = ObjectIntentSlot::open(dir.path(), name).unwrap();
+        assert_eq!(slot.sequence.get(), 1);
+        assert!(ObjectIntentSlot::open(dir.path(), "another").is_err());
+        slot.publish(b"original sealed bytes").unwrap();
+        drop(slot);
+        let existing = ObjectIntentSlot::open(dir.path(), name).unwrap();
+        assert_eq!(existing.sequence.get(), 1);
+        assert_eq!(
+            existing.original.as_deref(),
+            Some(b"original sealed bytes".as_slice())
+        );
+        assert!(existing.publish(b"other bytes").is_err());
+        drop(existing);
+        for i in 1..MAX_SOURCE_INTENTS {
+            std::fs::write(dir.path().join(format!("ordinary-{i}")), b"occupied").unwrap();
+        }
+        assert!(ObjectIntentSlot::open(dir.path(), "next").is_err());
+        assert!(ObjectIntentSlot::open(dir.path(), name).is_ok());
     }
 }
