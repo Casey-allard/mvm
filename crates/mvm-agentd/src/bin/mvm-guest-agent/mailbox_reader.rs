@@ -3,6 +3,8 @@
 
 #[path = "mailbox_reader/object_submit.rs"]
 pub(crate) mod object_submit;
+#[path = "mailbox_reader/ordinal.rs"]
+mod ordinal;
 #[path = "mailbox_reader/validity.rs"]
 mod validity;
 use mvm_core::mailbox::object_pair::role::SignedObjectRoleV1;
@@ -43,6 +45,7 @@ struct ActiveLease {
 }
 
 struct GuestReader {
+    ordinal: Option<Arc<Mutex<mvm_agentd::mailbox_outbox::ordinal::OrdinalOutbox>>>,
     role: Option<SignedObjectRoleV1>,
     settlement: object_submit::Settlement,
     outbox: std::path::PathBuf,
@@ -99,6 +102,7 @@ pub(crate) fn start(
     };
     let (tx, rx) = mpsc::sync_channel(1);
     let state = Arc::new(GuestReader {
+        ordinal: crate::mailbox::ordinal_outbox_for_boot(&boot),
         boot,
         role,
         settlement: Default::default(),
@@ -127,6 +131,14 @@ fn application_request(
     reader: &Arc<GuestReader>,
 ) -> Result<ReaderResponse, Refusal> {
     let request = match read_application_request(stream)? {
+        ApplicationReaderRequest::SenderOrdinalV1 { request } => {
+            match ordinal::prepare(reader, *request)? {
+                ordinal::Prepared::Staged(handle) => {
+                    return Ok(ReaderResponse::SenderPendingV1 { handle });
+                }
+                ordinal::Prepared::Forward(request) => ReaderRequest::SenderOrdinalV1 { request },
+            }
+        }
         ApplicationReaderRequest::AuthorizeObjectCallV1 {
             pair,
             lease,
@@ -241,6 +253,7 @@ fn application_request(
     };
     let (reply, received) = mpsc::sync_channel(1);
     let pending_status = match &request {
+        ReaderRequest::SenderOrdinalV1 { request } => Some(ordinal::pending(request)),
         ReaderRequest::SubmitObjectV1 { pair, submission } => {
             Some(ReaderResponse::ObjectPendingV1 {
                 pair: *pair,
@@ -285,7 +298,13 @@ fn perform_exchange(
     stream: &mut (impl Read + Write),
     pending: &PendingReader,
 ) -> Result<ReaderResponse, Refusal> {
-    if let ReaderRequest::SubmitObjectV1 { pair, submission } = &pending.request {
+    if let ReaderRequest::SenderOrdinalV1 { request } = &pending.request {
+        ordinal::preflight(&pending.reader, request)?;
+        match write_request(stream, &pending.request) {
+            Err(Refusal::Unavailable) => return Ok(ordinal::pending(request)),
+            result => result?,
+        }
+    } else if let ReaderRequest::SubmitObjectV1 { pair, submission } = &pending.request {
         object_submit::preflight(&pending.reader, *pair, submission)?;
         match write_request(stream, &pending.request) {
             Err(Refusal::Unavailable) => {
@@ -300,6 +319,9 @@ fn perform_exchange(
         write_request(stream, &pending.request)?;
     }
     match &pending.request {
+        ReaderRequest::SenderOrdinalV1 { request } => {
+            ordinal::complete(&pending.reader, request, stream)
+        }
         ReaderRequest::Receive | ReaderRequest::ReceiveObjectPairV1 { .. } => {
             let pair = match pending.request {
                 ReaderRequest::ReceiveObjectPairV1 { pair } => Some(pair),
@@ -520,10 +542,10 @@ mod tests {
 
     static SEED: OnceLock<Zeroizing<[u8; 32]>> = OnceLock::new();
 
-    #[test]
-    fn local_receive_is_explicit_and_an_empty_reply_does_not_sign_an_ack() {
+    fn ordinary_reader() -> Arc<GuestReader> {
         let ack_seed = SEED.get_or_init(|| Zeroizing::new([7; 32]));
-        let reader = Arc::new(GuestReader {
+        Arc::new(GuestReader {
+            ordinal: None,
             role: None,
             settlement: Default::default(),
             outbox: Default::default(),
@@ -541,7 +563,48 @@ mod tests {
             },
             ack_seed,
             active: Mutex::new(None),
-        });
+        })
+    }
+
+    #[test]
+    fn ordinal_request_on_an_ordinary_boot_never_reaches_the_host() {
+        use mvm_core::mailbox::sender_ordinal::{ApplicationSenderRequestV1, SenderOrdinalV1};
+        let reader = ordinary_reader();
+        let handle = SenderOrdinalV1 {
+            direction: [5; 32],
+            ordinal: 1,
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        for request in [
+            ApplicationSenderRequestV1::Stage {
+                handle,
+                payload: vec![0, 1, 0],
+            },
+            ApplicationSenderRequestV1::Status { handle },
+            ApplicationSenderRequestV1::Settle {
+                handle,
+                receipt_digest: [8; 32],
+            },
+        ] {
+            let (mut client, mut agent) = UnixStream::pair().unwrap();
+            write_application_request(
+                &mut client,
+                &ApplicationReaderRequest::SenderOrdinalV1 {
+                    request: Box::new(request),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                application_request(&mut agent, &tx, &reader),
+                Err(Refusal::NotAuthorized)
+            );
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+    }
+
+    #[test]
+    fn local_receive_is_explicit_and_an_empty_reply_does_not_sign_an_ack() {
+        let reader = ordinary_reader();
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let (sender, pending) = mpsc::sync_channel(1);
         let state = reader.clone();

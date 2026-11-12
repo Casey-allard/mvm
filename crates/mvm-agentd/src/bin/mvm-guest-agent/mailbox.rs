@@ -9,7 +9,7 @@
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
-use std::sync::{OnceLock, atomic::Ordering};
+use std::sync::{Arc, Mutex, OnceLock, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -32,11 +32,59 @@ use crate::transport::{accept_vsock, bind_vsock_listener, unix_transport_selecte
 
 static ACK_SEED: OnceLock<Zeroizing<[u8; 32]>> = OnceLock::new();
 static READER_BOOT: OnceLock<MailboxReaderBootBinding> = OnceLock::new();
+static ORDINAL_OUTBOX: OnceLock<Arc<Mutex<mvm_agentd::mailbox_outbox::ordinal::OrdinalOutbox>>> =
+    OnceLock::new();
+
+pub(super) fn ordinal_outbox_for_boot(
+    boot: &MailboxReaderBootBinding,
+) -> Option<Arc<Mutex<mvm_agentd::mailbox_outbox::ordinal::OrdinalOutbox>>> {
+    if READER_BOOT.get() == Some(boot)
+        && boot
+            .outbound_journal_v1
+            .is_some_and(|d| d.sender_settlement.is_some())
+    {
+        ORDINAL_OUTBOX.get().cloned()
+    } else {
+        None
+    }
+}
+
+fn capture_ordinal_outbox(
+    boot: &MailboxReaderBootBinding,
+) -> Result<(), mvm_agentd::guest_mount::MountError> {
+    use mvm_agentd::guest_mount::MountError;
+    use mvm_agentd::mailbox_outbox::ordinal::OrdinalOutbox;
+    use std::os::unix::fs::DirBuilderExt;
+    let denied =
+        || MountError::InvalidConfig("cannot provision original ordinal sender state".into());
+    if boot.durable_object_pair_sha256_v1.is_some()
+        || MailboxReaderBootBinding::load_guest_original()
+            .ok()
+            .as_ref()
+            != Some(boot)
+    {
+        return Err(denied());
+    }
+    // Only original PID 1 activation creates this private boot directory. A
+    // helper restart reuses the live guest. Refuse any previously present name.
+    let root = Path::new(RUN_MVM_DIR).join("sender-ordinal-private-v1");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .map_err(|_| denied())?;
+    let key = Arc::new(mvm_core::crypto::aead::Key::random());
+    let store = OrdinalOutbox::create(&root, boot, key).map_err(|_| denied())?;
+    mvm_core::util::atomic_io::sync_dir(Path::new(RUN_MVM_DIR)).map_err(|_| denied())?;
+    ORDINAL_OUTBOX
+        .set(Arc::new(Mutex::new(store)))
+        .map_err(|_| denied())
+}
 
 /// Retain the root-only ACK key before PID 1 drops to the workload UID.
 /// A missing or malformed key disables Receive; the existing Send path
 /// remains available, and warm children never inherit reader authority.
-pub(crate) fn capture_ack_key_before_privilege_drop() {
+pub(crate) fn capture_ack_key_before_privilege_drop()
+-> Result<(), mvm_agentd::guest_mount::MountError> {
     let dir = Path::new(RUN_MVM_DIR);
     let binding = match MailboxReaderBootBinding::load(dir) {
         Ok(binding) => binding,
@@ -47,25 +95,37 @@ pub(crate) fn capture_ack_key_before_privilege_drop() {
             {
                 eprintln!("mvm-guest-agent: mailbox reader boot unavailable: {error}");
             }
-            return;
+            return Ok(());
         }
     };
+    let ordinal = binding
+        .outbound_journal_v1
+        .is_some_and(|d| d.sender_settlement.is_some());
     match load_ack_seed(&dir.join(MAILBOX_ACK_SIGNING_KEY_FILE), 0) {
         Ok(seed)
             if SigningKey::from_bytes(&seed).verifying_key().to_bytes()
                 == binding.ack_public_key =>
         {
+            if ordinal {
+                capture_ordinal_outbox(&binding)?;
+            }
             if ACK_SEED.set(seed).is_err() || READER_BOOT.set(binding).is_err() {
                 eprintln!("mvm-guest-agent: mailbox ACK identity already initialized");
             }
         }
         Ok(_) | Err(_) => {
+            if ordinal {
+                return Err(mvm_agentd::guest_mount::MountError::InvalidConfig(
+                    "original ordinal sender has no matching mailbox key".into(),
+                ));
+            }
             if binding.durable_object_pair_sha256_v1.is_some() {
                 let _ = READER_BOOT.set(binding);
             }
             eprintln!("mvm-guest-agent: mailbox ACK key does not match this boot");
         }
     }
+    Ok(())
 }
 
 /// The workload runs under the same UID as the agent. A captured ACK key must
@@ -313,7 +373,11 @@ fn wait_for_operation(
     outbox: &Path,
 ) -> Result<(), Refusal> {
     let until = Instant::now() + MAILBOX_HOLD;
-    if reader_boot.is_some_and(|b| b.durable_object_pair_sha256_v1.is_some()) {
+    if reader_boot.is_some_and(|b| {
+        b.durable_object_pair_sha256_v1.is_some()
+            || b.outbound_journal_v1
+                .is_some_and(|direction| direction.sender_settlement.is_some())
+    }) {
         let rx = reader.ok_or(Refusal::NotAuthorized)?;
         loop {
             if let Ok(pending) = rx.try_recv() {

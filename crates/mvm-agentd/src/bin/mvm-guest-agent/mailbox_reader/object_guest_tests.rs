@@ -208,6 +208,7 @@ fn selected_guest_application_socket_rejects_downgrade_and_substitution_after_po
     });
     let seed = Box::leak(Box::new(Zeroizing::new(guest.to_bytes())));
     let reader = Arc::new(GuestReader {
+        ordinal: None,
         role: Some(role.clone()),
         settlement: Default::default(),
         outbox: Default::default(),
@@ -416,6 +417,7 @@ fn status_replays_exact_staged_operation_after_lost_v2_and_fences_other_signers(
     let pair = original.durable_object_pair_sha256_v1.unwrap();
     let new_reader = || {
         Arc::new(GuestReader {
+            ordinal: None,
             boot: original.clone(),
             ack_seed: Box::leak(Box::new(Zeroizing::new([8; 32]))),
             active: Mutex::new(None),

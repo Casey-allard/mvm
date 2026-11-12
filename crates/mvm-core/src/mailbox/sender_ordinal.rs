@@ -29,6 +29,37 @@ impl SenderOrdinalV1 {
     }
 }
 
+/// Check B's signed admission against the original sender generation and ordinal.
+pub fn verify_sender_receipt(
+    boot: &MailboxReaderBootBinding,
+    handle: SenderOrdinalV1,
+    receipt: &SignedDestinationReceipt,
+) -> Result<(), Refusal> {
+    let direction = boot
+        .outbound_journal_v1
+        .as_ref()
+        .ok_or(Refusal::NotAuthorized)?;
+    if direction.sender_settlement
+        != Some(mvm_contract::protocol::mailbox::SenderSettlementProfile::OrdinalV1)
+        || handle.direction
+            != journal_direction_commitment(boot).map_err(|_| Refusal::NotAuthorized)?
+        || receipt.receipt.message_id != handle.message_id()?
+        || receipt.receipt.address != direction.address
+        || receipt.receipt.execution_epoch != direction.execution_epoch
+        || receipt.receipt.protocol_version != mvm_contract::protocol::mailbox::ProtocolVersion::V2
+        || receipt.receipt.outcome
+            != mvm_contract::protocol::mailbox::DeliveryOutcome::AcceptedLocalDurable
+        || !(direction.not_before_unix_ms..direction.expires_at_unix_ms)
+            .contains(&receipt.receipt.observed_at_unix_ms)
+    {
+        return Err(Refusal::NotAuthorized);
+    }
+    let peer =
+        VerifyingKey::from_bytes(&direction.receipt_key).map_err(|_| Refusal::NotAuthorized)?;
+    super::verify_receipt(receipt, &peer).map_err(|_| Refusal::NotAuthorized)?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SenderSettlementV1 {
@@ -56,28 +87,14 @@ impl SenderSettlementV1 {
         receipt: &SignedDestinationReceipt,
         key: &SigningKey,
     ) -> Result<Self, Refusal> {
-        let direction = boot.outbound_journal_v1.ok_or(Refusal::NotAuthorized)?;
         let handle = SenderOrdinalV1 {
             direction: journal_direction_commitment(boot).map_err(|_| Refusal::NotAuthorized)?,
             ordinal,
         };
-        if direction.sender_settlement.is_none()
-            || key.verifying_key().to_bytes() != boot.ack_public_key
-            || receipt.receipt.message_id != handle.message_id()?
-            || receipt.receipt.address != direction.address
-            || receipt.receipt.execution_epoch != direction.execution_epoch
-            || receipt.receipt.protocol_version
-                != mvm_contract::protocol::mailbox::ProtocolVersion::V2
-            || receipt.receipt.outcome
-                != mvm_contract::protocol::mailbox::DeliveryOutcome::AcceptedLocalDurable
-            || !(direction.not_before_unix_ms..direction.expires_at_unix_ms)
-                .contains(&receipt.receipt.observed_at_unix_ms)
-        {
+        if key.verifying_key().to_bytes() != boot.ack_public_key {
             return Err(Refusal::NotAuthorized);
         }
-        let peer =
-            VerifyingKey::from_bytes(&direction.receipt_key).map_err(|_| Refusal::NotAuthorized)?;
-        super::verify_receipt(receipt, &peer).map_err(|_| Refusal::NotAuthorized)?;
+        verify_sender_receipt(boot, handle, receipt)?;
         let receipt_digest = Self::receipt_digest(receipt)?;
         let signature = key
             .sign(&Self::statement(handle, receipt_digest))

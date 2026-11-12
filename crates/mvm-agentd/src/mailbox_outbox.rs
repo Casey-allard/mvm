@@ -21,6 +21,7 @@
 
 pub mod journal_direction;
 pub mod object_pair;
+pub mod ordinal;
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

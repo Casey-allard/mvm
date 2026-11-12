@@ -55,6 +55,18 @@ The [Vsock message reference](/reference/vsock-messages/) contains every
 request, response and nested field, plus authentication, other typed services,
 builder protocols, raw channels and their availability restrictions.
 
+### Original mailbox sender settlement
+
+A signed outbound journal direction can select `OrdinalV1` for its original sender. The application talks to `/run/mvm/mailbox/receive.sock` using the versioned application reader frame. The agent forwards the corresponding requests over the admitted mailbox vsock port 5257.
+
+| Local request | Application contract |
+|---|---|
+| `Stage` | Supply the committed direction, next contiguous ordinal starting at one, and original payload. The agent permits one active operation and enforces both the signed direction limit and an 8,192-byte ceiling. `SenderPendingV1` confirms local staging. Repeat the same handle and bytes if this reply is lost. |
+| `Status` | Ask about the original handle. The agent contacts the host, verifies the destination's signed V2 receipt and records it before returning `SenderAcceptedV1`. A pending response permits retry. |
+| `Settle` | After the application accepts the receipt, supply its exact canonical digest and original handle. The agent records its signed statement before sending it. A matching `SenderSettledV1` confirms retirement. A lost reply can be recovered by retrying the same settlement. |
+
+The versioned application request carries no signing keys. B's durable mailbox admission, B's application ACK and A's retirement are distinct events. This profile disables the arbitrary-ID sender path on A. Original guest state belongs to the admitted boot. Restarting a mailbox helper leaves the guest running. A new guest boot requires fresh admission.
+
 ### Guest telemetry
 
 Every workload boot carries telemetry from the guest to the host by default.
