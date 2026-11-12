@@ -119,7 +119,7 @@ mod tests {
                 scope.spawn(move || {
                     started.send(()).unwrap();
                     let outcome = service().acquire_launch_lease(&jit_launch("vm-2"))
-                        .map(|prepared| prepared.lease.keys().len())
+                        .map(|prepared| prepared.volumes.len())
                         .map_err(|error| format!("{error:#}"));
                     result.send(outcome).unwrap();
                 });
