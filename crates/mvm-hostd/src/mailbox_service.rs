@@ -232,7 +232,7 @@ impl GuestSealer {
         if bytes.len() > MAX_SOURCE_INTENT_BYTES {
             return Err(Refusal::Oversized(MAX_SOURCE_INTENT_BYTES));
         }
-        self.open_intent(&bytes, message, external)
+        self.open_intent(&bytes, message, external, None)
     }
 
     fn open_intent(
@@ -240,6 +240,7 @@ impl GuestSealer {
         bytes: &[u8],
         message: &OutboxMessage,
         external: Option<OriginalSend<'_>>,
+        expected_sequence: Option<u64>,
     ) -> Result<(SignedMailboxCapability, MailboxEnvelope), Refusal> {
         let (capability, envelope) = decode_frame(bytes)?;
         if external.is_some_and(|role| role.signed != &capability) {
@@ -279,6 +280,7 @@ impl GuestSealer {
         )
         .map_err(|e| Refusal::Mailbox(e.to_string()))?;
         if (external.is_some() && opened.header().sender_boot != self.header.sender_boot)
+            || expected_sequence.is_some_and(|n| opened.header().sequence.get() != n)
             || opened.header().message_id != message.message_id
             || opened.header().kind != self.header.kind
             || opened.payload() != message.body
@@ -1161,7 +1163,7 @@ mod tests {
         );
     }
 
-    fn external_fixture(dir: &Path) -> (GuestSealer, MailboxPolicy, SignedMailboxCapability) {
+    pub(super) fn external_fixture(dir: &Path) -> (GuestSealer, MailboxPolicy, SignedMailboxCapability) {
         crate::audit::host_keypair::load_or_init_at(dir).unwrap();
         let keys = derive_launch_keys(dir, &grant_at(dir, 1), &test_secret()).unwrap();
         let (mut destination, mut sealer) = keys.trust();
@@ -1532,3 +1534,6 @@ pub(crate) mod object_intent_slot_tests {
         assert!(ObjectIntentSlot::open(dir.path(), name, [3; 32]).is_ok());
     }
 }
+
+#[cfg(test)]
+mod sender_ordinal_tests;

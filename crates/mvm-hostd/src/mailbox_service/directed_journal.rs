@@ -196,7 +196,10 @@ impl DirectedJournalSource {
                 let now = self.authorize(length)?;
                 let deadline = until.min(
                     Instant::now()
-                        + Duration::from_millis((self.direction.expires_at_unix_ms - now) as u64),
+                        .checked_add(Duration::from_millis(
+                            self.direction.expires_at_unix_ms.saturating_sub(now) as u64,
+                        ))
+                        .unwrap_or(until),
                 );
                 let message = OutboxMessage {
                     recipient: self.recipient(),
@@ -223,7 +226,9 @@ impl DirectedJournalSource {
                     verifier: &self.verifier,
                     commitment: self.original_commitment,
                 };
-                let (cap, env) = self.sealer.open_intent(&bytes, &message, Some(role))?;
+                let (cap, env) =
+                    self.sealer
+                        .open_intent(&bytes, &message, Some(role), Some(handle.ordinal))?;
                 let mut expected = self.sealer.header.clone();
                 expected.message_id = message.message_id;
                 let receipt = if let Some(r) = prior {

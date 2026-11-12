@@ -6,13 +6,13 @@ use ed25519_dalek::VerifyingKey;
 use mvm_contract::protocol::mailbox::SignedDestinationReceipt;
 use mvm_core::{
     mailbox::sender_ordinal::{SenderOrdinalV1, SenderSettlementV1},
-    util::atomic_io::{FileLock, atomic_write_durable, atomic_write_new, sync_dir},
+    util::atomic_io::{FileLock, atomic_write_new, sync_dir},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     fs,
-    io::Read,
+    io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -55,13 +55,23 @@ impl SenderWindow {
     /// directory with a missing snapshot cannot be initialized again.
     pub(crate) fn provision(root: &Path, direction: [u8; 32]) -> Result<(), Refusal> {
         let w = Self::at(root, direction);
-        let fresh = match std::fs::DirBuilder::new().mode(0o700).create(&w.path) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(_) => return Err(Refusal::Unavailable),
-        };
-        let _guard = w.lock()?;
-        if fresh {
+        // The launcher's generation fence outlives loss of the state directory.
+        // Only a pristine original may publish the fence; any torn preparation
+        // thereafter requires reconciliation, never a new sequence starting at one.
+        let fence = root.join("ordinal-generation-v1");
+        if fs::symlink_metadata(&fence).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            if !fs::symlink_metadata(&w.path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(Refusal::Unavailable);
+            }
+            atomic_write_new(&fence, &direction).map_err(|_| Refusal::Unavailable)?;
+            sync_dir(root).map_err(|_| Refusal::Unavailable)?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&w.path)
+                .map_err(|_| Refusal::Unavailable)?;
+            let _guard = w.lock()?;
             let zero = State {
                 version: 1,
                 direction,
@@ -75,11 +85,33 @@ impl SenderWindow {
             .map_err(|_| Refusal::Unavailable)?;
             sync_dir(root).map_err(|_| Refusal::Unavailable)?;
         }
-        w.load()?;
+        Self::reopen(root, direction)?;
         Ok(())
     }
     pub(super) fn reopen(root: &Path, direction: [u8; 32]) -> Result<Self, Refusal> {
         let w = Self::at(root, direction);
+        let fence = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(root.join("ordinal-generation-v1"))
+            .map_err(|_| Refusal::Unavailable)?;
+        let m = fence.metadata().map_err(|_| Refusal::Unavailable)?;
+        if !m.is_file()
+            || m.nlink() != 1
+            || m.uid() != rustix::process::geteuid().as_raw()
+            || m.mode() & 0o077 != 0
+            || m.len() != 32
+        {
+            return Err(Refusal::NotAuthorized);
+        }
+        let mut original = Vec::with_capacity(33);
+        fence
+            .take(33)
+            .read_to_end(&mut original)
+            .map_err(|_| Refusal::Unavailable)?;
+        if original != direction {
+            return Err(Refusal::NotAuthorized);
+        }
         let _guard = w.lock()?;
         w.load()?;
         Ok(w)
@@ -89,9 +121,11 @@ impl SenderWindow {
         if !m.is_dir() || m.mode() & 0o077 != 0 || m.uid() != rustix::process::geteuid().as_raw() {
             return Err(Refusal::NotAuthorized);
         }
-        FileLock::try_acquire(&self.path.join("custody"))
-            .map_err(|_| Refusal::Unavailable)?
-            .ok_or(Refusal::Unavailable)
+        FileLock::acquire_until(
+            &self.path.join("custody"),
+            std::time::Instant::now() + std::time::Duration::from_millis(10),
+        )
+        .map_err(|_| Refusal::Unavailable)
     }
     fn load(&self) -> Result<State, Refusal> {
         sync_dir(&self.path).map_err(|_| Refusal::Unavailable)?;
@@ -101,7 +135,8 @@ impl SenderWindow {
             .open(self.path.join("state"))
             .map_err(|_| Refusal::Unavailable)?;
         let m = f.metadata().map_err(|_| Refusal::Unavailable)?;
-        if !m.is_file()
+        if m.nlink() != 1
+            || !m.is_file()
             || m.uid() != rustix::process::geteuid().as_raw()
             || m.mode() & 0o077 != 0
             || m.len() > MAX_STATE as u64
@@ -136,7 +171,32 @@ impl SenderWindow {
         if bytes.len() > MAX_STATE {
             return Err(Refusal::StorageFull);
         }
-        atomic_write_durable(&self.path.join("state"), &bytes).map_err(|_| Refusal::Unavailable)
+        // One fixed temporary name bounds orphaned bytes even when the process
+        // crashes before rename. Reopen the old state until rename is durable.
+        let stage = self.path.join("next");
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&stage)
+            .map_err(|_| Refusal::Unavailable)?;
+        let m = file.metadata().map_err(|_| Refusal::Unavailable)?;
+        if !m.is_file()
+            || m.nlink() != 1
+            || m.uid() != rustix::process::geteuid().as_raw()
+            || m.mode() & 0o077 != 0
+        {
+            return Err(Refusal::NotAuthorized);
+        }
+        file.set_len(0)
+            .and_then(|_| file.write_all(&bytes))
+            .and_then(|_| file.sync_all())
+            .and_then(|_| fs::rename(&stage, self.path.join("state")))
+            .map_err(|_| Refusal::Unavailable)?;
+        sync_dir(&self.path).map_err(|_| Refusal::Unavailable)
     }
     fn index(&self, state: &State, h: SenderOrdinalV1) -> Result<usize, Refusal> {
         if h.direction != self.direction || h.ordinal == 0 {
