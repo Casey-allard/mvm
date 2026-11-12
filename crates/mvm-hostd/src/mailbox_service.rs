@@ -750,7 +750,11 @@ fn serve(
 
 /// Wait for the first byte (or EOF) without consuming it, in short slices
 /// while the owner still permits this guest connection.
-pub(crate) fn await_first_byte(stream: &UnixStream, wait: Duration, active: impl Fn() -> bool) -> bool {
+pub(crate) fn await_first_byte(
+    stream: &UnixStream,
+    wait: Duration,
+    active: impl Fn() -> bool,
+) -> bool {
     const SLICE_MS: i32 = 200;
     let deadline = std::time::Instant::now() + wait;
     loop {

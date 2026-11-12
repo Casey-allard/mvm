@@ -113,3 +113,6 @@ impl InstalledObjectPair<'_> {
         Ok(())
     }
 }
+
+mod join;
+pub use join::{OriginalLaunchGuard, OriginalObjectLaunch};

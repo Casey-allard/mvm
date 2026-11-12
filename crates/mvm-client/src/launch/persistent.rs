@@ -498,7 +498,7 @@ fn complete_writable_images(
 fn finish_legacy_persistent(
     backend: mvm_runtime::backend::AnyBackend,
     start_config: mvm_core::vm_backend::VmStartConfig,
-    admission: crate::admission::AdmissionContext,
+    mut admission: crate::admission::AdmissionContext,
     mut prepared_volumes: crate::volume::LaunchPreparation,
     name: &str,
     backend_name: &str,
@@ -519,6 +519,17 @@ fn finish_legacy_persistent(
         )?;
         if let Some(state) = fresh_state {
             state.commit();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(journal::InstalledJournal::Object { launch, .. }) = journal.as_deref() {
+            let id = admission.admitted.start_persistent_object_original(
+                launch,
+                &backend,
+                start_config.clone(),
+                images,
+                admission.policy_bundle.as_ref(),
+            )?;
+            return Ok(crate::StartedVm::from_started(backend, id));
         }
         Ok(crate::boot::start_prepared_custodied(
             backend,
@@ -546,8 +557,18 @@ fn finish_legacy_persistent(
     // host side starts here or the launch is rolled back.
     let paired = journal.is_some();
     if let Some(endpoint) = journal.as_deref_mut() {
-        if let Err(error) = endpoint.serve(&admission.admitted, &started) {
-            match endpoint.abort_original(admission.admitted.plan(), &started) {
+        #[cfg(target_os = "linux")]
+        let served = if let journal::InstalledJournal::Object { launch, owner } = endpoint {
+            let (original, result) = launch.join(admission.admitted, owner);
+            admission.admitted = original;
+            result
+        } else {
+            endpoint.serve(&admission.admitted, &started)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let served = endpoint.serve(&admission.admitted, &started);
+        if let Err(error) = served {
+            match endpoint.abort_original(&admission.admitted, &started) {
                 Ok(()) => {
                     crate::local::deregister_from_name_registry(name);
                     emit_failed(&admission, "mailbox-process", &error);
@@ -590,7 +611,7 @@ fn finish_legacy_persistent(
     let ready = match journal.as_deref_mut() {
         Some(endpoint) => {
             super::detached::require_serving_guest_with_rollback(name, &started, timeout, || {
-                endpoint.abort_original(admission.admitted.plan(), &started)
+                endpoint.abort_original(&admission.admitted, &started)
             })
         }
         None => super::detached::require_serving_guest(name, &started, timeout),
@@ -623,7 +644,7 @@ fn finish_legacy_persistent(
             &admission,
             &started,
             name,
-            || endpoint.abort_original(admission.admitted.plan(), &started),
+            || endpoint.abort_original(&admission.admitted, &started),
             || prepared_volumes.commit(),
         )?;
     } else {

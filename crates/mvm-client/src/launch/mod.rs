@@ -1276,6 +1276,11 @@ impl LocalBackend {
         grant: mvm_contract::protocol::mailbox::MailboxGrant,
         journal: &mut persistent::journal::InstalledJournal<'_>,
     ) -> Result<machine_start::MachineStart> {
+        #[cfg(target_os = "linux")]
+        let _wake_peer = match &*journal {
+            persistent::journal::InstalledJournal::Object { launch, .. } => Some(launch.guard()),
+            _ => None,
+        };
         persistent::journal::validate_slot(Some(journal), Some(&grant))
             .map_err(crate::local::backend_err)?;
         let reservation = reserve_named_lifecycle(name)?;

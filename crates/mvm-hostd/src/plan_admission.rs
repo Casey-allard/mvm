@@ -196,6 +196,79 @@ impl AdmittedPlan {
             .as_ref()
             .context("no original selected Firecracker launch for this admission")
     }
+    /// Dispatch a selected persistent SDK boot only under this original
+    /// reservation, rootfs digest and signed local plan. This consumes the
+    /// admission even if the backend subsequently reports a launch error.
+    #[cfg(target_os = "linux")]
+    pub fn start_persistent_object_original(
+        &mut self,
+        launch: &crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<'_>,
+        backend: &AnyBackend,
+        config: VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        bundle: Option<&PolicyBundle>,
+    ) -> Result<VmId> {
+        anyhow::ensure!(
+            !self.dispatched
+                && self.variant == Variant::Prod
+                && self.backend == Some(BackendKind::Firecracker)
+                && backend.kind() == BackendKind::Firecracker,
+            "requires fresh original Firecracker admission"
+        );
+        launch.require_open()?;
+        launch
+            .plan()
+            .verify_selected_plan(self.plan(), SystemClock.now().timestamp_millis())?;
+        let signed: SignedExecutionPlan = serde_json::from_str(
+            config
+                .plan_json
+                .as_deref()
+                .context("missing original signed plan")?,
+        )?;
+        anyhow::ensure!(
+            signed.0.signature == self.signed.0.signature
+                && signed.0.payload == self.signed.0.payload
+                && signed.0.signer_id == self.signed.0.signer_id
+                && config.name == self.plan.image.name
+                && mvm_core::crypto::image_verify::sha256_file(std::path::Path::new(
+                    &config.rootfs_path
+                ))? == self.plan.image.sha256,
+            "different persistent boot image or original signed plan"
+        );
+        verify_selected_runtime(&config)?;
+        if self.assurance_runtime.is_some() {
+            self.verify_assurance_launch(&config)?;
+        }
+        let (config, runtime) =
+            final_gates::run_post_admission_gates(config, self, backend.kind(), bundle)
+                .map_err(|(stage, e)| e.context(stage))?;
+        registry_pack::verify_runtime_at_dispatch(runtime.as_ref(), &config, self, None)?;
+        crate::mailbox_process::require_servable(
+            &config,
+            backend,
+            self.mailbox_posture().as_ref(),
+        )?;
+        self.dispatched = true;
+        let (id, original) =
+            backend.start_original_object_firecracker_custodied(&config, images)?;
+        self.object_firecracker = Some(original);
+        Ok(id)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn abort_unserved_object(&self, backend: &AnyBackend, id: &VmId) -> Result<()> {
+        let native = self.object_firecracker()?;
+        native.require_live()?;
+        native.boot()?.check_plan(self.plan())?;
+        let (pid, _) = native.original_peer()?;
+        anyhow::ensure!(
+            backend.kind() == BackendKind::Firecracker
+                && self.plan.image.name == id.0
+                && backend.host_process_id(id)? == Some(pid),
+            "original VMM changed before abort"
+        );
+        backend.abort_start(id).map(|_| ())
+    }
     /// The plan's content-address, re-derived and checked during admission.
     #[must_use]
     pub fn plan_id(&self) -> &PlanId {
@@ -860,6 +933,10 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
+    #[cfg(target_os = "linux")]
+    object_worker: Option<
+        &'a crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<'a>,
+    >,
     object_plan: Option<&'a crate::mailbox_launch::object_pair::OriginalObjectPlan<'a>>,
     incoming_journal: Option<&'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission>,
     paired_journal:
@@ -875,6 +952,8 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
+            #[cfg(target_os = "linux")]
+            object_worker: None,
             object_plan: None,
             incoming_journal: None,
             paired_journal: None,
@@ -894,6 +973,8 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
+            #[cfg(target_os = "linux")]
+            object_worker: None,
             object_plan: None,
             incoming_journal: None,
             paired_journal: None,
@@ -935,6 +1016,18 @@ impl<'a> RunPosture<'a> {
         self
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn with_original_object_worker(
+        mut self,
+        launch: &'a crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<
+            'a,
+        >,
+    ) -> Self {
+        self.object_plan = Some(launch.plan());
+        self.object_worker = Some(launch);
+        self
+    }
+
     fn enforce_journal(&self, plan: &ExecutionPlan, max_ms: Option<u64>) -> Result<()> {
         if let Some(original) = self.object_plan {
             anyhow::ensure!(
@@ -948,6 +1041,16 @@ impl<'a> RunPosture<'a> {
                 "object selection requires a dedicated sealed native participant"
             );
             original.verify_selected_plan(plan, SystemClock.now().timestamp_millis())?;
+            #[cfg(target_os = "linux")]
+            if let Some(worker) = self.object_worker {
+                anyhow::ensure!(
+                    std::ptr::eq(original, worker.plan())
+                        && self.backend == Some(BackendKind::Firecracker),
+                    "original Linux worker selection required"
+                );
+                worker.require_open()?;
+                return grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(), max_ms);
+            }
         }
         anyhow::ensure!(
             plan.mailbox
@@ -2189,6 +2292,13 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
         "original admitted plan was already dispatched"
     );
 
+    anyhow::ensure!(
+        admitted
+            .plan()
+            .mailbox
+            .is_none_or(|g| g.durable_object_pair_sha256_v1.is_none()),
+        "selected pair must dispatch through both original worker owners"
+    );
     // A refusal in any post-admission gate must still terminate the chain:
     // `plan.admitted` already fired, so a gate refusal emits `plan.failed`
     // carrying the refusing stage rather than leaving a dangling admission.

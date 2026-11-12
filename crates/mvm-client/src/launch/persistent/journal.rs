@@ -16,6 +16,16 @@ use mvm_hostd::{
 /// readiness or resource-accounting failure. Stop the VM and collect that
 /// exact helper before releasing the slot. A recovered PID is insufficient.
 pub enum InstalledJournal<'a> {
+    #[cfg(target_os = "linux")]
+    Object {
+        launch:
+            &'a mvm_hostd::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<
+                'a,
+            >,
+        owner: &'a mut Option<
+            mvm_hostd::mailbox_process::original_journal::object_workers::OriginalObjectWorker,
+        >,
+    },
     Destination {
         admission: &'a IncomingJournalAdmission,
         owner: &'a mut Option<OriginalJournalDestination>,
@@ -52,7 +62,21 @@ pub(crate) fn validate_slot(
     endpoint: Option<&InstalledJournal<'_>>,
     grant: Option<&MailboxGrant>,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(InstalledJournal::Object { launch, owner }) = endpoint {
+        ensure!(
+            owner.is_none() && grant == Some(&launch.plan().grant()),
+            "selected object grant or original worker slot differs"
+        );
+        return Ok(());
+    }
+    ensure!(
+        grant.is_none_or(|g| g.durable_object_pair_sha256_v1.is_none()),
+        "selected object grant requires the original pair launcher"
+    );
     let role = match endpoint {
+        #[cfg(target_os = "linux")]
+        Some(InstalledJournal::Object { .. }) => unreachable!(),
         Some(InstalledJournal::Destination { owner, .. }) => {
             ensure!(
                 owner.is_none(),
@@ -75,6 +99,8 @@ pub(crate) fn validate_slot(
 impl InstalledJournal<'_> {
     pub(crate) fn authorize<'a>(&'a self, posture: RunPosture<'a>) -> RunPosture<'a> {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::Object { launch, .. } => posture.with_original_object_worker(launch),
             Self::Destination { admission, .. } => posture.with_incoming_journal(admission),
             Self::Source { admission, .. } => posture.with_paired_journal(admission),
         }
@@ -82,11 +108,22 @@ impl InstalledJournal<'_> {
 
     pub(super) fn abort_original(
         &mut self,
-        plan: &mvm_core::plan::ExecutionPlan,
+        admitted: &AdmittedPlan,
         started: &crate::StartedVm,
     ) -> Result<()> {
         use mvm_hostd::mailbox_process::original_journal::JournalOwner;
+        let plan = admitted.plan();
         let original = match self {
+            #[cfg(target_os = "linux")]
+            Self::Object { owner, .. } => {
+                return match owner.as_mut() {
+                    Some(w) => {
+                        w.owner()
+                            .abort_original_launch(plan, started.backend(), started.vm_id())
+                    }
+                    None => admitted.abort_unserved_object(started.backend(), started.vm_id()),
+                };
+            }
             Self::Destination { owner, .. } => owner.as_mut().map(JournalOwner::Destination),
             Self::Source { owner, .. } => owner.as_mut().map(JournalOwner::Source),
         };
@@ -107,6 +144,8 @@ impl InstalledJournal<'_> {
         let name = &started.vm_id().0;
         let backend = started.backend();
         match self {
+            #[cfg(target_os = "linux")]
+            Self::Object { .. } => anyhow::bail!("object worker requires bilateral original join"),
             Self::Destination { owner, .. } => {
                 **owner = Some(OriginalJournalDestination::start_custodied(
                     admitted.plan(),
