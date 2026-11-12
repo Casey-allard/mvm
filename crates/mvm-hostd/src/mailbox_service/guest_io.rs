@@ -182,7 +182,16 @@ pub fn receive_original(
     if receipt.version != 1 || receipt.original != original_tag(owner) || receipt.counts.overflow {
         return Err(invalid("invalid original or overflowing guest IO report"));
     }
-    match socket.recv(&mut buf) {
+    let next = socket.recv(&mut buf);
+    // Darwin reports one ECONNRESET once all queued datagrams have been
+    // consumed and the original writer is closed. Only after receipt
+    // validation, clear that notification and still require an empty queue.
+    #[cfg(target_os = "macos")]
+    let next = match next {
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => socket.recv(&mut buf),
+        result => result,
+    };
+    match next {
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(receipt.counts),
         Err(e) => Err(e),
         Ok(_) => Err(invalid("duplicate guest IO report")),
@@ -296,6 +305,27 @@ mod tests {
         assert_eq!(next_session.guest_to_host_read_bytes, u64::MAX);
         assert!(!totals.overflow);
     }
+    #[test]
+    fn original_report_after_writer_exit_distinguishes_missing_single_and_duplicate() {
+        let original = owner(7);
+        for sent in 0..=2 {
+            let (tx, rx) = UnixDatagram::pair().unwrap();
+            let totals = GuestStreamCounts {
+                guest_to_host_read_bytes: 37,
+                ..Default::default()
+            };
+            for _ in 0..sent {
+                send_original(&tx, &original, totals.clone()).unwrap();
+            }
+            drop(tx);
+            let result = receive_original(&rx, &original);
+            match sent {
+                1 => assert_eq!(result.unwrap(), totals),
+                _ => assert!(result.is_err()),
+            }
+        }
+    }
+
     #[test]
     fn report_datagram_requires_one_complete_original_nonoverflowing_session() {
         let (writer, reader) = UnixDatagram::pair().unwrap();
