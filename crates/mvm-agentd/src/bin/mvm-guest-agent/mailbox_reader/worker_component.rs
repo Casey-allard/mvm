@@ -84,12 +84,18 @@ fn worker_holds_computed_reply_across_indeterminate_submission() {
                 timeout_secs: 4,
                 env: vec![],
             };
-            for _ in 0..2 {
+            for attempt in 0..2 {
                 write_pipe_frame(worker.stdin.as_mut().unwrap(), &input).unwrap();
                 let r: WorkerCallResponse =
                     read_pipe_frame(worker.stdout.as_mut().unwrap()).unwrap();
                 assert_ne!(r.outcome, WorkerOutcome::Exit { code: 0 });
-                eprintln!("worker_control={}", String::from_utf8(r.stderr).unwrap());
+                let public = String::from_utf8(r.stderr).unwrap();
+                assert!(public.contains("worker_cumulative"));
+                if attempt == 1 {
+                    assert!(public.contains("original Reply was refused"));
+                    assert!(public.contains("\"this_invocation\":[0,0,0,0,0,0]"));
+                }
+                eprintln!("worker_control={public}");
             }
             worker.stdin.take();
             assert!(worker.wait().unwrap().success());
@@ -172,9 +178,14 @@ fn worker_holds_computed_reply_across_indeterminate_submission() {
                         last = Some(submission)
                     }
                     submissions += 1;
+                    if submissions == 1 {
+                        drop(host);
+                        actor.join().unwrap();
+                        continue;
+                    }
                     // No destination journal was started in this fixture.
                     ReaderResponse::Refused {
-                        reason: Refusal::Unavailable,
+                        reason: Refusal::NotAuthorized,
                     }
                 }
                 _ => panic!("unexpected guest request or premature ACK"),
