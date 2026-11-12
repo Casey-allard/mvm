@@ -1,12 +1,14 @@
 //! Explicit guest-local Receive and ACK-after-processing over the existing
 //! mailbox vsock port. The workload can read the socket, not the ACK key.
 
+mod validity;
+
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use mvm_contract::protocol::mailbox::{
@@ -38,6 +40,7 @@ struct GuestReader {
 }
 
 pub(crate) struct PendingReader {
+    wait_until: Instant,
     request: ReaderRequest,
     reply: mpsc::SyncSender<ReaderResponse>,
     reader: Arc<GuestReader>,
@@ -143,6 +146,7 @@ fn application_request(
     };
     let (reply, received) = mpsc::sync_channel(1);
     tx.try_send(PendingReader {
+        wait_until: Instant::now() + validity::MAX_WINDOW_WAIT,
         request,
         reply,
         reader: reader.clone(),
@@ -192,20 +196,32 @@ fn perform_exchange(
             };
             let authority = VerifyingKey::from_bytes(&boot.authority_key)
                 .map_err(|_| Refusal::NotAuthorized)?;
-            let scope = MailboxGuestReaderScope {
-                plan: &grant,
-                plan_id: &boot.plan_id,
-                plan_nonce: &boot.plan_nonce,
-                receive: &capability.grant,
-                current_boot: boot.boot,
-                current_session: enrollment.enrollment.consumer_session,
-                now_unix_ms: now_unix_ms()?,
-            };
-            verify_guest_reader_enrollment(&enrollment, &capability, &scope, &authority, &[])
-                .map_err(|_| Refusal::NotAuthorized)?;
             if enrollment.enrollment.ack_public_key != boot.ack_public_key {
                 return Err(Refusal::NotAuthorized);
             }
+            let current_session = enrollment.enrollment.consumer_session;
+            validity::verify(
+                enrollment.enrollment.issued_at_unix_ms,
+                pending.wait_until,
+                |now| {
+                    let current_scope = MailboxGuestReaderScope {
+                        plan: &grant,
+                        plan_id: &boot.plan_id,
+                        plan_nonce: &boot.plan_nonce,
+                        receive: &capability.grant,
+                        current_boot: boot.boot,
+                        current_session,
+                        now_unix_ms: now,
+                    };
+                    verify_guest_reader_enrollment(
+                        &enrollment,
+                        &capability,
+                        &current_scope,
+                        &authority,
+                        &[],
+                    )
+                },
+            )?;
             let possession = sign_reader_possession(
                 &enrollment,
                 &challenge,
@@ -227,14 +243,11 @@ fn perform_exchange(
             {
                 verify_delivery_lease_signature(lease, &authority)
                     .map_err(|_| Refusal::NotAuthorized)?;
-                lease
-                    .check_scope(
-                        &grant,
-                        &capability.grant,
-                        scope.current_session,
-                        now_unix_ms()?,
-                    )
-                    .map_err(|_| Refusal::NotAuthorized)?;
+                validity::verify(lease.lease.issued_at_unix_ms, pending.wait_until, |now| {
+                    lease
+                        .check_scope(&grant, &capability.grant, current_session, now)
+                        .map_err(Into::into)
+                })?;
                 if payload.len() > capability.grant.max_payload_bytes as usize {
                     return Err(Refusal::NotAuthorized);
                 }
