@@ -227,7 +227,8 @@ pub fn boot_recorded(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
-    boot_recorded_with_journal(spec, host, params, None)
+    let reservation = super::PairedBootReservation::for_lifecycle_mutation(&spec.name)?;
+    boot_recorded_with_journal(spec, host, params, None, &reservation)
 }
 
 pub(super) fn boot_recorded_with_journal(
@@ -235,8 +236,9 @@ pub(super) fn boot_recorded_with_journal(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
     journal: Option<&mut super::persistent::journal::InstalledJournal<'_>>,
+    reservation: &super::PairedBootReservation,
 ) -> Result<MachineStart> {
-    let started = start_machine_spec_with_journal(spec, host, params, journal)?;
+    let started = start_machine_spec_with_journal(spec, host, params, journal, reservation)?;
     super::machine_start::record_machine_started(spec, started.resolved_digest.clone());
     if let Err(err) = mp::overwrite_machine_spec(spec) {
         tracing::warn!(error = %err, machine = %spec.name, "updating machine start metadata failed (non-fatal)");

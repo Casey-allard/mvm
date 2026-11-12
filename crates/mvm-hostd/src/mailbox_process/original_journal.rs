@@ -6,6 +6,8 @@ pub mod authorization;
 #[cfg(test)]
 mod paired_process_tests;
 pub mod relay;
+mod runtime_state;
+pub use runtime_state::FreshState;
 
 use super::{MailboxLaunchPosture, MailboxProcessConfig, spawn_serving, spawn_with_original};
 use anyhow::{Context, Result, ensure};
@@ -235,39 +237,81 @@ pub(super) fn claim_launch(
     }))
 }
 
-/// Serializes paired SDK starts for one machine through admission, helper
-/// installation and readiness. Persistent custody lives outside disposable VM state.
+/// Per-name exclusion held across lifecycle operations for ordinary and paired machines.
 pub struct PairedBootReservation {
     _boot: FileLock,
+    owner: PathBuf,
+    state: PathBuf,
 }
 
 impl PairedBootReservation {
-    pub fn acquire(name: &str) -> Result<Self> {
+    /// Serialize mutations without granting access to a helper. The paired
+    /// stop path must separately establish custody of its exact original Child.
+    pub fn for_original_lifecycle(name: &str) -> Result<Self> {
+        use sha2::{Digest, Sha256};
         mvm_core::naming::validate_vm_name(name)?;
-        let owner = owner_dir(&mvm_core::config::mvm_keys_dir(), name)?;
-        Self::acquire_at(
-            &owner,
-            &mvm_core::config::vm_state_dir(name),
-            &mvm_core::config::instance_dir(name),
-        )
+        let keys = mvm_core::config::mvm_keys_dir();
+        let digest = Sha256::digest(name.as_bytes());
+        let shard = u16::from_be_bytes([digest[0], digest[1]]) >> 4;
+        let locks = keys.join("mailbox-sdk-locks-v1");
+        mvm_core::private_fs::ensure_private_dir(&locks)?;
+        let boot =
+            FileLock::try_acquire(&locks.join(format!("{shard:03x}")))?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "machine lifecycle operation is already in progress",
+                )
+            })?;
+        Ok(Self {
+            _boot: boot,
+            owner: keys
+                .join("mailbox-original-owners-v1")
+                .join(hex::encode(digest)),
+            state: mvm_core::config::vm_state_dir(name),
+        })
     }
 
-    fn acquire_at(
-        owner: &std::path::Path,
-        state: &std::path::Path,
-        instance: &std::path::Path,
-    ) -> Result<Self> {
-        let boot = FileLock::try_acquire(&owner.join("paired-sdk-boot"))?
-            .context("paired persistent machine start is already in progress")?;
-        // Hold the canonical mailbox lock over cleanup; a surviving original
-        // marker, child pidfile or mailbox socket requires its original owner.
-        let _claim = claim_launch(state, owner, true)?;
+    pub fn for_lifecycle_mutation(name: &str) -> Result<Self> {
+        let reserved = Self::for_original_lifecycle(name)?;
+        // Ordinary transient names take a bounded shard lock without creating
+        // a permanent owner entry. Only an actual mailbox enrollment needs one.
+        match std::fs::symlink_metadata(&reserved.owner) {
+            Ok(_) => {
+                let original = owner_dir(&mvm_core::config::mvm_keys_dir(), name)?;
+                claim_launch(&reserved.state, &original, false)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
+        Ok(reserved)
+    }
+
+    pub fn require_name(&self, name: &str) -> Result<()> {
+        mvm_core::naming::validate_vm_name(name)?;
         ensure!(
-            mvm_runtime::vm::reconcile::reap_unowned_state_dir(state, instance)
-                .map_err(anyhow::Error::msg)?,
-            "VM runtime is still owned"
+            self.state == mvm_core::config::vm_state_dir(name),
+            "reservation is for a different machine or MVM home"
         );
-        Ok(Self { _boot: boot })
+        Ok(())
+    }
+
+    pub fn prepare_journal_runtime(&self, name: &str) -> Result<FreshState> {
+        self.require_name(name)?;
+        let home = mvm_core::config::mvm_home_strict()?;
+        let state = mvm_core::config::vm_state_dir_at(&home, name);
+        let original = owner_dir(&mvm_core::config::mvm_keys_dir(), name)?;
+        let _claim = claim_launch(&state, &original, true)?;
+        runtime_state::prepare(&home, name, || {
+            ensure!(
+                mvm_runtime::vm::reconcile::reap_unowned_state_dir(
+                    &state,
+                    &mvm_core::config::instance_dir(name)
+                )
+                .map_err(anyhow::Error::msg)?,
+                "VM runtime is still owned"
+            );
+            Ok(())
+        })
     }
 }
 
@@ -360,32 +404,59 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn paired_sdk_reap_preserves_owned_state_and_serializes_starts() {
+    fn unpaired_names_leave_only_bounded_lock_shards() {
         let root = tempfile::tempdir().unwrap();
-        let owner = root.path().join("owner");
-        let state = root.path().join("runtime");
-        let instance = root.path().join("instance");
-        std::fs::create_dir_all(&owner).unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(root.path());
+        let keys = mvm_core::config::mvm_keys_dir();
+        for i in 0..128 {
+            let name = format!("ephemeral-{i}");
+            let reservation = PairedBootReservation::for_lifecycle_mutation(&name).unwrap();
+            assert!(reservation.require_name("another-name").is_err());
+        }
+        assert!(!keys.join("mailbox-original-owners-v1").exists());
+        for shard in std::fs::read_dir(keys.join("mailbox-sdk-locks-v1")).unwrap() {
+            let path = shard.unwrap().path();
+            assert_eq!(path.extension().unwrap(), "lock");
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            assert_eq!(stem.len(), 3);
+            assert!(u16::from_str_radix(stem, 16).unwrap() < 4096);
+        }
+    }
+
+    #[test]
+    fn paired_sdk_reap_preserves_owned_state_and_serializes_starts() {
+        let root = tempfile::Builder::new()
+            .prefix("sc")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(root.path());
+        let name = "short";
+        let owner = owner_dir(&mvm_core::config::mvm_keys_dir(), name).unwrap();
+        let state = mvm_core::config::vm_state_dir(name);
+        let instance = mvm_core::config::instance_dir(name);
         std::fs::create_dir_all(&state).unwrap();
         let sample = state.join("preserved");
         std::fs::write(&sample, b"original").unwrap();
         let mut marker = OriginalMarker::claim(&owner).unwrap();
-        assert!(PairedBootReservation::acquire_at(&owner, &state, &instance).is_err());
+        assert!(PairedBootReservation::for_lifecycle_mutation(name).is_err());
         assert_eq!(std::fs::read(&sample).unwrap(), b"original");
         let mut child = std::process::Command::new("true").spawn().unwrap();
         child.wait().unwrap();
         assert!(marker.collect(&mut child).unwrap().is_some());
+        let first = PairedBootReservation::for_lifecycle_mutation(name).unwrap();
         let live = mvm_runtime::vm::instance_snapshot::try_lock_resume_in(&instance)
             .unwrap()
             .unwrap();
-        assert!(PairedBootReservation::acquire_at(&owner, &state, &instance).is_err());
+        assert!(first.prepare_journal_runtime(name).is_err());
         assert!(sample.exists());
         drop(live);
-        let first = PairedBootReservation::acquire_at(&owner, &state, &instance).unwrap();
-        assert!(!state.exists());
-        assert!(PairedBootReservation::acquire_at(&owner, &state, &instance).is_err());
+        first.prepare_journal_runtime(name).unwrap().commit();
+        assert!(!sample.exists());
+        assert!(PairedBootReservation::for_lifecycle_mutation(name).is_err());
         drop(first);
-        PairedBootReservation::acquire_at(&owner, &state, &instance).unwrap();
+        PairedBootReservation::for_lifecycle_mutation(name).unwrap();
     }
 
     #[test]
