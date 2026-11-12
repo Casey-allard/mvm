@@ -3,7 +3,9 @@ use super::*;
 use crate::mailbox_launch::object_pair::{
     InstalledObjectPair, OriginalObjectCallLease, SealedObjectTurn,
 };
+use crate::mailbox_process::original_journal::authorization::now_ms;
 use anyhow::{Context, Result, ensure};
+use mvm_core::mailbox::frame::send_local_receipted_frame;
 use mvm_core::mailbox::{
     object_pair::role::ObjectParticipantRole,
     reader_wire::{
@@ -11,6 +13,7 @@ use mvm_core::mailbox::{
     },
 };
 use std::os::unix::fs::OpenOptionsExt as _;
+use std::time::Instant;
 
 pub(super) struct ObjectIntentSlot {
     dir: PathBuf,
@@ -57,10 +60,19 @@ impl ObjectIntentSlot {
                 let ordinal = u64::from_be_bytes(bytes[..8].try_into()?);
                 (SequenceNumber::new(ordinal)?, Some(bytes.split_off(40)))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
-                SequenceNumber::new(reserved_intents(dir)? as u64 + 1)?,
-                None,
-            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A durable attempt means this ID already had a published seal.
+                // A missing original must never mint a second ciphertext for it.
+                match std::fs::symlink_metadata(dir.join(format!("{name}.attempts"))) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Ok(_) => anyhow::bail!("attempted object has lost its original seal"),
+                    Err(e) => return Err(e.into()),
+                }
+                (
+                    SequenceNumber::new(reserved_intents(dir)? as u64 + 1)?,
+                    None,
+                )
+            }
             Err(e) => return Err(e.into()),
         };
         Ok(Self {
@@ -91,23 +103,15 @@ impl ObjectIntentSlot {
 }
 
 /// Only built after the original source record and its attempt counter are durable.
-pub struct RetainedObjectSubmission {
+struct RetainedObjectSubmission {
     turn: SealedObjectTurn,
-    role: ObjectParticipantRole,
     original: OriginalObjectSealV1,
-}
-
-impl RetainedObjectSubmission {
-    /// Send these exact bytes under the original owner's admitted carrier.
-    pub fn turn(&self) -> &SealedObjectTurn {
-        &self.turn
-    }
 }
 
 impl InstalledObjectPair<'_> {
     /// Return only the originally persisted seal. Revalidate live authority
     /// and authenticate retained bytes even when staging an identical retry.
-    pub fn retain_submission(
+    fn retain_submission(
         &self,
         role: ObjectParticipantRole,
         pair: [u8; 32],
@@ -170,24 +174,69 @@ impl InstalledObjectPair<'_> {
         charge_source_attempt(&dir, &name)?;
         let original =
             OriginalObjectSealV1::from_original(pair, boot, submission, turn.envelope())?;
-        Ok(RetainedObjectSubmission {
-            turn,
-            role,
-            original,
-        })
+        Ok(RetainedObjectSubmission { turn, original })
     }
 
-    /// Bind B's independent receipt to the source owner's retained ciphertext
-    /// before the guest agent can retire an intent or acknowledge its Call lease.
-    pub fn confirm_submission(
+    /// Dispatch one canonical frame on the local peer socket selected by the
+    /// original owner. The guest cannot supply a socket or a destination key.
+    /// A retry enters this method again and charges a new durable attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_submission(
         &self,
-        held: &RetainedObjectSubmission,
-        receipt: mvm_contract::protocol::mailbox::SignedDestinationReceipt,
+        role: ObjectParticipantRole,
+        pair: [u8; 32],
+        boot: BootId,
+        submission: &ObjectSubmissionV1,
+        original: Option<OriginalObjectCallLease<'_>>,
+        destination: &mut crate::mailbox_process::original_journal::OriginalJournalDestination,
+        deadline: Instant,
     ) -> Result<ReaderResponse> {
-        self.workload_role(held.role, held.original.pair, held.original.sender_boot)?;
-        self.verify_accepted(held.role, &held.turn, &receipt)?;
+        ensure!(
+            Instant::now() < deadline,
+            "original peer exchange deadline passed"
+        );
+        let lease_end = original
+            .as_ref()
+            .map(|row| row.lease().lease.expires_at_unix_ms);
+        let held = self.retain_submission(role, pair, boot, submission, original)?;
+        let endpoint = self.workload_role(role, pair, boot)?;
+        let verifier = VerifyingKey::from_bytes(&endpoint.role.peer().authority_key)?;
+        let header = held.turn.header();
+        let expires = lease_end.map_or(header.expires_at_unix_ms, |end| {
+            end.min(header.expires_at_unix_ms)
+        });
+        let now = now_ms()?;
+        ensure!(
+            (header.issued_at_unix_ms..expires).contains(&now),
+            "original source seal expired"
+        );
+        let window = Duration::from_millis(expires.abs_diff(now));
+        let start = Instant::now();
+        let until = deadline
+            .min(start + durable::GUEST_EXCHANGE_TIMEOUT)
+            .min(start.checked_add(window).unwrap_or(deadline));
+        let peer = destination.connect_object_recipient(&endpoint.role, until)?;
+        self.workload_role(role, pair, boot)?;
+        ensure!(
+            (header.issued_at_unix_ms..expires).contains(&now_ms()?),
+            "original lease expired before send"
+        );
+        let mut peer = durable::GuestDeadline::new(peer, until)?;
+        let receipt = send_local_receipted_frame(
+            &mut peer,
+            held.turn.capability(),
+            held.turn.envelope(),
+            header,
+            &verifier,
+        )?;
+        self.workload_role(role, pair, boot)?;
+        self.verify_accepted(role, &held.turn, &receipt)?;
+        ensure!(
+            Instant::now() < until && (header.issued_at_unix_ms..expires).contains(&now_ms()?),
+            "original peer verdict expired"
+        );
         Ok(ReaderResponse::ObjectSealAcceptedV1 {
-            original: held.original.clone(),
+            original: held.original,
             receipt: Box::new(receipt),
         })
     }
