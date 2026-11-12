@@ -401,6 +401,7 @@ fn lease_and_ack_signatures_bind_committed_ciphertext_and_consumer() {
     .unwrap();
     let lease = sign_delivery_lease(
         MailboxDeliveryLease {
+            object_projection_v1: None,
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
             address: receive.address,

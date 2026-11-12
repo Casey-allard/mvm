@@ -449,7 +449,14 @@ fn serve_reader(
     let result = decode_request_body(body).and_then(|request| {
         let reader = shared.reader.get().ok_or(Refusal::NotAuthorized)?;
         match request {
-            ReaderRequest::Receive => {
+            ReaderRequest::Receive | ReaderRequest::ReceiveObjectPairV1 { .. } => {
+                let pair = match request {
+                    ReaderRequest::ReceiveObjectPairV1 { pair } => Some(pair),
+                    _ => None,
+                };
+                if pair != reader.grant.durable_object_pair_sha256_v1 || pair != reader.boot.durable_object_pair_sha256_v1 {
+                    return Err(Refusal::NotAuthorized);
+                }
                 {
                     let mut state = shared.state.lock().expect("mailbox journal lock poisoned");
                     let context = guest_context(&state.policy, reader)?;
@@ -506,11 +513,7 @@ fn serve_reader(
                     )
                     .map_err(reader_refusal)?;
                 Ok(match leased {
-                    Some(message) => ReaderResponse::Delivery {
-                        lease: Box::new(message.lease().clone()),
-                        content_type: message.content_type().clone(),
-                        payload: message.payload().to_vec(),
-                    },
+                    Some(message) => message.into_reader_response(pair).map_err(reader_refusal)?,
                     None => ReaderResponse::Empty,
                 })
             }
@@ -543,7 +546,7 @@ fn serve_reader(
     });
     let response = result.unwrap_or_else(|reason| ReaderResponse::Refused { reason });
     match &response {
-        ReaderResponse::Delivery { .. } => mark("lease_created"),
+        ReaderResponse::Delivery { .. } | ReaderResponse::ObjectDeliveryV1 { .. } => mark("lease_created"),
         ReaderResponse::Acknowledged { .. } => mark("ack_committed"),
         ReaderResponse::Refused { .. } => mark("reader_refused"),
         ReaderResponse::Empty => mark("reader_empty"),

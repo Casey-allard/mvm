@@ -31,6 +31,7 @@ pub const GUEST_READER_SOCKET_PATH: &str = "/run/mvm/mailbox/receive.sock";
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderRequest {
     Receive,
+    ReceiveObjectPairV1 { pair: [u8; 32] },
     Possession {
         signature: Vec<u8>,
     },
@@ -44,6 +45,7 @@ pub enum ReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApplicationReaderRequest {
+    ReceiveObjectPairV1 { pair: [u8; 32] },
     /// Feature availability only. The guest verifies the same boot again on dispatch.
     CheckOutboundJournalV1 {
         commitment: [u8; 32],
@@ -72,6 +74,12 @@ pub enum ReaderResponse {
     Delivery {
         lease: Box<SignedMailboxDeliveryLease>,
         content_type: ContentType,
+        #[serde(with = "payload_base64")]
+        payload: Vec<u8>,
+    },
+    ObjectDeliveryV1 {
+        lease: Box<SignedMailboxDeliveryLease>,
+        header: Box<mvm_contract::protocol::mailbox::MailboxEnvelopeHeader>,
         #[serde(with = "payload_base64")]
         payload: Vec<u8>,
     },

@@ -20,6 +20,53 @@ use sha2::{Digest as _, Sha256};
 
 use super::{MailboxError, canonical_bytes, sign_capability, verify_capability_signature};
 
+/// Digest committed by the original destination lease after canonical opening.
+pub fn object_delivery_commitment(
+    pair: &[u8; 32],
+    header: &MailboxEnvelopeHeader,
+    payload: &[u8],
+) -> Result<[u8; 32], MailboxError> {
+    use mvm_contract::protocol::mailbox::MailboxMessageKind;
+    if header.content_type.name() != "application/spiralcore-object" || header.content_type.version() != 1
+        || !matches!((header.kind, header.reply_to.is_some()),
+            (MailboxMessageKind::Call, true) | (MailboxMessageKind::Reply, false)) {
+        return Err(MailboxError::UnsupportedContentType);
+    }
+    if payload.len() != header.plaintext_len as usize {
+        return Err(MailboxError::PlaintextLengthMismatch);
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"mvm.mailbox.object-reader-lease.v1\0");
+    digest.update(pair);
+    let data = canonical_bytes(b"mvm.mailbox.object-reader-header.v1\0", header)?;
+    digest.update((data.len() as u64).to_be_bytes());
+    digest.update(data);
+    digest.update(header.plaintext_len.to_be_bytes());
+    digest.update(payload);
+    Ok(digest.finalize().into())
+}
+
+/// Check the returned application metadata against this authenticated destination narrowing.
+/// The caller separately verifies the current Receive grant, guest boot and consumer session.
+pub fn verify_object_delivery_projection(
+    pair: &[u8; 32],
+    header: &MailboxEnvelopeHeader,
+    payload: &[u8],
+    signed: &SignedMailboxDeliveryLease,
+    authority: &VerifyingKey,
+) -> Result<(), MailboxError> {
+    verify_delivery_lease_signature(signed, authority)?;
+    let lease = &signed.lease;
+    if lease.object_projection_v1 != Some(object_delivery_commitment(pair, header, payload)?)
+        || lease.address != (MailboxAddress { tenant: header.tenant, authorization_domain: header.authorization_domain,
+            mailbox: header.mailbox, recipient: header.recipient })
+        || lease.message_id != header.message_id || lease.sender != header.sender
+        || lease.sender_boot != header.sender_boot || lease.execution_epoch != header.execution_epoch {
+        return Err(MailboxError::DeliveryLeaseMismatch);
+    }
+    Ok(())
+}
+
 /// Name shared by the host writer and guest reader of one public boot binding.
 pub const MAILBOX_READER_BOOT_FILE: &str = "mailbox-reader-boot.json";
 /// Maximum encoded size before parsing a guest-visible boot binding.

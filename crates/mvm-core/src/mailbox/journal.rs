@@ -416,6 +416,23 @@ impl LeasedMailboxMessage {
         &self.lease
     }
 
+    /// The header and bytes come from the same reopened, canonically verified journal entry.
+    pub fn into_reader_response(self, pair: Option<[u8; 32]>) -> Result<super::reader_wire::ReaderResponse, JournalError> {
+        use super::reader_wire::ReaderResponse;
+        let header = self.message.opened.header();
+        let payload = self.message.payload();
+        match pair {
+            Some(pair) if self.lease.lease.object_projection_v1 ==
+                Some(super::reader::object_delivery_commitment(&pair, header, payload)?) =>
+                Ok(ReaderResponse::ObjectDeliveryV1 { header: Box::new(header.clone()),
+                    payload: payload.to_vec(), lease: Box::new(self.lease) }),
+            None if self.lease.lease.object_projection_v1.is_none() =>
+                Ok(ReaderResponse::Delivery { content_type: header.content_type.clone(),
+                    payload: payload.to_vec(), lease: Box::new(self.lease) }),
+            _ => Err(JournalError::Mailbox(super::MailboxError::DeliveryLeaseMismatch)),
+        }
+    }
+
     #[must_use]
     pub fn content_type(&self) -> &ContentType {
         &self.message.opened.header().content_type
@@ -1182,6 +1199,9 @@ impl MailboxJournal {
         }
         let signed = sign_delivery_lease(
             MailboxDeliveryLease {
+                object_projection_v1: request.plan.durable_object_pair_sha256_v1
+                    .map(|pair| super::reader::object_delivery_commitment(&pair, header, message.payload()))
+                    .transpose()?,
                 protocol_version: ProtocolVersion::V1,
                 signature_algorithm: SignatureAlgorithm::ED25519,
                 address: self.address,

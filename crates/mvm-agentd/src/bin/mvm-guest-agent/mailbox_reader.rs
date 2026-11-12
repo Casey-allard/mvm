@@ -124,7 +124,10 @@ fn application_request(
             )?;
             return Ok(ReaderResponse::OutboundJournalAvailableV1 { commitment });
         }
-        ApplicationReaderRequest::Receive => ReaderRequest::Receive,
+        ApplicationReaderRequest::Receive if reader.boot.durable_object_pair_sha256_v1.is_none() => ReaderRequest::Receive,
+        ApplicationReaderRequest::ReceiveObjectPairV1 { pair } if reader.boot.durable_object_pair_sha256_v1 == Some(pair) =>
+            ReaderRequest::ReceiveObjectPairV1 { pair },
+        ApplicationReaderRequest::Receive | ApplicationReaderRequest::ReceiveObjectPairV1 { .. } => return Err(Refusal::NotAuthorized),
         ApplicationReaderRequest::Ack { lease } => {
             let mut active = reader.active.lock().expect("mailbox reader lock poisoned");
             let active = active.as_mut().ok_or(Refusal::NotAuthorized)?;
@@ -192,7 +195,12 @@ fn perform_exchange(
 ) -> Result<ReaderResponse, Refusal> {
     write_request(stream, &pending.request)?;
     match &pending.request {
-        ReaderRequest::Receive => {
+        ReaderRequest::Receive | ReaderRequest::ReceiveObjectPairV1 { .. } => {
+            let pair = match pending.request {
+                ReaderRequest::ReceiveObjectPairV1 { pair } => Some(pair),
+                _ => None,
+            };
+            if pair != pending.reader.boot.durable_object_pair_sha256_v1 { return Err(Refusal::NotAuthorized); }
             let ReaderResponse::Challenge {
                 enrollment,
                 capability,
@@ -252,34 +260,28 @@ fn perform_exchange(
                 },
             )?;
             let response = read_response(stream)?;
-            if let ReaderResponse::Delivery {
-                lease,
-                content_type,
-                payload,
-            } = &response
-            {
-                verify_delivery_lease_signature(lease, &authority)
-                    .map_err(|_| Refusal::NotAuthorized)?;
-                validity::verify(lease.lease.issued_at_unix_ms, pending.wait_until, |now| {
-                    lease
-                        .check_scope(&grant, &capability.grant, current_session, now)
-                        .map_err(Into::into)
-                })?;
-                if payload.len() > capability.grant.max_payload_bytes as usize {
-                    return Err(Refusal::NotAuthorized);
+            let (lease, content_type, payload) = match (&response, pair) {
+                (ReaderResponse::Delivery { lease, content_type, payload }, None)
+                    if lease.lease.object_projection_v1.is_none() => {
+                    verify_delivery_lease_signature(lease, &authority).map_err(|_| Refusal::NotAuthorized)?;
+                    (lease, content_type, payload)
                 }
-                if !capability.grant.content_types.contains(content_type) {
-                    return Err(Refusal::NotAuthorized);
+                (ReaderResponse::ObjectDeliveryV1 {lease, header, payload}, Some(pair)) => {
+                    mvm_core::mailbox::reader::verify_object_delivery_projection(&pair, header, payload, lease, &authority)
+                        .map_err(|_| Refusal::NotAuthorized)?;
+                    (lease, &header.content_type, payload)
                 }
-                *pending
-                    .reader
-                    .active
-                    .lock()
-                    .expect("mailbox reader lock poisoned") = Some(ActiveLease {
-                    lease: (**lease).clone(),
-                    ack: None,
-                });
-            }
+                (ReaderResponse::Empty | ReaderResponse::Refused {..}, _) => return Ok(response),
+                _ => return Err(Refusal::NotAuthorized),
+            };
+            validity::verify(lease.lease.issued_at_unix_ms, pending.wait_until, |now| {
+                lease.check_scope(&grant, &capability.grant, current_session, now).map_err(Into::into)
+            })?;
+            if payload.len() > capability.grant.max_payload_bytes as usize ||
+                !capability.grant.content_types.contains(content_type) {return Err(Refusal::NotAuthorized);}
+            *pending.reader.active.lock().expect("mailbox reader lock poisoned") = Some(ActiveLease {
+                lease: (**lease).clone(), ack: None,
+            });
             Ok(response)
         }
         ReaderRequest::Ack { signed } => correlate_ack(read_response(stream)?, signed),
@@ -351,6 +353,7 @@ mod tests {
         let guest = SigningKey::from_bytes(&[10; 32]);
         let lease = sign_delivery_lease(
             MailboxDeliveryLease {
+                object_projection_v1: None,
                 protocol_version: ProtocolVersion::V1,
                 signature_algorithm: SignatureAlgorithm::ED25519,
                 address: MailboxAddress {
