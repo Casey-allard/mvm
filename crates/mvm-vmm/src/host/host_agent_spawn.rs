@@ -171,8 +171,10 @@ pub fn ensure_host_agent_daemon(tenant: &str) -> Result<PathBuf> {
     }
 
     let registration_journal_path = registration_journal_for_spawn(&dir, &control_socket)?;
-    // Stale socket from a dead daemon would block the rebind.
-    let _ = std::fs::remove_file(&control_socket);
+    // A directly provisioned worker can own this socket without a supervisor
+    // pid file. Do not adopt its connection or unlink its published address.
+    // The daemon handles a stale socket after it obtains installation ownership.
+    check_unsupervised_control_socket(&control_socket)?;
     warm_claim_debug("resolve_daemon_binary");
     // The daemon starts its key-holding signer from beside its own
     // executable, so the two are built together.
@@ -197,6 +199,37 @@ pub fn ensure_host_agent_daemon(tenant: &str) -> Result<PathBuf> {
     warm_claim_debug("daemon_pid_written");
     Ok(control_socket)
     // lock_file drops here → flock released.
+}
+
+fn check_unsupervised_control_socket(path: &Path) -> Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("inspect host-agent control socket"),
+        Ok(meta) if !meta.file_type().is_socket() => {
+            bail!(
+                "unexpected entry at host-agent control socket {}",
+                path.display()
+            );
+        }
+        Ok(_) => {}
+    }
+    let deadline = std::time::Instant::now() + CONTROL_IO_TIMEOUT;
+    match mvm_agentd::vsock::connect_unix_before(path, deadline) {
+        Ok(_) => bail!(
+            "live control socket has no matching supervisor pid: {}",
+            path.display()
+        ),
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound)
+            }) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).context("cannot determine host-agent control socket ownership"),
+    }
 }
 
 fn registration_journal_for_spawn(state_dir: &Path, control_socket: &Path) -> Result<PathBuf> {
@@ -819,6 +852,43 @@ mod tests {
 
     fn key() -> [u8; 32] {
         [11u8; 32]
+    }
+
+    #[test]
+    fn ensure_preserves_live_control_without_a_supervisor_pid() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+        const CHILD: &str = "MVM_TEST_STANDALONE_CONTROL_PRESERVATION";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir_in("/tmp").unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::host_agent_spawn::tests::ensure_preserves_live_control_without_a_supervisor_pid", "--nocapture"])
+                .env(CHILD, "1")
+                .env("MVM_HOME", home.path())
+                .env("MVM_HOST_AGENT_PATH", home.path().join("absent-host-agent"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let tenant = "original";
+        let dir = mvm_core::config::host_agent_dir(tenant);
+        std::fs::create_dir_all(&dir).unwrap();
+        mvm_core::config::secure_host_agent_socket_dir(tenant).unwrap();
+        let socket = mvm_core::config::host_agent_control_socket(tenant);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let inode = std::fs::symlink_metadata(&socket).unwrap().ino();
+        let result = ensure_host_agent_daemon(tenant);
+        assert_eq!(std::fs::symlink_metadata(&socket).unwrap().ino(), inode);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("live control socket")
+        );
+        assert!(!dir.join(DAEMON_PID_FILE).exists());
+        let _client = UnixStream::connect(&socket).unwrap();
+        listener.accept().unwrap();
     }
 
     #[test]
