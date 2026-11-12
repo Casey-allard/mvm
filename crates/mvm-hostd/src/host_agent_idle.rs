@@ -769,6 +769,58 @@ async fn health_watcher_passes(
 mod tests {
     use super::*;
 
+    #[test]
+    fn original_watcher_waits_for_transient_daemon_contention_before_admitting()
+    -> anyhow::Result<()> {
+        use mvm_core::tenant_lifecycle::{LifecycleCoordinator, LifecycleGeneration};
+        use mvm_vmm::host::installed_owner::{InstallationKey, InstallationOwner};
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+        let key = InstallationKey {
+            installation: [1; 32],
+            profile: [2; 32],
+        };
+        let mut owner = InstallationOwner::initialize(&home.join("resources"), key)?;
+        let epoch = owner.begin()?;
+        let binding = owner.active_binding(epoch)?;
+        let generation = LifecycleGeneration::new([3; 32], epoch.generation())?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let lifecycle = LifecycleCoordinator::prepare_after_exclusion(
+            home,
+            "local",
+            generation.clone(),
+            1,
+            deadline,
+        )?;
+        lifecycle.activate_after_reconciliation(&generation, deadline)?;
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        let mut original = HostAgentDaemon::new("local", signer.verifying_key(), 65_536)
+            .with_lifecycle_coordination(home, generation.clone())?;
+        original.open_local_admission(&generation)?;
+        let daemon = Arc::new(Mutex::new(original));
+        let held = daemon.try_lock().unwrap();
+        let (entered, ready) = std::sync::mpsc::sync_channel(0);
+        let probe = daemon.clone();
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let observer = scope.spawn(move || {
+                entered.send(()).unwrap();
+                admit_watcher_turn(&probe, &binding)
+            });
+            ready.recv()?;
+            std::thread::sleep(Duration::from_millis(40));
+            drop(held);
+            let mut turn = observer.join().unwrap()?;
+            assert!(daemon.try_lock().unwrap().has_accepted_work()?);
+            turn.settle()?;
+            assert!(!daemon.try_lock().unwrap().has_accepted_work()?);
+            Ok(())
+        })?;
+        owner.finish(epoch)?;
+        Ok(())
+    }
+
     // --- parse_idle_timeout ---
 
     #[test]
