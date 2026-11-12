@@ -84,14 +84,14 @@ fn worker_holds_computed_reply_across_indeterminate_submission() {
                 timeout_secs: 4,
                 env: vec![],
             };
-            for attempt in 0..2 {
+            for attempt in 0..3 {
                 write_pipe_frame(worker.stdin.as_mut().unwrap(), &input).unwrap();
                 let r: WorkerCallResponse =
                     read_pipe_frame(worker.stdout.as_mut().unwrap()).unwrap();
                 assert_ne!(r.outcome, WorkerOutcome::Exit { code: 0 });
                 let public = String::from_utf8(r.stderr).unwrap();
                 assert!(public.contains("worker_cumulative"));
-                if attempt == 1 {
+                if attempt == 2 {
                     assert!(public.contains("original Reply was refused"));
                     assert!(public.contains("\"this_invocation\":[0,0,0,0,0,0]"));
                 }
@@ -100,7 +100,7 @@ fn worker_holds_computed_reply_across_indeterminate_submission() {
             worker.stdin.take();
             assert!(worker.wait().unwrap().success());
         });
-        while submissions < 2 {
+        while submissions < 3 {
             let request = pending.recv_timeout(Duration::from_secs(5)).unwrap();
             let (mut host, mut guest) = UnixStream::pair().unwrap();
             let actor = scope.spawn(move || exchange(&mut guest, request).unwrap());
@@ -185,7 +185,11 @@ fn worker_holds_computed_reply_across_indeterminate_submission() {
                     }
                     // No destination journal was started in this fixture.
                     ReaderResponse::Refused {
-                        reason: Refusal::NotAuthorized,
+                        reason: if submissions == 2 {
+                            Refusal::Unavailable
+                        } else {
+                            Refusal::NotAuthorized
+                        },
                     }
                 }
                 _ => panic!("unexpected guest request or premature ACK"),
