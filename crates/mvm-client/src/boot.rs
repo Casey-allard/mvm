@@ -169,10 +169,9 @@ impl StartedVm {
         &self.backend
     }
 
-    /// Pair a backend with a VM it has already started. Crate-private: outside
-    /// tests the only way to hold one is to have gone through
-    /// [`start_prepared`].
-    #[cfg(any(test, target_os = "linux"))]
+    /// Retain an already started VM after canonical backend activation.
+    /// The persistent object path keeps the native launch owner separately.
+    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
     pub(crate) fn from_started(backend: mvm_runtime::backend::AnyBackend, vm_id: VmId) -> Self {
         Self { backend, vm_id }
     }
