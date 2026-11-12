@@ -309,6 +309,38 @@ mod tests {
     use super::*;
     use std::process::Command;
     #[test]
+    fn observed_helper_exit_keeps_the_original_claim_while_its_vm_lives() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut marker = OriginalMarker::claim(directory.path()).unwrap();
+        let mut vm = Command::new("sleep").arg("15").spawn().unwrap();
+        let pid = EndpointPid::of_child(vm.id());
+        let original = StopCustody {
+            state: File::open(directory.path()).unwrap(),
+            split_socket: None,
+            kind: BackendKind::Firecracker,
+            vmm: Some((pid, ProcessExitObserver::arm(pid.pid).unwrap())),
+            sdk_abort_confirmed: false,
+            vm_stopped: false,
+            kernel_exit_observed: false,
+            assisted: false,
+            sdk_cleanup: None,
+        };
+        let mut helper = Command::new("true").spawn().unwrap();
+        helper.wait().unwrap();
+        assert!(
+            original
+                .observe_helper(&mut marker, &mut helper)
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert!(marker.path.exists());
+        assert!(vm.try_wait().unwrap().is_none());
+        vm.kill().unwrap();
+        vm.wait().unwrap();
+    }
+
+    #[test]
     fn replaced_socket_directory_cannot_be_cleaned_as_the_original() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("socket");
