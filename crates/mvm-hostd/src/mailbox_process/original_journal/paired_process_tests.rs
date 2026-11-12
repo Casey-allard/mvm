@@ -27,6 +27,7 @@ fn original_plan(
     ExecutionPlan,
     MailboxReaderBootBinding,
     MailboxLaunchPosture,
+    SigningKey,
 )> {
     let mut plan = PlanFixture::new().build();
     plan.image.name = name.into();
