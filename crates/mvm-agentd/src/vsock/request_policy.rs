@@ -756,6 +756,7 @@ mod tests {
             }],
             extensions: Vec::new(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             verb_grant_envelope: None,
         });
         assert_eq!(req.verb(), Verb::ActivateEnvironment);

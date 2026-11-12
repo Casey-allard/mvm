@@ -133,7 +133,7 @@ impl DeliverEnrollmentV1 {
         boot_grant
             .verify(anchor, original_session, original_nonce, now)
             .map_err(|_| deny())?;
-        if boot_grant.cast_delivery_v1 != Some(self.commitment()?)
+        if boot_grant.cast_submit_v1.is_some() || boot_grant.cast_delivery_v1 != Some(self.commitment()?)
             || original_session != self.workload
             || self.mount_commitment != mounted_context
             || self.verity_root != mounted_verity

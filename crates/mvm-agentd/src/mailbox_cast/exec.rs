@@ -102,7 +102,7 @@ pub fn configure_oci(
 
 /// Application API. The number only locates a descriptor: the original kernel
 /// peer and the private launcher's first bounded datagram supply its context.
-pub fn original_workload_reader() -> io::Result<CastWorkloadReader> {
+pub(crate) fn original_socket() -> io::Result<UnixDatagram> {
     let raw: RawFd = std::env::var(SELECTOR)
         .ok()
         .and_then(|x| x.parse().ok())
@@ -116,6 +116,11 @@ pub fn original_workload_reader() -> io::Result<CastWorkloadReader> {
     }
     let socket = UnixDatagram::from(fd);
     socket.set_read_timeout(Some(crate::mailbox_outbox::MAILBOX_IO_TIMEOUT))?;
+    Ok(socket)
+}
+
+pub fn original_workload_reader() -> io::Result<CastWorkloadReader> {
+    let socket = original_socket()?;
     let mut packet = [0; BOOTSTRAP_MAX + 1];
     let n = socket.recv(&mut packet)?;
     if n > BOOTSTRAP_MAX {

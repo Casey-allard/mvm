@@ -28,8 +28,13 @@ use crate::telemetry::cmdline_asserts;
 use crate::transport::{accept_vsock, bind_vsock_listener, unix_transport_selected};
 
 #[cfg(target_os = "linux")]
+pub(crate) enum OriginalEndpoint {
+    Deliver(mvm_agentd::mailbox_cast::GuestCastEndpoint),
+    Submit(mvm_agentd::mailbox_cast::submit::GuestSubmitEndpoint),
+}
+#[cfg(target_os = "linux")]
 struct OriginalDelivery {
-    endpoint: std::sync::Mutex<Option<mvm_agentd::mailbox_cast::GuestCastEndpoint>>,
+    endpoint: std::sync::Mutex<Option<OriginalEndpoint>>,
     descriptor: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
 }
 #[cfg(target_os = "linux")]
@@ -41,21 +46,23 @@ static ORIGINAL: std::sync::OnceLock<OriginalDelivery> = std::sync::OnceLock::ne
 pub(crate) fn prepare_delivery(
     env: &mvm_agentd::vsock::ActivateEnvironment,
     boot: &crate::state::AgentBootState,
-) -> anyhow::Result<
-    Option<(
-        mvm_agentd::mailbox_cast::GuestCastEndpoint,
-        std::os::fd::OwnedFd,
-    )>,
-> {
+) -> anyhow::Result<Option<(OriginalEndpoint, std::os::fd::OwnedFd)>> {
     use anyhow::{Context, ensure};
     let (denied, held) = boot.grant_state();
-    let Some(enrollment) = env.cast_delivery_v1.as_ref() else {
+    let delivery = env.cast_delivery_v1.as_ref();
+    let submit = env.cast_submit_v1.as_ref();
+    ensure!(
+        !(delivery.is_some() && submit.is_some()),
+        "exactly one original guest mailbox role required"
+    );
+    if delivery.is_none() && submit.is_none() {
         ensure!(
-            held.as_ref().is_none_or(|g| g.cast_delivery_v1.is_none()),
-            "missing committed Deliver enrollment"
+            held.as_ref()
+                .is_none_or(|g| g.cast_delivery_v1.is_none() && g.cast_submit_v1.is_none()),
+            "missing committed mailbox role"
         );
         return Ok(None);
-    };
+    }
     ensure!(!denied, "boot grant authority denied");
     ensure!(
         crate::init::is_pid1()
@@ -69,7 +76,7 @@ pub(crate) fn prepare_delivery(
         selected == MailboxGuestService::ReliableV1,
         "missing signed reliable service selection"
     );
-    selected.require_implemented()?;
+    // Only the signed, original role checked below can activate this subset.
     let held = held.context("missing original boot grant")?;
     let anchor = boot
         .host_signer_key()
@@ -93,29 +100,42 @@ pub(crate) fn prepare_delivery(
             Ok::<_, anyhow::Error>(bytes)
         })
         .transpose()?;
-    let channel = enrollment.open_original(
+    let mount = env.cast_mount_commitment()?;
+    let now = chrono::Utc::now();
+    if let Some(e) = submit {
+        let original = e.open_original(
+            &held,
+            &anchor,
+            &held.session_id,
+            &held.plan_nonce,
+            root,
+            mount,
+            now,
+        )?;
+        let (endpoint, fd) =
+            mvm_agentd::mailbox_cast::submit::GuestSubmitEndpoint::prepare_original_worker(
+                original,
+            )?;
+        return Ok(Some((OriginalEndpoint::Submit(endpoint), fd)));
+    }
+    let e = delivery.context("missing original Deliver role")?;
+    let channel = e.open_original(
         &held,
         &anchor,
         &held.session_id,
         &held.plan_nonce,
         root,
-        env.cast_mount_commitment()?,
-        chrono::Utc::now(),
+        mount,
+        now,
     )?;
-    Ok(Some(
-        mvm_agentd::mailbox_cast::GuestCastEndpoint::prepare_original_worker(
-            channel,
-            enrollment.limits(),
-        )?,
-    ))
+    let (endpoint, fd) =
+        mvm_agentd::mailbox_cast::GuestCastEndpoint::prepare_original_worker(channel, e.limits())?;
+    Ok(Some((OriginalEndpoint::Deliver(endpoint), fd)))
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn install_delivery(
-    pair: Option<(
-        mvm_agentd::mailbox_cast::GuestCastEndpoint,
-        std::os::fd::OwnedFd,
-    )>,
+    pair: Option<(OriginalEndpoint, std::os::fd::OwnedFd)>,
 ) -> anyhow::Result<()> {
     if let Some((endpoint, fd)) = pair {
         use mvm_agentd::runtime_config::ConcurrencyConfig;
@@ -181,6 +201,17 @@ pub(crate) fn retire_for_restore() -> bool {
 pub(crate) fn init_mailbox() {
     let selected = std::fs::read_to_string("/proc/cmdline").and_then(|cmdline| {
         let service = parse_mailbox_service_cmdline(&cmdline).map_err(std::io::Error::other)?;
+        #[cfg(target_os = "linux")]
+        if service == MailboxGuestService::ReliableV1 {
+            let live = ORIGINAL
+                .get()
+                .and_then(|o| o.endpoint.lock().ok())
+                .is_some_and(|slot| slot.is_some());
+            if !live {
+                return Err(std::io::Error::other("no verified original mailbox role"));
+            }
+            return Ok(service);
+        }
         service
             .require_implemented()
             .map_err(std::io::Error::other)?;
@@ -207,7 +238,9 @@ pub(crate) fn init_mailbox() {
                         return;
                     };
                     while !SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
-                        if let Some(fd) = accept_vsock(listener.as_raw_fd(), "mailbox Deliver") {
+                        if let Some(fd) =
+                            accept_vsock(listener.as_raw_fd(), "original mailbox role")
+                        {
                             let original_fd = unsafe { OwnedFd::from_raw_fd(fd) };
                             let Ok(mut guard) = original.endpoint.lock() else {
                                 return;
@@ -215,8 +248,15 @@ pub(crate) fn init_mailbox() {
                             let Some(endpoint) = guard.as_mut() else {
                                 return;
                             };
-                            let _ = endpoint.receive_on_host_port(original_fd);
-                            let _ = endpoint.offer_to_workload();
+                            match endpoint {
+                                OriginalEndpoint::Deliver(endpoint) => {
+                                    let _ = endpoint.receive_on_host_port(original_fd);
+                                    let _ = endpoint.offer_to_workload();
+                                }
+                                OriginalEndpoint::Submit(endpoint) => {
+                                    let _ = endpoint.forward_on_host_port(original_fd);
+                                }
+                            }
                         }
                     }
                 }

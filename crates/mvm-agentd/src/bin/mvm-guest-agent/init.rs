@@ -135,7 +135,7 @@ pub(crate) fn apply_activation(
 ) -> Result<(), guest_mount::MountError> {
     admit_workload_seccomp()?;
     if !is_pid1() {
-        if env.cast_delivery_v1.is_some() {
+        if env.cast_delivery_v1.is_some() || env.cast_submit_v1.is_some() {
             return Err(guest_mount::MountError::InvalidConfig(
                 "original Cast requires PID 1".into(),
             ));

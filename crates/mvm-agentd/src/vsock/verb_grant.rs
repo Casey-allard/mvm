@@ -535,6 +535,7 @@ mod tests {
             drive: Some(drive_grant()),
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: Vec::new(),
         }
     }
@@ -688,6 +689,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         // listed => allowed
@@ -721,6 +723,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         let request = GuestRequest::RunEntrypoint {
@@ -759,6 +762,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         assert!(enforce_verb_grant(&GuestRequest::Ping, Some(&grant)).is_none());
@@ -784,6 +788,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         let requests = [
@@ -967,6 +972,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         good.sig = {
@@ -1055,6 +1061,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         grant.sig = {
@@ -1071,6 +1078,7 @@ mod tests {
             pubkey_hex: pubkey_hex.clone(),
             plan_nonce_hex: nonce.as_hex().to_string(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant,
@@ -1116,6 +1124,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         grant.sig = {
@@ -1132,6 +1141,7 @@ mod tests {
             pubkey_hex: attacker_pubkey_hex,
             plan_nonce_hex: nonce.as_hex().to_string(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant,
@@ -1711,6 +1721,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         grant.sig = signer.sign(&grant.signing_bytes()).to_bytes().to_vec();
@@ -1724,6 +1735,7 @@ mod tests {
             pubkey_hex,
             plan_nonce_hex: nonce.as_hex().to_string(),
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             predecessor_session_id: None,
             predecessor_plan_nonce_hex: None,
             grant,

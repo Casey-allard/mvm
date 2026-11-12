@@ -56,6 +56,8 @@ pub struct VerbGrant {
     /// The fixed-size digest keeps it within the boot command line budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_delivery_v1: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_submit_v1: Option<[u8; 32]>,
     /// Raw Ed25519 signature bytes (64) over signing_bytes(), serialized as
     /// base64. A `Vec<u8>` would otherwise render as a JSON array of 64 decimal
     /// numbers — roughly 230 characters against base64's 88 — and this grant
@@ -115,6 +117,8 @@ struct VerbGrantSigned<'a> {
     application_terminal: Option<&'a crate::grants::ApplicationTerminalBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cast_delivery_v1: Option<&'a [u8; 32]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cast_submit_v1: Option<&'a [u8; 32]>,
 }
 
 impl VerbGrant {
@@ -127,6 +131,7 @@ impl VerbGrant {
             drive: self.drive.as_ref(),
             application_terminal: self.application_terminal.as_ref(),
             cast_delivery_v1: self.cast_delivery_v1.as_ref(),
+            cast_submit_v1: self.cast_submit_v1.as_ref(),
         };
         serde_json::to_vec(&body).expect("VerbGrantSigned serializes")
     }
@@ -192,6 +197,7 @@ mod tests {
             drive: None,
             application_terminal: None,
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             sig: vec![],
         };
         g.sig = k.sign(&g.signing_bytes()).to_bytes().to_vec();

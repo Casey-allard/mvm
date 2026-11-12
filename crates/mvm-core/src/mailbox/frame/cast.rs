@@ -2,6 +2,7 @@
 //! original verified admission and its current policy while holding admission.
 //! This path never submits ciphertext to a relay, signs receipts, or activates a guest.
 pub mod enrollment;
+pub mod submit_enrollment;
 pub mod route;
 pub mod source;
 

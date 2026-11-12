@@ -1327,6 +1327,7 @@ mod tests {
             volumes: vec![],
             extensions: vec![],
             cast_delivery_v1: None,
+            cast_submit_v1: None,
             verb_grant_envelope: None,
         })
     }
@@ -1719,6 +1720,7 @@ mod tests {
                 volumes: vec![],
                 extensions: vec![],
                 cast_delivery_v1: None,
+                cast_submit_v1: None,
                 verb_grant_envelope: None,
             });
         assert!(ColdContinuation::Exec.next_request(&activation).is_err());

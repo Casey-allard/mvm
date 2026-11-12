@@ -4,6 +4,7 @@ use super::cast_pair::{InstalledCastParticipant, development::DevelopmentDirecti
 use crate::host_signer::keystore::Keystore;
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
+use mvm_contract::protocol::mailbox::ContentType;
 use mvm_contract::protocol::mailbox_worker::{MailboxWorkerOwner, MailboxWorkerState};
 use mvm_core::{
     mailbox::{
@@ -61,10 +62,11 @@ impl PreparedOriginalCastBoot {
         );
         let actual = mvm_runtime::microvm::build_activation_environment(config)?;
         ensure!(
-            self.boot
-                .cast_delivery_v1
-                .as_ref()
-                .is_some_and(|p| Some(p.mount_commitment) == actual.cast_mount_commitment().ok()),
+            match (&self.boot.cast_delivery_v1, &self.boot.cast_submit_v1) {
+                (Some(p), None) => p.mount_commitment == actual.cast_mount_commitment()?,
+                (None, Some(p)) => p.mount_commitment == actual.cast_mount_commitment()?,
+                _ => false,
+            },
             "original mounts changed"
         );
         let bytes = serde_json::to_vec(&self.boot)?;
@@ -113,7 +115,30 @@ impl OriginalCastBoot<'_> {
         config: &mvm_core::vm_backend::VmStartConfig,
         deadline: Instant,
     ) -> Result<PreparedOriginalCastBoot> {
-        let left = original(&self.source, false, deadline)?;
+        self.prepare_role(signer, original_grant, config, deadline, None)
+    }
+
+    /// Prepare the A worker's separate signed Submit scope on its own original boot.
+    pub fn prepare_submit(
+        &self,
+        signer: &Keystore,
+        original_grant: &VerbGrantEnvelope,
+        config: &mvm_core::vm_backend::VmStartConfig,
+        deadline: Instant,
+        content: &ContentType,
+    ) -> Result<PreparedOriginalCastBoot> {
+        self.prepare_role(signer, original_grant, config, deadline, Some(content))
+    }
+
+    fn prepare_role(
+        &self,
+        signer: &Keystore,
+        original_grant: &VerbGrantEnvelope,
+        config: &mvm_core::vm_backend::VmStartConfig,
+        deadline: Instant,
+        submit: Option<&ContentType>,
+    ) -> Result<PreparedOriginalCastBoot> {
+        let left = original(&self.source, submit.is_some(), deadline)?;
         let right = original(&self.destination, true, deadline)?;
         ensure!(
             left.daemon_boot_nonce == right.daemon_boot_nonce
@@ -121,7 +146,12 @@ impl OriginalCastBoot<'_> {
                 && left.context_commitment != right.context_commitment,
             "expected two distinct original Cast leases of one installed coordinator"
         );
-        let dst = self.destination.plan.plan();
+        let participant = if submit.is_some() {
+            &self.source
+        } else {
+            &self.destination
+        };
+        let dst = participant.plan.plan();
         ensure!(
             config.name == dst.workload.0
                 && config
@@ -132,7 +162,7 @@ impl OriginalCastBoot<'_> {
                     >(v)
                     .ok())
                     .is_some_and(|s| {
-                        let p = &self.destination.plan.signed().0;
+                        let p = &participant.plan.signed().0;
                         s.0.payload == p.payload
                             && s.0.signer_id == p.signer_id
                             && s.0.signature == p.signature
@@ -151,7 +181,9 @@ impl OriginalCastBoot<'_> {
                 && original_grant.predecessor_session_id.is_none()
                 && original_grant.predecessor_plan_nonce_hex.is_none()
                 && original_grant.grant.cast_delivery_v1.is_none()
-                && original_grant.cast_delivery_v1.is_none(),
+                && original_grant.cast_delivery_v1.is_none()
+                && original_grant.cast_submit_v1.is_none()
+                && original_grant.grant.cast_submit_v1.is_none(),
             "expected an original unbound boot grant"
         );
         let now = chrono::Utc::now();
@@ -183,7 +215,7 @@ impl OriginalCastBoot<'_> {
         let mut target = self.destination_policy.clone();
         origin.now_unix_ms = now.timestamp_millis();
         target.now_unix_ms = now.timestamp_millis();
-        let channel = CastChannel::from_signed_pair(
+        let mut channel = CastChannel::from_signed_pair(
             self.source.plan.signed(),
             self.destination.plan.signed(),
             self.trusted_plan_signers,
@@ -194,47 +226,101 @@ impl OriginalCastBoot<'_> {
             now.timestamp_millis(),
         )?;
         channel.authorize_addressed(self.grants, &origin, &target)?;
+        let owner = if submit.is_some() { left } else { right };
         let mut hash_owner = Sha256::new();
         hash_owner.update(b"mvm-cast-guest-original-owner-v1\0");
-        hash_owner.update(right.daemon_boot_nonce);
-        hash_owner.update(right.generation.to_be_bytes());
-        hash_owner.update(right.lease);
-        hash_owner.update(right.context_commitment);
-        let mut projection = channel.guest_enrollment(
-            hash_owner.finalize().into(),
-            direction_commitment,
-            hex::decode(hash)?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid image digest"))?,
-            activation.cast_mount_commitment()?,
-            root,
-            config.name.clone(),
-        )?;
+        hash_owner.update(owner.daemon_boot_nonce);
+        hash_owner.update(owner.generation.to_be_bytes());
+        hash_owner.update(owner.lease);
+        hash_owner.update(owner.context_commitment);
+        let owner_hash = hash_owner.finalize().into();
+        let image = hex::decode(hash)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid image digest"))?;
+        let mount = activation.cast_mount_commitment()?;
+        let source_plan = self.source.worker.acquire_request().plan_commitment;
+        let destination_plan = self.destination.worker.acquire_request().plan_commitment;
+        let mut bounds = channel.guest_validity();
+        bounds.end = bounds
+            .end
+            .min(original_grant.grant.not_after.timestamp_millis())
+            .min(direction_end);
         for grant in [
             self.grants.source_scope,
             self.grants.send,
             self.grants.receive,
         ] {
-            projection.narrow_validity(
-                grant.grant.not_before_unix_ms,
-                grant.grant.expires_at_unix_ms,
-            )?;
+            bounds.start = bounds.start.max(grant.grant.not_before_unix_ms);
+            bounds.end = bounds.end.min(grant.grant.expires_at_unix_ms);
         }
-        projection.narrow_validity(
-            i64::MIN,
-            original_grant
-                .grant
-                .not_after
-                .timestamp_millis()
-                .min(direction_end),
-        )?;
         let mut boot = original_grant.clone();
-        boot.grant.cast_delivery_v1 = Some(projection.commitment()?);
+        if let Some(content_type) = submit {
+            let send = &self.grants.send.grant;
+            let recv = &self.grants.receive.grant;
+            ensure!(
+                [
+                    &origin.accepted_content_types,
+                    &target.accepted_content_types,
+                    &send.content_types,
+                    &recv.content_types
+                ]
+                .iter()
+                .all(|allowed| allowed.contains(content_type)),
+                "source Cast content type not admitted"
+            );
+            let source_limits = self
+                .source
+                .worker
+                .acquire_request()
+                .mailbox_grant
+                .local_service
+                .context("missing original Submit limits")?
+                .limits;
+            let effective = channel.narrow_guest_limits(source_limits)?;
+            let hello = self.direction.source_greeting();
+            let projection =
+                mvm_core::mailbox::frame::cast::submit_enrollment::SubmitEnrollmentV1 {
+                    source_plan,
+                    destination_plan,
+                    source_owner: owner_hash,
+                    pair_commitment: direction_commitment,
+                    image_sha256: image,
+                    mount_commitment: mount,
+                    verity_root: root,
+                    workload: config.name.clone(),
+                    binding: hello.binding,
+                    generation: hello.generation,
+                    service_generation: *self.direction.sender_boot().as_bytes(),
+                    recipient: target.expected_recipient,
+                    content_type: content_type.clone(),
+                    max_payload: send
+                        .max_payload_bytes
+                        .min(recv.max_payload_bytes)
+                        .min(effective.payload_bytes)
+                        .min(1024),
+                    limits: effective,
+                    valid_from: bounds.start,
+                    valid_until: bounds.end,
+                };
+            boot.grant.cast_submit_v1 = Some(projection.commitment()?);
+            boot.cast_submit_v1 = Some(projection);
+        } else {
+            let mut projection = channel.guest_enrollment(
+                owner_hash,
+                direction_commitment,
+                image,
+                mount,
+                root,
+                config.name.clone(),
+            )?;
+            projection.narrow_validity(bounds.start, bounds.end)?;
+            boot.grant.cast_delivery_v1 = Some(projection.commitment()?);
+            boot.cast_delivery_v1 = Some(projection);
+        }
         boot.grant.sig = signer.sign(&boot.grant.signing_bytes()).signature;
-        boot.cast_delivery_v1 = Some(projection);
         Ok(PreparedOriginalCastBoot {
-            owner: right,
-            plan: self.destination.worker.acquire_request().plan_commitment,
+            owner,
+            plan: participant.worker.acquire_request().plan_commitment,
             prior: original_grant.clone(),
             boot,
         })
