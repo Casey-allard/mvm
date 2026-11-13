@@ -255,7 +255,7 @@ pub fn admit_and_boot_local(
             backend,
             req,
             signed,
-            &sha,
+            Some(&sha),
             ctx,
             #[cfg(unix)]
             None,
@@ -438,8 +438,7 @@ pub fn admit_and_boot_local_with_installed_mapping(
         .signed_plan
         .as_ref()
         .context("selected launch requires the externally signed original plan")?;
-    let sha = mvm_core::crypto::image_verify::sha256_file(&req.rootfs_path)?;
-    admit_signed_and_boot_local(backend, req, signed, &sha, ctx, Some(selected))
+    admit_signed_and_boot_local(backend, req, signed, None, ctx, Some(selected))
 }
 
 /// Admit an externally-signed plan through
@@ -456,7 +455,7 @@ fn admit_signed_and_boot_local(
     backend: &AnyBackend,
     req: &LocalRunRequest,
     signed: &mvm_core::plan::SignedExecutionPlan,
-    rootfs_sha: &str,
+    rootfs_sha: Option<&str>,
     ctx: LocalRunContext<'_>,
     #[cfg(unix)] selected: Option<SelectedLocalMapping<'_>>,
 ) -> Result<StartedMachine> {
@@ -478,7 +477,9 @@ fn admit_signed_and_boot_local(
     // that image. Synthesized plans get this by construction (synthesis stamps
     // the hash it just measured); an externally-signed plan gets it by
     // comparison.
-    if rootfs_sha != plan.image.sha256 {
+    if let Some(rootfs_sha) = rootfs_sha
+        && rootfs_sha != plan.image.sha256
+    {
         anyhow::bail!(
             "the signed plan pins image sha256 {} but the resolved rootfs at {} hashes to \
              {rootfs_sha}; refusing to boot an image the plan does not authorize",
@@ -543,19 +544,24 @@ fn admit_signed_and_boot_local(
             backend.kind(),
             pin,
         )?;
+        if let Some(kernel) = selected.owner.canonical_kernel() {
+            anyhow::ensure!(
+                kernel.pin() == pin
+                    && kernel.workload_root_declaration()?.sha256 == plan.image.sha256,
+                "canonical kernel and root must belong to the signed plan bundle"
+            );
+            kernel.bind_to_config(&mut config)?;
+        }
+        anyhow::ensure!(
+            mvm_core::crypto::image_verify::sha256_file(&req.rootfs_path)? == plan.image.sha256,
+            "selected root filesystem differs from the signed plan"
+        );
         mvm_runtime::bundle_runtime::attach_direct_runtime(
             &mut config,
             backend.name(),
             pin,
             bytes,
         )?;
-        anyhow::ensure!(
-            config
-                .legacy_portable_runtime
-                .as_ref()
-                .is_some_and(|r| &r.pin == pin),
-            "actual portable runtime differs from the original bundle"
-        );
         let resolver = mvm_core::plan::bundle::FsBundleResolver::default_path()?
             .with_exact_archive(&pin.bundle_sha256, bytes)?;
         let trust = mvm_core::plan::bundle::FsTrustStore::default_path()?;

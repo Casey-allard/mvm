@@ -58,7 +58,13 @@ pub fn attach_direct_runtime(
     let mut selected = config.clone();
     ensure!(
         attach_installed_bundle(&mut selected, backend, Some((pin, bytes)), || Ok(None))?
-            && selected.legacy_portable_runtime.is_some(),
+            && (selected
+                .legacy_portable_runtime
+                .as_ref()
+                .is_some_and(|runtime| &runtime.pin == pin)
+                || selected.canonical_kernel.as_ref().is_some_and(
+                    |kernel| kernel.pin() == pin && selected.runtime_release_proof.is_some()
+                )),
         "direct mapping requires the original installed portable bundle"
     );
     *config = selected;
@@ -79,48 +85,65 @@ fn attach_installed_bundle(
         FsTrustStore::default_path()?,
         &archive,
     );
-    let (verified, trust): (VerifiedBundleFile, Box<dyn TrustStore>) =
-        if let Some((pin, bytes)) = quote {
-            let trust = FsTrustStore::default_path()?;
-            let verified =
-                mvm_core::plan::bundle::verify_exact_bundle_file(&archive, &trust, pin, bytes)?;
-            ensure!(
-                verified
-                    .boot_assets
-                    .as_ref()
-                    .is_some_and(|boot| boot.cli_runtime.is_none())
-                    && matches!(verified.manifest.schema_version, 4 | 5)
-                    && !verified.manifest.members.iter().any(|m| matches!(
-                        m,
-                        mvm_core::plan::bundle::BundleMember::CanonicalLinuxProof(_)
-                    )),
+    let (verified, trust): (VerifiedBundleFile, Box<dyn TrustStore>) = if let Some((pin, bytes)) =
+        quote
+    {
+        let trust = FsTrustStore::default_path()?;
+        let verified =
+            mvm_core::plan::bundle::verify_exact_bundle_file(&archive, &trust, pin, bytes)?;
+        let boot = verified
+            .boot_assets
+            .as_ref()
+            .context("selected bundle boot assets missing")?;
+        let canonical = verified.manifest.members.iter().any(|m| {
+            matches!(
+                m,
+                mvm_core::plan::bundle::BundleMember::CanonicalLinuxProof(_)
+            )
+        });
+        match &config.canonical_kernel {
+            Some(owner) => {
+                ensure!(
+                    verified.manifest.schema_version == 7
+                        && canonical
+                        && boot.cli_runtime.is_some()
+                        && owner.pin() == pin,
+                    "selected canonical launch requires its original schema-7 CLI runtime and proof"
+                );
+                owner.verify_bundle_manifest(&verified.manifest)?;
+            }
+            None => ensure!(
+                matches!(verified.manifest.schema_version, 4 | 5)
+                    && !canonical
+                    && boot.cli_runtime.is_none(),
                 "installed direct mapping requires signed portable boot assets"
-            );
-            (verified, Box::new(trust))
-        } else if let Some(host_key) = host_key()? {
-            let host_key_id = key_id_from_pubkey(&host_key);
-            let trust = LocalBundleTrustStore::new(release, host_key_id.clone(), host_key);
-            let verified =
-                verify_bundle_file(&archive, &trust).context("verifying bundle boot assets")?;
-            ensure!(
-                bundle_origin(&verified.manifest, &host_key_id, trust.release())
-                    != BundleOrigin::Untrusted,
-                "installed bundle is neither release-verified nor a local build signed by this host"
-            );
-            (verified, Box::new(trust))
-        } else {
-            let verified =
-                verify_bundle_file(&archive, &release).context("verifying bundle boot assets")?;
-            ensure!(
-                verified
-                    .manifest
-                    .labels
-                    .get(BUNDLE_ORIGIN_LABEL)
-                    .is_none_or(|value| value != LOCAL_BUILD_ORIGIN),
-                "a local build requires this host's signing key"
-            );
-            (verified, Box::new(release))
-        };
+            ),
+        }
+        (verified, Box::new(trust))
+    } else if let Some(host_key) = host_key()? {
+        let host_key_id = key_id_from_pubkey(&host_key);
+        let trust = LocalBundleTrustStore::new(release, host_key_id.clone(), host_key);
+        let verified =
+            verify_bundle_file(&archive, &trust).context("verifying bundle boot assets")?;
+        ensure!(
+            bundle_origin(&verified.manifest, &host_key_id, trust.release())
+                != BundleOrigin::Untrusted,
+            "installed bundle is neither release-verified nor a local build signed by this host"
+        );
+        (verified, Box::new(trust))
+    } else {
+        let verified =
+            verify_bundle_file(&archive, &release).context("verifying bundle boot assets")?;
+        ensure!(
+            verified
+                .manifest
+                .labels
+                .get(BUNDLE_ORIGIN_LABEL)
+                .is_none_or(|value| value != LOCAL_BUILD_ORIGIN),
+            "a local build requires this host's signing key"
+        );
+        (verified, Box::new(release))
+    };
     mvm_core::plan::bundle::require_composable_local_enrollment(
         &verified.manifest,
         &FsTrustStore::default_path()?,
@@ -161,7 +184,7 @@ fn attach_installed_bundle(
         installed.manifest == verified.manifest,
         "installed bundle manifest changed"
     );
-    if quote.is_some() {
+    if quote.is_some() && config.canonical_kernel.is_none() {
         let kernel = installed
             .manifest
             .find_by_role(&ArtifactRole::Kernel)

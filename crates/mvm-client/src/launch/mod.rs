@@ -985,6 +985,28 @@ impl LocalBackend {
         .await
     }
 
+    /// Launch a selected direct TCP endpoint with the same preverified canonical Linux
+    /// owner, original signed bundle and independently funded workspace.
+    #[cfg(unix)]
+    pub async fn try_launch_with_canonical_direct_policy(
+        &self,
+        request: LaunchRequest,
+        mut lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
+        mapping: mvm_hostd::run::DirectTcpPolicy,
+        kernel: Arc<mvm_core::canonical_linux::PreparedCanonicalLinux>,
+    ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
+        if let Err(error) = lifetime.select_canonical_kernel(kernel) {
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: error.to_string(),
+                },
+                lifetime,
+            ));
+        }
+        self.try_launch_with_host_lifetime_and_direct_policy(request, lifetime, mapping)
+            .await
+    }
+
     /// Launch with the exact operator-supplied peer routes covered by the canonical signed policy.
     #[cfg(unix)]
     pub async fn try_launch_with_host_lifetime_and_direct_policy(

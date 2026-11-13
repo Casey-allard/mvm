@@ -79,6 +79,13 @@ impl PreparedCanonicalLinux {
         self.view_path
             .join(self.declaration.artifacts[0].name.as_str())
     }
+    pub fn workload_root_declaration(&self) -> Result<&crate::plan::bundle::BundleArtifact> {
+        self.inputs
+            .manifest()
+            .find_by_role(&crate::plan::bundle::ArtifactRole::Rootfs)
+            .ok_or_else(|| anyhow::anyhow!("canonical bundle has no signed workload root"))
+    }
+
     /// Digest selected by the canonical signed Linux root, not by the app key.
     pub fn kernel_sha256(&self) -> &str {
         self.declaration.artifacts[0].sha256.as_str()

@@ -487,7 +487,10 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         self.check_installed_endpoint_inputs(inputs)?;
         #[cfg(unix)]
         let workspace = match &inputs.config.host_lifetime {
-            Some(owner) if inputs.config.legacy_portable_runtime.is_some() => {
+            Some(owner)
+                if owner.canonical_kernel().is_some()
+                    || inputs.config.legacy_portable_runtime.is_some() =>
+            {
                 Some(owner.begin_startup_workspace(inputs.config, self.driver.kind())?)
             }
             Some(owner) => {

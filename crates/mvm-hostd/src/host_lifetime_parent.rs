@@ -24,6 +24,17 @@ pub trait ParentAdmissionProvider: Send + Sync {
         anyhow::bail!("original parent portable startup workspace unavailable")
     }
 
+    /// Verify previously funded workspace for the same preverified canonical kernel,
+    /// workload filesystem, and signed bundle before installed artifact resolution.
+    fn check_canonical_startup_workspace(
+        &self,
+        _owner: &Arc<HostLifetimeAnchor>,
+        _kernel: &Arc<mvm_core::canonical_linux::PreparedCanonicalLinux>,
+        _pin: &PlanArtifact,
+    ) -> Result<()> {
+        anyhow::bail!("original canonical startup workspace unavailable")
+    }
+
     /// Bind one original pre-reserved parent grant to actual opaque admission.
     fn bind(
         &self,
@@ -81,7 +92,11 @@ pub(crate) fn check_portable_startup_workspace(
         .context("portable startup requires the original host lifetime owner")?;
     owner.verify_config(config, backend)?;
     let bytes = owner.portable_archive_bytes(pin)?;
-    require_installed()?.check_portable_startup_workspace(owner, pin)?;
+    let provider = require_installed()?;
+    match owner.canonical_kernel() {
+        Some(kernel) => provider.check_canonical_startup_workspace(owner, kernel, pin)?,
+        None => provider.check_portable_startup_workspace(owner, pin)?,
+    }
     Ok(bytes)
 }
 

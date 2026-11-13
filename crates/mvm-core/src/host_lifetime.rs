@@ -263,6 +263,7 @@ pub struct PreparedHostLifetime {
     binding: HostLaunchBinding,
     parent_owner: Box<dyn Any + Send + Sync>,
     portable_archive: Option<(PlanArtifact, NonZeroU64)>,
+    canonical: Option<Arc<crate::canonical_linux::PreparedCanonicalLinux>>,
 }
 
 impl PreparedHostLifetime {
@@ -299,6 +300,7 @@ impl PreparedHostLifetime {
             binding: inputs.binding,
             parent_owner: Box::new(parent_owner),
             portable_archive: None,
+            canonical: None,
         })
     }
 
@@ -313,12 +315,32 @@ impl PreparedHostLifetime {
         Ok(self)
     }
 
+    /// Carry the original prepared kernel owner for this quoted Firecracker bundle.
+    pub fn select_canonical_kernel(
+        &mut self,
+        kernel: Arc<crate::canonical_linux::PreparedCanonicalLinux>,
+    ) -> Result<()> {
+        ensure!(
+            self.canonical.is_none()
+                && self.binding.backend == BackendKind::Firecracker
+                && kernel.backend() == self.binding.backend
+                && self
+                    .portable_archive
+                    .as_ref()
+                    .is_some_and(|(pin, _)| pin == kernel.pin()),
+            "original canonical kernel differs from the prepared Firecracker grant"
+        );
+        self.canonical = Some(kernel);
+        Ok(())
+    }
+
     pub fn into_anchor(self) -> Arc<HostLifetimeAnchor> {
         Arc::new(HostLifetimeAnchor {
             lease: self.lease,
             binding: self.binding,
             _parent_owner: self.parent_owner,
             portable_archive: self.portable_archive,
+            canonical: self.canonical,
             admitted: Mutex::new(None),
             current_parent: Mutex::new(None),
             native_claimed: AtomicBool::new(false),
@@ -372,6 +394,7 @@ pub struct HostLifetimeAnchor {
     binding: HostLaunchBinding,
     _parent_owner: Box<dyn Any + Send + Sync>,
     portable_archive: Option<(PlanArtifact, NonZeroU64)>,
+    canonical: Option<Arc<crate::canonical_linux::PreparedCanonicalLinux>>,
     admitted: Mutex<Option<AdmissionBinding>>,
     current_parent: Mutex<Option<Arc<dyn CoreCurrentParentPermit>>>,
     native_claimed: AtomicBool,
@@ -412,6 +435,10 @@ impl fmt::Debug for HostLifetimeAnchor {
 }
 
 impl HostLifetimeAnchor {
+    pub fn canonical_kernel(&self) -> Option<&Arc<crate::canonical_linux::PreparedCanonicalLinux>> {
+        self.canonical.as_ref()
+    }
+
     /// Match retained native disposal evidence after the grant has closed.
     /// Freshness is a launch/dispatch check. Disposal compares held objects.
     pub fn check_original_lease(&self, lease: &PreparedHostLifetimeLease) -> Result<()> {
@@ -588,6 +615,23 @@ impl HostLifetimeAnchor {
             .context("host lifetime signed plan missing")?;
         let plan = crate::plan::plan_from_admitted_json(encoded)
             .context("host lifetime original plan projection invalid")?;
+        if let Some(kernel) = self.canonical_kernel() {
+            ensure!(
+                config
+                    .canonical_kernel
+                    .as_ref()
+                    .is_some_and(|actual| Arc::ptr_eq(actual, kernel))
+                    && plan.bundle.as_ref() == Some(kernel.pin())
+                    && config.legacy_portable_runtime.is_none()
+                    && config.runtime_release_proof.is_some(),
+                "admitted canonical runtime owner changed"
+            );
+        } else {
+            ensure!(
+                config.canonical_kernel.is_none(),
+                "unselected canonical kernel in installed launch"
+            );
+        }
         if let Some(proof) = &config.legacy_portable_runtime {
             ensure!(
                 plan.bundle.as_ref() == Some(&proof.pin),
@@ -697,7 +741,7 @@ impl HostLifetimeAnchor {
         backend: BackendKind,
     ) -> Result<RuntimeStartupWorkspace> {
         ensure!(
-            config.legacy_portable_runtime.is_some(),
+            self.canonical.is_some() || config.legacy_portable_runtime.is_some(),
             "original launch has no portable runtime selection"
         );
         let permit = self.current_parent_permit(config, backend)?;
@@ -724,7 +768,7 @@ impl HostLifetimeAnchor {
     ) -> Result<PreparedHostLifetimeLease> {
         self.check_parent_current(config, backend)?;
         ensure!(
-            config.legacy_portable_runtime.is_none()
+            (self.canonical.is_none() && config.legacy_portable_runtime.is_none())
                 || self.startup_complete.load(Ordering::Acquire),
             "original startup workspace did not complete"
         );

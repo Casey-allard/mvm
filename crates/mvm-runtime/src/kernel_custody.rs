@@ -33,6 +33,8 @@ pub(crate) struct KernelBoundLaunch {
     record: PathBuf,
     #[cfg(unix)]
     kernel: Option<mvm_vmm::host::restore_image::VerifiedRestoreFile>,
+    #[cfg(unix)]
+    root: Option<std::sync::Mutex<Option<mvm_vmm::host::restore_image::VerifiedRestoreFile>>>,
 }
 
 impl KernelBoundLaunch {
@@ -79,6 +81,46 @@ impl KernelBoundLaunch {
                 )?);
             }
         }
+        #[cfg(unix)]
+        let root = if let Some(expected) = config
+            .host_lifetime
+            .as_ref()
+            .and_then(|anchor| anchor.canonical_kernel())
+        {
+            anyhow::ensure!(
+                config
+                    .canonical_kernel
+                    .as_ref()
+                    .is_some_and(|actual| std::sync::Arc::ptr_eq(expected, actual)),
+                "canonical workload root owner substituted"
+            );
+            let decl = expected.workload_root_declaration()?;
+            let signed = mvm_core::plan::plan_from_admitted_json(
+                config
+                    .plan_json
+                    .as_deref()
+                    .context("original root requires admitted plan")?,
+            )?;
+            ensure!(
+                signed.bundle.as_ref() == Some(expected.pin())
+                    && signed.image.sha256 == decl.sha256,
+                "workload root differs from original admitted bundle"
+            );
+            use std::os::unix::fs::OpenOptionsExt;
+            let source = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&config.rootfs_path)?;
+            let sealed = mvm_vmm::host::restore_image::VerifiedRestoreFile::prepare_clone_only(
+                &source,
+                expected.generation_dir(),
+                &decl.sha256,
+                decl.size_bytes,
+            )?;
+            Some(std::sync::Mutex::new(Some(sealed)))
+        } else {
+            None
+        };
         if let Some(owner) = &config.canonical_kernel {
             // Other backends retain their existing explicit refusal until
             // they provide equally instance-bound lifetime evidence.
@@ -126,6 +168,8 @@ impl KernelBoundLaunch {
             record,
             #[cfg(unix)]
             kernel,
+            #[cfg(unix)]
+            root,
         })
     }
 
@@ -161,7 +205,22 @@ impl KernelBoundLaunch {
         disks.validate_spec(spec)?;
         let files = mvm_vmm::driver::prepared_disks::PreparedBootFiles {
             kernel: self.kernel.as_ref(),
-            workload_root: None,
+            workload_root: self
+                .root
+                .as_ref()
+                .map(|root| {
+                    let file = root
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("original workload root poisoned"))?
+                        .take()
+                        .context("original workload root already handed off")?;
+                    mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot::bind(
+                        spec,
+                        Path::new(&self.config.rootfs_path),
+                        file,
+                    )
+                })
+                .transpose()?,
             writable: disks,
             data: None,
         };
