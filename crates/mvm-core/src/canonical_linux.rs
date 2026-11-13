@@ -683,9 +683,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut env = TestEnv::new();
         env.isolate_mvm_home(home.path());
+        let kernel = b"unit kernel";
         let original = frame(
-            b"unit kernel",
-            published_root::MANIFEST,
+            kernel,
+            &coherent_application_replacement(kernel),
             published_root::BUNDLE,
             FEED_SIGNATURE,
             true,
