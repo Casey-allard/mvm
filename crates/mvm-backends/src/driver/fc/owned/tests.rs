@@ -76,6 +76,9 @@ fn original_wait_after_report(
     assert!(!result.success);
     std::fs::write(root.join("workload.exit"), b"0").unwrap();
     assert_eq!(vm.wait_with_deadline(Instant::now()).unwrap(), result);
+    let original_report = vm
+        .original_workload_report()
+        .expect("original report evidence");
     state
         .lock()
         .unwrap()
@@ -84,6 +87,13 @@ fn original_wait_after_report(
         .unwrap()
         .stop(Instant::now() + Duration::from_secs(3))
         .unwrap();
+    drop(vm);
+    assert_eq!(
+        Arc::strong_count(state),
+        1,
+        "a report must not retain VM custody"
+    );
+    assert_eq!(original_report.wait_until(Instant::now()).unwrap(), result);
 }
 
 fn lease(root: &std::path::Path) -> PreparedHostLifetimeLease {

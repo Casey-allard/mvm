@@ -35,6 +35,13 @@ process exit, actual child collection and worker collection before returning
 the retained lease to the caller. A failed or uncertain launch keeps custody;
 it cannot become a successful no-spawn or retirement result.
 
+The runtime can clone `OriginalWorkloadReport` while it owns the original VM
+slot, release that slot's lock, and wait to a monotonic deadline. This report
+retains only the workload result and its notification state; it cannot keep a
+VM alive or grant retirement credit. Backends without an original report
+return `None` and refuse the bounded wait instead of substituting a named file
+or an unbounded operation.
+
 These driver mechanics do not grant launch, mailbox or egress authority. The
 canonical runtime must supply a matching admitted parent and enforce its
 resource budget. The component controls do not establish installed native,

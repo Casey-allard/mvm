@@ -705,6 +705,7 @@ mod tests {
             .boot(&sample_spec("bounded-wait-unsupported"))
             .unwrap();
         assert!(vm.wait_with_deadline(std::time::Instant::now()).is_err());
+        assert!(vm.original_workload_report().is_none());
         assert_eq!(vm.wait().unwrap().code, Some(0));
     }
 

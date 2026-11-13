@@ -375,8 +375,14 @@ pub trait VmmDriver: Send + Sync {
     }
 }
 
-/// A live VM handle. Launch-model-agnostic: an in-process VMM, a subprocess,
-/// and an external supervisor all present the same surface.
+/// Immutable original-workload observation, independent of VM custody.
+/// Holding this report grants no launch, effect or retirement authority.
+pub trait OriginalWorkloadReport: Send + Sync {
+    /// Return the original workload result, or unknown at the deadline.
+    fn wait_until(&self, until: std::time::Instant) -> Result<VmExitStatus>;
+}
+
+/// A live VM handle, retaining its backend's original resource ownership.
 pub trait RunningVm: Send {
     fn id(&self) -> &VmId;
     /// Host process that owns this VM's address space, when the driver can
@@ -391,6 +397,10 @@ pub trait RunningVm: Send {
     /// Unsupported backends refuse instead of calling an unbounded wait.
     fn wait_with_deadline(&self, _until: std::time::Instant) -> Result<VmExitStatus> {
         anyhow::bail!("backend does not provide an original bounded workload wait")
+    }
+    /// Clone only original report evidence before releasing an outer owner lock.
+    fn original_workload_report(&self) -> Option<std::sync::Arc<dyn OriginalWorkloadReport>> {
+        None
     }
     /// Prepare a cooperative stop while the guest is still responsive.
     fn prepare_stop(&self) -> Result<()> {
