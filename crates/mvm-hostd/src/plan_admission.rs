@@ -4677,6 +4677,20 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&signer.secret_path, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let prior = crate::host_signer::keystore::Keystore::test_signing_calls();
+        assert!(
+            issue().issue(&signer.verifying.to_bytes()).is_err(),
+            "registered issuer used a non-private original key"
+        );
+        assert_eq!(
+            crate::host_signer::keystore::Keystore::test_signing_calls(),
+            prior
+        );
+        std::fs::set_permissions(&signer.secret_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
         let held = issue();
         let envelope = held.issue(&signer.verifying.to_bytes()).unwrap();
         assert!(held.issue(&signer.verifying.to_bytes()).is_err());

@@ -224,6 +224,27 @@ pub(crate) fn encoded_len(
 }
 
 pub(crate) fn read_key(path: &std::path::Path) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+    read_key_checked(path, |_| Ok(()))
+}
+
+pub(crate) fn read_signer_secret(
+    path: &std::path::Path,
+) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+    read_key_checked(path, |metadata| {
+        mvm_core::private_fs::require_current_owner(metadata)?;
+        anyhow::ensure!(
+            mvm_core::private_fs::mode_bits(path, metadata)?
+                == crate::audit::host_keypair::SECRET_MODE,
+            "registered host signer requires owner-only mode 0600"
+        );
+        Ok(())
+    })
+}
+
+fn read_key_checked(
+    path: &std::path::Path,
+    check: impl FnOnce(&std::fs::Metadata) -> anyhow::Result<()>,
+) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -235,6 +256,7 @@ pub(crate) fn read_key(path: &std::path::Path) -> anyhow::Result<zeroize::Zeroiz
         metadata.is_file() && metadata.len() == 32,
         "owned key size/type"
     );
+    check(&metadata)?;
     let mut bytes = zeroize::Zeroizing::new([0; 32]);
     file.read_exact(bytes.as_mut())?;
     anyhow::ensure!(file.read(&mut [0; 1])? == 0, "owned key changed size");

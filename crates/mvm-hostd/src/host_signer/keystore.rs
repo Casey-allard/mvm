@@ -71,7 +71,7 @@ impl Keystore {
 
     /// Owned profile: inspect and read at most33 bytes, never an entire file.
     pub fn load_from_file_bounded(path: &Path) -> Result<Self> {
-        let bytes = crate::owned_resources::read_key(path)?;
+        let bytes = crate::owned_resources::read_signer_secret(path)?;
         let signing_key = SigningKey::from_bytes(&bytes);
         let pub_key_bytes = signing_key.verifying_key().to_bytes().to_vec();
         Ok(Self {
