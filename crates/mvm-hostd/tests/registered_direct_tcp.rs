@@ -252,7 +252,7 @@ mod registered_prepare {
         FlowMuxIdentitySpawnConfig, InstalledHostServices, SubstitutionSpawnParams,
         spawn_network_endpoint_installed_registered,
     };
-    use spiralcore_mvm_flowmux::tls::TlsCarrier;
+    use spiralcore_mvm_flowmux::tls::{TlsCarrier, TlsCounters};
     use std::time::{Duration, Instant};
     use std::{
         io::Read,
@@ -490,6 +490,7 @@ mod registered_prepare {
         use mvm_contract::policy::network_policy::{
             CooperatingPayloadPolicy, CooperatingTcpPeer, PayloadMappingProfile,
         };
+        let setup_start = Instant::now();
         let mut fixture = Fixture::new();
         fixture._env.set(
             "MVM_SUBSTITUTION_ENDPOINT_PATH",
@@ -632,6 +633,7 @@ mod registered_prepare {
             &Handshake::local("registered-direct-tcp").encode(),
         );
         ensure!(receive(&mut guest, &mut session).0 == Opcode::HelloAck);
+        let setup_elapsed = setup_start.elapsed();
         send(
             &mut guest,
             &mut session,
@@ -646,7 +648,7 @@ mod registered_prepare {
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
         );
         let initiator_spki = fixture_identity(&fixture.host_signer).spki_sha256();
-        let peer = std::thread::spawn(move || -> Result<()> {
+        let peer = std::thread::spawn(move || -> Result<TlsCounters> {
             let wrong = fixture_identity(&SigningKey::from_bytes(&[12; 32]));
             let first = accept(&listener)?;
             // Accept may finish the TLS handshake before learning that the initiator rejected its SPKI.
@@ -662,7 +664,7 @@ mod registered_prepare {
                     "failed peer received application bytes"
                 );
             }
-            serve_original(
+            let totals = serve_original(
                 accept(&listener)?,
                 address,
                 peer_key,
@@ -675,7 +677,7 @@ mod registered_prepare {
                     .accept()
                     .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
             );
-            Ok(())
+            Ok(totals)
         });
         send(
             &mut guest,
@@ -693,6 +695,7 @@ mod registered_prepare {
                 ),
             "wrong peer response {refusal:?}"
         );
+        let transfer_start = Instant::now();
         send(
             &mut guest,
             &mut session,
@@ -723,8 +726,12 @@ mod registered_prepare {
             }
         }
         ensure!(body == restored);
-        peer.join()
+        let transfer_elapsed = transfer_start.elapsed();
+        let totals = peer
+            .join()
             .map_err(|_| anyhow::anyhow!("original peer fixture failed"))??;
+        ensure!(totals.received > 0 && totals.sent > 0);
+        let retire_start = Instant::now();
         endpoint.shutdown().with_context(endpoint_diagnostic)?;
         ensure!(
             guest.read(&mut [0; 1])? == 0,
@@ -778,6 +785,15 @@ mod registered_prepare {
         registration.shutdown()?;
         second.shutdown()?;
         agent.shutdown()?;
+        eprintln!(
+            "direct_tcp_readback app_bytes_each_way={} tls_to_peer={} tls_from_peer={} setup_to_hello_ns={} valid_open_to_verified_half_close_ns={} retirement_with_archive_retry_ns={}",
+            body.len(),
+            totals.received,
+            totals.sent,
+            setup_elapsed.as_nanos(),
+            transfer_elapsed.as_nanos(),
+            retire_start.elapsed().as_nanos(),
+        );
         Ok(())
     }
 }

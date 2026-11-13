@@ -9,7 +9,7 @@ use mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan;
 use spiralcore_mvm_flowmux::{
     Role,
     scope::{PinnedScopePolicy, ScopeFacts},
-    tls::{PinnedIdentity, TlsCarrier},
+    tls::{PinnedIdentity, TlsCarrier, TlsCounters},
 };
 use spiralcore_transfer::{
     resource_profile::ResourceProfile,
@@ -50,9 +50,10 @@ pub fn serve_original(
     initiator_spki: [u8; 32],
     plan: AdmittedNetworkPlan,
     stream_id: u32,
-) -> Result<()> {
+) -> Result<TlsCounters> {
     let until = Instant::now() + Duration::from_secs(8);
     let tls = TlsCarrier::accept(socket, &server_identity, initiator_spki, until)?;
+    let meter = tls.try_clone()?;
     let facts = ScopeFacts {
         object_profile: 2,
         policy_sha256: hex::decode(&plan.policy_sha256)
@@ -138,7 +139,7 @@ pub fn serve_original(
     drop(mapped);
     pool.close_admission()?;
     ensure!(pool.drained()?);
-    Ok(())
+    Ok(meter.counters())
 }
 pub fn send(stream: &mut UnixStream, session: &mut Session, opcode: Opcode, id: u32, bytes: &[u8]) {
     let frame = mvm_contract::protocol::network_flow::encode(opcode, id, bytes).unwrap();
