@@ -317,13 +317,27 @@ impl DurableMailboxService {
     }
 
     #[cfg(feature = "durable-guest-io-witness")]
-    pub(crate) fn with_guest_meter(mut self, vm_state_dir: &Path) -> std::io::Result<Self> {
+    pub(crate) fn with_guest_meter(
+        mut self,
+        vm_state_dir: &Path,
+        replacement: bool,
+    ) -> std::io::Result<Self> {
+        // One original and one replacement per state directory. create_new
+        // fences any further measured incarnation or preexisting endpoint.
+        let transcript = if replacement {
+            "mailbox-guest-stream-replacement-v1.counts"
+        } else {
+            witness_io::FILE_NAME
+        };
         self.guest_meter = Some(witness_io::Recorder::create(
-            &vm_state_dir.join(witness_io::FILE_NAME),
+            &vm_state_dir.join(transcript),
         )?);
         #[cfg(feature = "sender-ordinal-io-witness")]
         {
-            self.aggregate_meter = Some(witness_io::aggregate::Aggregate::create(vm_state_dir)?);
+            self.aggregate_meter = Some(witness_io::aggregate::Aggregate::create(
+                vm_state_dir,
+                replacement,
+            )?);
         }
         Ok(self)
     }

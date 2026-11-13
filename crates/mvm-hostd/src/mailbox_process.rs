@@ -421,7 +421,9 @@ fn serve_local(
         inbound,
     )?;
     #[cfg(feature = "durable-guest-io-witness")]
-    let service = service.with_guest_meter(&vm_state_dir)?;
+    // Only a reconnect by the original controller supplies a pinned prior
+    // reader digest. load_reader has already verified it against this boot.
+    let service = service.with_guest_meter(&vm_state_dir, required_reader.is_some())?;
     service.install_guest_reader(reader)?;
     let mut dial = |until| {
         delegated
