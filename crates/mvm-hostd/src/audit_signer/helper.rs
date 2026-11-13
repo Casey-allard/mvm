@@ -31,7 +31,7 @@ const WORKLOAD_AUDIT_CATEGORY: &str = "workload_audit";
 pub type SharedSignerHelper = Arc<Mutex<SignerHelper>>;
 
 struct VmChain {
-    generation: Option<[u8;32]>,
+    generation: Option<[u8; 32]>,
     workload_id: String,
     chain: Chain,
 }
@@ -111,10 +111,27 @@ impl SignerHelper {
         match self.open_chain(&req) {
             Ok(chain) => {
                 let chain_head = chain.head().to_string();
-                let generation = self.chain_bytes.map(|_| rand::random::<[u8;32]>());
-                let inventory = match generation.map(|generation| chain.inventory(mvm_core::protocol::audit_signer::AuditInventoryPhase::Registered, generation, &self.tenant_id, &req.vm_id, &req.workload_id)).transpose() {
+                let generation = self.chain_bytes.map(|_| rand::random::<[u8; 32]>());
+                let inventory = match generation
+                    .map(|generation| {
+                        chain.inventory(
+                            mvm_core::protocol::audit_signer::AuditInventoryPhase::Registered,
+                            generation,
+                            &self.tenant_id,
+                            &req.vm_id,
+                            &req.workload_id,
+                        )
+                    })
+                    .transpose()
+                {
                     Ok(value) => value,
-                    Err(e) => return SignerHelperResponse::Err {request_id,code:AuditSignerErrorCode::InternalError,message:e.to_string()},
+                    Err(e) => {
+                        return SignerHelperResponse::Err {
+                            request_id,
+                            code: AuditSignerErrorCode::InternalError,
+                            message: e.to_string(),
+                        };
+                    }
                 };
                 self.chains.insert(
                     req.vm_id.clone(),
@@ -124,7 +141,12 @@ impl SignerHelper {
                         chain,
                     },
                 );
-                if let Some(value) = inventory {return SignerHelperResponse::FundedInventory {request_id,inventory:Box::new(value)};}
+                if let Some(value) = inventory {
+                    return SignerHelperResponse::FundedInventory {
+                        request_id,
+                        inventory: Box::new(value),
+                    };
+                }
                 SignerHelperResponse::Registered {
                     request_id,
                     vm_id: req.vm_id,
@@ -160,16 +182,29 @@ impl SignerHelper {
         let workload_chain_path = Path::new(&req.workload_chain_path);
         let chain_head_secondary_path = Path::new(&req.chain_head_secondary_path);
         if self.chain_bytes.is_some() {
-            let original_parent = workload_chain_path.parent().context("funded audit parent absent")?;
-            anyhow::ensure!(Some(original_parent)==chain_head_secondary_path.parent(), "funded audit head outside original directory");
+            let original_parent = workload_chain_path
+                .parent()
+                .context("funded audit parent absent")?;
+            anyhow::ensure!(
+                Some(original_parent) == chain_head_secondary_path.parent(),
+                "funded audit head outside original directory"
+            );
             mvm_core::private_fs::create_owned_private_dir(original_parent)?;
         } else {
             ensure_parent(workload_chain_path)?;
         }
         ensure_parent(chain_head_secondary_path)?;
         if let Some(limit) = self.chain_bytes {
-            anyhow::ensure!(self.owned, "funded audit chain requires original owned signer");
-            return Chain::open_owned_bounded(workload_chain_path, chain_head_secondary_path, self.software_chain_key_path.as_deref(), limit);
+            anyhow::ensure!(
+                self.owned,
+                "funded audit chain requires original owned signer"
+            );
+            return Chain::open_owned_bounded(
+                workload_chain_path,
+                chain_head_secondary_path,
+                self.software_chain_key_path.as_deref(),
+                limit,
+            );
         }
         let open = if self.owned {
             Chain::open_owned
@@ -184,13 +219,30 @@ impl SignerHelper {
     }
 
     fn deregister(&mut self, req: SignerHelperDeregisterVm) -> SignerHelperResponse {
-        if let Some(vm) = self.chains.get(&req.vm_id) && let Some(generation) = vm.generation {
-            match vm.chain.inventory(mvm_core::protocol::audit_signer::AuditInventoryPhase::Deregistered, generation, &self.tenant_id, &req.vm_id, &vm.workload_id) {
+        if let Some(vm) = self.chains.get(&req.vm_id)
+            && let Some(generation) = vm.generation
+        {
+            match vm.chain.inventory(
+                mvm_core::protocol::audit_signer::AuditInventoryPhase::Deregistered,
+                generation,
+                &self.tenant_id,
+                &req.vm_id,
+                &vm.workload_id,
+            ) {
                 Ok(value) => {
                     self.chains.remove(&req.vm_id);
-                    return SignerHelperResponse::FundedInventory {request_id:req.request_id,inventory:Box::new(value)};
+                    return SignerHelperResponse::FundedInventory {
+                        request_id: req.request_id,
+                        inventory: Box::new(value),
+                    };
                 }
-                Err(e) => return SignerHelperResponse::Err{request_id:req.request_id, code:AuditSignerErrorCode::InternalError,message:e.to_string()},
+                Err(e) => {
+                    return SignerHelperResponse::Err {
+                        request_id: req.request_id,
+                        code: AuditSignerErrorCode::InternalError,
+                        message: e.to_string(),
+                    };
+                }
             }
         }
         self.chains.remove(&req.vm_id);
@@ -527,22 +579,30 @@ mod tests {
         let start = mvm_core::protocol::audit_inventory::verify(&original, &original.key).unwrap();
         assert_eq!(start.phase, AuditInventoryPhase::Registered);
         assert_eq!(start.length, 0);
-        let accepted = helper.dispatch(append_req("vm-1","held"));
-        let SignerHelperResponse::Ok { chain_head, .. } = accepted else { panic!("append refused") };
-        let close = || SignerHelperRequest::DeregisterVm(SignerHelperDeregisterVm {
-            vm_id:"vm-1".into(), request_id:"end-1".into()
-        });
+        let accepted = helper.dispatch(append_req("vm-1", "held"));
+        let SignerHelperResponse::Ok { chain_head, .. } = accepted else {
+            panic!("append refused")
+        };
+        let close = || {
+            SignerHelperRequest::DeregisterVm(SignerHelperDeregisterVm {
+                vm_id: "vm-1".into(),
+                request_id: "end-1".into(),
+            })
+        };
         let end = match helper.dispatch(close()) {
-            SignerHelperResponse::FundedInventory {inventory,..} => inventory,
+            SignerHelperResponse::FundedInventory { inventory, .. } => inventory,
             other => panic!("missing terminal inventory: {other:?}"),
         };
         let terminal = mvm_core::protocol::audit_inventory::verify(&end, &original.key).unwrap();
         assert!(start.same_registration(&terminal));
-        assert_eq!(terminal.head,chain_head);
+        assert_eq!(terminal.head, chain_head);
         assert_eq!(terminal.phase, AuditInventoryPhase::Deregistered);
         assert!(terminal.length > 0);
-        assert!(mvm_core::protocol::audit_inventory::verify(&end, &[2;32]).is_err());
-        assert!(matches!(helper.dispatch(close()),SignerHelperResponse::Deregistered{..}));
+        assert!(mvm_core::protocol::audit_inventory::verify(&end, &[2; 32]).is_err());
+        assert!(matches!(
+            helper.dispatch(close()),
+            SignerHelperResponse::Deregistered { .. }
+        ));
     }
 
     fn append_req_with_category(

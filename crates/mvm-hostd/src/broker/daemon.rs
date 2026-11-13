@@ -30,8 +30,8 @@ pub use owned::bind_owned_signer_listener;
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::VerifyingKey;
 use mvm_core::protocol::audit_signer::{
-    SignerHelperAppendEntry, SignerHelperDeregisterVm, SignerHelperRegisterVm, SignerHelperRequest,
-    SignedAuditInventory, SignerHelperResponse,
+    SignedAuditInventory, SignerHelperAppendEntry, SignerHelperDeregisterVm,
+    SignerHelperRegisterVm, SignerHelperRequest, SignerHelperResponse,
 };
 use mvm_core::protocol::broker_control;
 use mvm_core::protocol::broker_control::{
@@ -790,13 +790,21 @@ impl HostAgentDaemon {
             client.send(&req)?
         };
         match response {
-            SignerHelperResponse::FundedInventory {request_id, inventory}
-                if self.owned_signer.is_some() && request_id == req.request_id() => {
-                    let value = mvm_core::protocol::audit_inventory::verify(&inventory,&inventory.key)?;
-                    anyhow::ensure!(value.phase == mvm_core::protocol::audit_signer::AuditInventoryPhase::Registered
-                        && value.tenant == self.tenant_id && value.vm == r.vm_id.as_str(), "unexpected signed original audit scope");
-                    Ok(Some(inventory))
-                }
+            SignerHelperResponse::FundedInventory {
+                request_id,
+                inventory,
+            } if self.owned_signer.is_some() && request_id == req.request_id() => {
+                let value =
+                    mvm_core::protocol::audit_inventory::verify(&inventory, &inventory.key)?;
+                anyhow::ensure!(
+                    value.phase
+                        == mvm_core::protocol::audit_signer::AuditInventoryPhase::Registered
+                        && value.tenant == self.tenant_id
+                        && value.vm == r.vm_id.as_str(),
+                    "unexpected signed original audit scope"
+                );
+                Ok(Some(inventory))
+            }
             SignerHelperResponse::Registered { vm_id, .. }
                 if self.owned_signer.is_none() || vm_id == r.vm_id =>
             {
@@ -827,13 +835,21 @@ impl HostAgentDaemon {
             client.send(&req)?
         };
         match response {
-            SignerHelperResponse::FundedInventory {request_id, inventory}
-                if self.owned_signer.is_some() && request_id == req.request_id() => {
-                    let value = mvm_core::protocol::audit_inventory::verify(&inventory,&inventory.key)?;
-                    anyhow::ensure!(value.phase == mvm_core::protocol::audit_signer::AuditInventoryPhase::Deregistered
-                        && value.tenant == self.tenant_id && value.vm == vm_id, "unexpected signed original audit scope");
-                    Ok(Some(inventory))
-                }
+            SignerHelperResponse::FundedInventory {
+                request_id,
+                inventory,
+            } if self.owned_signer.is_some() && request_id == req.request_id() => {
+                let value =
+                    mvm_core::protocol::audit_inventory::verify(&inventory, &inventory.key)?;
+                anyhow::ensure!(
+                    value.phase
+                        == mvm_core::protocol::audit_signer::AuditInventoryPhase::Deregistered
+                        && value.tenant == self.tenant_id
+                        && value.vm == vm_id,
+                    "unexpected signed original audit scope"
+                );
+                Ok(Some(inventory))
+            }
             SignerHelperResponse::Deregistered { vm_id: actual, .. }
                 if self.owned_signer.is_none() || actual == vm_id =>
             {

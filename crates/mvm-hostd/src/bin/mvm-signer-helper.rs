@@ -57,11 +57,16 @@ fn main() -> Result<()> {
         mvm_hostd::read_launch_config("mvm-signer-helper")?
     };
     let (cfg, chain_bytes): (SignerHelperConfig, _) = if owned {
-        let setup: mvm_hostd::audit_signer::config::OwnedSignerSetup = serde_json::from_slice(&raw)
-            .context("decoding original signer setup")?;
+        let setup: mvm_hostd::audit_signer::config::OwnedSignerSetup =
+            serde_json::from_slice(&raw).context("decoding original signer setup")?;
         mvm_hostd::owned_resources::check_process_address_space(setup.address_space_limit)?;
         (setup.config, setup.audit_chain_bytes)
-    } else { (parse_config(&raw).context("mvm-signer-helper config parse failed")?, None) };
+    } else {
+        (
+            parse_config(&raw).context("mvm-signer-helper config parse failed")?,
+            None,
+        )
+    };
     if owned {
         mvm_core::naming::validate_vm_name(&cfg.tenant_id)?;
     }
@@ -83,7 +88,9 @@ fn main() -> Result<()> {
         builder
             .thread_stack_size(2 * 1024 * 1024)
             .max_io_events_per_tick(16)
-            .max_blocking_threads(mvm_vmm::host::host_agent_spawn::OWNED_BLOCKING_WORKERS_PER_PROCESS);
+            .max_blocking_threads(
+                mvm_vmm::host::host_agent_spawn::OWNED_BLOCKING_WORKERS_PER_PROCESS,
+            );
     }
     let runtime = builder
         .build()
@@ -92,7 +99,9 @@ fn main() -> Result<()> {
     runtime.block_on(async move {
         let helper = SignerHelper::new(cfg.tenant_id, cfg.software_chain_key_path);
         let helper = Arc::new(Mutex::new(if owned {
-            helper.with_owned_resource_limits().with_audit_chain_bytes(chain_bytes)
+            helper
+                .with_owned_resource_limits()
+                .with_audit_chain_bytes(chain_bytes)
         } else {
             helper
         }));

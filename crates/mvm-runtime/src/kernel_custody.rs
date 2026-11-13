@@ -170,12 +170,7 @@ impl KernelBoundLaunch {
                 "backend has no original installed native lifetime"
             );
             let lease = owner.claim_for_native(&self.config, driver.kind())?;
-            return driver.boot_custodied_with_host_lifetime(
-                spec,
-                files,
-                lease,
-                owner.binding(),
-            );
+            return driver.boot_custodied_with_host_lifetime(spec, files, lease, owner.binding());
         }
         driver.boot_custodied(spec, files)
     }

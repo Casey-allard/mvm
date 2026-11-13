@@ -1,22 +1,58 @@
-use anyhow::{Result,ensure};
-use ed25519_dalek::{SigningKey,pkcs8::EncodePrivateKey};
-use mvm_core::net::session::{Session,read_sealed_frame,write_sealed_frame};
+use anyhow::{Result, ensure};
+use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
 use mvm_contract::protocol::network_flow::Opcode;
+use mvm_core::net::session::{Session, read_sealed_frame, write_sealed_frame};
+use mvm_hostd::supervisor::flowmux::{
+    PayloadResourceLimits, PayloadResourcePool, PreparedPayloadSession, accept_enrolled_payload,
+};
 use mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan;
-use mvm_hostd::supervisor::flowmux::{PayloadResourceLimits,PayloadResourcePool,PreparedPayloadSession,accept_enrolled_payload};
-use spiralcore_mvm_flowmux::{Role,scope::{PinnedScopePolicy,ScopeFacts},tls::{TlsCarrier,PinnedIdentity}};
-use spiralcore_transfer::{resource_profile::ResourceProfile,v1::{Capabilities,ObjectEndpoint,ObjectMode,ObjectSender}};
-use std::{net::{TcpStream,TcpListener,SocketAddr,Shutdown},io::{Read,Write},time::{Duration,Instant},os::unix::net::UnixStream};
-pub const TARGET:&str="cooperator.mvm.peer";
-pub fn fixture_identity(key:&SigningKey)->PinnedIdentity { PinnedIdentity::from_pkcs8(key.to_pkcs8_der().unwrap().as_bytes().to_vec()).unwrap() }
-pub fn payload()->Vec<u8> { let mut bytes = b"{\"kind\":\"flowmux\",\"value\":1}\n".repeat(200); bytes.extend_from_slice(&[0,255,0,0]); bytes }
-pub fn accept(listener:&TcpListener)->Result<TcpStream> {
-    rustix::event::poll(&mut [rustix::event::PollFd::new(listener, rustix::event::PollFlags::IN)], Some(&rustix::event::Timespec{tv_sec:8,tv_nsec:0}))?;
+use spiralcore_mvm_flowmux::{
+    Role,
+    scope::{PinnedScopePolicy, ScopeFacts},
+    tls::{PinnedIdentity, TlsCarrier},
+};
+use spiralcore_transfer::{
+    resource_profile::ResourceProfile,
+    v1::{Capabilities, ObjectEndpoint, ObjectMode, ObjectSender},
+};
+use std::{
+    io::{Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    os::unix::net::UnixStream,
+    time::{Duration, Instant},
+};
+pub const TARGET: &str = "cooperator.mvm.peer";
+pub fn fixture_identity(key: &SigningKey) -> PinnedIdentity {
+    PinnedIdentity::from_pkcs8(key.to_pkcs8_der().unwrap().as_bytes().to_vec()).unwrap()
+}
+pub fn payload() -> Vec<u8> {
+    let mut bytes = b"{\"kind\":\"flowmux\",\"value\":1}\n".repeat(200);
+    bytes.extend_from_slice(&[0, 255, 0, 0]);
+    bytes
+}
+pub fn accept(listener: &TcpListener) -> Result<TcpStream> {
+    rustix::event::poll(
+        &mut [rustix::event::PollFd::new(
+            listener,
+            rustix::event::PollFlags::IN,
+        )],
+        Some(&rustix::event::Timespec {
+            tv_sec: 8,
+            tv_nsec: 0,
+        }),
+    )?;
     Ok(listener.accept()?.0)
 }
-pub fn serve_original(socket:TcpStream,address:SocketAddr,server_identity:PinnedIdentity,initiator_spki:[u8;32],plan:AdmittedNetworkPlan,stream_id:u32)->Result<()> {
-    let until=Instant::now()+Duration::from_secs(8);
-    let tls=TlsCarrier::accept(socket, &server_identity,initiator_spki,until)?;
+pub fn serve_original(
+    socket: TcpStream,
+    address: SocketAddr,
+    server_identity: PinnedIdentity,
+    initiator_spki: [u8; 32],
+    plan: AdmittedNetworkPlan,
+    stream_id: u32,
+) -> Result<()> {
+    let until = Instant::now() + Duration::from_secs(8);
+    let tls = TlsCarrier::accept(socket, &server_identity, initiator_spki, until)?;
     let facts = ScopeFacts {
         object_profile: 2,
         policy_sha256: hex::decode(&plan.policy_sha256)
@@ -35,8 +71,8 @@ pub fn serve_original(socket:TcpStream,address:SocketAddr,server_identity:Pinned
             .unwrap(),
         tenant: plan.tenant_id,
         instance: plan.instance_id,
-        session: hex::encode([3;32]),
-        guest_key: SigningKey::from_bytes(&[7;32]).verifying_key().to_bytes(),
+        session: hex::encode([3; 32]),
+        guest_key: SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes(),
         stream_id,
         requested_host: TARGET.into(),
         requested_port: 443,
@@ -93,10 +129,16 @@ pub fn serve_original(socket:TcpStream,address:SocketAddr,server_identity:Pinned
     .unwrap();
     let mut mapped = accept_enrolled_payload(tls, prepared, until).unwrap();
     let mut body = Vec::new();
-    (&mut mapped).take((payload().len()+1) as u64).read_to_end(&mut body)?;
+    (&mut mapped)
+        .take((payload().len() + 1) as u64)
+        .read_to_end(&mut body)?;
     ensure!(body == payload());
-    mapped.write_all(&body)?; mapped.shutdown(Shutdown::Write)?;
-    drop(mapped); pool.close_admission()?; ensure!(pool.drained()?); Ok(())
+    mapped.write_all(&body)?;
+    mapped.shutdown(Shutdown::Write)?;
+    drop(mapped);
+    pool.close_admission()?;
+    ensure!(pool.drained()?);
+    Ok(())
 }
 pub fn send(stream: &mut UnixStream, session: &mut Session, opcode: Opcode, id: u32, bytes: &[u8]) {
     let frame = mvm_contract::protocol::network_flow::encode(opcode, id, bytes).unwrap();

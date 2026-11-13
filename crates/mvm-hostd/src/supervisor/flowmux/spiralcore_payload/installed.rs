@@ -225,8 +225,9 @@ impl InstalledScopeController {
         // Keep the final component a real private directory for the codec's
         // no-symlink checks. The controller holds the parent through the relay.
         use std::os::fd::AsRawFd;
-        let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
-            .join(&name);
+        let path =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+                .join(&name);
         permit.attach_owned_directory(path.clone(), directory, Arc::clone(&self.directory))?;
 
         self.lease.check_current().map_err(invalid)?;

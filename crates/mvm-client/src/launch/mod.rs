@@ -23,6 +23,8 @@ pub mod persistent;
 mod request;
 mod session;
 pub(crate) use request::persisted_spec_from_request;
+#[cfg(unix)]
+mod host_lifetime_preflight;
 pub mod runtime_overlay;
 pub mod runtime_source;
 pub mod start_params;
@@ -32,16 +34,14 @@ mod tests;
 mod transient;
 mod unbooted;
 #[cfg(unix)]
-mod host_lifetime_preflight;
-#[cfg(unix)]
 pub use host_lifetime_preflight::{HostLifetimeLaunchFailure, UnusedHostLifetimePreparation};
 
 use mvm_hostd::mailbox_process::original_journal::PairedBootReservation;
 use unbooted::DefinitionOrigin;
 
 pub use request::{
-    AccessMode, HostLifetimeIntent, LaunchNetworkPolicy, LaunchRequest, LaunchRequestBuilder, LaunchSource,
-    LaunchVolumeSpec, LifecycleMode, MachineSecretRef,
+    AccessMode, HostLifetimeIntent, LaunchNetworkPolicy, LaunchRequest, LaunchRequestBuilder,
+    LaunchSource, LaunchVolumeSpec, LifecycleMode, MachineSecretRef,
 };
 
 use std::path::PathBuf;
@@ -124,7 +124,10 @@ impl LaunchOutcome {
     /// Move the sealed endpoint owner once, without keeping the VM receipt
     /// mutex held during the parent's original disk cleanup.
     pub fn take_endpoint_retirement(&self) -> Result<Option<crate::EndpointRetirement>> {
-        let mut guard = self.retirement.try_lock().map_err(crate::local::backend_err)?;
+        let mut guard = self
+            .retirement
+            .try_lock()
+            .map_err(crate::local::backend_err)?;
         let receipt = guard.as_mut().ok_or_else(|| {
             crate::local::backend_err("original outcome has no positive owned retirement")
         })?;
@@ -138,7 +141,10 @@ impl LaunchOutcome {
         &self,
         inspect: impl FnOnce(&mvm_runtime::workload_runner::OwnedRetirement) -> R,
     ) -> Result<R> {
-        let guard = self.retirement.try_lock().map_err(crate::local::backend_err)?;
+        let guard = self
+            .retirement
+            .try_lock()
+            .map_err(crate::local::backend_err)?;
         let receipt = guard.as_ref().ok_or_else(|| {
             crate::local::backend_err("original outcome has no positive owned retirement")
         })?;
@@ -712,8 +718,19 @@ impl LocalBackend {
                 emitter: emitter.as_deref(),
                 assurance: campaign.as_ref(),
             };
-            let mapping = params.installed_payload_mapping.as_ref().ok_or_else(|| MvmError::InvalidSpec { reason: "installed launch requires its signed direct mapping".into() })?;
-            let started = mvm_hostd::run::admit_and_boot_local_with_installed_mapping(&backend, &req, context, mvm_hostd::run::SelectedLocalMapping { owner, mapping });
+            let mapping =
+                params
+                    .installed_payload_mapping
+                    .as_ref()
+                    .ok_or_else(|| MvmError::InvalidSpec {
+                        reason: "installed launch requires its signed direct mapping".into(),
+                    })?;
+            let started = mvm_hostd::run::admit_and_boot_local_with_installed_mapping(
+                &backend,
+                &req,
+                context,
+                mvm_hostd::run::SelectedLocalMapping { owner, mapping },
+            );
             return started.map_err(|e| crate::local::backend_err(format!("{e:#}")));
         }
         admit_and_boot_local(
@@ -957,8 +974,15 @@ impl LocalBackend {
         lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
         mapping: CooperatingPayloadPolicy,
     ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
-        self.try_launch_with_host_lifetime_and_direct_policy(request, lifetime,
-            mvm_hostd::run::DirectTcpPolicy { mapping, peers: Vec::new() }).await
+        self.try_launch_with_host_lifetime_and_direct_policy(
+            request,
+            lifetime,
+            mvm_hostd::run::DirectTcpPolicy {
+                mapping,
+                peers: Vec::new(),
+            },
+        )
+        .await
     }
 
     /// Launch with the exact operator-supplied peer routes covered by the canonical signed policy.
@@ -996,9 +1020,12 @@ impl LocalBackend {
         lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
     ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
         if request.installed_payload_mapping.is_none() {
-            return Err(HostLifetimeLaunchFailure::unused(MvmError::InvalidSpec{
-                reason:"installed call requires an explicit signed direct TCP policy".into(),
-            },lifetime));
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "installed call requires an explicit signed direct TCP policy".into(),
+                },
+                lifetime,
+            ));
         }
         if request.mode != LifecycleMode::Transient || request.name.is_none() {
             return Err(HostLifetimeLaunchFailure::unused(
@@ -1100,13 +1127,20 @@ impl LocalBackend {
                 reason: "installed launch outcome substituted".into(),
             });
         }
-        let mut retirement = outcome.retirement.try_lock().map_err(crate::local::backend_err)?;
+        let mut retirement = outcome
+            .retirement
+            .try_lock()
+            .map_err(crate::local::backend_err)?;
         if retirement.is_some() {
             return Ok(());
         }
         let id = VmId(outcome.machine.id.0.clone());
-        self.backend.stop_owned(&id, anchor).map_err(crate::local::backend_err)?;
-        let receipt = self.backend.take_owned_retirement(&id, anchor)
+        self.backend
+            .stop_owned(&id, anchor)
+            .map_err(crate::local::backend_err)?;
+        let receipt = self
+            .backend
+            .take_owned_retirement(&id, anchor)
             .map_err(crate::local::backend_err)?;
         *retirement = Some(receipt);
         Ok(())
@@ -1116,16 +1150,21 @@ impl LocalBackend {
     /// retained native record. Keep the linear receipt through parent release.
     /// Unknown/consumed records never become successful cleanup by absence.
     #[cfg(unix)]
-    pub async fn stop_owned_pending(&self,
-        binding: &mvm_core::host_lifetime::HostLaunchBinding)
-        -> Result<mvm_runtime::workload_runner::OwnedRetirement> {
+    pub async fn stop_owned_pending(
+        &self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<mvm_runtime::workload_runner::OwnedRetirement> {
         if binding.backend != self.backend.kind() {
             return Err(MvmError::InvalidSpec {
                 reason: "pending installed backend differs from original".into(),
             });
         }
-        self.backend.stop_owned_pending(binding).map_err(crate::local::backend_err)?;
-        self.backend.take_owned_retirement_pending(binding).map_err(crate::local::backend_err)
+        self.backend
+            .stop_owned_pending(binding)
+            .map_err(crate::local::backend_err)?;
+        self.backend
+            .take_owned_retirement_pending(binding)
+            .map_err(crate::local::backend_err)
     }
 
     /// Launch a machine from a fully-validated typed request. Transient
@@ -1353,11 +1392,18 @@ impl LocalBackend {
             Err(command) => {
                 #[cfg(unix)]
                 if let Some(anchor) = &outcome.host_lifetime {
-                    return Err(CommandStartFailure { command,
-                        stop:self.backend.stop_owned(&VmId(name),anchor)
-                            .map_err(crate::local::backend_err) });
+                    return Err(CommandStartFailure {
+                        command,
+                        stop: self
+                            .backend
+                            .stop_owned(&VmId(name), anchor)
+                            .map_err(crate::local::backend_err),
+                    });
                 }
-                Err(CommandStartFailure { command, stop:self.stop_for_recreate(&name) })
+                Err(CommandStartFailure {
+                    command,
+                    stop: self.stop_for_recreate(&name),
+                })
             }
         }
     }
@@ -1760,7 +1806,9 @@ impl LocalBackend {
     ) -> Result<ExitReport> {
         #[cfg(unix)]
         if outcome.host_lifetime.is_some() {
-            return Err(crate::local::backend_err("installed wait requires the original resident lifecycle; no name-based exit observation"));
+            return Err(crate::local::backend_err(
+                "installed wait requires the original resident lifecycle; no name-based exit observation",
+            ));
         }
         let name = outcome.machine.name.clone();
         let deadline = std::time::Instant::now() + timeout;
@@ -1782,7 +1830,9 @@ impl LocalBackend {
     pub fn report_exit(&self, outcome: &LaunchOutcome) -> Result<ExitReport> {
         #[cfg(unix)]
         if outcome.host_lifetime.is_some() {
-            return Err(crate::local::backend_err("installed exit reporting requires original native retirement; sidecars are not an exit proof"));
+            return Err(crate::local::backend_err(
+                "installed exit reporting requires original native retirement; sidecars are not an exit proof",
+            ));
         }
         let name = outcome.machine.name.as_str();
         let state_dir = vm_state_dir(name);

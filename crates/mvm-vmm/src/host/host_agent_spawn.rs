@@ -41,9 +41,10 @@ pub const OWNED_TENANT_MAX_THREADS: usize =
 mod owned;
 pub(crate) use owned::require_live_event;
 pub use owned::{
-    HostAgentParentPermit, OwnedAuditSideband, OwnedHostAgent, OwnedHostAgentInputs, OwnedHostAgentRegistrar,
-    OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration, PreparedEndpointAudit, RegisteredEndpointOwner, RegisteredAuditFile,
-    owned_host_agent_service, validate_owned_host_agent_services,
+    HostAgentParentPermit, OwnedAuditSideband, OwnedHostAgent, OwnedHostAgentInputs,
+    OwnedHostAgentRegistrar, OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration,
+    PreparedEndpointAudit, RegisteredAuditFile, RegisteredEndpointOwner, owned_host_agent_service,
+    validate_owned_host_agent_services,
 };
 
 /// PID file for the per-tenant host-agent daemon, under `host_agent_dir`.

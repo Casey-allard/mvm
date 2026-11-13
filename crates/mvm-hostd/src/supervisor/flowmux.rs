@@ -9,10 +9,10 @@
 
 mod http_flow;
 mod ingress;
-mod open_flow;
-mod owned_relays;
 #[cfg(all(test, unix))]
 mod installed_carrier_tests;
+mod open_flow;
+mod owned_relays;
 pub use owned_relays::{OWNED_TCP_RELAY_STACK_BYTES, OwnedTcpRelays};
 mod payload_mapping;
 mod spiralcore_payload;

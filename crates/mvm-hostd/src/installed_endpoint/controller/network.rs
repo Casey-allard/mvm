@@ -1,6 +1,5 @@
 //! Selected Object-TCP foreground controller. No legacy serve/runtime fallback.
 use super::*;
-use anyhow::Context as _;
 use crate::installed_endpoint::Component;
 use crate::supervisor::{
     flowmux::{
@@ -9,6 +8,7 @@ use crate::supervisor::{
     },
     network_endpoint::{EndpointConfig, ResolverBackend, build_egress_gate},
 };
+use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mvm_vmm::host::network_endpoint_spawn::EndpointTransport;
 use std::{
@@ -93,7 +93,10 @@ fn selected_config(config: &EndpointConfig) -> Result<&Path> {
         anyhow::bail!("installed Object-TCP requires original UDS transport")
     };
     let socket_dir = mvm_core::config::vm_socket_dir_at(state);
-    let telemetry = config.telemetry.as_ref().expect("checked original collector");
+    let telemetry = config
+        .telemetry
+        .as_ref()
+        .expect("checked original collector");
     ensure!(
         state.is_absolute()
             && state.parent().is_some()
@@ -102,9 +105,17 @@ fn selected_config(config: &EndpointConfig) -> Result<&Path> {
                 path.as_path() == state.join(name) || path.as_path() == socket_dir.join(name)
             })
             && config.session_marker.as_deref()
-                == Some(state.join(mvm_vmm::host::network_endpoint_spawn::SUBST_SESSION_FILE).as_path())
+                == Some(
+                    state
+                        .join(mvm_vmm::host::network_endpoint_spawn::SUBST_SESSION_FILE)
+                        .as_path()
+                )
             && config.session_ready_socket.as_deref()
-                == Some(socket_dir.join(mvm_vmm::host::network_endpoint_spawn::SUBST_SESSION_READY_SOCKET).as_path())
+                == Some(
+                    socket_dir
+                        .join(mvm_vmm::host::network_endpoint_spawn::SUBST_SESSION_READY_SOCKET)
+                        .as_path()
+                )
             && telemetry.telemetry_sock
                 == mvm_core::config::vm_hvf_vsock_port_socket_at(
                     state,
@@ -124,8 +135,8 @@ fn bind(path: &Path, directory: &File) -> Result<UnixListener> {
     // Resolve the socket name relative to the held directory even if its
     // canonical pathname is replaced after the authority check.
     let name = path.file_name().context("installed socket name missing")?;
-    let pinned = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-        .join(name);
+    let pinned =
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
     let listener = UnixListener::bind(pinned)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
@@ -152,7 +163,9 @@ pub(super) fn run(
         let funded = child.projection().limits.host_resident_bytes()?;
         let limit = getrlimit(Resource::As);
         ensure!(
-            limit.current.zip(limit.maximum)
+            limit
+                .current
+                .zip(limit.maximum)
                 .is_some_and(|(soft, hard)| soft <= hard && hard <= funded),
             "installed endpoint has no matching original process address-space bound"
         );
@@ -161,7 +174,10 @@ pub(super) fn run(
     let session_control =
         crate::installed_endpoint::InstalledSessionControl::new(controller.clone());
     let audit = resources.lease.audit()?;
-    let telemetry = config.telemetry.as_ref().context("original collector missing")?;
+    let telemetry = config
+        .telemetry
+        .as_ref()
+        .context("original collector missing")?;
     ensure!(
         audit.tenant() == config.tenant_id && audit.socket() == telemetry.signer_sock,
         "installed collector audit authority differs"
@@ -419,7 +435,10 @@ impl SessionWorker {
                         b"1",
                     )
                     .inspect_err(|error| {
-                        eprintln!("installed session marker publication refused ({:?})", error.kind());
+                        eprintln!(
+                            "installed session marker publication refused ({:?})",
+                            error.kind()
+                        );
                     })?;
                     authenticated.store(true, Ordering::Release);
                     let served = session.serve();

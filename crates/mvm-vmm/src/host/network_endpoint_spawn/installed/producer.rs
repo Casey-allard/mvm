@@ -83,7 +83,9 @@ impl Preparation {
         // Capture each actual observation before any fallible post-open work.
         // This is not a pathname-to-authority constructor: the SAME original
         // parent guard validates and protects this directory before key effects.
-        let (registered_state, _) = original.registration.original_directories(original.registrar, &original.params)?;
+        let (registered_state, _) = original
+            .registration
+            .original_directories(original.registrar, &original.params)?;
         let state = registered_state.try_clone()?;
         custody
             .telemetry

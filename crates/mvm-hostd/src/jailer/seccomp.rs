@@ -383,9 +383,7 @@ fn apply_inner(
         // x86_64's legacy profile admits rename, not renameat. Permit only
         // descriptor-relative sidecar publication within this held state.
         // On aarch64 the existing rename rule already maps to renameat.
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            rules.entry(libc::SYS_renameat)
-        {
+        if let std::collections::btree_map::Entry::Vacant(entry) = rules.entry(libc::SYS_renameat) {
             let conditions = [0, 2]
                 .into_iter()
                 .map(|argument| {
@@ -398,8 +396,10 @@ fn apply_inner(
                     .map_err(|error| JailerError::SeccompInstall(error.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            entry.insert(vec![SeccompRule::new(conditions)
-                .map_err(|error| JailerError::SeccompInstall(error.to_string()))?]);
+            entry
+                .insert(vec![SeccompRule::new(conditions).map_err(|error| {
+                    JailerError::SeccompInstall(error.to_string())
+                })?]);
         }
     }
     if owned_records {

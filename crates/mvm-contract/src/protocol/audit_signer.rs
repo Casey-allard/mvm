@@ -250,7 +250,10 @@ impl SignerHelperRequest {
 /// Snapshot of the original funded chain at an authenticated registration transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AuditInventoryPhase { Registered, Deregistered }
+pub enum AuditInventoryPhase {
+    Registered,
+    Deregistered,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -268,16 +271,18 @@ pub struct AuditInventory {
 
 impl AuditInventory {
     pub fn same_registration(&self, other: &Self) -> bool {
-        self.generation == other.generation && self.tenant == other.tenant
-            && self.vm == other.vm && self.workload == other.workload
-            && (self.dev,self.ino) == (other.dev,other.ino)
+        self.generation == other.generation
+            && self.tenant == other.tenant
+            && self.vm == other.vm
+            && self.workload == other.workload
+            && (self.dev, self.ino) == (other.dev, other.ino)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedAuditInventory {
-    pub key: [u8;32],
+    pub key: [u8; 32],
     pub envelope: super::signed_config::SignedConfigEnvelope,
 }
 
@@ -294,7 +299,10 @@ pub enum SignerHelperResponse {
     /// VM deregistration succeeded. Unknown VMs are idempotently accepted.
     Deregistered { request_id: String, vm_id: String },
     /// Original funded chain snapshot from the exclusively held signer.
-    FundedInventory { request_id: String, inventory: Box<SignedAuditInventory> },
+    FundedInventory {
+        request_id: String,
+        inventory: Box<SignedAuditInventory>,
+    },
     /// Append succeeded.
     Ok {
         request_id: String,

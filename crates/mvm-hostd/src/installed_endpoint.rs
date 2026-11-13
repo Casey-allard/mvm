@@ -196,7 +196,10 @@ impl InstalledEndpointResources {
             store: store.clone(),
         });
         let pool = PayloadResourcePool::from_installed_parent(
-            parent, plan, &session, projection.limits.host_carrier_bytes,
+            parent,
+            plan,
+            &session,
+            projection.limits.host_carrier_bytes,
         )?;
         Ok(Self {
             startup_deadline: child.startup_deadline(),
@@ -419,9 +422,9 @@ pub(crate) fn publish_runtime_sidecar(
         Mode::RUSR | Mode::WUSR,
     )?;
     let mut file = File::from(descriptor);
-    let result = file.write_all(bytes).and_then(|()| {
-        renameat(directory, scratch, directory, name).map_err(Into::into)
-    });
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| renameat(directory, scratch, directory, name).map_err(Into::into));
     if result.is_err() {
         let _ = unlinkat(directory, scratch, AtFlags::empty());
     }

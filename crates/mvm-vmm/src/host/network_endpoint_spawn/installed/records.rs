@@ -181,7 +181,9 @@ impl InstalledTelemetryRecords {
             Ok(())
         } else {
             self.lease.fail_cleanup();
-            Err(std::io::Error::other("installed records append left unverified bytes"))
+            Err(std::io::Error::other(
+                "installed records append left unverified bytes",
+            ))
         }
     }
 }
@@ -190,7 +192,10 @@ impl std::io::Write for InstalledTelemetryRecords {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let length = self.current_len()?;
         let cap = crate::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP;
-        if length.checked_add(bytes.len() as u64).is_none_or(|end| end > cap) {
+        if length
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|end| end > cap)
+        {
             return Err(std::io::Error::other("installed records append refused"));
         }
         self.file.write(bytes)

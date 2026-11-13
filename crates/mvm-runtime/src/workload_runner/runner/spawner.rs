@@ -70,7 +70,9 @@ pub trait NetworkEndpointSpawner: Send + Sync {
     /// Provision authentication without starting an endpoint or granting egress.
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>>;
     #[cfg(unix)]
-    fn supports_registered_installed_endpoint(&self) -> bool { false }
+    fn supports_registered_installed_endpoint(&self) -> bool {
+        false
+    }
     #[cfg(unix)]
     fn spawn_installed(
         &self,
@@ -236,36 +238,73 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
             AdmittedNetworkPlan, EndpointLifetime, spawn_network_endpoint_installed_registered,
         };
 
-        let original = original.context("installed direct endpoint requires signed host-service registration")?;
+        let original = original
+            .context("installed direct endpoint requires signed host-service registration")?;
         original.check_endpoint_binding(req.vm_name, req.tenant, req.state_dir)?;
-        let anchor = config.host_lifetime.as_ref().context("installed direct endpoint original lifetime missing")?;
-        anyhow::ensure!(self.supports_registered_installed_endpoint()
-            && anchor.binding().backend == BackendKind::Firecracker
-            && req.network_policy == &config.network_policy
-            && req.network_policy.payload_mapping().is_some()
-            && req.secrets.is_empty() && req.ingress.is_empty()
-            && matches!(req.identity, FlowMuxIdentitySource::Mint),
-            "unsupported original direct TCP endpoint launch");
+        let anchor = config
+            .host_lifetime
+            .as_ref()
+            .context("installed direct endpoint original lifetime missing")?;
+        anyhow::ensure!(
+            self.supports_registered_installed_endpoint()
+                && anchor.binding().backend == BackendKind::Firecracker
+                && req.network_policy == &config.network_policy
+                && req.network_policy.payload_mapping().is_some()
+                && req.secrets.is_empty()
+                && req.ingress.is_empty()
+                && matches!(req.identity, FlowMuxIdentitySource::Mint),
+            "unsupported original direct TCP endpoint launch"
+        );
         anchor.check_parent_current(config, BackendKind::Firecracker)?;
-        let plan = mvm_core::plan::plan_from_admitted_json(config.plan_json.as_deref().context("original admitted plan missing")?)?;
+        let plan = mvm_core::plan::plan_from_admitted_json(
+            config
+                .plan_json
+                .as_deref()
+                .context("original admitted plan missing")?,
+        )?;
         let facts = AdmittedNetworkPlan::from_plan(&plan, req.vm_name, req.network_policy)?;
         let handoff = anchor.prepare_endpoint_handoff(config, BackendKind::Firecracker)?;
         handoff.check_direct_network(&facts, &req.network_limits, req.redaction)?;
         let session = hex::encode(handoff.partition().projection().session);
         let uds = vm_network_endpoint_socket(req.vm_name);
-        let (identity, drive) = prepare_endpoint_identity(req, None, &BootEgressCa(None), &session, Some(original))?;
+        let (identity, drive) =
+            prepare_endpoint_identity(req, None, &BootEgressCa(None), &session, Some(original))?;
         mvm_vmm::host::telemetry_registration::register_telemetry_boot(
-            req.state_dir, req.vm_name, &identity.guest_verifying_key_base64)?;
+            req.state_dir,
+            req.vm_name,
+            &identity.guest_verifying_key_base64,
+        )?;
         mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(req.state_dir, true)?;
-        let endpoint = spawn_network_endpoint_installed_registered(SubstitutionSpawnParams {
-            vm_name: req.vm_name, state_dir: req.state_dir, lifetime: EndpointLifetime::Launcher,
-            telemetry: true, tenant: req.tenant, secrets: req.secrets, redaction: req.redaction,
-            transport: EndpointTransport::Uds { path: uds.clone() }, egress_proxy: None,
-            session_marker: None, tls_intermediate: None, admitted_network_plan: Some(facts),
-            network_policy: Some(req.network_policy), network_limits: req.network_limits, ingress: req.ingress,
-            resolver_remote: None, binding_store_dir: None, flowmux_identity: Some(identity),
-        }, handoff, original)?;
-        Ok(InstalledSpawnedEndpoint { egress_uds: Some(uds), identity_drive: drive, owner: Some(endpoint), telemetry: true })
+        let endpoint = spawn_network_endpoint_installed_registered(
+            SubstitutionSpawnParams {
+                vm_name: req.vm_name,
+                state_dir: req.state_dir,
+                lifetime: EndpointLifetime::Launcher,
+                telemetry: true,
+                tenant: req.tenant,
+                secrets: req.secrets,
+                redaction: req.redaction,
+                transport: EndpointTransport::Uds { path: uds.clone() },
+                egress_proxy: None,
+                session_marker: None,
+                tls_intermediate: None,
+                admitted_network_plan: Some(facts),
+                network_policy: Some(req.network_policy),
+                network_limits: req.network_limits,
+                ingress: req.ingress,
+                resolver_remote: None,
+                binding_store_dir: None,
+                flowmux_identity: Some(identity),
+            },
+            handoff,
+            original,
+        )?;
+        Ok(InstalledSpawnedEndpoint {
+            egress_uds: Some(uds),
+            identity_drive: drive,
+            owner: Some(endpoint),
+            telemetry: true,
+        })
     }
 
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>> {
@@ -389,7 +428,8 @@ fn spawn_local_endpoint(
 ) -> Result<SpawnedEndpoint> {
     let uds = vm_network_endpoint_socket(req.vm_name);
     let egress_ca = BootEgressCa::resolve(req)?;
-    let (identity, identity_drive) = prepare_endpoint_identity(req, capture, &egress_ca, req.vm_name, None)?;
+    let (identity, identity_drive) =
+        prepare_endpoint_identity(req, capture, &egress_ca, req.vm_name, None)?;
 
     // Same seam for minted and inherited identities: the boot the endpoint
     // authenticates is the boot the telemetry dialer must expect.
@@ -443,7 +483,10 @@ fn prepare_endpoint_identity(
     egress_ca: &BootEgressCa,
     session_id: &str,
     registered: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
-) -> Result<(mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig, Option<PathBuf>)> {
+) -> Result<(
+    mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig,
+    Option<PathBuf>,
+)> {
     use mvm_vmm::host::flowmux_identity::{
         FlowMuxIdentityMaterial, IDENTITY_DRIVE_FILE, IdentityDriveContents,
         load_inheritable_identity,
@@ -455,7 +498,8 @@ fn prepare_endpoint_identity(
             let material = FlowMuxIdentityMaterial::mint_from_host_signer(session_id)
                 .context("minting this boot's FlowMux identity")?;
             if let Some(original) = registered {
-                original.check_flowmux_host_anchor(&material.host_signer_verifying_key()?.to_bytes())?;
+                original
+                    .check_flowmux_host_anchor(&material.host_signer_verifying_key()?.to_bytes())?;
             }
             let reader_boot = mint_mailbox_reader_boot(req, material.guest_verifying_key())?;
             observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;

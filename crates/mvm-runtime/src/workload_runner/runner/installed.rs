@@ -356,11 +356,20 @@ impl InstalledSlot {
             }
         }
         #[cfg(target_os = "linux")]
-        let never_spawned = if let Some(proof) = state.failure.as_ref().and_then(|error| error.downcast_ref::<mvm_backends::driver::fc::OriginalFcNotSpawned>()) {
-            anyhow::ensure!(state.native_dispatch_entered && state.vm.is_none() && self.binding() == proof.binding(), "foreign pre-spawn refusal");
+        let never_spawned = if let Some(proof) = state.failure.as_ref().and_then(|error| {
+            error.downcast_ref::<mvm_backends::driver::fc::OriginalFcNotSpawned>()
+        }) {
+            anyhow::ensure!(
+                state.native_dispatch_entered
+                    && state.vm.is_none()
+                    && self.binding() == proof.binding(),
+                "foreign pre-spawn refusal"
+            );
             self.owner.check_original_lease(proof.lease())?;
             true
-        } else { false };
+        } else {
+            false
+        };
         #[cfg(not(target_os = "linux"))]
         let never_spawned = false;
         if state.native_dispatch_entered && state.exit.is_none() && !never_spawned {
@@ -375,8 +384,7 @@ impl InstalledSlot {
                 if let Some(failed) =
                     failure.downcast_mut::<mvm_backends::driver::fc::OwnedFcBootFailure>()
                 {
-                    let proof = failed
-                        .collect_original(Instant::now() + Duration::from_secs(2))?;
+                    let proof = failed.collect_original(Instant::now() + Duration::from_secs(2))?;
                     mvm_vmm::driver::traits::KernelStopOutcome {
                         fc_exit: Some(proof),
                         hvf_exit: None,
@@ -391,8 +399,14 @@ impl InstalledSlot {
             match self.binding().backend {
                 #[cfg(target_os = "linux")]
                 BackendKind::Firecracker => {
-                    let proof = stopped.fc_exit.as_ref().context("original Firecracker exit proof unavailable")?;
-                    anyhow::ensure!(proof.binding() == self.binding(), "foreign Firecracker exit binding");
+                    let proof = stopped
+                        .fc_exit
+                        .as_ref()
+                        .context("original Firecracker exit proof unavailable")?;
+                    anyhow::ensure!(
+                        proof.binding() == self.binding(),
+                        "foreign Firecracker exit binding"
+                    );
                     self.owner.check_original_lease(proof.lease())?;
                 }
                 BackendKind::Hvf => {
@@ -436,7 +450,10 @@ impl InstalledSlot {
             .as_ref()
             .context("original installed launch missing")?;
         let has_kernel = crate::kernel_custody::has_retained_kernel(lifecycle)?;
-        anyhow::ensure!(!never_spawned || !has_kernel, "generation has recorded native effects despite pre-spawn proof");
+        anyhow::ensure!(
+            !never_spawned || !has_kernel,
+            "generation has recorded native effects despite pre-spawn proof"
+        );
         if has_kernel {
             let stopped = state
                 .exit

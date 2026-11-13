@@ -474,8 +474,16 @@ fn unsupported_native_driver_refuses_before_reserving_installed_custody() {
         cmdline: "console=ttyS0".into(),
     };
 
-    let refused = runner.start_workload(&inputs).err().expect("unsupported native backend");
-    assert!(refused.to_string().contains("installed native backend unavailable"), "{refused:#}");
+    let refused = runner
+        .start_workload(&inputs)
+        .err()
+        .expect("unsupported native backend");
+    assert!(
+        refused
+            .to_string()
+            .contains("installed native backend unavailable"),
+        "{refused:#}"
+    );
     assert!(!installed::marker(&id).exists());
     assert!(runner.installed.find(&id).unwrap().is_none());
 }

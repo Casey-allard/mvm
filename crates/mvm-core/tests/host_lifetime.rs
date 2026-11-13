@@ -674,3 +674,30 @@ fn installed_resolver_reads_only_the_exact_quoted_archive() {
         .unwrap();
     assert!(resolver.resolve(&pin).is_err());
 }
+
+#[cfg(feature = "host-state")]
+#[test]
+fn installed_resolver_quotes_original_tar_bytes_in_gzip_storage() {
+    use flate2::{Compression, write::GzEncoder};
+    use mvm_core::plan::{BundleResolver, FsBundleResolver};
+    use std::{io::Write, num::NonZeroU64};
+    let body = b"exact original tar bytes";
+    let dir = tempfile::tempdir().unwrap();
+    let pin = hex::encode(Sha256::digest(body));
+    let plain = dir.path().join(format!("{pin}.mvmpkg"));
+    let compressed = dir.path().join(format!("{pin}.mvmpkg.gz"));
+    std::fs::write(&plain, body).unwrap();
+    let resolver = FsBundleResolver::new(dir.path())
+        .with_exact_archive(&pin, NonZeroU64::new(body.len() as u64).unwrap()).unwrap();
+    assert_eq!(resolver.resolve(&pin).unwrap(), body);
+    let mut encoded = GzEncoder::new(File::create(&compressed).unwrap(), Compression::fast());
+    encoded.write_all(body).unwrap();
+    encoded.finish().unwrap();
+    std::fs::remove_file(plain).unwrap();
+    assert_eq!(resolver.resolve(&pin).unwrap(), body);
+    for size in [body.len()-1, body.len()+1] {
+        let incorrect = FsBundleResolver::new(dir.path())
+            .with_exact_archive(&pin, NonZeroU64::new(size as u64).unwrap()).unwrap();
+        assert!(incorrect.resolve(&pin).is_err());
+    }
+}

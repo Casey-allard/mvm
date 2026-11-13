@@ -34,11 +34,18 @@ impl HostAgentParentPermit for Parent {
         );
         Ok(())
     }
-    fn owned_process_address_space_limit(&self, tenant:&str) -> Result<Option<std::num::NonZeroU64>> {
+    fn owned_process_address_space_limit(
+        &self,
+        tenant: &str,
+    ) -> Result<Option<std::num::NonZeroU64>> {
         self.check_current(tenant)?;
-        Ok(if OwnedHostAgent::supports_process_address_space_limit() { std::num::NonZeroU64::new(256 << 20) } else {None})
+        Ok(if OwnedHostAgent::supports_process_address_space_limit() {
+            std::num::NonZeroU64::new(256 << 20)
+        } else {
+            None
+        })
     }
-    fn owned_audit_chain_bytes(&self, tenant:&str) -> Result<Option<std::num::NonZeroU64>> {
+    fn owned_audit_chain_bytes(&self, tenant: &str) -> Result<Option<std::num::NonZeroU64>> {
         self.check_current(tenant)?;
         Ok(std::num::NonZeroU64::new(256 << 10))
     }
@@ -73,10 +80,7 @@ impl Fixture {
             .tempdir()
             .unwrap();
         env.set("MVM_HOME", home.path());
-        env.set(
-            "MVM_HOST_AGENT_PATH",
-            env!("CARGO_BIN_EXE_mvm-host-agent"),
-        );
+        env.set("MVM_HOST_AGENT_PATH", env!("CARGO_BIN_EXE_mvm-host-agent"));
         env.set(
             "MVM_SIGNER_HELPER_PATH",
             env!("CARGO_BIN_EXE_mvm-signer-helper"),
@@ -156,28 +160,65 @@ fn register(
 struct ArchiveRetry(AtomicBool);
 
 impl mvm_vmm::host::host_agent_spawn::RegisteredEndpointOwner for ArchiveRetry {
-    fn bind_registration(&self, _registrar:&OwnedHostAgentRegistrar, registration:&OwnedVmRegistration, _params:&HostAgentServicesParams<'_>) -> Result<()> {
-        ensure!(registration.registered_audit().is_some_and(|f| f.terminal().is_none()));
+    fn bind_registration(
+        &self,
+        _registrar: &OwnedHostAgentRegistrar,
+        registration: &OwnedVmRegistration,
+        _params: &HostAgentServicesParams<'_>,
+    ) -> Result<()> {
+        ensure!(
+            registration
+                .registered_audit()
+                .is_some_and(|f| f.terminal().is_none())
+        );
         Ok(())
     }
-    fn retired_audit(&self,_registration:&OwnedVmRegistration, file:&mvm_vmm::host::host_agent_spawn::RegisteredAuditFile) -> Result<()> {
-        let ended=file.terminal().ok_or_else(||anyhow::anyhow!("original signed terminal missing"))?;
-        ensure!(file.registered().same_registration(ended));
-        if self.0.swap(false, Ordering::SeqCst) { anyhow::bail!("fixture archive busy"); }
+    fn retired_audit(
+        &self,
+        _registration: &OwnedVmRegistration,
+        file: &mvm_vmm::host::host_agent_spawn::RegisteredAuditFile,
+    ) -> Result<()> {
+        let ended = file
+            .terminal()
+            .ok_or_else(|| anyhow::anyhow!("original signed terminal missing"))?;
+        let key = file.verifying_key();
+        let opening = mvm_core::protocol::audit_inventory::verify(file.signed_registered(), &key)?;
+        let closing = mvm_core::protocol::audit_inventory::verify(
+            file.signed_terminal().ok_or_else(|| anyhow::anyhow!("missing signed closing inventory"))?, &key,
+        )?;
+        ensure!(&opening == file.registered() && &closing == ended);
+        ensure!(opening.same_registration(&closing));
+        if self.0.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("fixture archive busy");
+        }
         Ok(())
     }
 }
 #[test]
 fn a_terminal_archive_retry_retains_only_its_original_registration() -> Result<()> {
-    let f=Fixture::new();
-    let mut agent=OwnedHostAgent::spawn(f.inputs())?;
-    let registrar=agent.registrar().with_registration_owner(Arc::new(ArchiveRetry(AtomicBool::new(true))))?;
-    let (state,socket)=f.vm("vm-1");
-    let mut first=register(&registrar,"vm-1",&state,&socket)?;
-    ensure!(first.shutdown().unwrap_err().to_string().contains("fixture archive busy"));
-    let (state2,socket2)=f.vm("vm-2");
-    let mut second=register(&registrar,"vm-2",&state2,&socket2)?;
-    ensure!(first.registered_audit().unwrap().terminal().is_some_and(|row|row.length==0));
+    let f = Fixture::new();
+    let mut agent = OwnedHostAgent::spawn(f.inputs())?;
+    let registrar = agent
+        .registrar()
+        .with_registration_owner(Arc::new(ArchiveRetry(AtomicBool::new(true))))?;
+    let (state, socket) = f.vm("vm-1");
+    let mut first = register(&registrar, "vm-1", &state, &socket)?;
+    ensure!(
+        first
+            .shutdown()
+            .unwrap_err()
+            .to_string()
+            .contains("fixture archive busy")
+    );
+    let (state2, socket2) = f.vm("vm-2");
+    let mut second = register(&registrar, "vm-2", &state2, &socket2)?;
+    ensure!(
+        first
+            .registered_audit()
+            .unwrap()
+            .terminal()
+            .is_some_and(|row| row.length == 0)
+    );
     first.shutdown()?;
     second.shutdown()?;
     agent.shutdown()?;
@@ -187,14 +228,12 @@ fn a_terminal_archive_retry_retains_only_its_original_registration() -> Result<(
 #[path = "support/registered_direct_peer.rs"]
 mod peer;
 mod registered_prepare {
-    use super::*;
     use super::peer::*;
-    use mvm_contract::protocol::network_flow::{Opcode, hello::Handshake};
-    use spiralcore_mvm_flowmux::tls::TlsCarrier;
-    use std::time::{Duration,Instant};
+    use super::*;
     use anyhow::Context;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use ed25519_dalek::SigningKey;
+    use mvm_contract::protocol::network_flow::{Opcode, hello::Handshake};
     use mvm_core::{
         host_lifetime::{
             CoreCurrentParentPermit, EndpointPartitionGuard, EndpointPartitionLimits,
@@ -211,6 +250,8 @@ mod registered_prepare {
         FlowMuxIdentitySpawnConfig, InstalledHostServices, SubstitutionSpawnParams,
         spawn_network_endpoint_installed_registered,
     };
+    use spiralcore_mvm_flowmux::tls::TlsCarrier;
+    use std::time::{Duration, Instant};
     use std::{
         io::Read,
         os::{fd::AsFd, unix::fs::MetadataExt},
@@ -333,9 +374,21 @@ mod registered_prepare {
     ) -> Result<(PreparedEndpointHandoff, AdmittedNetworkPlan, Arc<Guard>)> {
         let mut plan = PlanFixture::new().workload("vm-1").build();
         plan.network_mode = mvm_core::plan::NetworkMode::HostVsockProxy;
-        plan.asset_identities.push(mvm_core::plan::AssetIdentity::new(mvm_core::plan::AssetKind::Policy, "network_policy", mvm_core::policy::network_policy::content_sha256(policy))?);
-        plan.bundle = Some(mvm_core::plan::bundle::PlanArtifact::new("11".repeat(32), &[8;64], mvm_core::plan::bundle::KeyId("original-fixture".into())));
+        plan.asset_identities
+            .push(mvm_core::plan::AssetIdentity::new(
+                mvm_core::plan::AssetKind::Policy,
+                "network_policy",
+                mvm_core::policy::network_policy::content_sha256(policy),
+            )?);
+        plan.bundle = Some(mvm_core::plan::bundle::PlanArtifact::new(
+            "11".repeat(32),
+            &[8; 64],
+            mvm_core::plan::bundle::KeyId("original-fixture".into()),
+        ));
         plan.plan_id = compute_plan_id(&plan);
+        let issuer = SigningKey::from_bytes(&[8; 32]);
+        let signed = sign_plan(&plan, &issuer, "fixture");
+        let plan = mvm_core::plan::verify_plan(&signed, &[("fixture", &issuer.verifying_key())])?;
         let projection = AdmittedNetworkPlan::from_plan(&plan, "vm-1", policy)?;
         let metadata = store.metadata()?;
         let facts = EndpointPartitionProjection {
@@ -376,7 +429,8 @@ mod registered_prepare {
                 // This is not a Root production profile or capacity claim.
                 host_stack_bytes: 24 << 20,
                 cache_disk_bytes: (16 << 20)
-                    + mvm_vmm::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP + mvm_core::runtime_state_protection::INSTALLED_TELEMETRY_SIDECAR_BYTES,
+                    + mvm_vmm::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP
+                    + mvm_core::runtime_state_protection::INSTALLED_TELEMETRY_SIDECAR_BYTES,
                 staging_disk_bytes: 16 << 20,
                 workers: 1,
                 max_streams: 1,
@@ -400,11 +454,7 @@ mod registered_prepare {
             ..Default::default()
         };
         anchor.bind_to_config(&mut config)?;
-        config.plan_json = Some(serde_json::to_string(&sign_plan(
-            &plan,
-            &SigningKey::from_bytes(&[8; 32]),
-            "fixture",
-        ))?);
+        config.plan_json = Some(serde_json::to_string(&signed)?);
         anchor.bind_admitted(&config, BackendKind::Firecracker, &plan)?;
         let guard = Arc::new(Guard {
             projection: facts.clone(),
@@ -430,7 +480,10 @@ mod registered_prepare {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "selected process requires Linux address-space enforcement")]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "selected process requires Linux address-space enforcement"
+    )]
     fn registered_direct_tcp_transfers_exact_bytes_and_refunds_a_failed_peer() -> Result<()> {
         use mvm_contract::policy::network_policy::{
             CooperatingPayloadPolicy, CooperatingTcpPeer, PayloadMappingProfile,
@@ -442,7 +495,9 @@ mod registered_prepare {
         );
         let holder = fixture.inputs().holder;
         let mut agent = OwnedHostAgent::spawn(fixture.inputs())?;
-        let registrar = agent.registrar().with_registration_owner(Arc::new(ArchiveRetry(AtomicBool::new(true))))?;
+        let registrar = agent
+            .registrar()
+            .with_registration_owner(Arc::new(ArchiveRetry(AtomicBool::new(true))))?;
         let (state, socket) = fixture.vm("vm-1");
         let mut registration = register(&registrar, "vm-1", &state, &socket)?;
         let store = state.join("codec-functional-store");
@@ -467,10 +522,23 @@ mod registered_prepare {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
-        let peer_key = fixture_identity(&SigningKey::from_bytes(&[11;32]));
+        let peer_key = fixture_identity(&SigningKey::from_bytes(&[11; 32]));
         let policy = NetworkPolicy::deny_all()
-            .with_peers(vec![PeerBinding {name: PeerName::parse(TARGET)?, port:443, host_addr:address.ip().to_string(), host_port:address.port()}])
-            .with_payload_mapping(Some(CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer { host: TARGET.into(), port:443, server_name:TARGET.into(), spki_sha256:peer_key.spki_sha256(), profile:PayloadMappingProfile::SpiralCoreObjectStreamSmallV1 }])?));
+            .with_peers(vec![PeerBinding {
+                name: PeerName::parse(TARGET)?,
+                port: 443,
+                host_addr: address.ip().to_string(),
+                host_port: address.port(),
+            }])
+            .with_payload_mapping(Some(CooperatingPayloadPolicy::new(vec![
+                CooperatingTcpPeer {
+                    host: TARGET.into(),
+                    port: 443,
+                    server_name: TARGET.into(),
+                    spki_sha256: peer_key.spki_sha256(),
+                    profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
+                },
+            ])?));
         let (handoff, plan, guard) = handoff(&holder, &store, &state, &policy)?;
         let redaction = Default::default();
         let params = SubstitutionSpawnParams::builder()
@@ -508,11 +576,19 @@ mod registered_prepare {
             format!("signed controller stderr: {diagnostic}")
         };
         let mut substituted = plan.clone();
-        substituted.plan_nonce = mvm_core::plan::Nonce::from_bytes([88;16]);
-        ensure!(handoff.check_direct_network(&substituted, &Default::default(), &redaction).is_err());
+        substituted.plan_nonce = mvm_core::plan::Nonce::from_bytes([88; 16]);
+        ensure!(
+            handoff
+                .check_direct_network(&substituted, &Default::default(), &redaction)
+                .is_err()
+        );
         let mut changed_limits = mvm_core::plan::NetworkLimits::default();
         changed_limits.max_tcp_flows = 2;
-        ensure!(handoff.check_direct_network(&plan, &changed_limits, &redaction).is_err());
+        ensure!(
+            handoff
+                .check_direct_network(&plan, &changed_limits, &redaction)
+                .is_err()
+        );
         let launched = spawn_network_endpoint_installed_registered(params, handoff, &original);
         let mut endpoint = launched.with_context(endpoint_diagnostic)?;
         drop(original);
@@ -541,46 +617,112 @@ mod registered_prepare {
         let mut readiness = std::os::unix::net::UnixStream::connect(readiness_path)?;
         readiness.set_read_timeout(timeout)?;
         let mut ready = [0];
-        readiness.read_exact(&mut ready).with_context(endpoint_diagnostic)?;
+        readiness
+            .read_exact(&mut ready)
+            .with_context(endpoint_diagnostic)?;
         ensure!(ready == [1], "authenticated session readiness differs");
 
-        send(&mut guest, &mut session, Opcode::Hello, 0, &Handshake::local("registered-direct-tcp").encode());
+        send(
+            &mut guest,
+            &mut session,
+            Opcode::Hello,
+            0,
+            &Handshake::local("registered-direct-tcp").encode(),
+        );
         ensure!(receive(&mut guest, &mut session).0 == Opcode::HelloAck);
-        send(&mut guest, &mut session, Opcode::OpenTcp, 1, b"unbound.mvm.peer:443");
+        send(
+            &mut guest,
+            &mut session,
+            Opcode::OpenTcp,
+            1,
+            b"unbound.mvm.peer:443",
+        );
         ensure!(receive(&mut guest, &mut session).0 == Opcode::Refused);
-        ensure!(listener.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock));
+        ensure!(
+            listener
+                .accept()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+        );
         let initiator_spki = fixture_identity(&fixture.host_signer).spki_sha256();
         let peer = std::thread::spawn(move || -> Result<()> {
-            let wrong = fixture_identity(&SigningKey::from_bytes(&[12;32]));
+            let wrong = fixture_identity(&SigningKey::from_bytes(&[12; 32]));
             let first = accept(&listener)?;
             // Accept may finish the TLS handshake before learning that the initiator rejected its SPKI.
-            if let Ok(mut wrong_session) = TlsCarrier::accept(first, &wrong, initiator_spki, Instant::now()+Duration::from_secs(4)) {
-                let mut byte = [0]; ensure!(wrong_session.read(&mut byte).unwrap_or(0) == 0, "failed peer received application bytes");
+            if let Ok(mut wrong_session) = TlsCarrier::accept(
+                first,
+                &wrong,
+                initiator_spki,
+                Instant::now() + Duration::from_secs(4),
+            ) {
+                let mut byte = [0];
+                ensure!(
+                    wrong_session.read(&mut byte).unwrap_or(0) == 0,
+                    "failed peer received application bytes"
+                );
             }
-            serve_original(accept(&listener)?, address, peer_key, initiator_spki, plan, 5)?;
-            ensure!(listener.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock));
+            serve_original(
+                accept(&listener)?,
+                address,
+                peer_key,
+                initiator_spki,
+                plan,
+                5,
+            )?;
+            ensure!(
+                listener
+                    .accept()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+            );
             Ok(())
         });
-        send(&mut guest, &mut session, Opcode::OpenTcp, 3, format!("{TARGET}:443").as_bytes());
+        send(
+            &mut guest,
+            &mut session,
+            Opcode::OpenTcp,
+            3,
+            format!("{TARGET}:443").as_bytes(),
+        );
         let refusal = receive(&mut guest, &mut session);
-        ensure!(refusal.1 == 3 && matches!(refusal.0, Opcode::ConnectFailed | Opcode::Refused | Opcode::Reset), "wrong peer response {refusal:?}");
-        send(&mut guest, &mut session, Opcode::OpenTcp, 5, format!("{TARGET}:443").as_bytes());
-        let opened = receive(&mut guest, &mut session); ensure!((opened.0,opened.1) == (Opcode::Opened,5), "correct original failed after refusal: {opened:?}");
-        let body = payload(); send(&mut guest, &mut session, Opcode::Data, 5, &body);
+        ensure!(
+            refusal.1 == 3
+                && matches!(
+                    refusal.0,
+                    Opcode::ConnectFailed | Opcode::Refused | Opcode::Reset
+                ),
+            "wrong peer response {refusal:?}"
+        );
+        send(
+            &mut guest,
+            &mut session,
+            Opcode::OpenTcp,
+            5,
+            format!("{TARGET}:443").as_bytes(),
+        );
+        let opened = receive(&mut guest, &mut session);
+        ensure!(
+            (opened.0, opened.1) == (Opcode::Opened, 5),
+            "correct original failed after refusal: {opened:?}"
+        );
+        let body = payload();
+        send(&mut guest, &mut session, Opcode::Data, 5, &body);
         send(&mut guest, &mut session, Opcode::HalfClose, 5, &[]);
         let mut restored = Vec::new();
         loop {
-            let (op,id,bytes) = receive(&mut guest, &mut session);
+            let (op, id, bytes) = receive(&mut guest, &mut session);
             ensure!(id == 5);
             match op {
-                Opcode::Data => { ensure!(restored.len()+bytes.len() <= body.len()); restored.extend_from_slice(&bytes); },
+                Opcode::Data => {
+                    ensure!(restored.len() + bytes.len() <= body.len());
+                    restored.extend_from_slice(&bytes);
+                }
                 Opcode::WindowUpdate => (),
                 Opcode::HalfClose => break,
-                _ => anyhow::bail!("unexpected flow response {op:?}")
+                _ => anyhow::bail!("unexpected flow response {op:?}"),
             }
         }
         ensure!(body == restored);
-        peer.join().map_err(|_| anyhow::anyhow!("original peer fixture failed"))??;
+        peer.join()
+            .map_err(|_| anyhow::anyhow!("original peer fixture failed"))??;
         endpoint.shutdown().with_context(endpoint_diagnostic)?;
         ensure!(
             guest.read(&mut [0; 1])? == 0,
@@ -615,10 +757,22 @@ mod registered_prepare {
                 ))?)?
         );
         drop(retained);
-        ensure!(registration.shutdown().unwrap_err().to_string().contains("fixture archive busy"));
-        let (second_state,second_socket)=fixture.vm("vm-2");
-        let mut second=register(&registrar,"vm-2",&second_state,&second_socket)?;
-        ensure!(registration.registered_audit().unwrap().terminal().is_some());
+        ensure!(
+            registration
+                .shutdown()
+                .unwrap_err()
+                .to_string()
+                .contains("fixture archive busy")
+        );
+        let (second_state, second_socket) = fixture.vm("vm-2");
+        let mut second = register(&registrar, "vm-2", &second_state, &second_socket)?;
+        ensure!(
+            registration
+                .registered_audit()
+                .unwrap()
+                .terminal()
+                .is_some()
+        );
         registration.shutdown()?;
         second.shutdown()?;
         agent.shutdown()?;

@@ -58,13 +58,11 @@ pub mod host_agent_idle;
 /// Session idle-timeout enforcement by the host agent, for the backends with
 /// no per-VM supervisor.
 pub mod host_agent_sessions;
-pub mod host_signer;
 #[cfg(unix)]
 pub mod host_lifetime_parent;
+pub mod host_signer;
 #[cfg(unix)]
 pub mod installed_endpoint;
-#[cfg(unix)]
-pub mod owned_resources;
 pub mod jailer;
 /// Secret keyholder — the `SecretRef` → credential boundary: the
 /// [`keyholder::SecretResolver`] trait + the single-host
@@ -75,6 +73,8 @@ pub mod mailbox_launch;
 pub mod mailbox_process;
 pub mod mailbox_service;
 pub mod operator_admitted_trial_booter;
+#[cfg(unix)]
+pub mod owned_resources;
 /// Redacting panic hook for the daemon bins. A panic payload is the one
 /// string the no-`Display`-on-secret-types gate cannot reach.
 pub mod panic_hook;

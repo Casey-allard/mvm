@@ -25,9 +25,9 @@
 #![deny(unreachable_pub)]
 
 pub mod build_env;
+pub mod bundle_runtime;
 mod host_shell;
 mod legacy_bundle_runtime;
-pub mod bundle_runtime;
 mod legacy_portable_runtime;
 #[cfg(any(test, feature = "test-support"))]
 pub use legacy_bundle_runtime::fixtures::signed_legacy_runtime_fixture;

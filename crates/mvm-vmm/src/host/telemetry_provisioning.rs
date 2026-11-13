@@ -118,8 +118,6 @@ pub fn load_records_key(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-
-
 #[cfg(unix)]
 pub(crate) fn provision_records_key_owned_with_file(
     state: &std::fs::File,

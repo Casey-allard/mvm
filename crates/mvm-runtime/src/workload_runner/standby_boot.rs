@@ -155,7 +155,7 @@ pub fn factory_parent_config(
         plan_json: _,
         caller_registration: _,
         #[cfg(unix)]
-        host_lifetime: _,
+            host_lifetime: _,
         bundle_json: _,
         warm_pool_size: _,
         network_policy: _,

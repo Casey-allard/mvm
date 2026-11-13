@@ -844,7 +844,10 @@ impl AnyBackend {
     pub fn start(&self, config: &VmStartConfig) -> Result<VmId> {
         #[cfg(unix)]
         if config.host_lifetime.is_some() {
-            anyhow::ensure!(self.supports_host_lifetime(),"backend has no original installed native lifetime");
+            anyhow::ensure!(
+                self.supports_host_lifetime(),
+                "backend has no original installed native lifetime"
+            );
         }
         if !self.activation_waits_for_admission() {
             config.wait_for_admission_durability()?;
@@ -891,18 +894,20 @@ impl AnyBackend {
     }
 
     #[cfg(unix)]
-    pub fn supports_host_lifetime(&self)->bool {
+    pub fn supports_host_lifetime(&self) -> bool {
         match self {
-            Self::Firecracker(runner)=>runner.supports_host_lifetime(),
-            Self::Hvf(runner)=>runner.supports_host_lifetime(),
-            _=>false,
+            Self::Firecracker(runner) => runner.supports_host_lifetime(),
+            Self::Hvf(runner) => runner.supports_host_lifetime(),
+            _ => false,
         }
     }
 
     /// No name/marker fallback can manufacture original installed ownership.
     #[cfg(unix)]
-    pub fn install_owned_host_agent(&self,
-        registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar) -> Result<()> {
+    pub fn install_owned_host_agent(
+        &self,
+        registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
+    ) -> Result<()> {
         match self {
             Self::Firecracker(runner) => runner.install_owned_host_agent(registrar),
             Self::Hvf(runner) => runner.install_owned_host_agent(registrar),
@@ -912,8 +917,11 @@ impl AnyBackend {
 
     /// No name/marker fallback can manufacture original installed ownership.
     #[cfg(unix)]
-    pub fn stop_owned(&self,id:&VmId,
-        owner:&std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>)->Result<()> {
+    pub fn stop_owned(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<()> {
         match self {
             Self::Firecracker(runner) => runner.stop_owned(id, owner),
             Self::Hvf(runner) => runner.stop_owned(id, owner),
@@ -922,7 +930,10 @@ impl AnyBackend {
     }
 
     #[cfg(unix)]
-    pub fn stop_owned_pending(&self,binding:&mvm_core::host_lifetime::HostLaunchBinding)->Result<()> {
+    pub fn stop_owned_pending(
+        &self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<()> {
         match self {
             Self::Firecracker(runner) => runner.stop_owned_pending(binding),
             Self::Hvf(runner) => runner.stop_owned_pending(binding),
@@ -931,9 +942,11 @@ impl AnyBackend {
     }
 
     #[cfg(unix)]
-    pub fn take_owned_retirement(&self, id: &VmId,
-        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>)
-        -> Result<crate::workload_runner::OwnedRetirement> {
+    pub fn take_owned_retirement(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<crate::workload_runner::OwnedRetirement> {
         match self {
             Self::Firecracker(runner) => runner.take_owned_retirement(id, owner),
             Self::Hvf(runner) => runner.take_owned_retirement(id, owner),
@@ -942,9 +955,10 @@ impl AnyBackend {
     }
 
     #[cfg(unix)]
-    pub fn take_owned_retirement_pending(&self,
-        binding: &mvm_core::host_lifetime::HostLaunchBinding)
-        -> Result<crate::workload_runner::OwnedRetirement> {
+    pub fn take_owned_retirement_pending(
+        &self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<crate::workload_runner::OwnedRetirement> {
         match self {
             Self::Firecracker(runner) => runner.take_owned_retirement_pending(binding),
             Self::Hvf(runner) => runner.take_owned_retirement_pending(binding),

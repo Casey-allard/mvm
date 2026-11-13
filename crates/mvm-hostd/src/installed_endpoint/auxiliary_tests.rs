@@ -155,9 +155,7 @@ fn current_check_runs_outside_ledger_and_failure_fences_other_components() {
 }
 #[test]
 fn canonical_owned_collector_fits_existing_eighty_mib_auxiliary_credit() {
-    use crate::telemetry_collector::{
-        owned_scanner_requested_bytes, owned_collector_requirements,
-    };
+    use crate::telemetry_collector::{owned_collector_requirements, owned_scanner_requested_bytes};
     let policy = mvm_core::policy::RedactionPolicy::default();
     let facts = owned_collector_requirements().unwrap();
     let scanner = owned_scanner_requested_bytes(&policy).unwrap();
@@ -194,9 +192,7 @@ fn canonical_owned_collector_fits_existing_eighty_mib_auxiliary_credit() {
 }
 #[test]
 fn dual_nfa_collector_fits_existing_sixty_mib_auxiliary_credit() {
-    use crate::telemetry_collector::{
-        owned_scanner_requested_bytes, owned_collector_requirements,
-    };
+    use crate::telemetry_collector::{owned_collector_requirements, owned_scanner_requested_bytes};
     let policy = mvm_core::policy::RedactionPolicy::default();
     let facts = owned_collector_requirements().unwrap();
     let scanner = owned_scanner_requested_bytes(&policy).unwrap();

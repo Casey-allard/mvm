@@ -250,7 +250,11 @@ pub fn spawn_network_endpoint_installed_registered(
     owned::require_child_custody()?;
     handoff.check_current()?;
     original.check_endpoint(&params)?;
-    anyhow::ensure!(original.registrar.process_address_space_limit().is_some() && original.registrar.audit_chain_bytes().is_some(), "original daemon, signer and retained audit chain require funded limits");
+    anyhow::ensure!(
+        original.registrar.process_address_space_limit().is_some()
+            && original.registrar.audit_chain_bytes().is_some(),
+        "original daemon, signer and retained audit chain require funded limits"
+    );
 
     let projection = handoff.partition().projection();
     if params.lifetime != EndpointLifetime::Launcher
@@ -413,7 +417,10 @@ pub fn spawn_network_endpoint_installed_registered(
 /// Bound the selected worker and all its threads before the loader or any
 /// user code runs. Preserve a stricter limit inherited from the host.
 #[cfg(target_os = "linux")]
-pub(crate) fn limit_original_address_space(command: &mut std::process::Command, bytes: u64) -> Result<()> {
+pub(crate) fn limit_original_address_space(
+    command: &mut std::process::Command,
+    bytes: u64,
+) -> Result<()> {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     use std::os::unix::process::CommandExt;
     anyhow::ensure!(bytes > 0, "original endpoint address space is unfunded");
@@ -426,7 +433,13 @@ pub(crate) fn limit_original_address_space(command: &mut std::process::Command, 
                 .into_iter()
                 .flatten()
                 .min();
-            setrlimit(Resource::As, Rlimit { current: limit, maximum: limit })?;
+            setrlimit(
+                Resource::As,
+                Rlimit {
+                    current: limit,
+                    maximum: limit,
+                },
+            )?;
             Ok(())
         });
     }
@@ -715,7 +728,8 @@ impl InstalledEndpointChild {
             CONTROL_LIMIT,
             deadline,
         )?;
-        let prepared: Prepare<Box<serde_json::value::RawValue>> = read_frame(&mut input, CONFIG_LIMIT, deadline)?;
+        let prepared: Prepare<Box<serde_json::value::RawValue>> =
+            read_frame(&mut input, CONFIG_LIMIT, deadline)?;
         if prepared.version != 1
             || prepared.nonce != nonce
             || parent.wait_event(Instant::now())? != ProcessExitWait::TimedOut

@@ -251,7 +251,15 @@ pub fn admit_and_boot_local(
     // against the operator-pinned signer set, never synthesized or re-signed
     // under the host key.
     if let Some(signed) = req.signed_plan.as_ref() {
-        return admit_signed_and_boot_local(backend, req, signed, &sha, ctx, #[cfg(unix)] None);
+        return admit_signed_and_boot_local(
+            backend,
+            req,
+            signed,
+            &sha,
+            ctx,
+            #[cfg(unix)]
+            None,
+        );
     }
 
     // Pin the kernel into the signed plan. Deliberately the uncached digest: a
@@ -378,21 +386,34 @@ pub fn admit_and_boot_local(
 }
 
 #[cfg(unix)]
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub struct DirectTcpPolicy {
     pub mapping: mvm_contract::policy::network_policy::CooperatingPayloadPolicy,
     pub peers: Vec<mvm_contract::peer::PeerBinding>,
 }
 #[cfg(unix)]
 impl DirectTcpPolicy {
-    fn project(&self,base:mvm_core::network_policy::NetworkPolicy) -> Result<mvm_core::network_policy::NetworkPolicy> {
-        anyhow::ensure!(self.peers.len() <= self.mapping.peers().len(), "direct TCP peer routes exceed selected mappings");
-        for (index,peer) in self.peers.iter().enumerate() {
+    fn project(
+        &self,
+        base: mvm_core::network_policy::NetworkPolicy,
+    ) -> Result<mvm_core::network_policy::NetworkPolicy> {
+        anyhow::ensure!(
+            self.peers.len() <= self.mapping.peers().len(),
+            "direct TCP peer routes exceed selected mappings"
+        );
+        for (index, peer) in self.peers.iter().enumerate() {
             peer.validate()?;
-            anyhow::ensure!(self.mapping.select(peer.name.as_str(),peer.port).is_some() &&
-                !self.peers[..index].iter().any(|p| p.admits(&peer.name,peer.port)), "unselected or duplicate direct TCP peer route");
+            anyhow::ensure!(
+                self.mapping.select(peer.name.as_str(), peer.port).is_some()
+                    && !self.peers[..index]
+                        .iter()
+                        .any(|p| p.admits(&peer.name, peer.port)),
+                "unselected or duplicate direct TCP peer route"
+            );
         }
-        Ok(base.with_peers(self.peers.clone()).with_payload_mapping(Some(self.mapping.clone())))
+        Ok(base
+            .with_peers(self.peers.clone())
+            .with_payload_mapping(Some(self.mapping.clone())))
     }
 }
 
@@ -403,9 +424,20 @@ pub struct SelectedLocalMapping<'a> {
 }
 
 #[cfg(unix)]
-pub fn admit_and_boot_local_with_installed_mapping(backend: &AnyBackend, req: &LocalRunRequest, ctx: LocalRunContext<'_>, selected: SelectedLocalMapping<'_>) -> Result<StartedMachine> {
-    anyhow::ensure!(req.volumes.is_empty() && req.secrets.is_empty() && req.mailbox.is_none(), "selected launch supports only its signed direct network");
-    let signed = req.signed_plan.as_ref().context("selected launch requires the externally signed original plan")?;
+pub fn admit_and_boot_local_with_installed_mapping(
+    backend: &AnyBackend,
+    req: &LocalRunRequest,
+    ctx: LocalRunContext<'_>,
+    selected: SelectedLocalMapping<'_>,
+) -> Result<StartedMachine> {
+    anyhow::ensure!(
+        req.volumes.is_empty() && req.secrets.is_empty() && req.mailbox.is_none(),
+        "selected launch supports only its signed direct network"
+    );
+    let signed = req
+        .signed_plan
+        .as_ref()
+        .context("selected launch requires the externally signed original plan")?;
     let sha = mvm_core::crypto::image_verify::sha256_file(&req.rootfs_path)?;
     admit_signed_and_boot_local(backend, req, signed, &sha, ctx, Some(selected))
 }
@@ -481,21 +513,70 @@ fn admit_signed_and_boot_local(
     let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind());
     #[cfg(unix)]
     let admitted = if let Some(selected) = selected {
-        anyhow::ensure!(cfg!(target_os = "linux") && backend.kind() == mvm_core::vm_backend::BackendKind::Firecracker && backend.supports_host_lifetime(), "installed direct runtime is unavailable");
-        anyhow::ensure!(plan.post_run.destroy_on_exit && plan.network_mode == mvm_core::plan::NetworkMode::HostVsockProxy && plan.mailbox.is_none() && plan.ingress.is_empty() && plan.secrets.is_empty(), "selected direct scope requires transient vsock egress only");
+        anyhow::ensure!(
+            cfg!(target_os = "linux")
+                && backend.kind() == mvm_core::vm_backend::BackendKind::Firecracker
+                && backend.supports_host_lifetime(),
+            "installed direct runtime is unavailable"
+        );
+        anyhow::ensure!(
+            plan.post_run.destroy_on_exit
+                && plan.network_mode == mvm_core::plan::NetworkMode::HostVsockProxy
+                && plan.mailbox.is_none()
+                && plan.ingress.is_empty()
+                && plan.secrets.is_empty(),
+            "selected direct scope requires transient vsock egress only"
+        );
         config.network_policy = selected.mapping.project(config.network_policy)?;
-        mvm_core::policy::direct_plan::AdmittedNetworkPlan::from_plan(plan, &config.name, &config.network_policy)?;
+        mvm_core::policy::direct_plan::AdmittedNetworkPlan::from_plan(
+            plan,
+            &config.name,
+            &config.network_policy,
+        )?;
         selected.owner.bind_to_config(&mut config)?;
-        let pin = plan.bundle.as_ref().context("signed portable bundle required")?;
-        let bytes = crate::host_lifetime_parent::check_portable_startup_workspace(&config, backend.kind(), pin)?;
-        mvm_runtime::bundle_runtime::attach_direct_runtime(&mut config, backend.name(), pin, bytes)?;
-        anyhow::ensure!(config.legacy_portable_runtime.as_ref().is_some_and(|r| &r.pin == pin), "actual portable runtime differs from the original bundle");
-        let resolver = mvm_core::plan::bundle::FsBundleResolver::default_path()?.with_exact_archive(&pin.bundle_sha256, bytes)?;
+        let pin = plan
+            .bundle
+            .as_ref()
+            .context("signed portable bundle required")?;
+        let bytes = crate::host_lifetime_parent::check_portable_startup_workspace(
+            &config,
+            backend.kind(),
+            pin,
+        )?;
+        mvm_runtime::bundle_runtime::attach_direct_runtime(
+            &mut config,
+            backend.name(),
+            pin,
+            bytes,
+        )?;
+        anyhow::ensure!(
+            config
+                .legacy_portable_runtime
+                .as_ref()
+                .is_some_and(|r| &r.pin == pin),
+            "actual portable runtime differs from the original bundle"
+        );
+        let resolver = mvm_core::plan::bundle::FsBundleResolver::default_path()?
+            .with_exact_archive(&pin.bundle_sha256, bytes)?;
         let trust = mvm_core::plan::bundle::FsTrustStore::default_path()?;
-        let support = mvm_core::image_set::BackendImageSupport::for_backend(backend.kind()).context("selected backend lacks image support")?;
+        let support = mvm_core::image_set::BackendImageSupport::for_backend(backend.kind())
+            .context("selected backend lacks image support")?;
         let protocols = mvm_build::stage0_kernel::current_image_set_protocol_support();
-        let bundle = crate::plan_admission::BundleAdmissionContext {resolver:&resolver, trust:&trust, image:Some(crate::plan_admission::BundleImageAdmissionContext {arch:mvm_core::arch::GuestArch::host(), backend:&support, host_protocols:&protocols})};
-        verified.admit(ctx.clock, ctx.ledger, Some(&bundle), posture.with_selected_direct_owner(&config, &selected.owner))?
+        let bundle = crate::plan_admission::BundleAdmissionContext {
+            resolver: &resolver,
+            trust: &trust,
+            image: Some(crate::plan_admission::BundleImageAdmissionContext {
+                arch: mvm_core::arch::GuestArch::host(),
+                backend: &support,
+                host_protocols: &protocols,
+            }),
+        };
+        verified.admit(
+            ctx.clock,
+            ctx.ledger,
+            Some(&bundle),
+            posture.with_selected_direct_owner(&config, &selected.owner),
+        )?
     } else {
         let admitted = verified.admit(ctx.clock, ctx.ledger, None, posture)?;
         attach_guest_runtime(&mut config, &req.backend_name)?;

@@ -20,16 +20,19 @@ use zeroize::Zeroizing;
 
 mod audit_capability;
 mod inventory;
-pub use inventory::RegisteredAuditFile;
-use mvm_core::protocol::audit_signer::SignedAuditInventory;
 use audit_capability::receive_signer_event;
 pub(crate) use audit_capability::require_live_event;
+pub use inventory::RegisteredAuditFile;
+use mvm_core::protocol::audit_signer::SignedAuditInventory;
 
 /// Trusted installed DI retaining the actual aggregate helper reservation.
 pub trait HostAgentParentPermit: Send + Sync {
     fn check_current(&self, tenant: &str) -> Result<()>;
     /// Per-process address-space reservation for the original daemon and its one signer.
-    fn owned_process_address_space_limit(&self, _tenant: &str) -> Result<Option<std::num::NonZeroU64>> {
+    fn owned_process_address_space_limit(
+        &self,
+        _tenant: &str,
+    ) -> Result<Option<std::num::NonZeroU64>> {
         Ok(None)
     }
     /// Funded bytes retained for each VM's original signed audit JSONL.
@@ -212,12 +215,20 @@ pub struct OwnedHostAgentRegistrar {
 /// Trusted embedding observes the authenticated per-VM registration before endpoint handoff.
 pub trait RegisteredEndpointOwner: Send + Sync {
     fn bind_registration(
-        &self, registrar: &OwnedHostAgentRegistrar, registration: &OwnedVmRegistration,
+        &self,
+        registrar: &OwnedHostAgentRegistrar,
+        registration: &OwnedVmRegistration,
         params: &HostAgentServicesParams<'_>,
     ) -> Result<()>;
     /// Called after confirmed deregistration while the exact registration still owns its slot.
     /// An error leaves the same terminal receipt available for a retry.
-    fn retired_audit(&self, _registration:&OwnedVmRegistration, _file:&RegisteredAuditFile) -> Result<()> { Ok(()) }
+    fn retired_audit(
+        &self,
+        _registration: &OwnedVmRegistration,
+        _file: &RegisteredAuditFile,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 /// Exact local registration serial, never reconstructed from markers.
 #[must_use]
@@ -240,7 +251,9 @@ struct RegisteredDirectories {
 
 impl RegisteredDirectories {
     fn capture(state: &Path, socket: &Path) -> Result<Self> {
-        let parent = socket.parent().context("registered socket parent missing")?;
+        let parent = socket
+            .parent()
+            .context("registered socket parent missing")?;
         Ok(Self {
             state: crate::host::restore_image::open_trusted_dir(state)?,
             socket_parent: crate::host::restore_image::open_trusted_dir(parent)?,
@@ -249,11 +262,16 @@ impl RegisteredDirectories {
 
     fn check(&self, state: &Path, socket: &Path) -> Result<()> {
         let current = Self::capture(state, socket)?;
-        for (held, current) in [(&self.state, &current.state), (&self.socket_parent, &current.socket_parent)] {
+        for (held, current) in [
+            (&self.state, &current.state),
+            (&self.socket_parent, &current.socket_parent),
+        ] {
             let held = held.metadata()?;
             let current = current.metadata()?;
-            ensure!((held.dev(), held.ino()) == (current.dev(), current.ino()),
-                "original registration directory changed");
+            ensure!(
+                (held.dev(), held.ino()) == (current.dev(), current.ino()),
+                "original registration directory changed"
+            );
         }
         Ok(())
     }
@@ -500,8 +518,13 @@ impl OwnedHostAgent {
         inputs.parent.check_current(&inputs.tenant)?;
         inputs.holder.verify_current()?;
         let audit_chain_bytes = inputs.parent.owned_audit_chain_bytes(&inputs.tenant)?;
-        let address_space_limit = inputs.parent.owned_process_address_space_limit(&inputs.tenant)?;
-        ensure!(address_space_limit.is_none() || Self::supports_process_address_space_limit(), "funded daemon and signer require native address-space enforcement");
+        let address_space_limit = inputs
+            .parent
+            .owned_process_address_space_limit(&inputs.tenant)?;
+        ensure!(
+            address_space_limit.is_none() || Self::supports_process_address_space_limit(),
+            "funded daemon and signer require native address-space enforcement"
+        );
         require_owned_child_custody()?;
         refuse_existing(&inputs.tenant)?;
         let directory = mvm_core::config::host_agent_dir(&inputs.tenant);
@@ -565,7 +588,10 @@ impl OwnedHostAgent {
         inputs.holder.verify_current()?;
         #[cfg(target_os = "linux")]
         if let Some(limit) = address_space_limit {
-            crate::host::network_endpoint_spawn::limit_original_address_space(&mut command, limit.get())?;
+            crate::host::network_endpoint_spawn::limit_original_address_space(
+                &mut command,
+                limit.get(),
+            )?;
         }
         let mut child = command.spawn().context("spawn original host-agent child")?;
         drop(descriptors);
@@ -871,7 +897,10 @@ fn owned_control(
     shared: &Shared,
     request: ControlRequest,
     registration: Option<&HostAgentServicesParams<'_>>,
-) -> Result<(Option<std::os::fd::OwnedFd>,Option<Box<SignedAuditInventory>>)> {
+) -> Result<(
+    Option<std::os::fd::OwnedFd>,
+    Option<Box<SignedAuditInventory>>,
+)> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let signed = broker_control::sign(request, &shared.key)?;
     let mut stream =
@@ -904,12 +933,22 @@ fn owned_control(
     )? {
         ControlResponse::Ok => {
             let inventory = if shared.audit_chain_bytes.is_some() {
-                Some(crate::host::hvf_control_transport::read_frame_with_limit(&mut stream,deadline,4096)?)
-            } else {None};
-            let signer = if registration.is_some() && shared.audit_sideband != OwnedAuditSideband::Unavailable {
+                Some(crate::host::hvf_control_transport::read_frame_with_limit(
+                    &mut stream,
+                    deadline,
+                    4096,
+                )?)
+            } else {
+                None
+            };
+            let signer = if registration.is_some()
+                && shared.audit_sideband != OwnedAuditSideband::Unavailable
+            {
                 Some(receive_signer_event(&stream, deadline)?)
-            } else {None};
-            Ok((signer,inventory))
+            } else {
+                None
+            };
+            Ok((signer, inventory))
         }
         ControlResponse::Err { message } => bail!("owned host-agent refused control: {message}"),
     }
@@ -926,8 +965,14 @@ impl OwnedHostAgentRegistrar {
 
     /// Attach the original resource owner before passing this registrar to the runner.
     /// The underlying tenant daemon and its signed registration protocol stay the same.
-    pub fn with_registration_owner(mut self, owner: Arc<dyn RegisteredEndpointOwner>) -> Result<Self> {
-        ensure!(self.registered.is_none(), "registration observer already selected");
+    pub fn with_registration_owner(
+        mut self,
+        owner: Arc<dyn RegisteredEndpointOwner>,
+    ) -> Result<Self> {
+        ensure!(
+            self.registered.is_none(),
+            "registration observer already selected"
+        );
         self.check_current_for_tenant(&self.shared.tenant)?;
         self.registered = Some(owner);
         Ok(self)
@@ -984,7 +1029,8 @@ impl OwnedHostAgentRegistrar {
         self.shared.parent.check_registration(&params)?;
         validate_owned_host_agent_services(&params)?;
         registration_bounds(&params)?;
-        let directories = RegisteredDirectories::capture(params.state_dir, params.broker_listen_socket)?;
+        let directories =
+            RegisteredDirectories::capture(params.state_dir, params.broker_listen_socket)?;
         let request = registration(&params, &self.shared.tenant);
         let commitment = registration_commitment(&request)?;
         self.shared.holder.verify_current()?;
@@ -1031,8 +1077,8 @@ impl OwnedHostAgentRegistrar {
             serial,
             commitment,
             directories,
-            archive_owner:self.registered.clone(),
-            archive:None,
+            archive_owner: self.registered.clone(),
+            archive: None,
             retired: false,
             audit: Mutex::new(AuditPreparation::default()),
         };
@@ -1041,9 +1087,15 @@ impl OwnedHostAgentRegistrar {
             ControlRequest::Register(Box::new(request.clone())),
             Some(&params),
         )
-        .and_then(|(event,inventory)| {
+        .and_then(|(event, inventory)| {
             if let Some(limit) = self.shared.audit_chain_bytes {
-                guard.archive=Some(RegisteredAuditFile::capture(&request,inventory.as_deref().context("original audit inventory missing")?,limit.get())?);
+                guard.archive = Some(RegisteredAuditFile::capture(
+                    &request,
+                    inventory
+                        .as_deref()
+                        .context("original audit inventory missing")?,
+                    limit.get(),
+                )?);
             }
             if let Some(event) = event {
                 require_live_event(&event)?;
@@ -1055,7 +1107,11 @@ impl OwnedHostAgentRegistrar {
             }
             self.shared.running()
         })
-        .and_then(|()| guard.directories.check(params.state_dir, params.broker_listen_socket))
+        .and_then(|()| {
+            guard
+                .directories
+                .check(params.state_dir, params.broker_listen_socket)
+        })
         .and_then(|()| self.shared.parent.check_registration(&params))
         .and_then(|()| self.shared.holder.verify_current());
         let mut ledger = self
@@ -1092,21 +1148,32 @@ impl OwnedHostAgentRegistrar {
         }
         drop(ledger);
         if let Some(owner) = &self.registered {
-            let result = owner.bind_registration(self, &guard, &params)
+            let result = owner
+                .bind_registration(self, &guard, &params)
                 .and_then(|()| guard.check_current_for(self, &params));
             if let Err(reason) = result {
-                return Err(OwnedRegistrationError { reason, registration: guard }.into());
+                return Err(OwnedRegistrationError {
+                    reason,
+                    registration: guard,
+                }
+                .into());
             }
         }
         Ok(guard)
     }
 }
 impl OwnedVmRegistration {
-    pub fn registered_audit(&self) -> Option<&RegisteredAuditFile> { self.archive.as_ref() }
+    pub fn registered_audit(&self) -> Option<&RegisteredAuditFile> {
+        self.archive.as_ref()
+    }
 
     /// Borrow both protected directory identities captured before this signed registration.
     /// The first is the VM state directory, the second the original broker socket parent.
-    pub fn original_directories(&self, original: &OwnedHostAgentRegistrar, params: &HostAgentServicesParams<'_>) -> Result<(&File, &File)> {
+    pub fn original_directories(
+        &self,
+        original: &OwnedHostAgentRegistrar,
+        params: &HostAgentServicesParams<'_>,
+    ) -> Result<(&File, &File)> {
         self.check_current_for(original, params)?;
         Ok((&self.directories.state, &self.directories.socket_parent))
     }
@@ -1231,7 +1298,8 @@ impl OwnedVmRegistration {
         // No parent/filesystem/process observation runs under the ledger.
         self.shared.parent.check_current(&self.shared.tenant)?;
         self.shared.parent.check_registration(params)?;
-        self.directories.check(params.state_dir, params.broker_listen_socket)?;
+        self.directories
+            .check(params.state_dir, params.broker_listen_socket)?;
         self.shared.holder.verify_current()?;
         self.shared.running()?;
         active()
@@ -1290,28 +1358,55 @@ impl OwnedVmRegistration {
                 .get_mut(&self.vm)
                 .context("owned registration slot absent")?;
             ensure!(
-                slot.serial == self.serial && (slot.phase != Phase::Closing || self.archive.as_ref().and_then(RegisteredAuditFile::terminal).is_some()),
+                slot.serial == self.serial
+                    && (slot.phase != Phase::Closing
+                        || self
+                            .archive
+                            .as_ref()
+                            .and_then(RegisteredAuditFile::terminal)
+                            .is_some()),
                 "owned registration identity or phase changed"
             );
             slot.phase = Phase::Closing;
         }
         let mut callback_pending = false;
         let result = (|| -> Result<()> {
-            if self.archive.as_ref().and_then(RegisteredAuditFile::terminal).is_none() {
+            if self
+                .archive
+                .as_ref()
+                .and_then(RegisteredAuditFile::terminal)
+                .is_none()
+            {
                 self.shared.running()?;
-                let (_,terminal)=owned_control(&self.shared, ControlRequest::Deregister(DeregisterVm{vm_id:self.vm.clone()}),None)?;
+                let (_, terminal) = owned_control(
+                    &self.shared,
+                    ControlRequest::Deregister(DeregisterVm {
+                        vm_id: self.vm.clone(),
+                    }),
+                    None,
+                )?;
                 self.shared.running()?;
                 if let Some(limit) = self.shared.audit_chain_bytes {
-                    self.archive.as_mut().context("original audit enrollment unavailable")?
-                        .close(terminal.as_deref().context("missing signed audit terminal")?,limit.get())?;
+                    self.archive
+                        .as_mut()
+                        .context("original audit enrollment unavailable")?
+                        .close(
+                            terminal
+                                .as_deref()
+                                .context("missing signed audit terminal")?,
+                            limit.get(),
+                        )?;
                 }
             }
-            if let (Some(owner),Some(file))=(&self.archive_owner,&self.archive) {
-                let limit=self.shared.audit_chain_bytes.context("original audit limit missing")?;
+            if let (Some(owner), Some(file)) = (&self.archive_owner, &self.archive) {
+                let limit = self
+                    .shared
+                    .audit_chain_bytes
+                    .context("original audit limit missing")?;
                 file.check_terminal(limit.get())?;
-                if let Err(error)=owner.retired_audit(self,file) {
+                if let Err(error) = owner.retired_audit(self, file) {
                     file.check_terminal(limit.get())?;
-                    callback_pending=true;
+                    callback_pending = true;
                     return Err(error);
                 }
                 file.check_terminal(limit.get())?;
@@ -1332,7 +1427,9 @@ impl OwnedVmRegistration {
         );
         if let Err(error) = result {
             // Closing retains this one slot until the consumer durably adopts the file.
-            if callback_pending {return Err(error);}
+            if callback_pending {
+                return Err(error);
+            }
             if let Some(slot) = ledger.slots.get_mut(&self.vm) {
                 slot.phase = Phase::Uncertain;
             }

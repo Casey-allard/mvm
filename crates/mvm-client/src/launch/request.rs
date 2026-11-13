@@ -161,8 +161,7 @@ pub struct LaunchRequest {
     #[cfg(unix)]
     pub(crate) host_lifetime: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
     #[cfg(unix)]
-    pub(crate) installed_payload_mapping:
-        Option<mvm_hostd::run::DirectTcpPolicy>,
+    pub(crate) installed_payload_mapping: Option<mvm_hostd::run::DirectTcpPolicy>,
     pub(crate) name: Option<String>,
     pub(crate) mode: LifecycleMode,
     pub(crate) source: LaunchSource,

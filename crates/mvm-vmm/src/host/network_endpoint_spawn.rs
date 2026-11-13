@@ -50,10 +50,10 @@ mod installed;
 pub(crate) use installed::limit_original_address_space;
 mod owned;
 pub use installed::{
-    INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointAudit, InstalledEndpointChild,
-    InstalledEndpointLease, InstalledHostServices, InstalledTelemetryRecords,
+    INSTALLED_BOOTSTRAP_MIN_BYTES, INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointAudit,
+    InstalledEndpointChild, InstalledEndpointLease, InstalledHostServices,
+    InstalledTelemetryRecords, installed_endpoint_bootstrap_requirement,
     spawn_network_endpoint_installed, spawn_network_endpoint_installed_registered,
-    INSTALLED_BOOTSTRAP_MIN_BYTES, installed_endpoint_bootstrap_requirement,
 };
 use owned::endpoint_command;
 pub use owned::{

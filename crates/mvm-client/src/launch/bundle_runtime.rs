@@ -4,7 +4,11 @@ use mvm_core::vm_backend::VmStartConfig;
 pub use mvm_runtime::bundle_runtime::installed_archive_for_rootfs;
 
 pub fn attach_if_installed_bundle(config: &mut VmStartConfig, backend: &str) -> Result<bool> {
-    mvm_runtime::bundle_runtime::attach_if_installed_bundle(config, backend, crate::bundle::existing_host_verifying_key)
+    mvm_runtime::bundle_runtime::attach_if_installed_bundle(
+        config,
+        backend,
+        crate::bundle::existing_host_verifying_key,
+    )
 }
 
 #[cfg(test)]
@@ -14,11 +18,14 @@ mod published_root;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
     use mvm_core::arch::GuestArch;
-    use mvm_core::vm_backend::BundleBootAssetsPin;
     use mvm_core::plan::bundle::verify_bundle_file;
-    use mvm_core::plan::{FsTrustStore, bundle::{ArtifactRole, BundleRegistry, LocalBundleTrustStore}};
+    use mvm_core::plan::{
+        FsTrustStore,
+        bundle::{ArtifactRole, BundleRegistry, LocalBundleTrustStore},
+    };
+    use mvm_core::vm_backend::BundleBootAssetsPin;
+    use std::path::{Path, PathBuf};
 
     use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use mvm_build::boot_asset_fixture;

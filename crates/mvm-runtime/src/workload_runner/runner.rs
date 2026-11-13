@@ -64,14 +64,14 @@ mod durability;
 mod installed;
 #[cfg(unix)]
 pub use installed::OwnedRetirement;
+#[cfg(all(test, unix))]
+mod installed_tests;
 mod parent_verify;
 mod preload;
 mod refusal;
 mod sockets;
 mod spawner;
 mod warm_claim;
-#[cfg(all(test,unix))]
-mod installed_tests;
 
 pub use cold_hvf_channel::{ColdHvfChannel, NativeCompletion, OwnedRuntimeLaunch};
 
@@ -94,13 +94,13 @@ use refusal::{
     require_late_volumes_mounted,
 };
 use sockets::standing_sockets;
+#[cfg(unix)]
+pub use spawner::InstalledSpawnedEndpoint;
 pub(crate) use spawner::OriginalObjectSpawner;
 pub use spawner::{
     FlowMuxIdentitySource, NetworkEndpointSpawnRequest, NetworkEndpointSpawner,
     RealNetworkEndpointSpawner, SpawnedEndpoint, TelemetryStart,
 };
-#[cfg(unix)]
-pub use spawner::InstalledSpawnedEndpoint;
 /// What the runner needs to register the per-VM host-services broker after boot.
 pub struct BrokerRegisterRequest<'a> {
     /// VM name — the registration's `vm_id`, workload id, and per-VM chain key.
@@ -133,7 +133,9 @@ impl<'a> BrokerRegisterRequest<'a> {
             tenant_id: Some(self.tenant.context("installed tenant missing")?),
             vm_name: self.vm_name,
             state_dir: self.state_dir,
-            broker_listen_socket: self.broker_listen_socket.context("installed broker socket missing")?,
+            broker_listen_socket: self
+                .broker_listen_socket
+                .context("installed broker socket missing")?,
             services: self.services,
             capability_bindings: self.capability_bindings,
             service_proxies: self.service_proxies,
@@ -415,8 +417,12 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         &self,
         registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
     ) -> Result<()> {
-        anyhow::ensure!(!self.installed.has_any()?, "installed workload already retained");
-        self.installed_agent.set(registrar)
+        anyhow::ensure!(
+            !self.installed.has_any()?,
+            "installed workload already retained"
+        );
+        self.installed_agent
+            .set(registrar)
             .map_err(|_| anyhow::anyhow!("original installed host agent already configured"))
     }
 
@@ -436,7 +442,9 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
     }
 
     #[cfg(unix)]
-    pub fn supports_host_lifetime(&self)->bool {self.driver.supports_host_lifetime()}
+    pub fn supports_host_lifetime(&self) -> bool {
+        self.driver.supports_host_lifetime()
+    }
 
     /// How many read-only volumes a claim on this runner's parents can attach.
     #[must_use]
@@ -639,20 +647,22 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         let guards = ClaimGuards::new(&self.spawner);
         let socks = standing_sockets(&state_dir, inputs.config);
         let endpoint_inputs = EndpointSpawnInputs {
-                state_dir: &state_dir,
-                tenant: inputs.tenant,
-                secrets: inputs.secrets,
-                redaction: inputs.redaction,
-                network_policy: inputs.network_policy,
-                network_limits,
-                ingress: &ingress,
-                reader_plan: reader_plan.as_ref().filter(|plan| plan.mailbox.is_some()),
-                // A cold boot mints this guest's identity and hands it a drive.
-                identity: FlowMuxIdentitySource::Mint,
+            state_dir: &state_dir,
+            tenant: inputs.tenant,
+            secrets: inputs.secrets,
+            redaction: inputs.redaction,
+            network_policy: inputs.network_policy,
+            network_limits,
+            ingress: &ingress,
+            reader_plan: reader_plan.as_ref().filter(|plan| plan.mailbox.is_some()),
+            // A cold boot mints this guest's identity and hands it a drive.
+            identity: FlowMuxIdentitySource::Mint,
         };
         #[cfg(unix)]
         let installed = if let Some(owner) = &inputs.config.host_lifetime {
-            let slot = self.installed.find(&VmId(inputs.config.name.clone()))?
+            let slot = self
+                .installed
+                .find(&VmId(inputs.config.name.clone()))?
                 .context("original installed slot missing")?;
             anyhow::ensure!(slot.matches(owner), "installed launch owner differs");
             owner.verify_config(inputs.config, self.driver.kind())?;
@@ -664,7 +674,10 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         let endpoint = if let Some(slot) = &installed {
             let id = VmId(inputs.config.name.clone());
             if cmdline::uses_installed_payload_anchor(inputs.config) {
-                let registrar = self.installed_agent.get().context("original installed host agent missing")?;
+                let registrar = self
+                    .installed_agent
+                    .get()
+                    .context("original installed host agent missing")?;
                 let (services, capabilities) =
                     admitted_broker_bindings(inputs.config.plan_json.as_deref())?;
                 let request = BrokerRegisterRequest {
@@ -678,7 +691,9 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 };
                 let broker = match self.broker.register_installed(&request, registrar) {
                     Ok(broker) => broker,
-                    Err(error) => match error.downcast::<mvm_vmm::host::host_agent_spawn::OwnedRegistrationError>() {
+                    Err(error) => match error
+                        .downcast::<mvm_vmm::host::host_agent_spawn::OwnedRegistrationError>()
+                    {
                         Ok(failed) => {
                             let (reason, registration) = failed.into_parts();
                             slot.retain_broker(BrokerGuard::from_owned_registration(registration))?;
@@ -692,10 +707,17 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 trace.mark("broker_register");
                 let registration = slot.broker_registration()?;
                 let original = mvm_vmm::host::network_endpoint_spawn::InstalledHostServices::new(
-                    registrar, &registration, request.host_agent_params()?,
+                    registrar,
+                    &registration,
+                    request.host_agent_params()?,
                 )?;
                 slot.begin_endpoint_start()?;
-                guards.spawn_endpoint_installed(&id, &endpoint_inputs, inputs.config, Some(&original))?
+                guards.spawn_endpoint_installed(
+                    &id,
+                    &endpoint_inputs,
+                    inputs.config,
+                    Some(&original),
+                )?
             } else {
                 slot.begin_endpoint_start()?;
                 guards.spawn_endpoint_installed(&id, &endpoint_inputs, inputs.config, None)?
@@ -704,7 +726,8 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             guards.spawn_endpoint(&VmId(inputs.config.name.clone()), &endpoint_inputs)?
         };
         #[cfg(not(unix))]
-        let endpoint = guards.spawn_endpoint(&VmId(inputs.config.name.clone()), &endpoint_inputs)?;
+        let endpoint =
+            guards.spawn_endpoint(&VmId(inputs.config.name.clone()), &endpoint_inputs)?;
         let identity_drive = endpoint.identity_drive().map(Path::to_path_buf);
         let egress_uds = endpoint.egress_uds().map(Path::to_path_buf);
         #[cfg(unix)]
@@ -858,7 +881,9 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         #[cfg(unix)]
         let vm = if let Some(slot) = &installed {
             slot.retain_vm(vm)?
-        } else { vm };
+        } else {
+            vm
+        };
         if let Some(kernel) = kernel {
             kernel.observe_booted(&*vm)?;
         }
@@ -899,7 +924,10 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             trace.write_to(&state_dir);
             return Ok(vm);
         }
-        endpoint.as_mut().context("legacy endpoint missing")?.defuse();
+        endpoint
+            .as_mut()
+            .context("legacy endpoint missing")?
+            .defuse();
         broker_guard.defuse();
         trace.write_to(&state_dir);
         Ok(vm)

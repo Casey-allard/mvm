@@ -16,8 +16,6 @@ use mvm_core::plan::bundle::{
 };
 use mvm_core::vm_backend::{BackendKind, BundleBootAssetsPin, VmStartConfig};
 
-
-
 /// Locate a registry-owned bundle. This path is only a hint; never proof.
 pub fn installed_archive_for_rootfs(rootfs: &Path) -> Result<Option<PathBuf>> {
     let registry = BundleRegistry::default_path()?;
@@ -39,7 +37,11 @@ pub fn installed_archive_for_rootfs(rootfs: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// False means an ordinary source or a legacy bundle without boot assets.
-pub fn attach_if_installed_bundle(config: &mut VmStartConfig, backend: &str, host_key: impl FnOnce() -> Result<Option<ed25519_dalek::VerifyingKey>>) -> Result<bool> {
+pub fn attach_if_installed_bundle(
+    config: &mut VmStartConfig,
+    backend: &str,
+    host_key: impl FnOnce() -> Result<Option<ed25519_dalek::VerifyingKey>>,
+) -> Result<bool> {
     let mut selected = config.clone();
     let attached = attach_installed_bundle(&mut selected, backend, None, host_key)?;
     *config = selected;
@@ -47,14 +49,28 @@ pub fn attach_if_installed_bundle(config: &mut VmStartConfig, backend: &str, hos
 }
 
 #[cfg(unix)]
-pub fn attach_direct_runtime(config: &mut VmStartConfig, backend: &str, pin: &mvm_core::plan::PlanArtifact, bytes: std::num::NonZeroU64) -> Result<()> {
+pub fn attach_direct_runtime(
+    config: &mut VmStartConfig,
+    backend: &str,
+    pin: &mvm_core::plan::PlanArtifact,
+    bytes: std::num::NonZeroU64,
+) -> Result<()> {
     let mut selected = config.clone();
-    ensure!(attach_installed_bundle(&mut selected, backend, Some((pin, bytes)), || Ok(None))? && selected.legacy_portable_runtime.is_some(), "direct mapping requires the original installed portable bundle");
+    ensure!(
+        attach_installed_bundle(&mut selected, backend, Some((pin, bytes)), || Ok(None))?
+            && selected.legacy_portable_runtime.is_some(),
+        "direct mapping requires the original installed portable bundle"
+    );
     *config = selected;
     Ok(())
 }
 
-fn attach_installed_bundle(config: &mut VmStartConfig, backend: &str, quote: Option<(&mvm_core::plan::PlanArtifact, std::num::NonZeroU64)>, host_key: impl FnOnce() -> Result<Option<ed25519_dalek::VerifyingKey>>) -> Result<bool> {
+fn attach_installed_bundle(
+    config: &mut VmStartConfig,
+    backend: &str,
+    quote: Option<(&mvm_core::plan::PlanArtifact, std::num::NonZeroU64)>,
+    host_key: impl FnOnce() -> Result<Option<ed25519_dalek::VerifyingKey>>,
+) -> Result<bool> {
     let Some(archive) = installed_archive_for_rootfs(Path::new(&config.rootfs_path))? else {
         return Ok(false);
     };
@@ -66,8 +82,20 @@ fn attach_installed_bundle(config: &mut VmStartConfig, backend: &str, quote: Opt
     let (verified, trust): (VerifiedBundleFile, Box<dyn TrustStore>) =
         if let Some((pin, bytes)) = quote {
             let trust = FsTrustStore::default_path()?;
-            let verified = mvm_core::plan::bundle::verify_exact_bundle_file(&archive, &trust, pin, bytes)?;
-            ensure!(verified.boot_assets.as_ref().is_some_and(|boot| boot.cli_runtime.is_none()) && matches!(verified.manifest.schema_version, 4 | 5) && !verified.manifest.members.iter().any(|m|matches!(m, mvm_core::plan::bundle::BundleMember::CanonicalLinuxProof(_))), "installed direct mapping requires signed portable boot assets");
+            let verified =
+                mvm_core::plan::bundle::verify_exact_bundle_file(&archive, &trust, pin, bytes)?;
+            ensure!(
+                verified
+                    .boot_assets
+                    .as_ref()
+                    .is_some_and(|boot| boot.cli_runtime.is_none())
+                    && matches!(verified.manifest.schema_version, 4 | 5)
+                    && !verified.manifest.members.iter().any(|m| matches!(
+                        m,
+                        mvm_core::plan::bundle::BundleMember::CanonicalLinuxProof(_)
+                    )),
+                "installed direct mapping requires signed portable boot assets"
+            );
             (verified, Box::new(trust))
         } else if let Some(host_key) = host_key()? {
             let host_key_id = key_id_from_pubkey(&host_key);
@@ -122,7 +150,9 @@ fn attach_installed_bundle(config: &mut VmStartConfig, backend: &str, quote: Opt
     );
     let installed = match registry.find(&verified.bundle_sha256)? {
         Some(installed) => installed,
-        None if quote.is_some() => anyhow::bail!("selected portable bundle must already be installed"),
+        None if quote.is_some() => {
+            anyhow::bail!("selected portable bundle must already be installed")
+        }
         None => registry
             .materialize_cached(&verified.bundle_sha256, trust.as_ref())
             .context("restoring installed bundle from its signed archive")?,
@@ -593,5 +623,4 @@ mod tests {
         assert!(format!("{error:#}").contains("digest") || format!("{error:#}").contains("size"));
         assert_eq!(format!("{config:?}"), before);
     }
-
 }

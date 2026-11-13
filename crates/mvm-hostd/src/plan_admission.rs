@@ -572,7 +572,9 @@ pub(crate) struct VerifiedExternalPlan<'a> {
     signed: &'a SignedExecutionPlan,
 }
 
-pub(crate) fn verify_external_plan(signed: &SignedExecutionPlan) -> Result<VerifiedExternalPlan<'_>> {
+pub(crate) fn verify_external_plan(
+    signed: &SignedExecutionPlan,
+) -> Result<VerifiedExternalPlan<'_>> {
     let trusted = host_trusted_plan_signers()?;
     if trusted.is_empty() {
         anyhow::bail!(
@@ -584,44 +586,55 @@ pub(crate) fn verify_external_plan(signed: &SignedExecutionPlan) -> Result<Verif
         trusted.iter().map(|(id, key)| (id.as_str(), key)).collect();
     let verified =
         verify_plan(signed, &trusted_refs).context("verifying externally-signed plan")?;
-    Ok(VerifiedExternalPlan { body: verified, signed })
+    Ok(VerifiedExternalPlan {
+        body: verified,
+        signed,
+    })
 }
 
 impl VerifiedExternalPlan<'_> {
-    pub(crate) fn plan(&self) -> &ExecutionPlan { &self.body }
+    pub(crate) fn plan(&self) -> &ExecutionPlan {
+        &self.body
+    }
 
-    pub(crate) fn admit(self, clock: &dyn Clock, ledger: &InMemoryNonceLedger, bundle_ctx: Option<&BundleAdmissionContext<'_>>, posture: RunPosture) -> Result<AdmittedPlan> {
+    pub(crate) fn admit(
+        self,
+        clock: &dyn Clock,
+        ledger: &InMemoryNonceLedger,
+        bundle_ctx: Option<&BundleAdmissionContext<'_>>,
+        posture: RunPosture,
+    ) -> Result<AdmittedPlan> {
         let verified = self.body;
         let signed = self.signed;
         let signer_id = signed.0.signer_id.clone();
-    posture.verify_runtime()?;
-    let assurance_runtime = posture.assurance_runtime(&verified)?;
-    validate_extension_bindings(&verified)?;
-    // No extension verification context on this path: a plan that binds
-    // optional extensions is refused rather than admitted unchecked.
-    let extensions = verify_extension_packs(&verified, None)?;
-    verify_registry_pack_assets(&verified)?;
-    admit_grants(&verified, &host_grant_ceiling(), posture)?;
-    posture.enforce_journal(
-        &verified,
-        mvm_core::user_config::load(None).max_mailbox_retention_ms,
-    )?;
-    admit_within_host_budget(&verified)?;
-    admit_host_interface(&verified)?;
+        posture.verify_runtime()?;
+        let assurance_runtime = posture.assurance_runtime(&verified)?;
+        validate_extension_bindings(&verified)?;
+        // No extension verification context on this path: a plan that binds
+        // optional extensions is refused rather than admitted unchecked.
+        let extensions = verify_extension_packs(&verified, None)?;
+        verify_registry_pack_assets(&verified)?;
+        admit_grants(&verified, &host_grant_ceiling(), posture)?;
+        posture.enforce_journal(
+            &verified,
+            mvm_core::user_config::load(None).max_mailbox_retention_ms,
+        )?;
+        admit_within_host_budget(&verified)?;
+        admit_host_interface(&verified)?;
 
-    finish_admission(VerifiedAdmission {
-        verified,
-        // The caller lends the envelope; the admitted plan owns a copy so
-        // downstream consumers can re-verify without trusting this process.
-        signed: signed.clone(),
-        signer_id,
-        extensions,
-        assurance_runtime,
-        posture,
-        clock,
-        ledger,
-        bundle_ctx,
-    })
+        finish_admission(VerifiedAdmission {
+            verified,
+            // The caller lends the envelope; the admitted plan owns a copy so
+            // downstream consumers can re-verify without trusting this process.
+            signed: signed.clone(),
+            signer_id,
+            extensions,
+            assurance_runtime,
+            posture,
+            clock,
+            ledger,
+            bundle_ctx,
+        })
     }
 }
 

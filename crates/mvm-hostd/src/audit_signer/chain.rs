@@ -98,8 +98,19 @@ impl Chain {
         )
     }
 
-    pub fn open_owned_bounded(jsonl_path: &Path, secondary_head_path: &Path, software_chain_key_path: Option<&Path>, limit: std::num::NonZeroU64) -> Result<Self> {
-        Self::open_profile(jsonl_path, secondary_head_path, software_chain_key_path, true, Some(limit))
+    pub fn open_owned_bounded(
+        jsonl_path: &Path,
+        secondary_head_path: &Path,
+        software_chain_key_path: Option<&Path>,
+        limit: std::num::NonZeroU64,
+    ) -> Result<Self> {
+        Self::open_profile(
+            jsonl_path,
+            secondary_head_path,
+            software_chain_key_path,
+            true,
+            Some(limit),
+        )
     }
 
     fn open_profile(
@@ -170,7 +181,10 @@ impl Chain {
         })?;
 
         if let Some(limit) = retained_bytes {
-            anyhow::ensure!(jsonl_file.metadata()?.len() <= limit.get(), "existing audit chain exceeds retained reservation");
+            anyhow::ensure!(
+                jsonl_file.metadata()?.len() <= limit.get(),
+                "existing audit chain exceeds retained reservation"
+            );
         }
         let head = if owned {
             owned::recover_head(&jsonl_file, secondary_head_path)?
@@ -191,16 +205,42 @@ impl Chain {
         })
     }
 
-    pub(super) fn inventory(&self, phase: mvm_core::protocol::audit_signer::AuditInventoryPhase, generation:[u8;32], tenant:&str, vm:&str, workload:&str) -> Result<mvm_core::protocol::audit_signer::SignedAuditInventory> {
+    pub(super) fn inventory(
+        &self,
+        phase: mvm_core::protocol::audit_signer::AuditInventoryPhase,
+        generation: [u8; 32],
+        tenant: &str,
+        vm: &str,
+        workload: &str,
+    ) -> Result<mvm_core::protocol::audit_signer::SignedAuditInventory> {
         use std::os::unix::fs::MetadataExt;
-        let limit = self.retained_bytes.context("original funded reservation missing")?;
+        let limit = self
+            .retained_bytes
+            .context("original funded reservation missing")?;
         anyhow::ensure!(!self.resync_needed, "audit chain has unresolved writes");
         self.jsonl_file.sync_all()?;
         let stat = self.jsonl_file.metadata()?;
-        anyhow::ensure!(stat.is_file() && stat.nlink() == 1 && stat.mode() & 0o077 == 0 && stat.len() <= limit.get(), "original audit file or reservation changed");
-        mvm_core::protocol::audit_inventory::sign(&mvm_core::protocol::audit_signer::AuditInventory{
-            phase,generation,tenant:tenant.into(),vm:vm.into(),workload:workload.into(),dev:stat.dev(),ino:stat.ino(),head:self.head.clone(),length:stat.len(),
-        },&self.signing_key)
+        anyhow::ensure!(
+            stat.is_file()
+                && stat.nlink() == 1
+                && stat.mode() & 0o077 == 0
+                && stat.len() <= limit.get(),
+            "original audit file or reservation changed"
+        );
+        mvm_core::protocol::audit_inventory::sign(
+            &mvm_core::protocol::audit_signer::AuditInventory {
+                phase,
+                generation,
+                tenant: tenant.into(),
+                vm: vm.into(),
+                workload: workload.into(),
+                dev: stat.dev(),
+                ino: stat.ino(),
+                head: self.head.clone(),
+                length: stat.len(),
+            },
+            &self.signing_key,
+        )
     }
 
     /// Current head hash (hex). For tests + supervisor inspection.
@@ -286,7 +326,11 @@ impl Chain {
         // write costs nothing and keeps the guarantee local to this function.
         line.push('\n');
         if let Some(limit) = self.retained_bytes {
-            let previous = self.jsonl_file.metadata().map_err(|_| AuditSignerErrorCode::InternalError)?.len();
+            let previous = self
+                .jsonl_file
+                .metadata()
+                .map_err(|_| AuditSignerErrorCode::InternalError)?
+                .len();
             if line.len() as u64 > limit.get().saturating_sub(previous) {
                 return Err(AuditSignerErrorCode::InvalidRequest);
             }
@@ -452,7 +496,9 @@ mod tests {
         let head = dir.path().join("HEAD");
         {
             let mut original = Chain::open_owned(&jsonl, &head, None).unwrap();
-            original.append(sample_entry(original.head().into())).unwrap();
+            original
+                .append(sample_entry(original.head().into()))
+                .unwrap();
         }
         let original = std::fs::read(&jsonl).unwrap();
         let limit = std::num::NonZeroU64::new(original.len() as u64).unwrap();

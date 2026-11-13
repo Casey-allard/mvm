@@ -622,10 +622,18 @@ impl HostAgentDaemon {
                 ),
             )
             .await;
-            if matches!(written, Ok(Ok(()))) && let Some(inventory) = inventory {
+            if matches!(written, Ok(Ok(())))
+                && let Some(inventory) = inventory
+            {
                 signer_current(original_exit, &admission)?;
-                if !matches!(tokio::time::timeout_at(deadline, crate::framing::write_json_frame_bounded(
-                    &mut stream, &inventory, 4096)).await, Ok(Ok(()))) {
+                if !matches!(
+                    tokio::time::timeout_at(
+                        deadline,
+                        crate::framing::write_json_frame_bounded(&mut stream, &inventory, 4096)
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) {
                     continue;
                 }
             }
@@ -666,7 +674,10 @@ impl HostAgentDaemon {
         )?);
         Ok(self)
     }
-    pub(crate) async fn apply_owned(&mut self, request: &ControlRequest) -> Result<Option<Box<SignedAuditInventory>>> {
+    pub(crate) async fn apply_owned(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<Option<Box<SignedAuditInventory>>> {
         match request {
             ControlRequest::Register(registration) => {
                 tokio::task::block_in_place(|| self.register(registration))?;
@@ -684,12 +695,20 @@ impl HostAgentDaemon {
                     if let Some(handle) = self.vms.get_mut(&request.vm_id) {
                         handle.stop_owned().await?;
                     }
-                    let terminal = tokio::task::block_in_place(|| self.deregister_helper_vm(&request.vm_id))?;
+                    let terminal =
+                        tokio::task::block_in_place(|| self.deregister_helper_vm(&request.vm_id))?;
                     if let Some(original) = self.funded_inventory.get(&request.vm_id) {
-                        let receipt = terminal.as_ref().context("original signer terminal missing")?;
-                        let open = mvm_core::protocol::audit_inventory::verify(original, &original.key)?;
-                        let close = mvm_core::protocol::audit_inventory::verify(receipt, &original.key)?;
-                        ensure!(open.same_registration(&close) && close.length >= open.length, "original signer audit registration changed");
+                        let receipt = terminal
+                            .as_ref()
+                            .context("original signer terminal missing")?;
+                        let open =
+                            mvm_core::protocol::audit_inventory::verify(original, &original.key)?;
+                        let close =
+                            mvm_core::protocol::audit_inventory::verify(receipt, &original.key)?;
+                        ensure!(
+                            open.same_registration(&close) && close.length >= open.length,
+                            "original signer audit registration changed"
+                        );
                     }
                     if let Some(path) = self.owned_paths.get_mut(&request.vm_id) {
                         path.remove()?;

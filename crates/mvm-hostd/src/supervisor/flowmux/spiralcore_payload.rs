@@ -710,7 +710,11 @@ impl OwnedPayloadStore {
         let directory = std::fs::File::open(&path)?;
         Self::capture_directory(path, directory, None)
     }
-    fn capture_directory(path: std::path::PathBuf, directory: std::fs::File, parent: Option<Arc<std::fs::File>>) -> io::Result<Self> {
+    fn capture_directory(
+        path: std::path::PathBuf,
+        directory: std::fs::File,
+        parent: Option<Arc<std::fs::File>>,
+    ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let before = std::fs::symlink_metadata(&path)?;
         mvm_core::private_fs::require_current_owner(&before)?;
