@@ -239,14 +239,9 @@ pub(super) fn run(
         anchor_metadata.is_file() && anchor_metadata.len() == 32,
         "installed collector public anchor shape differs"
     );
-    let runtime_state = Arc::new(resources.open_original_state_directory()?);
-    let socket_dir = mvm_core::config::vm_socket_dir_at(&telemetry.state_dir);
-    let alternate = if socket_dir == telemetry.state_dir {
-        None
-    } else {
-        Some(mvm_vmm::host::restore_image::open_trusted_dir(&socket_dir)?)
-    };
-    let readiness_dir = alternate.as_ref().unwrap_or(&runtime_state);
+    let (state_directory, socket_directory) = resources.open_original_directories()?;
+    let runtime_state = Arc::new(state_directory);
+    let readiness_dir = &socket_directory;
     let network_dir = if path.parent() == Some(telemetry.state_dir.as_path()) {
         &runtime_state
     } else {

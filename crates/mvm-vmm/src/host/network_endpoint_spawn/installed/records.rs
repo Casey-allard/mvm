@@ -13,6 +13,8 @@ pub(super) struct RecordsProjection {
     state_path: PathBuf,
     state_device: u64,
     state_inode: u64,
+    socket_device: u64,
+    socket_inode: u64,
     device: u64,
     inode: u64,
 }
@@ -71,27 +73,33 @@ fn object(metadata: &rustix::fs::Stat) -> (u64, u64) {
 }
 
 impl RecordsProjection {
-    pub(super) fn from_original(state_path: &Path, state: &File, records: &File) -> Result<Self> {
+    pub(super) fn from_original(state_path: &Path, state: &File, socket: &File, records: &File) -> Result<Self> {
         let directory = state.metadata().map_err(|_| refused())?;
+        let socket = socket.metadata().map_err(|_| refused())?;
         let file = check_file(records.as_fd())?;
         let projection = Self {
-            version: 1,
+            version: 2,
             descriptor: records.as_raw_fd(),
             state_path: state_path.into(),
             state_device: directory.dev(),
             state_inode: directory.ino(),
+            socket_device: socket.dev(),
+            socket_inode: socket.ino(),
             device: object(&file).0,
             inode: object(&file).1,
         };
         projection.preflight(&[])?;
         Ok(projection)
     }
+    fn open_registered_socket_at(&self, path: &Path) -> Result<File> {
+        check_state(path, self.socket_device, self.socket_inode)
+    }
     pub(super) fn descriptor(&self) -> i32 {
         self.descriptor
     }
     /// Borrow only: no supplied descriptor has been adopted at this point.
     pub(super) fn preflight(&self, existing: &[i32]) -> Result<()> {
-        if self.version != 1 || self.descriptor <= 2 || existing.contains(&self.descriptor) {
+        if self.version != 2 || self.descriptor <= 2 || existing.contains(&self.descriptor) {
             return Err(refused());
         }
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
@@ -162,13 +170,15 @@ impl InstalledTelemetryRecords {
         self.projection.preflight(&[])
     }
     /// Pin the directory identity admitted with the original records writer.
-    pub fn open_original_state_directory(&self) -> Result<File> {
+    pub fn open_original_directories(&self) -> Result<(File, File)> {
         self.lease.check_current()?;
-        check_state(
-            &self.projection.state_path,
-            self.projection.state_device,
-            self.projection.state_inode,
-        )
+        let state = check_state(
+            &self.projection.state_path, self.projection.state_device, self.projection.state_inode,
+        )?;
+        let socket = self.projection.open_registered_socket_at(
+            &mvm_core::config::vm_socket_dir_at(&self.projection.state_path),
+        )?;
+        Ok((state, socket))
     }
 
     pub fn current_len(&self) -> std::io::Result<u64> {

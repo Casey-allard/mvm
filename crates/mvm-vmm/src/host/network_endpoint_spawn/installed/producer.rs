@@ -83,7 +83,7 @@ impl Preparation {
         // Capture each actual observation before any fallible post-open work.
         // This is not a pathname-to-authority constructor: the SAME original
         // parent guard validates and protects this directory before key effects.
-        let (registered_state, _) = original
+        let (registered_state, registered_socket) = original
             .registration
             .original_directories(original.registrar, &original.params)?;
         let state = registered_state.try_clone()?;
@@ -125,7 +125,7 @@ impl Preparation {
             .as_ref()
             .expect("original records observation");
         let projection =
-            records::RecordsProjection::from_original(params.state_dir, state, records)?;
+            records::RecordsProjection::from_original(params.state_dir, state, registered_socket, records)?;
         current(handoff, audit, original, params, deadline)?;
         handoff.bind_retained_telemetry_files(
             params.state_dir,

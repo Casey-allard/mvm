@@ -220,12 +220,12 @@ impl InstalledEndpointResources {
         self.confine_with_runtime_state(spec, None)
     }
 
-    pub(crate) fn open_original_state_directory(&self) -> Result<File> {
+    pub(crate) fn open_original_directories(&self) -> Result<(File, File)> {
         match self.records.lock() {
             Ok(records) => records
                 .as_ref()
                 .context("installed original records writer unavailable")?
-                .open_original_state_directory(),
+                .open_original_directories(),
             Err(_) => {
                 self.lease.fence();
                 anyhow::bail!("installed original records writer poisoned")
