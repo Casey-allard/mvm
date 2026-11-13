@@ -588,10 +588,7 @@ impl OwnedHostAgent {
         inputs.holder.verify_current()?;
         #[cfg(target_os = "linux")]
         if let Some(limit) = address_space_limit {
-            crate::host::process_limits::limit_original_address_space(
-                &mut command,
-                limit.get(),
-            )?;
+            crate::host::process_limits::limit_original_address_space(&mut command, limit.get())?;
         }
         let mut child = command.spawn().context("spawn original host-agent child")?;
         drop(descriptors);
