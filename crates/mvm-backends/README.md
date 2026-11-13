@@ -24,6 +24,26 @@ namespace setup, control requests, snapshots, host resources, and event-driven
 process observation. Guards use RAII so partial launch failures tear down only
 resources created by that attempt.
 
+The selected Linux installed-lifetime path retains the original `Child`, a
+kernel process descriptor and the original installation holder through cold
+boot and teardown. It authenticates configuration and readiness against that
+process, and does not adopt an idle process or recover authority from a PID
+file. Its workload-exit listener owns one explicitly sized worker, cancellation
+socket and original join handle. Workload status comes from that worker's
+single report rather than a prior run's file. Retirement requires original
+process exit, actual child collection and worker collection before returning
+the retained lease to the caller. A failed or uncertain launch keeps custody;
+it cannot become a successful no-spawn or retirement result.
+
+These driver mechanics do not grant launch, mailbox or egress authority. The
+canonical runtime must supply a matching admitted parent and enforce its
+resource budget. The component controls do not establish installed native,
+restart, WAN or fleet acceptance. The exit-report writer provides visibility
+before its best-effort acknowledgment, without a power-loss durability claim;
+the final native thread join has no hard real-time deadline. Orphan recovery,
+complete disk/log limits and the supported native capacity envelope still
+require qualification through the installed service.
+
 ## Main modules
 
 | Module | Responsibility |
