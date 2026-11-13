@@ -38,6 +38,8 @@ use crate::rust_source::{CommentSyntax, blank_comments};
 // SLOC and 1,305,881 physical lines. The difference from upstream was 61,035
 // first-party SLOC (including inline tests) and 7,485 test/bench SLOC. Vendored
 // and generated totals were unchanged. Round each measured total up to 100.
+// CI witness, overclaim, snapshot-owner, Yocto importer, and CLI option-source
+// tests remain measured. Leave room for concurrent main changes.
 /// Ceiling on total SLOC, all categories.
 const MAX_TOTAL_SLOC: usize = 1_035_800;
 /// Ceiling on total physical lines, all categories.
