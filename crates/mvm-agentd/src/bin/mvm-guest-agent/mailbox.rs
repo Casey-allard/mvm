@@ -543,48 +543,50 @@ mod tests {
 
     #[test]
     fn a_pending_send_still_uses_the_existing_port_when_receive_is_enabled() {
-        use mvm_contract::protocol::mailbox::PrincipalId;
-        use mvm_core::mailbox::frame::OutboxMessage;
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = dir.path().join("outbox");
-        let local_outbox = dir.path().join("outbox-local");
-        mvm_agentd::mailbox_outbox::write_outbox(
-            &outbox,
-            &OutboxMessage::new(PrincipalId::from_bytes([0; 32]), b"hello".to_vec()),
-        )
-        .unwrap();
-        mvm_agentd::mailbox_outbox::write_outbox(
-            &local_outbox,
-            &OutboxMessage::new(PrincipalId::from_bytes([0; 32]), b"local".to_vec()),
-        )
-        .unwrap();
-        let (mut guest, mut host) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (_sender, reader) = std::sync::mpsc::sync_channel(1);
-        let peer = std::thread::spawn(move || {
-            let mut len = [0; 4];
-            host.read_exact(&mut len).unwrap();
-            let mut body = vec![0; u32::from_be_bytes(len) as usize];
-            host.read_exact(&mut body).unwrap();
-            assert!(!mvm_core::mailbox::reader_wire::is_reader_frame(&body));
-            assert_eq!(OutboxMessage::decode(&body).unwrap().body, b"hello");
-            host.write_all(&serde_json::to_vec(&Ok::<(), Refusal>(())).unwrap())
-                .unwrap();
+        mvm_core::util::test_env::isolated_lock_probe(|| {
+            use mvm_contract::protocol::mailbox::PrincipalId;
+            use mvm_core::mailbox::frame::OutboxMessage;
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = dir.path().join("outbox");
+            let local_outbox = dir.path().join("outbox-local");
+            mvm_agentd::mailbox_outbox::write_outbox(
+                &outbox,
+                &OutboxMessage::new(PrincipalId::from_bytes([0; 32]), b"hello".to_vec()),
+            )
+            .unwrap();
+            mvm_agentd::mailbox_outbox::write_outbox(
+                &local_outbox,
+                &OutboxMessage::new(PrincipalId::from_bytes([0; 32]), b"local".to_vec()),
+            )
+            .unwrap();
+            let (mut guest, mut host) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (_sender, reader) = std::sync::mpsc::sync_channel(1);
+            let peer = std::thread::spawn(move || {
+                let mut len = [0; 4];
+                host.read_exact(&mut len).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(len) as usize];
+                host.read_exact(&mut body).unwrap();
+                assert!(!mvm_core::mailbox::reader_wire::is_reader_frame(&body));
+                assert_eq!(OutboxMessage::decode(&body).unwrap().body, b"hello");
+                host.write_all(&serde_json::to_vec(&Ok::<(), Refusal>(())).unwrap())
+                    .unwrap();
+            });
+            wait_for_operation(
+                &mut guest,
+                &mut JournalAttempts::default(),
+                Some(&reader),
+                None,
+                &local_outbox,
+                &outbox,
+            )
+            .unwrap();
+            peer.join().unwrap();
+            assert!(!outbox.exists(), "accepted Send is removed as before");
+            assert!(
+                local_outbox.exists(),
+                "missing boot authority cannot downgrade a local request"
+            );
         });
-        wait_for_operation(
-            &mut guest,
-            &mut JournalAttempts::default(),
-            Some(&reader),
-            None,
-            &local_outbox,
-            &outbox,
-        )
-        .unwrap();
-        peer.join().unwrap();
-        assert!(!outbox.exists(), "accepted Send is removed as before");
-        assert!(
-            local_outbox.exists(),
-            "missing boot authority cannot downgrade a local request"
-        );
     }
 
     #[test]
