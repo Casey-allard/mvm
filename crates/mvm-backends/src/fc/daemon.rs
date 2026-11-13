@@ -12,15 +12,7 @@ use super::{firecracker_vsock_uds_path, resolve_running_vm_dir};
 #[cfg(any(target_os = "linux", test))]
 #[derive(serde::Deserialize)]
 struct WriterConfig {
-    drives: Vec<WriterDrive>,
-}
-
-#[cfg(any(target_os = "linux", test))]
-#[derive(serde::Deserialize)]
-struct WriterDrive {
-    drive_id: String,
-    path_on_host: std::path::PathBuf,
-    is_read_only: bool,
+    drives: Vec<super::runtime_artifacts::Drive>,
 }
 
 /// Authenticate the configured writable drives against the original objects
@@ -68,24 +60,35 @@ pub(crate) fn verify_original_workload_root(
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
     original.authenticate_config(session.connected_stream())?;
-    let config: WriterConfig = serde_json::from_str(&session.call("GET", "/vm/config", None)?)?;
-    let mut roots = config
-        .drives
-        .iter()
-        .filter(|drive| drive.drive_id == format!("blk{}", root.slot()));
-    let drive = roots
-        .next()
-        .context("original workload root not configured")?;
-    anyhow::ensure!(
-        roots.next().is_none()
-            && drive.is_read_only
-            && drive.path_on_host
-                == std::path::PathBuf::from(format!("/proc/self/fd/{}", root.file().as_raw_fd())),
-        "original workload root configuration differs"
-    );
+    let mut config: WriterConfig =
+        serde_json::from_str(&session.call("GET", "/vm/config", None)?)?;
+    validate_original_root_layout(
+        &mut config,
+        root.slot(),
+        std::path::Path::new(&format!("/proc/self/fd/{}", root.file().as_raw_fd())),
+    )?;
     original.require_live()?;
     root.verify_writer_descriptors(original.pid())?;
     original.require_live()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_original_root_layout(
+    config: &mut WriterConfig,
+    slot: u8,
+    path: &std::path::Path,
+) -> Result<()> {
+    let drives = super::runtime_artifacts::canonical_drive_observations(&mut config.drives)?;
+    let root_id = format!("blk{slot}");
+    let root = drives
+        .iter()
+        .find(|drive| drive.drive_id == root_id)
+        .context("original workload root not configured")?;
+    anyhow::ensure!(
+        root.is_root_device && root.is_read_only && root.path == path,
+        "original workload root configuration differs"
+    );
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -985,7 +988,7 @@ mod tests {
             plan_binding: None,
         };
         let matching: WriterConfig = serde_json::from_str(
-            r#"{"drives":[{"drive_id":"blk3","path_on_host":"/original/volume","is_read_only":false}]}"#,
+            r#"{"drives":[{"drive_id":"blk3","is_root_device":false,"path_on_host":"/original/volume","is_read_only":false}]}"#,
         )
         .unwrap();
         validate_writer_config(&matching, &spec).unwrap();
@@ -994,11 +997,35 @@ mod tests {
         assert!(validate_writer_config(&matching, &read_only_spec).is_err());
         for body in [
             r#"{"drives":[]}"#,
-            r#"{"drives":[{"drive_id":"blk3","path_on_host":"/replacement","is_read_only":false}]}"#,
-            r#"{"drives":[{"drive_id":"blk4","path_on_host":"/original/volume","is_read_only":false}]}"#,
+            r#"{"drives":[{"drive_id":"blk3","is_root_device":false,"path_on_host":"/replacement","is_read_only":false}]}"#,
+            r#"{"drives":[{"drive_id":"blk4","is_root_device":false,"path_on_host":"/original/volume","is_read_only":false}]}"#,
         ] {
             let changed: WriterConfig = serde_json::from_str(body).unwrap();
             assert!(validate_writer_config(&changed, &spec).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn original_root_readback_requires_one_readonly_root_without_path_aliases() {
+        let path = std::path::Path::new("/proc/self/fd/42");
+        let good = r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_root_device":true,"is_read_only":true}]}"#;
+        validate_original_root_layout(&mut serde_json::from_str(good).unwrap(), 0, path).unwrap();
+        for body in [
+            r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_read_only":true}]}"#,
+            r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_root_device":"true","is_read_only":true}]}"#,
+        ] {
+            assert!(serde_json::from_str::<WriterConfig>(body).is_err());
+        }
+        for body in [
+            good.replace("\"is_root_device\":true", "\"is_root_device\":false"),
+            good.replace("\"is_read_only\":true", "\"is_read_only\":false"),
+            good.replace("/proc/self/fd/42", "/other/root"),
+            good.replace("blk0", "blk1"),
+            r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_root_device":true,"is_read_only":true},{"drive_id":"blk1","path_on_host":"/another","is_root_device":true,"is_read_only":true}]}"#.into(),
+            r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_root_device":true,"is_read_only":true},{"drive_id":"blk1","path_on_host":"/proc/self/fd/42","is_root_device":false,"is_read_only":false}]}"#.into(),
+        ] {
+            let mut config = serde_json::from_str(&body).unwrap();
+            assert!(validate_original_root_layout(&mut config, 0, path).is_err(), "{body}");
         }
     }
 

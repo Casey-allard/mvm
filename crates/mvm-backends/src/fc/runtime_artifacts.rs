@@ -26,11 +26,11 @@ struct BootSource {
 }
 
 #[derive(Deserialize)]
-struct Drive {
-    drive_id: String,
-    is_root_device: bool,
-    path_on_host: PathBuf,
-    is_read_only: bool,
+pub(super) struct Drive {
+    pub(super) drive_id: String,
+    pub(super) is_root_device: bool,
+    pub(super) path_on_host: PathBuf,
+    pub(super) is_read_only: bool,
 }
 
 pub(super) fn query(socket: &Path) -> Result<RuntimeArtifacts> {
@@ -51,32 +51,7 @@ fn from_config(json: &str) -> Result<RuntimeArtifacts> {
         config.boot_source.kernel_image_path.is_absolute(),
         "Firecracker did not report its boot-source kernel identity"
     );
-    // Managed launches assign blk{slot} in numeric slot order. Firecracker's
-    // snapshot save traverses a HashMap and restores resource configuration in
-    // that traversal order, so GET array order is not stable after restore.
-    // Native snapshot authentication preserves the ID/device-info association;
-    // these canonical IDs recover the managed driver's slot order.
-    for drive in &config.drives {
-        canonical_slot(&drive.drive_id)?;
-    }
-    config
-        .drives
-        .sort_by_key(|drive| canonical_slot(&drive.drive_id).ok());
-    // These are configuration observations, not a measurement of loaded RAM.
-    // Admission compares their exact paths to a protected retained generation
-    // and verifies that generation independently. Writable devices cannot
-    // establish an immutable runtime binding.
-    let firecracker_drives = config
-        .drives
-        .iter()
-        .map(|drive| FirecrackerDrive {
-            drive_id: drive.drive_id.clone(),
-            path: drive.path_on_host.clone(),
-            is_root_device: drive.is_root_device,
-            is_read_only: drive.is_read_only,
-        })
-        .collect::<Vec<_>>();
-    validate_layout(&firecracker_drives)?;
+    let firecracker_drives = canonical_drive_observations(&mut config.drives)?;
     let disks = config
         .drives
         .into_iter()
@@ -95,6 +70,33 @@ fn from_config(json: &str) -> Result<RuntimeArtifacts> {
             "reboot=k panic=1 nomodule 8250.nr_uarts=0 i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce".into()
         }),
     })
+}
+
+pub(super) fn canonical_drive_observations(drives: &mut [Drive]) -> Result<Vec<FirecrackerDrive>> {
+    // Managed launches assign blk{slot} in numeric slot order. Firecracker's
+    // snapshot save traverses a HashMap and restores resource configuration in
+    // that traversal order, so GET array order is not stable after restore.
+    // Native snapshot authentication preserves the ID/device-info association;
+    // these canonical IDs recover the managed driver's slot order.
+    for drive in drives.iter() {
+        canonical_slot(&drive.drive_id)?;
+    }
+    drives.sort_by_key(|drive| canonical_slot(&drive.drive_id).ok());
+    // These are configuration observations, not a measurement of loaded RAM.
+    // Admission compares their exact paths to a protected retained generation
+    // and verifies that generation independently. Writable devices cannot
+    // establish an immutable runtime binding.
+    let firecracker_drives = drives
+        .iter()
+        .map(|drive| FirecrackerDrive {
+            drive_id: drive.drive_id.clone(),
+            path: drive.path_on_host.clone(),
+            is_root_device: drive.is_root_device,
+            is_read_only: drive.is_read_only,
+        })
+        .collect::<Vec<_>>();
+    validate_layout(&firecracker_drives)?;
+    Ok(firecracker_drives)
 }
 
 fn observe_file(path: PathBuf) -> Result<RuntimeArtifact> {
