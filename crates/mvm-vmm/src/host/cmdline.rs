@@ -157,14 +157,20 @@ fn workload_cmdline_for_hostname(
     let gpu = gpu_cmdline_token(config);
     let hostname = guest_hostname.and_then(hostname_cmdline_token);
     let [mailbox, sender] = mailbox_cmdline_tokens(config);
+    let [verb, required, signer] = if uses_installed_payload_anchor(config) {
+        // The registered original supplies all three tokens after registration.
+        [None, None, None]
+    } else {
+        [
+            verb_grant_cmdline_token(&config.name),
+            require_grant_cmdline_token(&config.name),
+            host_signer_pub_cmdline_token(&config.name),
+        ]
+    };
     let grants: Vec<String> = [
-        verb_grant_cmdline_token(&config.name),
-        require_grant_cmdline_token(&config.name),
-        if uses_installed_payload_anchor(config) {
-            None
-        } else {
-            host_signer_pub_cmdline_token(&config.name)
-        },
+        verb,
+        required,
+        signer,
         telemetry_cmdline_token(&config.name),
         seccomp_cmdline_token(config),
         mailbox,

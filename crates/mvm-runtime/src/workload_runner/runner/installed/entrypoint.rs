@@ -65,7 +65,12 @@ impl InstalledSlot {
             plan.resources.timeouts.boot_secs,
         )?;
         let channel = crate::microvm::activation::activate_installed_entrypoint(
-            vm, config, &plan, &host, until,
+            vm,
+            config,
+            &plan,
+            &host,
+            boot_cmdline,
+            until,
         )?;
         let mut state = self.access()?;
         let custody = state

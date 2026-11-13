@@ -4652,6 +4652,65 @@ mod tests {
         assert!(err.to_string().contains("memory_mib"), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_entrypoint_issues_only_the_original_admitted_boot_grant() {
+        let (_env, _home) = host_with_ceiling(Default::default());
+        let keys = mvm_core::config::mvm_keys_dir();
+        let mut input = fixture_input("vm-original");
+        input.agent_verbs = Some(vec![
+            mvm_core::plan::VerbId::new("activate-environment").unwrap(),
+            mvm_core::plan::VerbId::new("run-entrypoint").unwrap(),
+        ]);
+        let admitted = admit_for_run(
+            &input,
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(&keys),
+            None,
+            RunPosture::on_backend(Variant::Dev, BackendKind::Firecracker),
+        )
+        .unwrap();
+        let signer = crate::audit::host_keypair::load_or_init_at(&keys).unwrap();
+        let issue = || {
+            verb_grant_sidecar::installed_issuer(&admitted, "vm-original")
+                .unwrap()
+                .unwrap()
+        };
+        let held = issue();
+        let envelope = held.issue(&signer.verifying.to_bytes()).unwrap();
+        assert!(held.issue(&signer.verifying.to_bytes()).is_err());
+        assert!(issue().issue(&[1; 32]).is_err());
+        let plan = admitted.plan();
+        envelope
+            .grant
+            .verify(
+                &signer.verifying,
+                "vm-original",
+                &plan.nonce,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(Some(envelope.grant.verbs.clone()), input.agent_verbs);
+        assert_eq!(envelope.grant.not_after, plan.valid_until);
+        assert!(
+            envelope
+                .grant
+                .verify(
+                    &signer.verifying,
+                    "different",
+                    &plan.nonce,
+                    chrono::Utc::now()
+                )
+                .is_err()
+        );
+        assert!(
+            !mvm_core::config::vm_state_dir("vm-original")
+                .join("verb-grant.json")
+                .exists()
+        );
+    }
+
     #[test]
     fn happy_path_returns_admitted_plan_with_plan_id() {
         let (_env, _home) = host_with_ceiling(Default::default());

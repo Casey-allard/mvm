@@ -33,10 +33,33 @@ pub(super) fn mint_verb_grant_sidecar(
     let plan: ExecutionPlan = serde_json::from_slice(&signed.0.payload)
         .context("decode admitted plan for guest grant")?;
 
+    let Some(scope) = grant_scope(&plan, vm_name)? else {
+        return Ok(None);
+    };
+    let keys_dir = mvm_core::config::mvm_keys_dir();
+    let signer = crate::audit::host_keypair::load_or_init_at(&keys_dir)
+        .context("load host signer for verb-grant mint")?;
+    let keystore = crate::host_signer::keystore::Keystore::load_from_file(&signer.secret_path)
+        .context("load Keystore from host-signer key file")?;
+    let envelope = scope.sign(&keystore)?;
+    let envelope_json = serde_json::to_vec(&envelope).context("serialize VerbGrantEnvelope")?;
+    write_secret_file(&sidecar_path, &envelope_json)?;
+    Ok(Some(envelope))
+}
+
+struct GrantScope {
+    vm_name: String,
+    nonce: mvm_core::plan::Nonce,
+    expires: chrono::DateTime<chrono::Utc>,
+    verbs: Vec<VerbId>,
+    authority: crate::host_signer::VerbGrantAuthority,
+}
+
+fn grant_scope(plan: &ExecutionPlan, vm_name: &str) -> Result<Option<GrantScope>> {
     // The grant expires with the plan's validity window. Minting one that is
     // already dead guarantees the guest refuses activation, and the guest can
     // only say `VerbNotAuthorized`; refusing here says what actually expired.
-    refuse_expired_plan(&plan, chrono::Utc::now())?;
+    refuse_expired_plan(plan, chrono::Utc::now())?;
     let drive = plan.grants.as_ref().and_then(|grants| grants.drive.clone());
     let application_terminal = plan
         .grants
@@ -44,42 +67,97 @@ pub(super) fn mint_verb_grant_sidecar(
         .and_then(|grants| grants.application_terminal.as_ref())
         .map(mvm_contract::grants::ApplicationTerminalBinding::from);
     let other_authority = drive.is_some() || application_terminal.is_some();
-    let Some(verbs) = granted_verbs(&plan, other_authority) else {
+    let Some(verbs) = granted_verbs(plan, other_authority) else {
         return Ok(None);
     };
 
-    let keys_dir = mvm_core::config::mvm_keys_dir();
-    let signer = crate::audit::host_keypair::load_or_init_at(&keys_dir)
-        .context("load host signer for verb-grant mint")?;
-    let keystore = crate::host_signer::keystore::Keystore::load_from_file(&signer.secret_path)
-        .context("load Keystore from host-signer key file")?;
-    let grant = crate::host_signer::mint_verb_grant(
-        &keystore,
-        vm_name,
-        &plan.nonce,
-        plan.valid_until,
+    Ok(Some(GrantScope {
+        vm_name: vm_name.to_owned(),
+        nonce: plan.nonce.clone(),
+        expires: plan.valid_until,
         verbs,
-        crate::host_signer::VerbGrantAuthority {
+        authority: crate::host_signer::VerbGrantAuthority {
             drive,
             application_terminal,
         },
-    )
-    .context("mint verb grant")?;
+    }))
+}
 
-    let envelope = VerbGrantEnvelope {
-        pubkey_hex: keystore
-            .pub_key()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-        plan_nonce_hex: plan.nonce.as_hex().to_string(),
-        predecessor_session_id: None,
-        predecessor_plan_nonce_hex: None,
-        grant,
-    };
-    let envelope_json = serde_json::to_vec(&envelope).context("serialize VerbGrantEnvelope")?;
-    write_secret_file(&sidecar_path, &envelope_json)?;
-    Ok(Some(envelope))
+impl GrantScope {
+    fn sign(self, keystore: &crate::host_signer::keystore::Keystore) -> Result<VerbGrantEnvelope> {
+        let grant = crate::host_signer::mint_verb_grant(
+            keystore,
+            &self.vm_name,
+            &self.nonce,
+            self.expires,
+            self.verbs,
+            self.authority,
+        )
+        .context("mint verb grant")?;
+
+        Ok(VerbGrantEnvelope {
+            pubkey_hex: keystore
+                .pub_key()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            plan_nonce_hex: self.nonce.as_hex().to_string(),
+            predecessor_session_id: None,
+            predecessor_plan_nonce_hex: None,
+            grant,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct InstalledIssuer {
+    scope: std::sync::Mutex<Option<GrantScope>>,
+    valid_from: chrono::DateTime<chrono::Utc>,
+}
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for InstalledIssuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InstalledIssuer")
+    }
+}
+#[cfg(target_os = "linux")]
+impl mvm_core::vm_backend::RegisteredBootGrant for InstalledIssuer {
+    fn issue(&self, host: &[u8; 32]) -> Result<VerbGrantEnvelope> {
+        let scope = self
+            .scope
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original grant issuer poisoned"))?
+            .take()
+            .context("original boot grant already consumed")?;
+        let now = chrono::Utc::now();
+        anyhow::ensure!(
+            self.valid_from <= now && now < scope.expires,
+            "original guest grant outside admitted window"
+        );
+        let path =
+            mvm_core::config::mvm_keys_dir().join(crate::audit::host_keypair::SECRET_FILENAME);
+        let key = crate::host_signer::keystore::Keystore::load_from_file_bounded(&path)?;
+        anyhow::ensure!(
+            key.pub_key() == host,
+            "boot grant signer differs from registered host"
+        );
+        scope.sign(&key)
+    }
+}
+
+/// Capture only the authority of this already-admitted plan, with one invocation shared across config clones.
+#[cfg(target_os = "linux")]
+pub(super) fn installed_issuer(
+    admitted: &super::AdmittedPlan,
+    vm_name: &str,
+) -> Result<Option<std::sync::Arc<dyn mvm_core::vm_backend::RegisteredBootGrant>>> {
+    let plan = admitted.plan();
+    Ok(grant_scope(plan, vm_name)?.map(|scope| {
+        std::sync::Arc::new(InstalledIssuer {
+            scope: std::sync::Mutex::new(Some(scope)),
+            valid_from: plan.valid_from,
+        }) as _
+    }))
 }
 
 /// The verbs a minted grant carries, or `None` when the plan needs no grant.

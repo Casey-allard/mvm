@@ -599,7 +599,12 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         }
         anyhow::ensure!(
             !cmdline::uses_installed_payload_anchor(inputs.config)
-                || mvm_agentd::vsock::host_signer_pub_token(&inputs.cmdline).is_none(),
+                || (mvm_agentd::vsock::host_signer_pub_token(&inputs.cmdline).is_none()
+                    && !inputs
+                        .cmdline
+                        .split_ascii_whitespace()
+                        .any(|token| token.starts_with("mvm.verb_grant=")
+                            || token.starts_with("mvm.require_grant="))),
             "installed workload cmdline contains an unbound host signer anchor"
         );
         #[cfg(unix)]
@@ -714,6 +719,11 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                     request.host_agent_params()?,
                 )?;
                 original.append_host_signer_cmdline(&mut boot_cmdline)?;
+                #[cfg(target_os = "linux")]
+                crate::microvm::activation::append_registered_boot_grant(
+                    inputs.config,
+                    &mut boot_cmdline,
+                )?;
                 slot.begin_endpoint_start()?;
                 guards.spawn_endpoint_installed(
                     &id,

@@ -101,8 +101,18 @@ pub struct BundleBootAssetsPin {
     pub initrd_sha256: crate::packs::Sha256Hex,
 }
 
+#[cfg(target_os = "linux")]
+pub trait RegisteredBootGrant: std::fmt::Debug + Send + Sync {
+    /// Consume the original admitted grant at registered boot. Implementations verify
+    /// their existing keystore against this host key before they sign.
+    fn issue(&self, registered_host: &[u8; 32]) -> Result<VerbGrantEnvelope>;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct VmStartConfig {
+    /// One-use in-process grant projection installed after final admission.
+    #[cfg(target_os = "linux")]
+    pub registered_boot_grant: Option<std::sync::Arc<dyn RegisteredBootGrant>>,
     /// Original in-process installed lifetime retained across this launch.
     #[cfg(unix)]
     pub host_lifetime: Option<std::sync::Arc<crate::host_lifetime::HostLifetimeAnchor>>,

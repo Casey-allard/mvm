@@ -334,6 +334,14 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
     let render = |config| cmdline::runner_cmdline(config, &state_dir, |_| "console=ttyS0".into());
     assert!(mvm_agentd::vsock::host_signer_pub_token(&render(&config)).is_some());
     assert!(mvm_agentd::vsock::host_signer_pub_token(&render(&injected_config)).is_none());
+    let stale = state_dir.join("verb-grant.json");
+    std::fs::write(&stale, b"predecessor").unwrap();
+    assert!(render(&config).contains("mvm.require_grant=1"));
+    assert!(
+        !render(&injected_config).contains("mvm.require_grant="),
+        "an installed boot inherited the predecessor grant by VM name"
+    );
+    std::fs::remove_file(stale).unwrap();
     std::fs::remove_file(signer).unwrap();
     let redaction = RedactionPolicy::default();
     let injected = WorkloadLaunchInputs {

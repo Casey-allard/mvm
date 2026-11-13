@@ -85,6 +85,20 @@ pub(super) fn run_post_admission_gates(
     #[cfg(unix)]
     crate::host_lifetime_parent::bind_current(admitted, &config, backend)
         .map_err(|error| ("original-resources", error))?;
+    #[cfg(target_os = "linux")]
+    {
+        if config.registered_boot_grant.is_some() {
+            return Err((
+                "original-boot-grant",
+                anyhow::anyhow!("caller supplied a boot grant issuer"),
+            ));
+        }
+        if mvm_vmm::host::cmdline::uses_installed_payload_anchor(&config) {
+            config.registered_boot_grant =
+                verb_grant_sidecar::installed_issuer(admitted, &config.name)
+                    .map_err(|error| ("original-boot-grant", error))?;
+        }
+    }
     Ok((config, runtime))
 }
 
