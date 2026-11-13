@@ -194,6 +194,14 @@ pub struct OwnedHostAgent {
 #[derive(Clone)]
 pub struct OwnedHostAgentRegistrar {
     shared: Arc<Shared>,
+    registered: Option<Arc<dyn RegisteredEndpointOwner>>,
+}
+/// Trusted embedding observes the authenticated per-VM registration before endpoint handoff.
+pub trait RegisteredEndpointOwner: Send + Sync {
+    fn bind_registration(
+        &self, registrar: &OwnedHostAgentRegistrar, registration: &OwnedVmRegistration,
+        params: &HostAgentServicesParams<'_>,
+    ) -> Result<()>;
 }
 /// Exact local registration serial, never reconstructed from markers.
 #[must_use]
@@ -631,6 +639,7 @@ impl OwnedHostAgent {
     pub fn registrar(&self) -> OwnedHostAgentRegistrar {
         OwnedHostAgentRegistrar {
             shared: self.shared.clone(),
+            registered: None,
         }
     }
     /// Original Child identity for observation only; never a cleanup handle.
@@ -875,6 +884,15 @@ fn owned_control(
     }
 }
 impl OwnedHostAgentRegistrar {
+    /// Attach the original resource owner before passing this registrar to the runner.
+    /// The underlying tenant daemon and its signed registration protocol stay the same.
+    pub fn with_registration_owner(mut self, owner: Arc<dyn RegisteredEndpointOwner>) -> Result<Self> {
+        ensure!(self.registered.is_none(), "registration observer already selected");
+        self.check_current_for_tenant(&self.shared.tenant)?;
+        self.registered = Some(owner);
+        Ok(self)
+    }
+
     /// Both handles came from the same originally held tenant agent.
     pub fn same_original(&self, expected: &Self) -> bool {
         Arc::ptr_eq(&self.shared, &expected.shared)
@@ -1028,6 +1046,13 @@ impl OwnedHostAgentRegistrar {
             .into());
         }
         drop(ledger);
+        if let Some(owner) = &self.registered {
+            let result = owner.bind_registration(self, &guard, &params)
+                .and_then(|()| guard.check_current_for(self, &params));
+            if let Err(reason) = result {
+                return Err(OwnedRegistrationError { reason, registration: guard }.into());
+            }
+        }
         Ok(guard)
     }
 }
