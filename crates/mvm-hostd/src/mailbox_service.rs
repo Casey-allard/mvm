@@ -1163,7 +1163,9 @@ mod tests {
         );
     }
 
-    pub(super) fn external_fixture(dir: &Path) -> (GuestSealer, MailboxPolicy, SignedMailboxCapability) {
+    pub(super) fn external_fixture(
+        dir: &Path,
+    ) -> (GuestSealer, MailboxPolicy, SignedMailboxCapability) {
         crate::audit::host_keypair::load_or_init_at(dir).unwrap();
         let keys = derive_launch_keys(dir, &grant_at(dir, 1), &test_secret()).unwrap();
         let (mut destination, mut sealer) = keys.trust();

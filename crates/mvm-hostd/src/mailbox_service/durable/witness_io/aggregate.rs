@@ -90,8 +90,9 @@ mod tests {
     fn torn_turn_preserves_protocol_error_and_cannot_close_observation() {
         let d = tempfile::tempdir().unwrap();
         let m = Aggregate::create(d.path()).unwrap();
-        let panic =
-            std::panic::catch_unwind(|| m.observe(Cursor::new(Vec::<u8>::new()), |_| panic!("interrupted")));
+        let panic = std::panic::catch_unwind(|| {
+            m.observe(Cursor::new(Vec::<u8>::new()), |_| panic!("interrupted"))
+        });
         assert!(panic.is_err());
         drop(m);
         assert_eq!(std::fs::read(d.path().join(FILE)).unwrap(), HEADER);
