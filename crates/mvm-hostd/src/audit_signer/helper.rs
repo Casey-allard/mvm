@@ -189,7 +189,7 @@ impl SignerHelper {
                 workload_chain_path == audit && chain_head_secondary_path == head,
                 "funded audit paths differ from original registration"
             );
-            mvm_core::private_fs::create_owned_private_dir(&mvm_core::config::mvm_audit_dir())?;
+            mvm_core::private_fs::create_owned_private_dir(mvm_core::config::mvm_audit_dir())?;
             mvm_vmm::host::restore_image::open_trusted_dir(&state)?;
         } else {
             ensure_parent(workload_chain_path)?;
