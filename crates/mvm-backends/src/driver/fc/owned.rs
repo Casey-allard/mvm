@@ -47,7 +47,7 @@ pub(crate) struct OwnedFcState {
     pub spawn_attempted: bool,
     pub retired: bool,
     pub authenticated: bool,
-    pub exit_capture: Option<super::owned_capture::CaptureWorker>,
+    pub(super) exit_capture: Option<super::owned_capture::CaptureWorker>,
 }
 
 pub(super) fn boot(
