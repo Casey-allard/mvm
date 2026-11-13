@@ -1,7 +1,7 @@
 use super::*;
 use mvm_core::host_lifetime::HostLeaseExpectation;
 use mvm_vmm::driver::{
-    VmmDriver,
+    RunningVm, VmmDriver,
     prepared_disks::{PreparedBootFiles, PreparedWritableDisks},
 };
 use std::{
@@ -10,6 +10,81 @@ use std::{
     process::Stdio,
     time::Duration,
 };
+
+#[test]
+fn the_original_running_handle_waits_for_its_worker_and_never_a_stale_file() {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = root.path().join("exit.sock");
+    let mut state = state(root.path());
+    state.exit_capture =
+        Some(super::super::owned_capture::CaptureWorker::spawn(&socket, root.path()).unwrap());
+    let state = Arc::new(Mutex::new(state));
+    let report = state
+        .lock()
+        .unwrap()
+        .exit_capture
+        .as_ref()
+        .unwrap()
+        .report();
+    let vm = super::super::running::FcRunningVm {
+        owned: Some(Arc::clone(&state)),
+        original_report: Some(report),
+        id: mvm_core::vm_backend::VmId("w".into()),
+        state_dir: root.path().into(),
+        pid_file: root.path().join("unused.pid"),
+        pid: None,
+        vsock_uds: "unused".into(),
+        flush_via_agent: false,
+    };
+    std::fs::write(root.path().join("workload.exit"), b"0").unwrap();
+    {
+        let guard = state.lock().unwrap();
+        let (sender, done) = std::sync::mpsc::sync_channel(1);
+        let pending = std::thread::spawn(move || {
+            let result = vm.wait_with_deadline(Instant::now());
+            sender.send((vm, result)).unwrap();
+        });
+        let result = done.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        pending.join().unwrap();
+        let (returned, result) =
+            result.expect("original wait must not block behind lifecycle cleanup");
+        assert_eq!(result.unwrap(), mvm_core::vm_backend::VmExitStatus::UNKNOWN);
+        original_wait_after_report(returned, &state, root.path(), &socket);
+    }
+}
+
+fn original_wait_after_report(
+    vm: super::super::running::FcRunningVm,
+    state: &Arc<Mutex<OwnedFcState>>,
+    root: &std::path::Path,
+    socket: &std::path::Path,
+) {
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(&42_i32.to_le_bytes()).unwrap();
+    let mut ack = [0];
+    stream.read_exact(&mut ack).unwrap();
+    assert_eq!(ack, [1]);
+    let result = vm
+        .wait_with_deadline(Instant::now() + Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(result.code, Some(42));
+    assert!(!result.success);
+    std::fs::write(root.join("workload.exit"), b"0").unwrap();
+    assert_eq!(vm.wait_with_deadline(Instant::now()).unwrap(), result);
+    state
+        .lock()
+        .unwrap()
+        .exit_capture
+        .as_mut()
+        .unwrap()
+        .stop(Instant::now() + Duration::from_secs(3))
+        .unwrap();
+}
 
 fn lease(root: &std::path::Path) -> PreparedHostLifetimeLease {
     let state = b"original Firecracker admission";

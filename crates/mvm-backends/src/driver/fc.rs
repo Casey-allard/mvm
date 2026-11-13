@@ -1049,6 +1049,8 @@ impl FcDriver {
             flush_via_agent: spec.serves_guest_agent(),
             #[cfg(target_os = "linux")]
             owned: self.owned.clone(),
+            #[cfg(target_os = "linux")]
+            original_report: self.original_exit_report()?,
         });
         firecracker_guard.defuse();
         Ok(vm)
@@ -1486,6 +1488,8 @@ impl VmmDriver for FcDriver {
             flush_via_agent: true,
             #[cfg(target_os = "linux")]
             owned: None,
+            #[cfg(target_os = "linux")]
+            original_report: None,
         }))
     }
 
@@ -2458,6 +2462,8 @@ mod tests {
             flush_via_agent: true,
             #[cfg(target_os = "linux")]
             owned: None,
+            #[cfg(target_os = "linux")]
+            original_report: None,
         };
         let _guard = mvm_vmm::host::shell::mock::install_handler(|script| {
             if script.starts_with("cat ") {
@@ -2483,6 +2489,8 @@ mod tests {
             flush_via_agent: true,
             #[cfg(target_os = "linux")]
             owned: None,
+            #[cfg(target_os = "linux")]
+            original_report: None,
         };
         vm.prepare_stop().expect("there is no guest to flush");
     }
@@ -2498,6 +2506,8 @@ mod tests {
             flush_via_agent: true,
             #[cfg(target_os = "linux")]
             owned: None,
+            #[cfg(target_os = "linux")]
+            original_report: None,
         };
         assert_eq!(vm.host_process_id(), Some(4242));
     }
@@ -2741,6 +2751,8 @@ mod tests {
             flush_via_agent: true,
             #[cfg(target_os = "linux")]
             owned: None,
+            #[cfg(target_os = "linux")]
+            original_report: None,
         };
         // In range but no listener ⇒ a connect error (not an allow-list refusal).
         let in_range = vm
@@ -3023,6 +3035,8 @@ mod tests {
                 flush_via_agent: true,
                 #[cfg(target_os = "linux")]
                 owned: None,
+                #[cfg(target_os = "linux")]
+                original_report: None,
             };
 
             let mut s = vm.vsock_connect(port).unwrap();

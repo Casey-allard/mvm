@@ -695,6 +695,19 @@ mod tests {
 
     use mvm_vmm::driver::spec::{ConsoleCapture, KernelImage};
 
+    #[test]
+    fn a_backend_without_bounded_wait_support_cannot_substitute_its_scripted_exit() {
+        let driver = MockDriver::with_exit(VmExitStatus {
+            code: Some(0),
+            success: true,
+        });
+        let vm = driver
+            .boot(&sample_spec("bounded-wait-unsupported"))
+            .unwrap();
+        assert!(vm.wait_with_deadline(std::time::Instant::now()).is_err());
+        assert_eq!(vm.wait().unwrap().code, Some(0));
+    }
+
     fn sample_spec(name: &str) -> VmmSpec {
         VmmSpec {
             builder_egress_endpoint: None,
