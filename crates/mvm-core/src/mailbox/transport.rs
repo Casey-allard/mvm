@@ -534,6 +534,13 @@ pub struct PreparedMailboxEnvelope {
 }
 
 impl PreparedMailboxEnvelope {
+    /// Borrow the exact header paired with this prepared outbound envelope.
+    /// Capability and transport authorization are still required before send.
+    #[must_use]
+    pub fn header(&self) -> &MailboxEnvelopeHeader {
+        &self.header
+    }
+
     #[must_use]
     pub fn envelope(&self) -> &MailboxEnvelope {
         &self.envelope
