@@ -399,7 +399,7 @@ fn pipe_exchange(mode: &str) {
 
 #[test]
 fn private_endpoint_handshake_holds_original_sh_until_drained_and_child_exit() {
-    pipe_exchange("ready-drain");
+    mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("ready-drain"));
 }
 #[test]
 fn wrong_private_parent_nonce_refuses_before_readiness() {
@@ -408,12 +408,12 @@ fn wrong_private_parent_nonce_refuses_before_readiness() {
 
 #[test]
 fn endpoint_retirement_requires_drained_and_original_child_and_retains_sh() {
-    pipe_exchange("retirement");
+    mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("retirement"));
 }
 
 #[test]
 fn real_child_lease_checks_original_holder_and_never_resets_after_failure() {
-    pipe_exchange("stale-holder");
+    mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("stale-holder"));
 }
 
 #[test]
