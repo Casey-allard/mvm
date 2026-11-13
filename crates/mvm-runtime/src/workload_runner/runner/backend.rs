@@ -196,8 +196,11 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
         owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
         until: std::time::Instant,
     ) -> Result<VmExitStatus> {
-        self.original_installed_slot(id, owner)?
-            .with_vm(|vm| vm.wait_with_deadline(until))
+        let report = self.original_installed_slot(id, owner)?.with_vm(|vm| {
+            vm.original_workload_report()
+                .context("original installed workload report unavailable")
+        })?;
+        report.wait_until(until)
     }
 
     #[cfg(unix)]

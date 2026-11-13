@@ -10,13 +10,32 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+struct ControlledReport {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl mvm_vmm::driver::OriginalWorkloadReport for ControlledReport {
+    fn wait_until(&self, until: std::time::Instant) -> Result<VmExitStatus> {
+        let remaining = until
+            .checked_duration_since(std::time::Instant::now())
+            .context("expired fixture wait")?;
+        self.entered.send(())?;
+        self.release.lock().unwrap().recv_timeout(remaining)?;
+        Ok(VmExitStatus {
+            code: Some(19),
+            success: false,
+        })
+    }
+}
 struct NativeDriver {
+    report: Option<Arc<ControlledReport>>,
     inner: MockDriver,
     dropped: Arc<AtomicUsize>,
     attached: Arc<AtomicUsize>,
     dispatched: Arc<AtomicUsize>,
 }
 struct NativeVm {
+    report: Option<Arc<ControlledReport>>,
     inner: Box<dyn RunningVm>,
     _holder: Option<mvm_core::host_lifetime::PreparedHostLifetimeLease>,
     dropped: Arc<AtomicUsize>,
@@ -34,11 +53,12 @@ impl RunningVm for NativeVm {
         self.inner.wait()
     }
     fn wait_with_deadline(&self, until: std::time::Instant) -> Result<VmExitStatus> {
-        anyhow::ensure!(std::time::Instant::now() < until, "expired fixture wait");
-        Ok(VmExitStatus {
-            code: Some(19),
-            success: false,
-        })
+        self.original_workload_report()
+            .context("no report")?
+            .wait_until(until)
+    }
+    fn original_workload_report(&self) -> Option<Arc<dyn mvm_vmm::driver::OriginalWorkloadReport>> {
+        self.report.as_ref().map(|report| Arc::clone(report) as _)
     }
     fn kill(&self) -> Result<()> {
         self.inner.kill()
@@ -81,6 +101,7 @@ impl VmmDriver for NativeDriver {
     fn boot(&self, spec: &crate::driver::VmmSpec) -> Result<Box<dyn RunningVm>> {
         Ok(Box::new(NativeVm {
             inner: self.inner.boot(spec)?,
+            report: self.report.clone(),
             _holder: None,
             dropped: self.dropped.clone(),
         }))
@@ -103,6 +124,7 @@ impl VmmDriver for NativeDriver {
         assert!(files.writable.is_empty());
         Ok(Box::new(NativeVm {
             inner: self.inner.boot(spec)?,
+            report: self.report.clone(),
             _holder: Some(lease),
             dropped: self.dropped.clone(),
         }))
@@ -181,6 +203,7 @@ fn fixture(
     let attached = Arc::new(AtomicUsize::new(0));
     let driver = NativeDriver {
         inner: MockDriver::default(),
+        report: None,
         dropped: dropped.clone(),
         attached: attached.clone(),
         dispatched: Arc::new(AtomicUsize::new(0)),
@@ -265,7 +288,13 @@ fn fixture(
 
 #[test]
 fn owned_native_handle_survives_canonical_runner_start_return() {
-    let (_env, _root, driver, config, anchor) = fixture(false);
+    let (_env, _root, mut driver, config, anchor) = fixture(false);
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    driver.report = Some(Arc::new(ControlledReport {
+        entered,
+        release: std::sync::Mutex::new(released),
+    }));
     let dropped = Arc::clone(&driver.dropped);
     let attached = Arc::clone(&driver.attached);
     let runner = WorkloadRunner::new(driver, NoEndpoint, NoBroker);
@@ -391,6 +420,7 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
     let other = WorkloadRunner::new(
         NativeDriver {
             inner: MockDriver::default(),
+            report: None,
             dropped: dropped.clone(),
             attached: attached.clone(),
             dispatched: Arc::new(AtomicUsize::new(0)),
@@ -402,17 +432,23 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
         other.status(&id).is_err(),
         "a different runner cannot attach through an installed marker"
     );
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
     assert!(other.wait_owned_until(&id, &anchor, until).is_err());
     assert!(
         runner
             .wait_owned_until(&id, &anchor, std::time::Instant::now())
             .is_err()
     );
-    assert_eq!(
-        runner.wait_owned_until(&id, &anchor, until).unwrap().code,
-        Some(19)
-    );
+    std::thread::scope(|scope| {
+        let wait = scope.spawn(|| runner.wait_owned_until(&id, &anchor, until));
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let status = runner.status(&id);
+        release.send(()).unwrap();
+        assert_eq!(wait.join().unwrap().unwrap().code, Some(19));
+        status.expect("waiting for the original report must leave original custody available");
+    });
     assert!(other.stop_owned(&id, &anchor).is_err());
     assert_eq!(attached.load(Ordering::SeqCst), 0);
     drop(runner);
