@@ -710,6 +710,14 @@ pub fn capture_canonical_linux_inputs(
 
 #[cfg(feature = "host-state")]
 pub fn open_archive(path: &Path) -> Result<Box<dyn Read>, BundleVerifyError> {
+    open_quoted_archive(path, None)
+}
+
+#[cfg(feature = "host-state")]
+pub(super) fn open_quoted_archive(
+    path: &Path,
+    quoted: Option<std::num::NonZeroU64>,
+) -> Result<Box<dyn Read>, BundleVerifyError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -733,6 +741,11 @@ pub fn open_archive(path: &Path) -> Result<Box<dyn Read>, BundleVerifyError> {
             super::MAX_BUNDLE_TOTAL_BYTES + 64 * 1024 * 1024 + 1,
         )))
     } else {
+        if quoted.is_some_and(|n| n.get() != metadata.len()) {
+            return Err(BundleVerifyError::ManifestParse(
+                "plain bundle differs from quoted archive length".into(),
+            ));
+        }
         Ok(Box::new(file))
     }
 }

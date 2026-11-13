@@ -688,16 +688,18 @@ fn installed_resolver_quotes_original_tar_bytes_in_gzip_storage() {
     let compressed = dir.path().join(format!("{pin}.mvmpkg.gz"));
     std::fs::write(&plain, body).unwrap();
     let resolver = FsBundleResolver::new(dir.path())
-        .with_exact_archive(&pin, NonZeroU64::new(body.len() as u64).unwrap()).unwrap();
+        .with_exact_archive(&pin, NonZeroU64::new(body.len() as u64).unwrap())
+        .unwrap();
     assert_eq!(resolver.resolve(&pin).unwrap(), body);
     let mut encoded = GzEncoder::new(File::create(&compressed).unwrap(), Compression::fast());
     encoded.write_all(body).unwrap();
     encoded.finish().unwrap();
     std::fs::remove_file(plain).unwrap();
     assert_eq!(resolver.resolve(&pin).unwrap(), body);
-    for size in [body.len()-1, body.len()+1] {
+    for size in [body.len() - 1, body.len() + 1] {
         let incorrect = FsBundleResolver::new(dir.path())
-            .with_exact_archive(&pin, NonZeroU64::new(size as u64).unwrap()).unwrap();
+            .with_exact_archive(&pin, NonZeroU64::new(size as u64).unwrap())
+            .unwrap();
         assert!(incorrect.resolve(&pin).is_err());
     }
 }

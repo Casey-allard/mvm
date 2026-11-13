@@ -8,7 +8,6 @@
 use std::path::{Path, PathBuf};
 #[cfg(feature = "host-state")]
 use std::{
-    fs::File,
     io::{self, Read},
     num::NonZeroU64,
 };
@@ -73,29 +72,14 @@ fn check_exact_archive_size(bytes: NonZeroU64) -> io::Result<usize> {
     usize::try_from(bytes.get()).map_err(io::Error::other)
 }
 
-/// Read exactly the quoted bytes from a single regular file, refusing
-/// pathname links on Unix and lengths that differ before allocating.
+/// Read the quoted original tar bytes from one pinned plain or gzip file.
+/// Raw archives must have the quoted size before allocation; compressed archives
+/// must produce exactly that many bytes, including across concatenated members.
 #[cfg(feature = "host-state")]
 pub fn read_exact_bundle_archive(path: &Path, bytes: NonZeroU64) -> io::Result<Vec<u8>> {
     let length = check_exact_archive_size(bytes)?;
-    #[cfg(unix)]
-    let mut file = File::from(rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    )?);
-    #[cfg(not(unix))]
-    let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() != bytes.get() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file differs from quoted archive length or is not regular",
-        ));
-    }
+    let mut file =
+        super::stream::open_quoted_archive(path, Some(bytes)).map_err(io::Error::other)?;
     let mut archive = Vec::new();
     archive
         .try_reserve_exact(length)
@@ -105,7 +89,7 @@ pub fn read_exact_bundle_archive(path: &Path, bytes: NonZeroU64) -> io::Result<V
     if file.read(&mut [0])? != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "file grew beyond quoted archive length",
+            "decoded bundle exceeds quoted archive length",
         ));
     }
     Ok(archive)
@@ -160,8 +144,12 @@ impl BundleResolver for FsBundleResolver {
         #[cfg(feature = "host-state")]
         let read = match &self.exact_archive {
             Some((pin, bytes)) if pin == bundle_sha256 => read_exact_bundle_archive(&path, *bytes),
-            Some(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, "bundle differs from quoted archive identity")),
-            None => super::stream::read_bundle_archive(&path).map_err(|e| io::Error::other(e.to_string())),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bundle differs from quoted archive identity",
+            )),
+            None => super::stream::read_bundle_archive(&path)
+                .map_err(|e| io::Error::other(e.to_string())),
         };
         #[cfg(not(feature = "host-state"))]
         let read = if path.extension().is_some_and(|ext| ext == "gz") {
