@@ -154,6 +154,8 @@ pub fn factory_parent_config(
         tenant_id: _,
         plan_json: _,
         caller_registration: _,
+        #[cfg(unix)]
+        host_lifetime: _,
         bundle_json: _,
         warm_pool_size: _,
         network_policy: _,
@@ -244,6 +246,8 @@ pub fn factory_parent_config(
         tenant_id: None,
         plan_json: None,
         caller_registration: None,
+        #[cfg(unix)]
+        host_lifetime: None,
         bundle_json: None,
         warm_pool_size: 0,
         network_policy: parent_egress_enablement(spec.vsock_egress),

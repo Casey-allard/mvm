@@ -20,6 +20,14 @@ impl std::fmt::Debug for EgressProxySpawnConfig {
     }
 }
 
+/// An original operator snapshot, after canonical proxy resolution.
+/// This carries data only: it grants no egress and has no wire representation.
+#[derive(Debug)]
+pub enum InstalledEndpointSettings {
+    ResolvedDirect,
+    ResolvedConfigured(EgressProxySpawnConfig),
+}
+
 impl EgressProxySpawnConfig {
     /// Resolve the operator's host config before considering ambient variables.
     /// A present, even empty, table is a complete override.

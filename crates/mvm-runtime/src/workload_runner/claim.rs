@@ -97,7 +97,7 @@ pub fn bind_claim_policy_to_plan(
         .filter(|asset| asset.kind == mvm_core::plan::AssetKind::Policy)
         .peekable();
     let bound = match recorded.peek() {
-        None => !policy.admits_outbound(),
+        None => !policy.admits_outbound() && policy.payload_mapping().is_none(),
         Some(_) => recorded.any(|asset| asset.digest == got),
     };
     if bound {
@@ -397,6 +397,31 @@ mod tests {
             bind_claim_policy_to_plan(&[], &NetworkPolicy::unrestricted()),
             Err(ClaimRefusal::PolicyNotAdmitted { .. })
         ));
+    }
+
+    #[test]
+    fn selected_direct_mapping_requires_the_original_policy_asset_even_on_deny_all() {
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, PayloadMappingProfile,
+        };
+
+        let selected = |spki_sha256| {
+            let peer = CooperatingTcpPeer {
+                host: "peer.example".into(),
+                port: 443,
+                server_name: "peer.example".into(),
+                spki_sha256,
+                profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
+            };
+            NetworkPolicy::deny_all()
+                .with_payload_mapping(Some(CooperatingPayloadPolicy::new(vec![peer]).unwrap()))
+        };
+        let admitted = selected([7; 32]);
+        let recorded = [policy_identity(&admitted)];
+        assert!(bind_claim_policy_to_plan(&[], &admitted).is_err());
+        assert!(bind_claim_policy_to_plan(&recorded, &selected([8; 32])).is_err());
+        assert!(bind_claim_policy_to_plan(&recorded, &admitted).is_ok());
+        assert!(!admitted.admits_outbound());
     }
 
     #[test]

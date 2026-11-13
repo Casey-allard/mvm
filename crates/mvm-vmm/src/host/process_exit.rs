@@ -103,6 +103,19 @@ enum ObserverKind {
 }
 
 impl ProcessExitObserver {
+    pub(crate) fn event_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        let fd: Option<libc::c_int> = match &self.kind {
+            ObserverKind::AlreadyExited => None,
+            #[cfg(target_os = "linux")]
+            ObserverKind::PidFd { fd } => Some(*fd),
+            #[cfg(target_os = "macos")]
+            ObserverKind::Kqueue { fd } => Some(*fd),
+        };
+        // SAFETY: this observer exclusively owns fd until Drop; the borrow is
+        // tied to &self and cannot outlive that owned descriptor.
+        fd.map(|fd| unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) })
+    }
+
     /// Arm an observer for `pid`.
     ///
     /// The registration happens before the caller sends SIGTERM, closing the

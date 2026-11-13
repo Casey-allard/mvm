@@ -158,6 +158,8 @@ pub use local::{LocalBackend, auto_selected_backend_name, default_vcpus};
 pub use mvm_hostd::parent_death::exit_when_orphaned;
 pub use mvm_hostd::supervisor::secrets_scanner::SecretsScanner;
 pub use mvm_runtime::agent_session::replay_input;
+#[cfg(unix)]
+pub use mvm_vmm::host::network_endpoint_spawn::EndpointRetirement;
 pub use mvm_runtime::build_env::default_build_env;
 pub use mvm_runtime::builder_runner::{
     DriverBuilderVm, HvfPersistentHostVm, register_driver_backed_builders,

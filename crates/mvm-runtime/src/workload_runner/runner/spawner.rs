@@ -401,6 +401,7 @@ fn spawn_local_endpoint(
         egress_proxy: None,
         session_marker: None,
         tls_intermediate: egress_ca.endpoint_tls(),
+        admitted_network_plan: None,
         network_policy: Some(req.network_policy),
         network_limits: req.network_limits,
         ingress: req.ingress,
