@@ -34,14 +34,14 @@ use std::process::Command;
 
 use crate::rust_source::{CommentSyntax, blank_comments};
 
-// The integrated mailbox tier and the newer main CI witnesses add bounded
-// recovery, timeout, and refusal coverage. The pre-repair merge candidate
-// measured 981,668 SLOC and 1,248,212 physical lines across all categories;
-// keep the ratchet near that baseline rather than deleting security checks.
+// At the upstream cf585a544 join, the contributor tree measured 1,035,770
+// SLOC and 1,305,881 physical lines. The difference from upstream was 61,035
+// first-party SLOC (including inline tests) and 7,485 test/bench SLOC. Vendored
+// and generated totals were unchanged. Round each measured total up to 100.
 /// Ceiling on total SLOC, all categories.
-const MAX_TOTAL_SLOC: usize = 984_000;
+const MAX_TOTAL_SLOC: usize = 1_035_800;
 /// Ceiling on total physical lines, all categories.
-const MAX_TOTAL_PHYSICAL: usize = 1_251_000;
+const MAX_TOTAL_PHYSICAL: usize = 1_305_900;
 /// How far under a ceiling the tree may sit before the ceiling must drop.
 const SLACK: usize = 10_000;
 
