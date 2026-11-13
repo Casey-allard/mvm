@@ -159,6 +159,8 @@ impl Fixture {
             binding: self.projection.binding.clone(),
             _parent_owner: Box::new(()),
             portable_archive: None,
+            canonical: None,
+            root_copy_claimed: AtomicBool::new(false),
             admitted: Mutex::new(None),
             current_parent: Mutex::new(Some(Arc::new(Parent(self.parent.clone())))),
             native_claimed: AtomicBool::new(false),
