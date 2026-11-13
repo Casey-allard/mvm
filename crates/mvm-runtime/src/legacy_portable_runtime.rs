@@ -607,8 +607,7 @@ mod tests {
         assert_eq!(verified.plan_artifact(), proof.pin);
         let short_quote = NonZeroU64::new(length.get() - 1).unwrap();
         let error = verify_exact_bundle_file(&proof.archive, &trust, &proof.pin, short_quote)
-            .err()
-            .expect("wrong archive length refused");
+            .expect_err("wrong archive length refused");
         assert!(
             error.to_string().contains("quoted archive length"),
             "{error}"
@@ -616,8 +615,7 @@ mod tests {
         *archive.last_mut().unwrap() ^= 1;
         std::fs::write(&proof.archive, archive).unwrap();
         let error = verify_exact_bundle_file(&proof.archive, &trust, &proof.pin, length)
-            .err()
-            .expect("same-length substitution refused");
+            .expect_err("same-length substitution refused");
         assert!(
             error.to_string().contains("signed archive digest"),
             "{error}"

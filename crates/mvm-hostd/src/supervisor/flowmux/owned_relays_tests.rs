@@ -2,6 +2,22 @@ use super::*;
 use crate::supervisor::flowmux::PayloadResourcePool;
 use std::sync::Weak;
 
+#[test]
+fn repeated_guest_wake_across_aliases_preserves_original_shutdown_result() {
+    use mvm_vmm::host::network_endpoint_spawn::InstalledGuestWake;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    let (socket, mut peer) = UnixStream::pair().expect("original socket pair");
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .expect("bounded EOF check");
+    let setup = Arc::new(InstalledGuestWake::new(socket));
+    let relay = setup.clone();
+    setup.shutdown().expect("first shutdown");
+    assert_eq!(peer.read(&mut [0]).expect("original peer EOF"), 0);
+    relay.shutdown().expect("same original already stopped");
+}
+
 // The installed factory fixture also supports standalone integration targets.
 #[allow(dead_code, unreachable_pub)]
 mod installed_factory {

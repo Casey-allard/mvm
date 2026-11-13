@@ -259,8 +259,27 @@ mod registered_prepare {
         os::{fd::AsFd, unix::fs::MetadataExt},
         sync::Mutex,
     };
+    // Credit for the single fixture partition only. Its owner retains the actual
+    // store directory. No aggregate host budget or installation grant is modeled.
+    struct FixtureStoreCredit {
+        directory: File,
+        partition_serial: u64,
+        descriptors: u64,
+        codec_bytes: u64,
+    }
+    impl FixtureStoreCredit {
+        fn new(store: &Path) -> Result<Self> {
+            Ok(Self {
+                directory: File::open(store)?,
+                partition_serial: 1,
+                descriptors: 7,
+                codec_bytes: 16 << 20,
+            })
+        }
+    }
     struct Guard {
         projection: EndpointPartitionProjection,
+        store_credit: Option<FixtureStoreCredit>,
         retained: Option<Mutex<FixtureRetention>>,
     }
     struct FixtureRetention {
@@ -276,6 +295,40 @@ mod registered_prepare {
     impl EndpointPartitionGuard for Guard {
         fn check_current(&self, facts: &EndpointPartitionProjection) -> Result<()> {
             ensure!(facts == &self.projection, "foreign functional partition");
+            Ok(())
+        }
+        fn check_owned_payload_store_resources(
+            &self,
+            facts: &EndpointPartitionProjection,
+        ) -> Result<()> {
+            self.check_current(facts)?;
+            let credit = self
+                .store_credit
+                .as_ref()
+                .context("original functional store credit absent")?;
+            let store = facts
+                .store
+                .as_ref()
+                .context("functional store locator missing")?;
+            let required =
+                mvm_hostd::supervisor::flowmux::SpiralCorePayloadFactory::owned_store_requirements(
+                )?;
+            let codec = spiralcore_transfer::resource_profile::ResourceProfile::SmallV1
+                .operation_charge()
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?
+                .checked_add(required.workspace_bytes)
+                .context("functional store workspace overflow")?;
+            ensure!(
+                credit.partition_serial == facts.partition_serial
+                    && file_id(&credit.directory)? == (store.device, store.inode)
+                    && facts.limits.max_streams == 1
+                    && credit.descriptors
+                        >= u64::from(required.shared_parent_fds)
+                            + u64::from(required.fds_per_store)
+                    && credit.codec_bytes >= codec
+                    && facts.limits.host_codec_bytes >= codec,
+                "original functional store credit differs or is insufficient"
+            );
             Ok(())
         }
         fn prepare_retained_telemetry(
@@ -368,32 +421,12 @@ mod registered_prepare {
         }
     }
 
-    fn handoff(
-        holder: &PreparedHostLifetimeLease,
+    fn fixture_projection(
         store: &Path,
-        state: &Path,
-        policy: &NetworkPolicy,
-    ) -> Result<(PreparedEndpointHandoff, AdmittedNetworkPlan, Arc<Guard>)> {
-        let mut plan = PlanFixture::new().workload("vm-1").build();
-        plan.network_mode = mvm_core::plan::NetworkMode::HostVsockProxy;
-        plan.asset_identities
-            .push(mvm_core::plan::AssetIdentity::new(
-                mvm_core::plan::AssetKind::Policy,
-                "network_policy",
-                mvm_core::policy::network_policy::content_sha256(policy),
-            )?);
-        plan.bundle = Some(mvm_core::plan::bundle::PlanArtifact::new(
-            "11".repeat(32),
-            &[8; 64],
-            mvm_core::plan::bundle::KeyId("original-fixture".into()),
-        ));
-        plan.plan_id = compute_plan_id(&plan);
-        let issuer = SigningKey::from_bytes(&[8; 32]);
-        let signed = sign_plan(&plan, &issuer, "fixture");
-        let plan = mvm_core::plan::verify_plan(&signed, &[("fixture", &issuer.verifying_key())])?;
-        let projection = AdmittedNetworkPlan::from_plan(&plan, "vm-1", policy)?;
+        admitted_plan_id: String,
+    ) -> Result<EndpointPartitionProjection> {
         let metadata = store.metadata()?;
-        let facts = EndpointPartitionProjection {
+        Ok(EndpointPartitionProjection {
             version: 1,
             binding: HostLaunchBinding {
                 installation: [1; 32],
@@ -405,7 +438,7 @@ mod registered_prepare {
                 cpus: 1,
                 memory_mib: 128,
             },
-            admitted_plan_id: plan.plan_id.0.clone(),
+            admitted_plan_id,
             session: [3; 32],
             partition_serial: 1,
             profile: 2,
@@ -437,7 +470,34 @@ mod registered_prepare {
                 workers: 1,
                 max_streams: 1,
             },
-        };
+        })
+    }
+
+    fn handoff(
+        holder: &PreparedHostLifetimeLease,
+        store: &Path,
+        state: &Path,
+        policy: &NetworkPolicy,
+    ) -> Result<(PreparedEndpointHandoff, AdmittedNetworkPlan, Arc<Guard>)> {
+        let mut plan = PlanFixture::new().workload("vm-1").build();
+        plan.network_mode = mvm_core::plan::NetworkMode::HostVsockProxy;
+        plan.asset_identities
+            .push(mvm_core::plan::AssetIdentity::new(
+                mvm_core::plan::AssetKind::Policy,
+                "network_policy",
+                mvm_core::policy::network_policy::content_sha256(policy),
+            )?);
+        plan.bundle = Some(mvm_core::plan::bundle::PlanArtifact::new(
+            "11".repeat(32),
+            &[8; 64],
+            mvm_core::plan::bundle::KeyId("original-fixture".into()),
+        ));
+        plan.plan_id = compute_plan_id(&plan);
+        let issuer = SigningKey::from_bytes(&[8; 32]);
+        let signed = sign_plan(&plan, &issuer, "fixture");
+        let plan = mvm_core::plan::verify_plan(&signed, &[("fixture", &issuer.verifying_key())])?;
+        let projection = AdmittedNetworkPlan::from_plan(&plan, "vm-1", policy)?;
+        let facts = fixture_projection(store, plan.plan_id.0.clone())?;
         let anchor = PreparedHostLifetime::bind(
             HostLifetimeInputs {
                 directory: holder.directory().try_clone()?,
@@ -460,6 +520,7 @@ mod registered_prepare {
         anchor.bind_admitted(&config, BackendKind::Firecracker, &plan)?;
         let guard = Arc::new(Guard {
             projection: facts.clone(),
+            store_credit: Some(FixtureStoreCredit::new(store)?),
             retained: Some({
                 Mutex::new(FixtureRetention {
                     state_path: state.into(),
@@ -479,6 +540,55 @@ mod registered_prepare {
             projection,
             guard,
         ))
+    }
+
+    #[test]
+    fn store_preflight_requires_the_original_funded_fixture_guard() -> Result<()> {
+        let store = tempfile::tempdir()?;
+        let facts = fixture_projection(store.path(), "fixture-plan".into())?;
+        let prepared = |credit| {
+            PreparedEndpointPartition::new(
+                facts.clone(),
+                Arc::new(Guard {
+                    projection: facts.clone(),
+                    store_credit: credit,
+                    retained: None,
+                }),
+            )
+        };
+        let unfunded = prepared(None)?;
+        assert!(unfunded.check_current().is_ok());
+        assert!(unfunded.check_owned_payload_store_resources().is_err());
+        let credit = || FixtureStoreCredit::new(store.path());
+        let mut short = credit()?;
+        short.descriptors -= 1;
+        assert!(
+            prepared(Some(short))?
+                .check_owned_payload_store_resources()
+                .is_err()
+        );
+        let mut short_bytes = credit()?;
+        short_bytes.codec_bytes = 0;
+        assert!(
+            prepared(Some(short_bytes))?
+                .check_owned_payload_store_resources()
+                .is_err()
+        );
+        let mut wrong = credit()?;
+        wrong.partition_serial += 1;
+        assert!(
+            prepared(Some(wrong))?
+                .check_owned_payload_store_resources()
+                .is_err()
+        );
+        let other = tempfile::tempdir()?;
+        assert!(
+            prepared(Some(FixtureStoreCredit::new(other.path())?))?
+                .check_owned_payload_store_resources()
+                .is_err()
+        );
+        prepared(Some(credit()?))?.check_owned_payload_store_resources()?;
+        Ok(())
     }
 
     #[test]
@@ -601,8 +711,10 @@ mod registered_prepare {
                 .check_direct_network(&substituted, &Default::default(), &redaction)
                 .is_err()
         );
-        let mut changed_limits = mvm_core::plan::NetworkLimits::default();
-        changed_limits.max_tcp_flows = 2;
+        let changed_limits = mvm_core::plan::NetworkLimits {
+            max_tcp_flows: 2,
+            ..Default::default()
+        };
         ensure!(
             handoff
                 .check_direct_network(&plan, &changed_limits, &redaction)
@@ -610,7 +722,6 @@ mod registered_prepare {
         );
         let launched = spawn_network_endpoint_installed_registered(params, handoff, &original);
         let mut endpoint = launched.with_context(endpoint_diagnostic)?;
-        drop(original);
         ensure!(
             registration.shutdown().is_err(),
             "active endpoint lost original audit pin"

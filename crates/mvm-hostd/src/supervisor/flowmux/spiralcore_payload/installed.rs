@@ -10,7 +10,7 @@ use spiralcore_transfer::{
     shared_runtime::{OutputKind, Recipe, State},
     shared_transfer::PreparedPrediction,
 };
-use std::{fs::File, os::unix::fs::MetadataExt};
+use std::fs::File;
 
 const READER_METADATA_BYTES: u64 = 64 << 10;
 
@@ -63,10 +63,7 @@ impl SpiralCorePayloadFactory {
             .payload_pool()
             .ok_or_else(|| invalid("original payload pool missing"))?
             .clone();
-        let locator = original
-            .store_locator()
-            .ok_or_else(|| invalid("original payload store missing"))?
-            .clone();
+        let directory = original.checked_store_directory()?;
         let configured = config
             .flowmux_identity
             .as_ref()
@@ -76,22 +73,6 @@ impl SpiralCorePayloadFactory {
         let private = zeroize::Zeroizing::new(decode_key(&configured.host_signing_key_base64)?);
         let key = SigningKey::from_bytes(&private);
         let identity = pinned_identity(&key)?;
-        let directory = File::from(rustix::fs::open(
-            &locator.path,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?);
-        let meta = directory.metadata()?;
-        if !meta.is_dir() || meta.dev() != locator.device || meta.ino() != locator.inode {
-            return Err(invalid("original payload store identity differs"));
-        }
-        mvm_core::private_fs::require_current_owner(&meta)?;
-        if meta.mode() & 0o077 != 0 {
-            return Err(invalid("original payload store is not private"));
-        }
         let controller = InstalledScopeController {
             plan: plan.clone(),
             policy: policy
@@ -104,7 +85,7 @@ impl SpiralCorePayloadFactory {
             host_key: key.verifying_key().to_bytes(),
             pool,
             lease: original.lease().clone(),
-            directory: Arc::new(directory),
+            directory,
             reader_resources,
         };
         controller.lease.check_current().map_err(invalid)?;
@@ -188,51 +169,6 @@ impl InstalledScopeController {
         self.reader_resources.check_current()?;
         self.lease.check_current().map_err(invalid)
     }
-    fn create_store(
-        &self,
-        permit: &mut PayloadResourcePermit,
-        facts: &ScopeFacts,
-    ) -> io::Result<std::path::PathBuf> {
-        let name = format!("flow-{}", hex::encode(facts.commitment().map_err(invalid)?));
-        if let Err(error) = rustix::fs::mkdirat(
-            self.directory.as_ref(),
-            name.as_str(),
-            rustix::fs::Mode::from_raw_mode(0o700),
-        ) {
-            // An uncertain creation must not refund its admitted storage. An
-            // existing foreign namespace is never adopted or removed.
-            if error != rustix::io::Errno::EXIST {
-                permit.uncertain = true;
-            }
-            return Err(error.into());
-        }
-        let directory = match rustix::fs::openat(
-            self.directory.as_ref(),
-            name.as_str(),
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        ) {
-            Ok(directory) => File::from(directory),
-            Err(error) => {
-                permit.uncertain = true;
-                return Err(error.into());
-            }
-        };
-        // Anchor every codec path under the original retained parent FD.
-        // Keep the final component a real private directory for the codec's
-        // no-symlink checks. The controller holds the parent through the relay.
-        use std::os::fd::AsRawFd;
-        let path =
-            std::path::PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
-                .join(&name);
-        permit.attach_owned_directory(path.clone(), directory, Arc::clone(&self.directory))?;
-
-        self.lease.check_current().map_err(invalid)?;
-        Ok(path)
-    }
     pub(super) fn reserve(
         &self,
         request: &AdmittedTcpPayload,
@@ -313,7 +249,6 @@ impl InstalledScopeController {
         let authority = scopes
             .authorize_scope(facts, facts.acceptor_spki, Role::Initiator)
             .map_err(invalid)?;
-        let path = self.create_store(permit, facts)?;
         remaining(deadline)?;
         let context = authority.context();
         let checkpoint = State::seeded(32)
@@ -342,9 +277,23 @@ impl InstalledScopeController {
             resources,
         )
         .map_err(invalid)?;
-        let endpoint = ObjectEndpoint::open_with_resource_profile(
-            &path,
-            resources.receiver_limits(),
+        let limits = resources.receiver_limits();
+        let policy = spiralcore_transfer::v1::OwnedStorePolicy::small_v1(
+            &limits,
+            permit.owned_store_visits()?,
+            spiralcore_transfer::v1::OwnedLaneNamespaces::One(
+                context.namespace().map_err(invalid)?,
+            ),
+        )
+        .map_err(invalid)?;
+        let name = format!("flow-{}", hex::encode(facts.commitment().map_err(invalid)?));
+        let lease = permit
+            .begin_installed_store(Arc::clone(&self.directory), name)?
+            .capture(policy)?;
+        self.pool.inner.check_current()?;
+        let endpoint = ObjectEndpoint::open_at_with_resource_profile(
+            lease,
+            limits,
             authority.clone(),
             profile,
             resources,

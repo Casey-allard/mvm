@@ -163,6 +163,33 @@ enum Controller {
     Enrolled(Arc<dyn PayloadScopeController>),
     Installed(Box<installed::InstalledScopeController>),
 }
+#[derive(Clone, Copy, Debug)]
+pub struct OwnedStoreWork {
+    pub funded_entry_visits: u16,
+    pub shared_parent_fds: u16,
+    pub fds_per_store: u16,
+    pub workspace_bytes: u64,
+}
+impl SpiralCorePayloadFactory {
+    /// Capacity required by one installed SmallV1 receiver. Only its original
+    /// partition can authorize and book these resources.
+    pub fn owned_store_requirements() -> io::Result<OwnedStoreWork> {
+        let limits =
+            spiralcore_transfer::resource_profile::ResourceProfile::SmallV1.receiver_limits();
+        let visits = limits
+            .max_publications
+            .checked_add(limits.max_states)
+            .and_then(|n| n.checked_add(6))
+            .ok_or_else(|| invalid("owned store visit count overflow"))?;
+        Ok(OwnedStoreWork {
+            funded_entry_visits: u16::try_from(visits).map_err(invalid)?,
+            shared_parent_fds: 1,
+            fds_per_store: 6,
+            workspace_bytes: 1 << 20,
+        })
+    }
+}
+
 enum PendingScope<'a> {
     Enrolled(&'a dyn PayloadScopeController),
     Installed(
@@ -562,7 +589,7 @@ impl PayloadResourcePool {
         &self,
         resources: spiralcore_transfer::resource_profile::ResourceProfile,
     ) -> io::Result<PayloadResourcePermit> {
-        self.reserve_profile_with_carrier(resources, 0)
+        self.reserve_profile_with_carrier(resources, 0, None)
     }
     fn reserve_installed_profile(
         &self,
@@ -574,12 +601,23 @@ impl PayloadResourcePool {
         if carrier == 0 {
             return Err(invalid("original payload carrier credit unavailable"));
         }
-        self.reserve_profile_with_carrier(resources, carrier)
+        if resources != spiralcore_transfer::resource_profile::ResourceProfile::SmallV1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "installed store requires SmallV1",
+            ));
+        }
+        self.reserve_profile_with_carrier(
+            resources,
+            carrier,
+            Some(SpiralCorePayloadFactory::owned_store_requirements()?),
+        )
     }
     fn reserve_profile_with_carrier(
         &self,
         resources: spiralcore_transfer::resource_profile::ResourceProfile,
         carrier_bytes: u64,
+        store_work: Option<OwnedStoreWork>,
     ) -> io::Result<PayloadResourcePermit> {
         let limits = resources.receiver_limits();
         let disk_bytes = limits
@@ -589,12 +627,17 @@ impl PayloadResourcePool {
             .ok_or_else(|| invalid("store charge overflow"))?;
         let mut permit = self.reserve_charge_with_carrier(
             PayloadResourceCharge {
-                resident_bytes: resources.operation_charge().map_err(invalid)?,
+                resident_bytes: resources
+                    .operation_charge()
+                    .map_err(invalid)?
+                    .checked_add(store_work.map_or(0, |w| w.workspace_bytes))
+                    .ok_or_else(|| invalid("store workspace charge overflow"))?,
                 disk_bytes,
             },
             carrier_bytes,
         )?;
         permit.profile = Some(resources);
+        permit.store_work = store_work;
         Ok(permit)
     }
     pub fn reserve_shared_sender(
@@ -663,6 +706,7 @@ impl PayloadResourcePool {
             charge,
             carrier_bytes,
             store: None,
+            store_work: None,
             uncertain: false,
             profile: None,
         })
@@ -691,15 +735,111 @@ impl PoolInner {
         }
     }
 }
-struct OwnedPayloadStore {
+enum OwnedPayloadStore {
+    Path(QualificationPayloadStore),
+    Installed(InstalledPayloadStore),
+}
+
+struct InstalledPayloadStore {
+    parent: Arc<std::fs::File>,
+    name: String,
+    created_inode: Option<u64>,
+    directory: Option<Arc<std::fs::File>>,
+    lease: Option<spiralcore_transfer::v1::OwnedStoreLease>,
+}
+impl InstalledPayloadStore {
+    fn named(&self) -> io::Result<rustix::fs::Stat> {
+        Ok(rustix::fs::statat(
+            self.parent.as_ref(),
+            self.name.as_str(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?)
+    }
+    fn check_child(&self) -> io::Result<()> {
+        let original = self
+            .created_inode
+            .ok_or_else(|| invalid("missing created store identity"))?;
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| invalid("missing original store directory"))?;
+        let held = rustix::fs::fstat(directory.as_ref())?;
+        let named = self.named()?;
+        if held.st_ino != original
+            || held.st_dev != rustix::fs::fstat(self.parent.as_ref())?.st_dev
+            || (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino)
+            || rustix::fs::FileType::from_raw_mode(named.st_mode) != rustix::fs::FileType::Directory
+            || named.st_uid != rustix::process::geteuid().as_raw()
+            || named.st_mode & 0o7777 != 0o700
+        {
+            return Err(invalid("original installed store identity differs"));
+        }
+        Ok(())
+    }
+    fn open_child(&mut self) -> io::Result<()> {
+        if self.directory.is_some() {
+            return Err(invalid("original installed child already opened"));
+        }
+        let directory = rustix::fs::openat(
+            self.parent.as_ref(),
+            self.name.as_str(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        self.directory = Some(Arc::new(std::fs::File::from(directory)));
+        self.check_child()
+    }
+    fn capture(
+        &mut self,
+        policy: spiralcore_transfer::v1::OwnedStorePolicy,
+    ) -> io::Result<&spiralcore_transfer::v1::OwnedStoreLease> {
+        self.open_child()?;
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| invalid("missing original store directory"))?;
+        let lease = spiralcore_transfer::v1::OwnedStoreLease::capture(
+            Arc::clone(&self.parent),
+            self.name.as_ref(),
+            Arc::clone(directory),
+            policy,
+        )
+        .map_err(invalid)?;
+        Ok(self.lease.insert(lease))
+    }
+    fn cleanup(&mut self, authority: &PoolInner) -> io::Result<()> {
+        authority.check_current()?;
+        self.check_child()?;
+        self.lease
+            .as_mut()
+            .ok_or_else(|| invalid("original store claim missing"))?
+            .retire_contents()
+            .map_err(invalid)?;
+        authority.check_current()?;
+        self.check_child()?;
+        rustix::fs::unlinkat(
+            self.parent.as_ref(),
+            self.name.as_str(),
+            rustix::fs::AtFlags::REMOVEDIR,
+        )?;
+        self.parent.sync_all()?;
+        match self.named() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => authority.check_current(),
+            _ => Err(invalid("installed store retirement not confirmed")),
+        }
+    }
+}
+
+struct QualificationPayloadStore {
     path: std::path::PathBuf,
     directory: std::fs::File,
-    // Own the parent referenced by the codec path until cleanup or quarantine.
-    _parent: Option<Arc<std::fs::File>>,
     device: u64,
     inode: u64,
 }
-impl OwnedPayloadStore {
+impl QualificationPayloadStore {
     fn capture(path: std::path::PathBuf) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let before = std::fs::symlink_metadata(&path)?;
@@ -708,13 +848,9 @@ impl OwnedPayloadStore {
             return Err(invalid("payload store is not private directory"));
         }
         let directory = std::fs::File::open(&path)?;
-        Self::capture_directory(path, directory, None)
+        Self::capture_directory(path, directory)
     }
-    fn capture_directory(
-        path: std::path::PathBuf,
-        directory: std::fs::File,
-        parent: Option<Arc<std::fs::File>>,
-    ) -> io::Result<Self> {
+    fn capture_directory(path: std::path::PathBuf, directory: std::fs::File) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let before = std::fs::symlink_metadata(&path)?;
         mvm_core::private_fs::require_current_owner(&before)?;
@@ -728,7 +864,6 @@ impl OwnedPayloadStore {
         Ok(Self {
             path,
             directory,
-            _parent: parent,
             device: opened.dev(),
             inode: opened.ino(),
         })
@@ -761,30 +896,64 @@ pub struct PayloadResourcePermit {
     charge: PayloadResourceCharge,
     carrier_bytes: u64,
     store: Option<OwnedPayloadStore>,
+    store_work: Option<OwnedStoreWork>,
     uncertain: bool,
     profile: Option<spiralcore_transfer::resource_profile::ResourceProfile>,
 }
 impl PayloadResourcePermit {
-    fn attach_owned_directory(
+    fn owned_store_visits(&self) -> io::Result<u16> {
+        self.check_current()?;
+        self.store_work
+            .map(|work| work.funded_entry_visits)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "installed store workspace not booked",
+                )
+            })
+    }
+    fn begin_installed_store(
         &mut self,
-        path: std::path::PathBuf,
-        directory: std::fs::File,
         parent: Arc<std::fs::File>,
-    ) -> io::Result<()> {
+        name: String,
+    ) -> io::Result<&mut InstalledPayloadStore> {
         if self.store.is_some() {
-            self.uncertain = true;
             return Err(invalid("payload store already attached"));
         }
-        match OwnedPayloadStore::capture_directory(path, directory, Some(parent)) {
-            Ok(store) => {
-                self.store = Some(store);
-                Ok(())
-            }
-            Err(error) => {
-                self.uncertain = true;
-                Err(error)
-            }
+        if !name.strip_prefix("flow-").is_some_and(|suffix| {
+            suffix.len() == 64
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(invalid("invalid original store commitment name"));
         }
+        self.check_current()?;
+        let store = InstalledPayloadStore {
+            parent,
+            name,
+            created_inode: None,
+            directory: None,
+            lease: None,
+        };
+        // EEXIST has no effect and confers no ownership. Retain the original
+        // parent and name for every other outcome before further fallible I/O.
+        let made = rustix::fs::mkdirat(
+            store.parent.as_ref(),
+            store.name.as_str(),
+            rustix::fs::Mode::from_raw_mode(0o700),
+        );
+        if made == Err(rustix::io::Errno::EXIST) {
+            return Err(rustix::io::Errno::EXIST.into());
+        }
+        let OwnedPayloadStore::Installed(store) =
+            self.store.insert(OwnedPayloadStore::Installed(store))
+        else {
+            unreachable!("just inserted the installed store")
+        };
+        made?;
+        store.created_inode = Some(store.named()?.st_ino);
+        Ok(store)
     }
     pub fn with_owned_store(mut self, path: std::path::PathBuf) -> io::Result<Self> {
         if self.store.is_some() {
@@ -793,9 +962,9 @@ impl PayloadResourcePermit {
         }
         // A failed identity capture cannot prove that the newly created path
         // contains no retained storage. Refuse and retain its admitted charge.
-        match OwnedPayloadStore::capture(path) {
+        match QualificationPayloadStore::capture(path) {
             Ok(store) => {
-                self.store = Some(store);
+                self.store = Some(OwnedPayloadStore::Path(store));
                 Ok(self)
             }
             Err(error) => {
@@ -811,10 +980,13 @@ impl PayloadResourcePermit {
 impl Drop for PayloadResourcePermit {
     fn drop(&mut self) {
         let mut uncertain = self.uncertain
-            || self
-                .store
-                .as_ref()
-                .is_some_and(|store| store.cleanup().is_err());
+            || self.store.as_mut().is_some_and(|store| {
+                match store {
+                    OwnedPayloadStore::Path(store) => store.cleanup(),
+                    OwnedPayloadStore::Installed(store) => store.cleanup(&self.inner),
+                }
+                .is_err()
+            });
         let mut ledger = match self.inner.ledger.lock() {
             Ok(ledger) => ledger,
             Err(poisoned) => {
@@ -864,6 +1036,181 @@ impl Drop for PayloadResourcePermit {
 #[cfg(test)]
 mod resource_pool_tests {
     use super::*;
+    #[test]
+    fn replaced_installed_store_quarantines_original_locked_owner_after_endpoint_drop() {
+        use spiralcore_transfer::{
+            resource_profile::ResourceProfile,
+            v1::{OwnedLaneNamespaces, OwnedStorePolicy},
+            wan,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private original parent");
+        let parent = Arc::new(std::fs::File::open(root.path()).expect("original parent FD"));
+        let name = format!("flow-{}", hex::encode([9u8; 32]));
+        let path = root.path().join(&name);
+        let profile = ResourceProfile::SmallV1;
+        let limits = profile.receiver_limits();
+        let context = wan::context([9; 32]);
+        let charge = profile.operation_charge().expect("engine bytes")
+            + SpiralCorePayloadFactory::owned_store_requirements()
+                .expect("filesystem work")
+                .workspace_bytes;
+        let pool = PayloadResourcePool::new(
+            PayloadResourceLimits {
+                max_active: 1,
+                resident_bytes: charge,
+                disk_bytes: 32 << 20,
+            },
+            None,
+            1 << 20,
+        )
+        .expect("fixture ledger");
+        let mut permit = pool
+            .reserve_installed_profile(profile)
+            .expect("fixture debit");
+        let policy = OwnedStorePolicy::small_v1(
+            &limits,
+            permit.owned_store_visits().expect("booked visits"),
+            OwnedLaneNamespaces::One(context.namespace().expect("fixture scope")),
+        )
+        .expect("policy");
+        let lease = permit
+            .begin_installed_store(parent, name)
+            .expect("original directory")
+            .capture(policy)
+            .expect("retained lease");
+        let capabilities = Capabilities::small_v1();
+        let endpoint = ObjectEndpoint::open_at_with_resource_profile(
+            lease,
+            limits,
+            wan::BenchAuthority,
+            capabilities
+                .negotiate(&capabilities)
+                .expect("fixture profile"),
+            profile,
+        )
+        .expect("original claim");
+        let contender = std::fs::File::open(path.join(".owner")).expect("same lock inode");
+        drop(endpoint);
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        let moved = root.path().join("moved");
+        std::fs::rename(&path, &moved).expect("move original after claim");
+        mvm_core::private_fs::create_owned_private_dir(&path).expect("replacement directory");
+        std::fs::write(path.join("sentinel"), b"foreign").expect("sentinel");
+        drop(permit);
+        let snapshot = pool.snapshot().expect("quarantine");
+        assert_eq!(
+            (
+                snapshot.active,
+                snapshot.quarantined,
+                snapshot.resident_charge
+            ),
+            (1, 1, charge)
+        );
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert!(moved.join(".owner").exists());
+        assert_eq!(
+            std::fs::read(path.join("sentinel")).expect("unchanged replacement"),
+            b"foreign"
+        );
+    }
+    #[test]
+    fn installed_store_workspace_is_charged_before_visits_are_available() {
+        use spiralcore_transfer::resource_profile::ResourceProfile;
+        let small = ResourceProfile::SmallV1;
+        let operation = small.operation_charge().expect("small operation charge");
+        let terms = SpiralCorePayloadFactory::owned_store_requirements().expect("store work");
+        assert_eq!(terms.funded_entry_visits, 102);
+        assert_eq!((terms.shared_parent_fds, terms.fds_per_store), (1, 6));
+        let charge = operation + terms.workspace_bytes;
+        for (resident_bytes, funded) in [(charge - 1, false), (charge, true)] {
+            let pool = PayloadResourcePool::new(
+                PayloadResourceLimits {
+                    max_active: 1,
+                    resident_bytes,
+                    disk_bytes: 32 << 20,
+                },
+                None,
+                1 << 20,
+            )
+            .expect("fixture ledger");
+            let plain = pool.reserve_profile(small).expect("qualification charge");
+            assert_eq!(
+                plain
+                    .owned_store_visits()
+                    .expect_err("no installed workspace")
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+            drop(plain);
+            let permit = pool.reserve_installed_profile(small);
+            if funded {
+                let permit = permit.expect("funded store work");
+                assert_eq!(
+                    permit.owned_store_visits().expect("booked visits"),
+                    terms.funded_entry_visits
+                );
+                assert_eq!(pool.snapshot().expect("booked").resident_charge, charge);
+            } else {
+                assert!(matches!(permit, Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+            }
+            assert_eq!(
+                pool.snapshot().expect("released"),
+                PayloadPoolSnapshot::default()
+            );
+        }
+    }
+    #[test]
+    fn partial_installed_store_retains_original_parent_name_and_debit() {
+        let root = tempfile::tempdir().expect("private fixture root");
+        let parent = Arc::new(std::fs::File::open(root.path()).expect("original parent"));
+        let name = format!("flow-{}", hex::encode([8u8; 32]));
+        let path = root.path().join(&name);
+        let pool = PayloadResourcePool::for_qualification(PayloadResourceLimits {
+            max_active: 2,
+            resident_bytes: 8 << 20,
+            disk_bytes: 32 << 20,
+        })
+        .expect("fixture pool");
+        let charge = PayloadResourceCharge {
+            resident_bytes: 1 << 20,
+            disk_bytes: 8 << 20,
+        };
+        let mut permit = pool.reserve_charge(charge).expect("original debit");
+        let store = permit
+            .begin_installed_store(Arc::clone(&parent), name.clone())
+            .expect("create and attach original name");
+        assert!(Arc::ptr_eq(&parent, &store.parent));
+        let moved = root.path().join("moved");
+        std::fs::rename(&path, &moved).expect("move original");
+        std::fs::write(&path, b"foreign").expect("substitute");
+        assert!(store.open_child().is_err());
+        drop(permit);
+        let snapshot = pool.snapshot().expect("retained debit");
+        assert_eq!((snapshot.active, snapshot.quarantined), (1, 1));
+        assert_eq!(
+            (snapshot.resident_charge, snapshot.disk_charge),
+            (charge.resident_bytes, charge.disk_bytes)
+        );
+        let ledger = pool.inner.ledger.lock().expect("original ledger");
+        let [OwnedPayloadStore::Installed(retained)] = ledger.stores.as_slice() else {
+            panic!("original pending store missing");
+        };
+        assert!(Arc::ptr_eq(&parent, &retained.parent));
+        assert_eq!(retained.name, name);
+        assert!(retained.directory.is_none());
+        assert!(moved.is_dir());
+        assert_eq!(std::fs::read(path).expect("foreign bytes"), b"foreign");
+    }
 
     #[test]
     fn carrier_refusal_cannot_partially_debit_the_original_payload_pool() {

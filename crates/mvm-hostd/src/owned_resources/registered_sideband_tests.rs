@@ -41,11 +41,15 @@ async fn sideband_sends_exactly_one_byte_and_same_original_file() {
         &peer,
         &mut [IoSliceMut::new(&mut byte)],
         &mut ancillary,
-        RecvFlags::DONTWAIT,
+        RecvFlags::empty(),
     )
     .unwrap();
     assert_eq!(received.bytes, 1);
-    assert!(received.flags.is_empty());
+    assert!(
+        received.flags.is_empty(),
+        "unexpected recvmsg flags {:#x}",
+        received.flags.bits()
+    );
     assert_eq!(byte, [0xa1]);
     let mut descriptors = Vec::new();
     for control in ancillary.drain() {

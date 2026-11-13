@@ -49,7 +49,7 @@ mod installed;
 mod owned;
 pub use installed::{
     INSTALLED_BOOTSTRAP_MIN_BYTES, INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointAudit,
-    InstalledEndpointChild, InstalledEndpointLease, InstalledHostServices,
+    InstalledEndpointChild, InstalledEndpointLease, InstalledGuestWake, InstalledHostServices,
     InstalledTelemetryRecords, installed_endpoint_bootstrap_requirement,
     spawn_network_endpoint_installed, spawn_network_endpoint_installed_registered,
 };

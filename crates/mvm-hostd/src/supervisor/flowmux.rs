@@ -71,7 +71,7 @@ use self::udp_relay::{
 use self::wire::{
     SharedWriter, is_peer_disconnect, lock_registry, lock_session, lock_validator, write_frame_to,
 };
-use mvm_vmm::host::network_endpoint_spawn::InstalledEndpointAudit;
+use mvm_vmm::host::network_endpoint_spawn::{InstalledEndpointAudit, InstalledGuestWake};
 
 use crate::supervisor::audit_recorder::{EventCategory, Recorder};
 use crate::supervisor::dns_resolver::resolve_hostname_ips;
@@ -167,7 +167,7 @@ pub struct FlowMuxSession {
     leaves: Arc<terminator::flow::LeafCache>,
     payload_mapping: Option<Arc<PayloadMappingConfig>>,
     owned_tcp_relays: Option<Arc<OwnedTcpRelays>>,
-    owned_guest_control: Option<Arc<UnixStream>>,
+    owned_guest_control: Option<Arc<InstalledGuestWake>>,
     installed_audit: Option<InstalledEndpointAudit>,
     installed_session_control: Option<Arc<crate::installed_endpoint::InstalledSessionControl>>,
 }
@@ -487,7 +487,7 @@ impl FlowMuxSession {
             }
             _ => {}
         }
-        if let Some(audit) = &installed_audit {
+        let bound_guest = if let Some(audit) = &installed_audit {
             if !recorder
                 .as_ref()
                 .is_some_and(|recorder| recorder.has_installed_origin(audit))
@@ -509,10 +509,12 @@ impl FlowMuxSession {
                 .map_err(|_| {
                     FlowMuxError::FrameRefused("original installed audit partition refused".into())
                 })?;
-            audit.bind_guest_transport(&stream).map_err(|_| {
+            Some(audit.bind_guest_transport(&stream).map_err(|_| {
                 FlowMuxError::FrameRefused("original guest cancellation refused".into())
-            })?;
-        }
+            })?)
+        } else {
+            None
+        };
         if let Some(control) = &installed_session_control {
             if !installed_audit
                 .as_ref()
@@ -560,10 +562,13 @@ impl FlowMuxSession {
                 control.fail();
             }
         })?;
-        let owned_guest_control = owned_tcp_relays
-            .as_ref()
-            .map(|_| stream.try_clone().map(Arc::new))
-            .transpose()?;
+        let owned_guest_control = match bound_guest {
+            Some(original) => Some(original),
+            None if owned_tcp_relays.is_some() => {
+                Some(Arc::new(InstalledGuestWake::new(stream.try_clone()?)))
+            }
+            None => None,
+        };
 
         info!(session_id, "FlowMux handshake complete");
 

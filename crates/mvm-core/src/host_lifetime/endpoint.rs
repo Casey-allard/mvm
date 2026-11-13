@@ -84,6 +84,20 @@ impl EndpointPartitionLimits {
 pub trait EndpointPartitionGuard: Send + Sync {
     fn check_current(&self, projection: &EndpointPartitionProjection) -> Result<()>;
 
+    /// Check that this partition's retained parent reservation funds the installed
+    /// payload store's descriptors, workspace and bounded traversal.
+    /// This preflight neither allocates a second reservation nor authorizes a flow.
+    fn check_owned_payload_store_resources(
+        &self,
+        _projection: &EndpointPartitionProjection,
+    ) -> Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "original payload store resource owner unavailable",
+        )
+        .into())
+    }
+
     /// Observe the minted guest key and authenticated host signer on this exact partition.
     /// An observer may refuse. This notification never authorizes a peer or flow.
     fn observe_flowmux_guest(
@@ -192,6 +206,15 @@ impl PreparedEndpointPartition {
 
     pub fn check_current(&self) -> Result<()> {
         self.guard.check_current(&self.projection)
+    }
+
+    /// Check store funding on the same original guard before installed payload effects.
+    /// A provider refusal or a change of generation during the check fails admission.
+    pub fn check_owned_payload_store_resources(&self) -> Result<()> {
+        self.check_current()?;
+        self.guard
+            .check_owned_payload_store_resources(&self.projection)?;
+        self.check_current()
     }
 
     /// Cleanup identity only: equal projection fields do not own this guard.

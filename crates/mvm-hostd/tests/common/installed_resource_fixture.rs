@@ -83,6 +83,16 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         projection.profile = 2;
         projection.limits.host_codec_bytes = 8 << 20;
         if mode == "carrier-funded" {
+            let store_work =
+                mvm_hostd::supervisor::flowmux::SpiralCorePayloadFactory::owned_store_requirements(
+                )
+                .expect("SmallV1 store work");
+            projection.limits.host_codec_bytes =
+                spiralcore_transfer::resource_profile::ResourceProfile::SmallV1
+                    .operation_charge()
+                    .expect("SmallV1 engine charge")
+                    .checked_add(store_work.workspace_bytes)
+                    .expect("one funded engine and store");
             projection.limits.host_carrier_bytes = 1 << 20;
         }
         projection.limits.cache_disk_bytes = 16 << 20;
@@ -105,7 +115,8 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
     }
     let records = matches!(
         mode,
-        "collector" | "records-original"
+        "collector"
+            | "records-original"
             | "records-alias"
             | "records-inspect"
             | "records-partial"
@@ -293,7 +304,10 @@ pub(super) async fn exchange_with_program(mode: &str, child_args: &[&str], endpo
         drop(input);
         if mode == "records-partial" {
             let mut byte = [0];
-            anyhow::ensure!(output.read(&mut byte).await? == 0, "partial records published Drained");
+            anyhow::ensure!(
+                output.read(&mut byte).await? == 0,
+                "partial records published Drained"
+            );
             return Ok(());
         }
         let drained: Value = read_json_frame(&mut output, 1024).await?;

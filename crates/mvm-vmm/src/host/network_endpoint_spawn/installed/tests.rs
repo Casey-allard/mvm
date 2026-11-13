@@ -50,6 +50,24 @@ fn installed_endpoint_fixture_child() {
         serde_json::json!({"fixture":true})
     );
     assert!(context.take_config().is_err());
+    let guest_wake = (mode == "stale-holder").then(|| {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let wake = lease.bind_guest_transport(&stream).unwrap();
+        assert!(Arc::ptr_eq(
+            &wake,
+            alias
+                .authority
+                .guest
+                .lock()
+                .unwrap()
+                .original
+                .as_ref()
+                .unwrap()
+        ));
+        assert!(alias.bind_guest_transport(&stream).is_err());
+        (wake, peer, stream)
+    });
     context
         .send_ready(
             EndpointHandshake::default(),
@@ -64,6 +82,9 @@ fn installed_endpoint_fixture_child() {
         let mut event = [0; 1];
         coord.read_exact(&mut event).unwrap();
         assert!(lease.check_current().is_err());
+        let (wake, mut peer, _original) = guest_wake.unwrap();
+        assert_eq!(peer.read(&mut event).unwrap(), 0);
+        wake.shutdown().unwrap();
         coord.write_all(&[1]).unwrap();
         coord.read_exact(&mut event).unwrap();
         assert!(
@@ -414,6 +435,31 @@ fn endpoint_retirement_requires_drained_and_original_child_and_retains_sh() {
 #[test]
 fn real_child_lease_checks_original_holder_and_never_resets_after_failure() {
     mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("stale-holder"));
+}
+
+#[test]
+fn installed_guest_wake_reuses_positive_shutdown_across_aliases() {
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let wake = Arc::new(InstalledGuestWake::new(socket));
+    let alias = wake.clone();
+    wake.shutdown().unwrap();
+    assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+    alias.shutdown().unwrap();
+}
+
+#[test]
+fn installed_guest_wake_preserves_the_first_kernel_failure_on_retry() {
+    // Deliberately pass an owned regular file description. Both shutdown calls
+    // must reach the kernel and report that this descriptor is not a socket.
+    let fd: std::os::fd::OwnedFd = tempfile::tempfile().unwrap().into();
+    let wake = InstalledGuestWake::new(UnixStream::from(fd));
+    for _ in 0..2 {
+        assert_eq!(
+            wake.shutdown().unwrap_err().raw_os_error(),
+            Some(libc::ENOTSOCK)
+        );
+    }
 }
 
 #[test]

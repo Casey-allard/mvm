@@ -628,7 +628,12 @@ fn child_mode(
         let relays = relays.as_ref().unwrap();
         let reservation = relays.reserve_until(deadline).unwrap();
         let (guest, _guest_peer) = UnixStream::pair().unwrap();
-        reservation.bind_setup(&upstream, Arc::new(guest)).unwrap();
+        reservation
+            .bind_setup(
+                &upstream,
+                Arc::new(mvm_vmm::host::network_endpoint_spawn::InstalledGuestWake::new(guest)),
+            )
+            .unwrap();
         let result = mapping.map(
             upstream,
             AdmittedTcpFacts {
@@ -644,9 +649,15 @@ fn child_mode(
                 owned_relay: Some(reservation.witness().unwrap()),
             },
         );
+        let Err(error) = result else {
+            panic!("custody injection unexpectedly published a stream");
+        };
         assert!(
-            result.is_err(),
-            "custody injection unexpectedly published a stream"
+            error.kind() == std::io::ErrorKind::PermissionDenied
+                && error.to_string() == "prepared reader retained after admission closed",
+            "unexpected mapping refusal: kind={:?} os_code={:?}",
+            error.kind(),
+            error.raw_os_error()
         );
         drop(reservation);
     } else {
@@ -864,9 +875,9 @@ fn finish_child(
 
 fn small_send_buffer(stream: &UnixStream) -> usize {
     let requested: libc::c_int = 1024;
-    // SAFETY: both values have the exact SOL_SOCKET integer ABI and the
-    // descriptor remains borrowed from the original fixture socket.
     assert_eq!(
+        // SAFETY: stream keeps the FD live; SO_SNDBUF reads one c_int from
+        // requested, whose address and exact byte length are supplied here.
         unsafe {
             libc::setsockopt(
                 stream.as_raw_fd(),
@@ -881,6 +892,8 @@ fn small_send_buffer(stream: &UnixStream) -> usize {
     let mut observed: libc::c_int = 0;
     let mut length = std::mem::size_of_val(&observed) as libc::socklen_t;
     assert_eq!(
+        // SAFETY: stream keeps the FD live; observed is writable c_int storage,
+        // and length is a separate writable socklen_t set to its capacity.
         unsafe {
             libc::getsockopt(
                 stream.as_raw_fd(),

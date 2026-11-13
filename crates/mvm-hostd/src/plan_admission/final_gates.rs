@@ -102,6 +102,45 @@ pub(super) fn run_post_admission_gates(
     Ok((config, runtime))
 }
 
+pub(super) fn attach_admitted_extensions(
+    config: &mut VmStartConfig,
+    admitted: &AdmittedPlan,
+) -> Result<()> {
+    if !admitted.extensions().is_empty() {
+        config.extension_plan_id = Some(admitted.plan_id().0.clone());
+    }
+    for extension in admitted.extensions() {
+        if extension.binding.placement
+            != mvm_contract::protocol::extension_pack::ExtensionPlacement::GuestWorkload
+        {
+            anyhow::bail!(
+                "extension placement isolated_controller reached guest attachment after admission"
+            );
+        }
+        let digest = hex::encode(extension.binding.pack_digest);
+        let guest = format!("/run/mvm/extensions/{digest}");
+        if config.volumes.iter().any(|volume| volume.guest == guest) {
+            anyhow::bail!("extension mountpoint collision at {guest}");
+        }
+        config.volumes.push(mvm_core::vm_backend::VmVolume {
+            materialized_image: None,
+            volume_label: None,
+            host: extension
+                .root
+                .join(&extension.binding.artifact)
+                .display()
+                .to_string(),
+            guest,
+            size: String::new(),
+            read_only: true,
+            kind: mvm_core::vm_backend::VmVolumeKind::Disk,
+            encrypted: false,
+        });
+        config.extensions.push(extension.binding.clone());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,48 +191,8 @@ mod tests {
             };
             let (stage, _) =
                 run_post_admission_gates(cfg, &admitted, BackendKind::Firecracker, None)
-                    .err()
-                    .expect("no resources supplied");
+                    .expect_err("no resources supplied");
             assert_eq!(stage, expected);
         }
     }
-}
-
-pub(super) fn attach_admitted_extensions(
-    config: &mut VmStartConfig,
-    admitted: &AdmittedPlan,
-) -> Result<()> {
-    if !admitted.extensions().is_empty() {
-        config.extension_plan_id = Some(admitted.plan_id().0.clone());
-    }
-    for extension in admitted.extensions() {
-        if extension.binding.placement
-            != mvm_contract::protocol::extension_pack::ExtensionPlacement::GuestWorkload
-        {
-            anyhow::bail!(
-                "extension placement isolated_controller reached guest attachment after admission"
-            );
-        }
-        let digest = hex::encode(extension.binding.pack_digest);
-        let guest = format!("/run/mvm/extensions/{digest}");
-        if config.volumes.iter().any(|volume| volume.guest == guest) {
-            anyhow::bail!("extension mountpoint collision at {guest}");
-        }
-        config.volumes.push(mvm_core::vm_backend::VmVolume {
-            materialized_image: None,
-            volume_label: None,
-            host: extension
-                .root
-                .join(&extension.binding.artifact)
-                .display()
-                .to_string(),
-            guest,
-            size: String::new(),
-            read_only: true,
-            kind: mvm_core::vm_backend::VmVolumeKind::Disk,
-            encrypted: false,
-        });
-        config.extensions.push(extension.binding.clone());
-    }
-    Ok(())
 }

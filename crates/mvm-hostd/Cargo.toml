@@ -91,8 +91,8 @@ path = "src/bin/mvm-apfs-snapshot-helper.rs"
 required-features = ["trusted-apfs"]
 
 [dependencies]
-spiralcore-mvm-flowmux = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6" }
-spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6" }
+spiralcore-mvm-flowmux = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "4ea98b9e27116a163c9767f5a351bf177eff3b6b" }
+spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "4ea98b9e27116a163c9767f5a351bf177eff3b6b" }
 # `egress-ca`: the https terminator mints per-SNI leaves
 # under the per-VM intermediate (`mvm_core::crypto::egress_ca`).
 mvm-core = { workspace = true, features = ["egress-ca", "host-state"] }

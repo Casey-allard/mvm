@@ -135,7 +135,15 @@ async fn resource_exchange_program_handoffs_with(
         std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let metadata = std::fs::metadata(&store_path).unwrap();
         projection.profile = 2;
-        projection.limits.host_codec_bytes = 8 << 20;
+        let store_work =
+            mvm_hostd::supervisor::flowmux::SpiralCorePayloadFactory::owned_store_requirements()
+                .expect("SmallV1 store work");
+        projection.limits.host_codec_bytes =
+            spiralcore_transfer::resource_profile::ResourceProfile::SmallV1
+                .operation_charge()
+                .expect("SmallV1 engine charge")
+                .checked_add(store_work.workspace_bytes)
+                .expect("one funded engine and store");
         projection.limits.cache_disk_bytes = 16 << 20;
         projection.limits.staging_disk_bytes = 16 << 20;
         projection.limits.max_streams = 2;
@@ -261,8 +269,10 @@ async fn resource_exchange_program_handoffs_with(
     inherited.extend(records.as_ref().map(AsRawFd::as_raw_fd));
     inherited.extend(second_records.as_ref().map(AsRawFd::as_raw_fd));
     mvm_vmm::host::restore_image::inherit_descriptors(command.as_std_mut(), inherited);
-    // SAFETY: descriptor-only operations in the fixture's owned child.
     if program.is_none() {
+        // SAFETY: after fork this closure uses only async-signal-safe dup2 on
+        // the child's stdio, preserving stdout on 199 before redirecting it.
+        // A failed call returns the saved errno without allocating or locking.
         unsafe {
             command.as_std_mut().pre_exec(|| {
                 if libc::dup2(1, 199) < 0 || libc::dup2(2, 1) < 0 {

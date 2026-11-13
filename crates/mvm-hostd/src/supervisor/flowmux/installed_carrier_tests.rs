@@ -48,7 +48,12 @@ fn carrier_fixture_child() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (guest, _guest_peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        reservation.bind_setup(&socket, Arc::new(guest)).unwrap();
+        reservation
+            .bind_setup(
+                &socket,
+                Arc::new(mvm_vmm::host::network_endpoint_spawn::InstalledGuestWake::new(guest)),
+            )
+            .unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let reader = std::thread::spawn(move || peer.read(&mut [0; 1]));

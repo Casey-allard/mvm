@@ -162,7 +162,10 @@ impl InstalledEndpointAudit {
     pub fn same_endpoint(&self, lease: &InstalledEndpointLease) -> bool {
         self.lease.same_authority(lease)
     }
-    pub fn bind_guest_transport(&self, stream: &std::os::unix::net::UnixStream) -> Result<()> {
+    pub fn bind_guest_transport(
+        &self,
+        stream: &std::os::unix::net::UnixStream,
+    ) -> Result<Arc<InstalledGuestWake>> {
         self.lease.bind_guest_transport(stream)
     }
     fn projection(&self) -> &AuditProjection {

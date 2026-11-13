@@ -6166,7 +6166,7 @@ checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 [[package]]
 name = "spiralcore-mvm-flowmux"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6#7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=4ea98b9e27116a163c9767f5a351bf177eff3b6b#4ea98b9e27116a163c9767f5a351bf177eff3b6b"
 dependencies = [
  "mio",
  "rustls",
@@ -6177,7 +6177,7 @@ dependencies = [
 [[package]]
 name = "spiralcore-storage-windows"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6#7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=4ea98b9e27116a163c9767f5a351bf177eff3b6b#4ea98b9e27116a163c9767f5a351bf177eff3b6b"
 dependencies = [
  "windows-sys 0.61.2",
 ]
@@ -6185,12 +6185,14 @@ dependencies = [
 [[package]]
 name = "spiralcore-transfer"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6#7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=4ea98b9e27116a163c9767f5a351bf177eff3b6b#4ea98b9e27116a163c9767f5a351bf177eff3b6b"
 dependencies = [
  "cpu-time",
  "httparse",
+ "libc",
  "libm",
  "memchr",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6973,7 +6975,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "uor-r4-object-store"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6#7458294c9bdf8eaca19aafe9b5dafbda4f0da6f6"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=4ea98b9e27116a163c9767f5a351bf177eff3b6b#4ea98b9e27116a163c9767f5a351bf177eff3b6b"
 dependencies = [
  "sha2 0.10.9",
 ]

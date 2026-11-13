@@ -256,7 +256,7 @@ impl InstalledEndpointResources {
         crate::jailer::confine_self_with_owned_files(
             spec,
             &self.verification_state,
-            self.store.as_ref().map(|store| &store.directory),
+            self.store.as_ref().map(|store| store.directory.as_ref()),
             runtime_state,
             records,
         )?;
@@ -269,6 +269,13 @@ impl InstalledEndpointResources {
     /// Captured location data only; the pool retains the actual current checker.
     pub fn store_locator(&self) -> Option<&EndpointStoreLocator> {
         self.store.as_ref().map(|store| &store.locator)
+    }
+    pub(crate) fn checked_store_directory(&self) -> io::Result<Arc<File>> {
+        self.lease.check_current().map_err(invalid)?;
+        self.store
+            .as_ref()
+            .ok_or_else(|| invalid("original payload store missing"))?
+            .checked_directory()
     }
     pub(crate) fn network_config(&self) -> Option<&EndpointConfig> {
         match &self.program {
@@ -470,8 +477,37 @@ fn take_original_records(
 #[derive(Debug)]
 struct HeldStore {
     locator: EndpointStoreLocator,
-    directory: File,
+    directory: Arc<File>,
     fenced: AtomicBool,
+}
+#[cfg(test)]
+#[test]
+fn installed_store_shares_original_descriptor_and_fences_name_replacement() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let path = fixture.path().join("original");
+    mvm_core::private_fs::create_owned_private_dir(&path).expect("private store");
+    let meta = path.metadata().expect("original identity");
+    let store = HeldStore::capture(EndpointStoreLocator {
+        version: 1,
+        path: path.clone(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        reservation_serial: 3,
+        tenant: [4; 32],
+        session: [5; 32],
+    })
+    .expect("original store");
+    let original = store.checked_directory().expect("original descriptor");
+    assert!(Arc::ptr_eq(&original, &store.directory));
+    assert!(Arc::ptr_eq(
+        &original,
+        &store.checked_directory().expect("same original")
+    ));
+    let moved = fixture.path().join("moved");
+    std::fs::rename(&path, &moved).expect("move original");
+    assert!(store.checked_directory().is_err());
+    std::fs::rename(moved, path).expect("restore original");
+    assert!(store.checked_directory().is_err());
 }
 impl HeldStore {
     fn capture(locator: EndpointStoreLocator) -> Result<Self> {
@@ -479,7 +515,7 @@ impl HeldStore {
             .context("open original installed codec store")?;
         let held = Self {
             locator,
-            directory,
+            directory: Arc::new(directory),
             fenced: AtomicBool::new(false),
         };
         held.check_current()?;
@@ -494,6 +530,10 @@ impl HeldStore {
             self.fenced.store(true, Ordering::Release);
         }
         result
+    }
+    fn checked_directory(&self) -> io::Result<Arc<File>> {
+        self.check_current()?;
+        Ok(Arc::clone(&self.directory))
     }
     fn check_identity(&self) -> io::Result<()> {
         let held = self.directory.metadata()?;

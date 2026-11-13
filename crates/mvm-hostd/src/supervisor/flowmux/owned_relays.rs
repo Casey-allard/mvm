@@ -6,10 +6,10 @@ mod custody_tests;
 
 use super::socket::FlowSocket;
 use crate::installed_endpoint::{InstalledEndpointComponentPermit, InstalledEndpointResources};
+use mvm_vmm::host::network_endpoint_spawn::InstalledGuestWake;
 use std::{
     io,
     net::{Shutdown, TcpStream},
-    os::unix::net::UnixStream,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -93,12 +93,12 @@ impl Drop for Completion {
 }
 pub(super) struct RelayWake {
     pub upstream: Mutex<FlowSocket>,
-    pub guest: Arc<UnixStream>,
+    pub guest: Arc<InstalledGuestWake>,
     pub retired: Arc<AtomicBool>,
 }
 struct SetupWake {
     upstream: TcpStream,
-    guest: Arc<UnixStream>,
+    guest: Arc<InstalledGuestWake>,
     upstream_stopped: Mutex<bool>,
 }
 impl SetupWake {
@@ -116,7 +116,7 @@ impl SetupWake {
             }
             Ok(())
         })();
-        let guest = self.guest.shutdown(Shutdown::Both);
+        let guest = self.guest.shutdown();
         upstream.and(guest)
     }
 }
@@ -148,7 +148,7 @@ impl RelayWake {
         self.retired.store(true, Ordering::Release);
         // Always attempt both original paths, including if the first fails.
         let upstream = self.cancel_reader();
-        let guest = self.guest.shutdown(Shutdown::Both);
+        let guest = self.guest.shutdown();
         upstream.and(guest)
     }
     fn complete_reader_until(&self, until: Instant) -> io::Result<()> {
@@ -599,7 +599,7 @@ pub(super) struct RelayWitness {
     inner: Arc<Inner>,
     index: usize,
     serial: u64,
-    guest: Arc<UnixStream>,
+    guest: Arc<InstalledGuestWake>,
 }
 impl std::fmt::Debug for RelayWitness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -687,7 +687,7 @@ impl RelayReservation {
     pub(super) fn bind_setup(
         &self,
         upstream: &TcpStream,
-        guest: Arc<UnixStream>,
+        guest: Arc<InstalledGuestWake>,
     ) -> io::Result<()> {
         self.inner.resource.check_current()?;
         let wake = Arc::new(SetupWake {

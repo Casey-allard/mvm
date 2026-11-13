@@ -650,7 +650,7 @@ mod tests {
         // and the status text exceeds the canonical static coverage codes.
         let mut snapshot = status_snapshot("\0".repeat(256));
         snapshot.status = format!("degraded:{}", "x".repeat(256));
-        let mut losses = serde_json::to_value(&snapshot.losses).unwrap();
+        let mut losses = serde_json::to_value(snapshot.losses).unwrap();
         let counters = losses.as_object_mut().unwrap();
         assert!(!counters.is_empty());
         for value in counters.values_mut() {

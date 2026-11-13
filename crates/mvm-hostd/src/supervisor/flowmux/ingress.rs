@@ -1,8 +1,8 @@
 //! Host-initiated ingress flows carried by one authenticated FlowMux session.
 
+use mvm_vmm::host::network_endpoint_spawn::InstalledGuestWake;
 use std::collections::BTreeMap;
 use std::net::TcpStream;
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
@@ -40,7 +40,7 @@ pub struct FlowMuxIngressHandle {
     pub(super) udp_idle_timeout: Duration,
     pub(super) max_udp_peers: usize,
     pub(super) owned_tcp_relays: Option<Arc<super::OwnedTcpRelays>>,
-    pub(super) owned_guest_control: Option<Arc<UnixStream>>,
+    pub(super) owned_guest_control: Option<Arc<InstalledGuestWake>>,
 }
 
 impl FlowMuxIngressHandle {

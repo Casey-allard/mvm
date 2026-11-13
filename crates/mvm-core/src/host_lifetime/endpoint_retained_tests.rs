@@ -39,6 +39,20 @@ impl EndpointPartitionGuard for Guard {
         ensure!(self.current.load(Ordering::Acquire), "fixture guard closed");
         Ok(())
     }
+    fn check_owned_payload_store_resources(
+        &self,
+        projection: &EndpointPartitionProjection,
+    ) -> Result<()> {
+        ensure!(
+            projection == &self.expected,
+            "fixture store projection differs"
+        );
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        if self.mode.load(Ordering::Acquire) == 1 {
+            self.current.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
     fn prepare_retained_telemetry(
         &self,
         projection: &EndpointPartitionProjection,
@@ -174,6 +188,51 @@ impl Fixture {
             anchor,
         }
     }
+}
+
+fn selected_store_fixture() -> Fixture {
+    let mut f = Fixture::new();
+    let meta = f.directory.metadata().unwrap();
+    f.projection.profile = 2;
+    f.projection.store = Some(EndpointStoreLocator {
+        version: 1,
+        path: f.path.clone(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        reservation_serial: 1,
+        tenant: [7; 32],
+        session: f.projection.session,
+    });
+    f.projection.limits.host_codec_bytes = 16 << 20;
+    f
+}
+
+#[test]
+fn owned_store_resource_guard_default_refuses_before_effects() {
+    let f = selected_store_fixture();
+    let partition = PreparedEndpointPartition::new(f.projection, Arc::new(DefaultGuard)).unwrap();
+    let error = partition.check_owned_payload_store_resources().unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(fs::read_dir(&f.path).unwrap().count(), 0);
+}
+
+#[test]
+fn owned_store_resource_guard_uses_original_and_rechecks_freshness() {
+    let f = selected_store_fixture();
+    let original = f.guard();
+    let other = f.guard();
+    let partition = PreparedEndpointPartition::new(f.projection, original.clone()).unwrap();
+    partition.check_owned_payload_store_resources().unwrap();
+    assert_eq!(original.calls.load(Ordering::Acquire), 1);
+    original.mode.store(1, Ordering::Release);
+    assert!(partition.check_owned_payload_store_resources().is_err());
+    assert!(partition.check_owned_payload_store_resources().is_err());
+    assert_eq!(original.calls.load(Ordering::Acquire), 2);
+    assert_eq!(other.calls.load(Ordering::Acquire), 0);
+    assert_eq!(fs::read_dir(&f.path).unwrap().count(), 0);
 }
 
 #[test]

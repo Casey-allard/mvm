@@ -189,6 +189,7 @@ pub fn spawn_network_endpoint_installed(
     if plan.plan_id.0 != projection.admitted_plan_id || policy.payload_mapping().is_none() {
         bail!("installed endpoint differs from original admitted mapping")
     }
+    handoff.partition().check_owned_payload_store_resources()?;
     let env_path = mvm_core::config::vm_substitution_env_path(params.vm_name);
     owned::refuse_existing_evidence(&params, &env_path)?;
     if params.egress_proxy.is_none() {
@@ -303,6 +304,7 @@ pub fn spawn_network_endpoint_installed_registered(
     if plan.plan_id.0 != projection.admitted_plan_id || policy.payload_mapping().is_none() {
         bail!("installed endpoint differs from original admitted mapping")
     }
+    handoff.partition().check_owned_payload_store_resources()?;
     let env_path = mvm_core::config::vm_substitution_env_path(params.vm_name);
     owned::refuse_existing_evidence(&params, &env_path)?;
     // Installed embeddings resolve the canonical operator table/environment
@@ -577,10 +579,37 @@ struct ChildAuthority {
     guest: Mutex<GuestTransport>,
 }
 
+/// Cancellation of one original guest transport, shared by setup, relay and
+/// the installed lease. A successful wake records no reader or worker exit.
+pub struct InstalledGuestWake {
+    stream: std::os::unix::net::UnixStream,
+    stopped: Mutex<bool>,
+}
+
+impl InstalledGuestWake {
+    pub fn new(stream: std::os::unix::net::UnixStream) -> Self {
+        Self {
+            stream,
+            stopped: Mutex::new(false),
+        }
+    }
+
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        let mut stopped = self
+            .stopped
+            .lock()
+            .map_err(|_| std::io::Error::other("original guest wake poisoned"))?;
+        if !*stopped {
+            self.stream.shutdown(std::net::Shutdown::Both)?;
+            *stopped = true;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct GuestTransport {
-    claimed: bool,
-    original: Option<std::os::unix::net::UnixStream>,
+    original: Option<Arc<InstalledGuestWake>>,
 }
 
 /// Original child authority retained by its one local pool and bounded workers.
@@ -605,9 +634,11 @@ impl InstalledEndpointLease {
     }
     /// Retain one cancellation clone before the original guest authentication.
     /// This monotonic slot grants no network or audit authority.
-    pub fn bind_guest_transport(&self, stream: &std::os::unix::net::UnixStream) -> Result<()> {
+    pub fn bind_guest_transport(
+        &self,
+        stream: &std::os::unix::net::UnixStream,
+    ) -> Result<Arc<InstalledGuestWake>> {
         self.check_current()?;
-        let original = stream.try_clone()?;
         let mut guest = match self.authority.guest.lock() {
             Ok(guest) => guest,
             Err(poisoned) => {
@@ -616,28 +647,29 @@ impl InstalledEndpointLease {
                 bail!("installed guest cancellation slot poisoned")
             }
         };
-        if self.authority.fenced.load(Ordering::Acquire) || guest.claimed {
+        if self.authority.fenced.load(Ordering::Acquire) || guest.original.is_some() {
             bail!("installed guest cancellation slot unavailable")
         }
-        guest.claimed = true;
-        guest.original = Some(original);
+        let original = Arc::new(InstalledGuestWake::new(stream.try_clone()?));
+        guest.original = Some(original.clone());
         drop(guest);
-        self.check_current()
+        self.check_current()?;
+        Ok(original)
     }
     /// Monotonic admission fence and original transport wake, with socket I/O
     /// outside the publication mutex. It provides no exit or drain receipt.
     pub fn fence(&self) {
         self.authority.fenced.store(true, Ordering::Release);
         let original = {
-            let mut guest = self
+            let guest = self
                 .authority
                 .guest
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guest.original.take()
+            guest.original.clone()
         };
         if let Some(original) = original {
-            let _ = original.shutdown(std::net::Shutdown::Both);
+            let _ = original.shutdown();
         }
     }
     fn fail_cleanup(&self) {

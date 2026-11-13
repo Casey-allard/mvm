@@ -29,6 +29,20 @@ returns the stream reservation. Guest ingress, UDP, typed HTTP, secret
 substitution and delegated proxies have no selected mapping in this profile.
 Starting the endpoint binary alone cannot select it.
 
+The installed SmallV1 object receiver keeps the parent and child directory
+descriptors admitted by that owner. Store operations and retirement stay
+relative to those held descriptors. Before spawning the selected endpoint,
+the original partition guard must confirm funding for one serial receiver:
+seven descriptors and a 1 MiB store workspace in addition to the codec operation
+charge. Providers that do not implement this check refuse activation. A
+projection or cache digest does not grant resource or mailbox authority.
+
+Cancellation closes the original guest transport through one shared wake
+handle. Setup, relay and lease fencing reuse a successful shutdown; a failed
+kernel shutdown remains an error. Shutdown alone does not release storage:
+the owner must collect the original reader and verify retirement of the
+original store. An uncertain join or changed directory retains its charge.
+
 The SDK checks the native backend's lifetime support before launch. Releasing a
 VM reservation requires the original owner's proof of disposal or a proved
 pre-spawn refusal. A successful endpoint shutdown settles its own allocation.

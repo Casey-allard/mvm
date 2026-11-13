@@ -599,25 +599,27 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn collected_helper_can_retire_only_its_original_stale_socket() {
-        let root = tempfile::Builder::new()
-            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .tempdir()
+        mvm_core::util::test_env::isolated_lock_probe(|| {
+            let root = tempfile::Builder::new()
+                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let path = root.path().join("original");
+            let listener = UnixListener::bind(&path).unwrap();
+            let mut pin = SocketOriginal::capture(
+                &path,
+                &File::open(root.path()).unwrap(),
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
             .unwrap();
-        let path = root.path().join("original");
-        let listener = UnixListener::bind(&path).unwrap();
-        let mut pin = SocketOriginal::capture(
-            &path,
-            &File::open(root.path()).unwrap(),
-            Instant::now() + std::time::Duration::from_secs(1),
-        )
-        .unwrap();
-        assert!(
+            assert!(
+                pin.retire(&path, Instant::now() + std::time::Duration::from_secs(1))
+                    .is_err()
+            );
+            drop(listener);
             pin.retire(&path, Instant::now() + std::time::Duration::from_secs(1))
-                .is_err()
-        );
-        drop(listener);
-        pin.retire(&path, Instant::now() + std::time::Duration::from_secs(1))
-            .unwrap();
-        assert!(!path.exists());
+                .unwrap();
+            assert!(!path.exists());
+        });
     }
 }

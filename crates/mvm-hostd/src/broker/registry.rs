@@ -1728,6 +1728,7 @@ mod tests {
         use crate::broker::audit_client::AuditClient;
         use crate::broker::handlers::host_audit_v1::HostAuditV1Handler;
         use mvm_core::protocol::audit_signer::{SignerHelperRequest, SignerHelperResponse};
+        use std::io::ErrorKind;
         use std::time::Instant;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1753,6 +1754,8 @@ mod tests {
                         Err(error) => panic!("batch fixture accept: {error}"),
                     }
                 };
+                // Darwin inherits the listener's nonblocking flag; framed I/O uses socket deadlines.
+                stream.set_nonblocking(false).unwrap();
                 let request: SignerHelperRequest =
                     mvm_vmm::host::hvf_control_transport::read_frame_with_limit(
                         &mut stream,
@@ -1779,14 +1782,24 @@ mod tests {
                 );
                 if let Err(error) = result {
                     let error = error.downcast::<std::io::Error>().unwrap();
-                    assert!(matches!(
-                        error.kind(),
-                        std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::NotConnected
-                    ));
+                    assert_eq!(index, 1, "only the delayed reply may fail: {error}");
                     assert!(finished.load(Ordering::Acquire));
-                    return accepted;
+                    match error.kind() {
+                        ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::NotConnected => {}
+                        #[cfg(target_os = "macos")]
+                        ErrorKind::InvalidInput if error.raw_os_error() == Some(libc::EINVAL) => {
+                            // Darwin may reject SO_SNDTIMEO on a closed peer. Prove EOF on this stream.
+                            let read = mvm_vmm::host::hvf_control_transport::read_exact(
+                                &mut stream,
+                                &mut [0],
+                                watchdog,
+                            );
+                            assert_eq!(read.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+                        }
+                        _ => panic!("unexpected late batch reply error: {error}"),
+                    }
                 }
             }
             accepted

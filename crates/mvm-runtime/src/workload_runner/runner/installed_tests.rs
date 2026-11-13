@@ -477,7 +477,7 @@ impl ConsoleStreamer for CleanupObserver {
     fn start(&self, _capture: &ConsoleCapture<'_>) {}
     fn stop(&self, _vm_name: &str) {
         let slot = self.slot.lock().unwrap().as_ref().cloned().unwrap();
-        let refused = slot.view().status().err().expect("cleanup owns the slot");
+        let refused = slot.view().status().expect_err("cleanup owns the slot");
         assert_eq!(
             refused.to_string(),
             "original installed cleanup in progress"
@@ -494,7 +494,7 @@ fn installed_pre_dispatch_failure_retains_and_retires_endpoint() {
     let runner =
         WorkloadRunner::new(driver, NoEndpoint, NoBroker).with_console_streamer(observer.clone());
     let id = VmId(config.name.clone());
-    mvm_core::config::create_private_dir(&vm_state_dir(&config.name)).unwrap();
+    mvm_core::config::create_private_dir(vm_state_dir(&config.name)).unwrap();
     let redaction = RedactionPolicy::default();
     let inputs = WorkloadLaunchInputs {
         config: &config,
@@ -526,7 +526,7 @@ fn unsupported_native_driver_refuses_before_reserving_installed_custody() {
     let (_env, _root, driver, config, _anchor) = fixture(false);
     let runner = WorkloadRunner::new(driver.inner, NoEndpoint, NoBroker);
     let id = VmId(config.name.clone());
-    mvm_core::config::create_private_dir(&vm_state_dir(&config.name)).unwrap();
+    mvm_core::config::create_private_dir(vm_state_dir(&config.name)).unwrap();
     let redaction = RedactionPolicy::default();
     let inputs = WorkloadLaunchInputs {
         config: &config,
