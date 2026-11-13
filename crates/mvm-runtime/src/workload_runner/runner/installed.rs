@@ -6,6 +6,9 @@ use super::*;
 use mvm_core::host_lifetime::{HostLaunchBinding, HostLifetimeAnchor};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
+mod startup_failure;
+pub(super) use startup_failure::StartupStage;
+
 #[derive(Default)]
 pub(super) struct InstalledSlots(Mutex<Vec<Arc<InstalledSlot>>>);
 
@@ -209,10 +212,7 @@ impl InstalledSlot {
         state.launch = Some((lifecycle, kernel));
         match outcome {
             Ok(vm) => Ok(vm),
-            Err(error) => {
-                state.failure = Some(error);
-                anyhow::bail!("installed native startup failed; original error retained")
-            }
+            Err(error) => Err(startup_failure::retain_failure(&mut state.failure, error)),
         }
     }
 
