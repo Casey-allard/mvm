@@ -350,6 +350,10 @@ impl InstalledSlot {
             .launch
             .as_ref()
             .context("installed launch custody unavailable")?;
+        // The unused channel also retains original kernel and lease custody.
+        // Close it before any disposal receipt can release this launch's debit.
+        #[cfg(target_os = "linux")]
+        drop(state.entrypoint.take());
         if !state.native_dispatch_entered {
             anyhow::ensure!(
                 state.failure.is_some() && state.vm.is_none() && state.exit.is_none(),
