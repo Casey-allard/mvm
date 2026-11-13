@@ -138,6 +138,23 @@ impl<T: std::io::Read + std::io::Write + Send> DuplexStream for T {}
 
 /// VMM mechanics, written once per VMM.
 pub trait VmmDriver: Send + Sync {
+    /// Whether the native boot path retains the original installation holder.
+    fn supports_host_lifetime(&self) -> bool {
+        false
+    }
+
+    /// Keep original installation custody through a native process launch.
+    /// Unsupported drivers refuse before invoking their ordinary boot path.
+    #[cfg(unix)]
+    fn boot_custodied_with_host_lifetime(
+        &self,
+        _spec: &VmmSpec,
+        _files: crate::driver::prepared_disks::PreparedBootFiles<'_>,
+        _lease: mvm_core::host_lifetime::PreparedHostLifetimeLease,
+        _binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<Box<dyn RunningVm>> {
+        anyhow::bail!("backend does not enforce original host lifetime custody")
+    }
     /// Stable backend token (`"libkrun"`, `"firecracker"`, `"hvf"`, `"mock"`).
     fn name(&self) -> &str;
     /// The typed discriminant; branch on this, never on `name()`.
@@ -388,6 +405,8 @@ pub trait RunningVm: Send {
             timing: self.terminate_with_timing()?,
             #[cfg(unix)]
             hvf_exit: None,
+            #[cfg(target_os = "linux")]
+            fc_exit: None,
         })
     }
     #[cfg(unix)]
@@ -414,6 +433,8 @@ pub struct KernelStopOutcome {
     pub timing: Option<RunningVmStopTiming>,
     #[cfg(unix)]
     pub hvf_exit: Option<crate::host::hvf_stop::ConfirmedExit>,
+    #[cfg(target_os = "linux")]
+    pub fc_exit: Option<crate::host::fc_lifetime::ConfirmedExit>,
 }
 
 /// Backend-specific phases observed while terminating a running VM.
