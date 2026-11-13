@@ -796,9 +796,13 @@ mod tests {
             FEED_SIGNATURE,
             true,
         );
-        let owner = Arc::new(
-            prepare_with_clock(frame.capture().unwrap(), BackendKind::Hvf, inside_window).unwrap(),
-        );
+        let backend = if cfg!(target_os = "linux") {
+            BackendKind::Firecracker
+        } else {
+            BackendKind::Hvf
+        };
+        let owner =
+            Arc::new(prepare_with_clock(frame.capture().unwrap(), backend, inside_window).unwrap());
         let root = owner.workload_root_declaration().unwrap();
         assert_eq!(root.sha256, sha256_hex(b"fixture workload filesystem"));
         assert_eq!(root.size_bytes, b"fixture workload filesystem".len() as u64);
@@ -807,21 +811,19 @@ mod tests {
             ..Default::default()
         };
         owner.bind_to_config(&mut config).unwrap();
-        owner
-            .verify_config(&config, BackendKind::Hvf, &test_host())
-            .unwrap();
+        owner.verify_config(&config, backend, &test_host()).unwrap();
         let mut replaced = config.clone();
         replaced.kernel_path = Some("/tmp/not-the-owned-kernel".into());
         assert!(
             owner
-                .verify_config(&replaced, BackendKind::Hvf, &test_host())
+                .verify_config(&replaced, backend, &test_host())
                 .is_err()
         );
         replaced = config.clone();
         replaced.name = "another-vm".into();
         assert!(
             owner
-                .verify_config(&replaced, BackendKind::Hvf, &test_host())
+                .verify_config(&replaced, backend, &test_host())
                 .is_err()
         );
         assert!(
@@ -831,29 +833,24 @@ mod tests {
         );
         let mut protocols = test_host();
         protocols.builder_cache_contract += 1;
-        assert!(
-            owner
-                .verify_config(&config, BackendKind::Hvf, &protocols)
-                .is_err()
-        );
-        let other = Arc::new(
-            prepare_with_clock(frame.capture().unwrap(), BackendKind::Hvf, inside_window).unwrap(),
-        );
+        assert!(owner.verify_config(&config, backend, &protocols).is_err());
+        let other =
+            Arc::new(prepare_with_clock(frame.capture().unwrap(), backend, inside_window).unwrap());
         replaced = config.clone();
         replaced.canonical_kernel = Some(other);
         assert!(
             owner
-                .verify_config(&replaced, BackendKind::Hvf, &test_host())
+                .verify_config(&replaced, backend, &test_host())
                 .is_err()
         );
         let generation = owner.generation_dir().to_owned();
         let selected = owner.kernel_path();
         owner
-            .retain_for_native_handoff(&config, BackendKind::Hvf, &test_host())
+            .retain_for_native_handoff(&config, backend, &test_host())
             .unwrap();
         assert!(
             owner
-                .retain_for_native_handoff(&config, BackendKind::Hvf, &test_host())
+                .retain_for_native_handoff(&config, backend, &test_host())
                 .is_err()
         );
         assert!(owner.bind_to_config(&mut config).is_err());
