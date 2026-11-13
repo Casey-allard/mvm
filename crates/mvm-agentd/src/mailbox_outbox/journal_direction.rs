@@ -314,77 +314,82 @@ mod tests {
 
     #[test]
     fn original_remote_intent_survives_lost_reply_and_wrong_domain_before_exact_b_receipt() {
-        let (boot, msg, receipt, b) = fixture();
-        let dir = tempfile::tempdir().unwrap();
-        let slot = dir.path().join(slot_name(&boot).unwrap());
-        write_single_outbox(&slot, &msg).unwrap();
-        let mut attempts = JournalAttempts::default();
-        let mut lost = Peer::new(None);
-        assert_eq!(
-            forward_for_original_boot(&mut lost, &slot, &boot, &mut attempts, || Ok(150)),
-            Err(Refusal::Unavailable)
-        );
-        let mut unrelated = receipt.clone();
-        unrelated.address.authorization_domain = AuthorizationDomainId::from_bytes([27; 32]);
-        let mut wrong = Peer::new(Some(sign_receipt(unrelated, &b).unwrap()));
-        assert_eq!(
-            forward_for_original_boot(&mut wrong, &slot, &boot, &mut attempts, || Ok(150)),
-            Err(Refusal::Unavailable)
-        );
-        assert_eq!(std::fs::read(&slot).unwrap(), msg.encode());
-        let signed = sign_receipt(receipt, &b).unwrap();
-        let mut exact = Peer::new(Some(signed.clone()));
-        assert_eq!(
-            forward_for_original_boot(&mut exact, &slot, &boot, &mut attempts, || Ok(150)).unwrap(),
-            signed
-        );
-        assert_eq!(lost.sent, wrong.sent);
-        assert_eq!(lost.sent, exact.sent);
-        assert_eq!(&exact.sent[4..], msg.encode());
-        assert!(!slot.exists());
+        mvm_core::util::test_env::isolated_lock_probe(|| {
+            let (boot, msg, receipt, b) = fixture();
+            let dir = tempfile::tempdir().unwrap();
+            let slot = dir.path().join(slot_name(&boot).unwrap());
+            write_single_outbox(&slot, &msg).unwrap();
+            let mut attempts = JournalAttempts::default();
+            let mut lost = Peer::new(None);
+            assert_eq!(
+                forward_for_original_boot(&mut lost, &slot, &boot, &mut attempts, || Ok(150)),
+                Err(Refusal::Unavailable)
+            );
+            let mut unrelated = receipt.clone();
+            unrelated.address.authorization_domain = AuthorizationDomainId::from_bytes([27; 32]);
+            let mut wrong = Peer::new(Some(sign_receipt(unrelated, &b).unwrap()));
+            assert_eq!(
+                forward_for_original_boot(&mut wrong, &slot, &boot, &mut attempts, || Ok(150)),
+                Err(Refusal::Unavailable)
+            );
+            assert_eq!(std::fs::read(&slot).unwrap(), msg.encode());
+            let signed = sign_receipt(receipt, &b).unwrap();
+            let mut exact = Peer::new(Some(signed.clone()));
+            assert_eq!(
+                forward_for_original_boot(&mut exact, &slot, &boot, &mut attempts, || Ok(150))
+                    .unwrap(),
+                signed
+            );
+            assert_eq!(lost.sent, wrong.sent);
+            assert_eq!(lost.sent, exact.sent);
+            assert_eq!(&exact.sent[4..], msg.encode());
+            assert!(!slot.exists());
+        });
     }
     #[test]
     fn own_authority_cannot_retire_remote_intent_and_retry_credit_ends_without_dispatch() {
-        let (boot, msg, receipt, _) = fixture();
-        let dir = tempfile::tempdir().unwrap();
-        let slot = dir.path().join(slot_name(&boot).unwrap());
-        write_single_outbox(&slot, &msg).unwrap();
-        let wrong = sign_receipt(receipt, &SigningKey::from_bytes(&[8; 32])).unwrap();
-        let mut attempts = JournalAttempts::default();
-        for _ in 0..3 {
-            let mut peer = Peer::new(Some(wrong.clone()));
+        mvm_core::util::test_env::isolated_lock_probe(|| {
+            let (boot, msg, receipt, _) = fixture();
+            let dir = tempfile::tempdir().unwrap();
+            let slot = dir.path().join(slot_name(&boot).unwrap());
+            write_single_outbox(&slot, &msg).unwrap();
+            let wrong = sign_receipt(receipt, &SigningKey::from_bytes(&[8; 32])).unwrap();
+            let mut attempts = JournalAttempts::default();
+            for _ in 0..3 {
+                let mut peer = Peer::new(Some(wrong.clone()));
+                assert_eq!(
+                    forward_for_original_boot(&mut peer, &slot, &boot, &mut attempts, || Ok(150)),
+                    Err(Refusal::Unavailable)
+                );
+                assert_eq!(&peer.sent[4..], msg.encode());
+                assert!(slot.exists());
+            }
+            let mut fourth = Peer::new(None);
             assert_eq!(
-                forward_for_original_boot(&mut peer, &slot, &boot, &mut attempts, || Ok(150)),
-                Err(Refusal::Unavailable)
+                forward_for_original_boot(&mut fourth, &slot, &boot, &mut attempts, || Ok(150)),
+                Err(Refusal::RetriesExhausted)
             );
-            assert_eq!(&peer.sent[4..], msg.encode());
-            assert!(slot.exists());
-        }
-        let mut fourth = Peer::new(None);
-        assert_eq!(
-            forward_for_original_boot(&mut fourth, &slot, &boot, &mut attempts, || Ok(150)),
-            Err(Refusal::RetriesExhausted)
-        );
-        assert!(fourth.sent.is_empty());
-        let files = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>();
-        assert_eq!(files.len(), 1);
-        assert!(
-            files[0]
-                .file_name()
+            assert!(fourth.sent.is_empty());
+            let files = std::fs::read_dir(dir.path())
                 .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("uncertain-")
-        );
-        assert_eq!(std::fs::read(&files[0]).unwrap(), msg.encode());
-        assert_eq!(
-            write_single_outbox(&slot, &msg),
-            Err(Refusal::RetriesExhausted)
-        );
-        assert!(!slot.exists());
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            assert_eq!(files.len(), 1);
+            assert!(
+                files[0]
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("uncertain-")
+            );
+            assert_eq!(std::fs::read(&files[0]).unwrap(), msg.encode());
+            assert_eq!(
+                write_single_outbox(&slot, &msg),
+                Err(Refusal::RetriesExhausted)
+            );
+            assert!(!slot.exists());
+        });
     }
     #[test]
     fn original_signed_plan_and_boot_commit_the_destination_and_both_credentials() {
@@ -450,40 +455,42 @@ mod tests {
 
     #[test]
     fn expiry_after_dispatch_retains_original_in_uncertain_archive() {
-        use std::cell::Cell;
-        let (boot, msg, receipt, b) = fixture();
-        let dir = tempfile::tempdir().unwrap();
-        let slot = dir.path().join(slot_name(&boot).unwrap());
-        write_single_outbox(&slot, &msg).unwrap();
-        let mut attempts = JournalAttempts::default();
-        let mut peer = Peer::new(Some(sign_receipt(receipt, &b).unwrap()));
-        let time = Cell::new(150);
-        assert_eq!(
-            forward_for_original_boot(&mut peer, &slot, &boot, &mut attempts, || Ok(
-                time.replace(200)
-            )),
-            Err(Refusal::Unavailable)
-        );
-        assert_eq!(std::fs::read(&slot).unwrap(), msg.encode());
-        let mut retry = Peer::new(None);
-        assert_eq!(
-            forward_for_original_boot(&mut retry, &slot, &boot, &mut attempts, || Ok(200)),
-            Err(Refusal::RetriesExhausted)
-        );
-        assert!(retry.sent.is_empty());
-        let stored = std::fs::read_dir(dir.path())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert!(
-            stored
-                .file_name()
-                .to_str()
+        mvm_core::util::test_env::isolated_lock_probe(|| {
+            use std::cell::Cell;
+            let (boot, msg, receipt, b) = fixture();
+            let dir = tempfile::tempdir().unwrap();
+            let slot = dir.path().join(slot_name(&boot).unwrap());
+            write_single_outbox(&slot, &msg).unwrap();
+            let mut attempts = JournalAttempts::default();
+            let mut peer = Peer::new(Some(sign_receipt(receipt, &b).unwrap()));
+            let time = Cell::new(150);
+            assert_eq!(
+                forward_for_original_boot(&mut peer, &slot, &boot, &mut attempts, || Ok(
+                    time.replace(200)
+                )),
+                Err(Refusal::Unavailable)
+            );
+            assert_eq!(std::fs::read(&slot).unwrap(), msg.encode());
+            let mut retry = Peer::new(None);
+            assert_eq!(
+                forward_for_original_boot(&mut retry, &slot, &boot, &mut attempts, || Ok(200)),
+                Err(Refusal::RetriesExhausted)
+            );
+            assert!(retry.sent.is_empty());
+            let stored = std::fs::read_dir(dir.path())
                 .unwrap()
-                .starts_with("uncertain-")
-        );
-        assert_eq!(std::fs::read(stored.path()).unwrap(), msg.encode());
+                .next()
+                .unwrap()
+                .unwrap();
+            assert!(
+                stored
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("uncertain-")
+            );
+            assert_eq!(std::fs::read(stored.path()).unwrap(), msg.encode());
+        });
     }
 
     #[test]
@@ -542,62 +549,64 @@ mod tests {
 
     #[test]
     fn original_directed_file_moves_identical_bytes_across_two_real_socket_turns() {
-        use std::{
-            os::unix::net::UnixStream,
-            time::{Duration, Instant},
-        };
-        let (boot, msg, receipt, b) = fixture();
-        let signed = sign_receipt(receipt, &b).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let slot = dir.path().join(slot_name(&boot).unwrap());
-        write_single_outbox(&slot, &msg).unwrap();
-        let mut attempts = JournalAttempts::default();
-        for reply in [false, true] {
-            let (mut guest, mut host) = UnixStream::pair().unwrap();
-            for socket in [&host, &guest] {
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                socket
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-            }
-            let original = msg.clone();
-            let verdict = serde_json::to_vec(&Ok::<_, Refusal>(&signed)).unwrap();
-            let t = std::thread::spawn(move || {
-                let mut header = [0; 4];
-                host.read_exact(&mut header).unwrap();
-                assert_eq!(u32::from_be_bytes(header) as usize, original.encode().len());
-                let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
-                host.read_exact(&mut bytes).unwrap();
-                assert_eq!(OutboxMessage::decode(&bytes).unwrap(), original);
-                if reply {
-                    host.write_all(&verdict).unwrap();
+        mvm_core::util::test_env::isolated_lock_probe(|| {
+            use std::{
+                os::unix::net::UnixStream,
+                time::{Duration, Instant},
+            };
+            let (boot, msg, receipt, b) = fixture();
+            let signed = sign_receipt(receipt, &b).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let slot = dir.path().join(slot_name(&boot).unwrap());
+            write_single_outbox(&slot, &msg).unwrap();
+            let mut attempts = JournalAttempts::default();
+            for reply in [false, true] {
+                let (mut guest, mut host) = UnixStream::pair().unwrap();
+                for socket in [&host, &guest] {
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
                 }
-                (
-                    header.len() + bytes.len(),
-                    if reply { verdict.len() } else { 0 },
-                )
-            });
-            let started = Instant::now();
-            let result =
-                forward_for_original_boot(&mut guest, &slot, &boot, &mut attempts, || Ok(150));
-            let wall = started.elapsed();
-            let (to_peer, from_peer) = t.join().unwrap();
-            assert_eq!(slot.exists(), !reply);
-            if reply {
-                assert_eq!(result.unwrap(), signed);
-            } else {
-                assert_eq!(result, Err(Refusal::Unavailable));
+                let original = msg.clone();
+                let verdict = serde_json::to_vec(&Ok::<_, Refusal>(&signed)).unwrap();
+                let t = std::thread::spawn(move || {
+                    let mut header = [0; 4];
+                    host.read_exact(&mut header).unwrap();
+                    assert_eq!(u32::from_be_bytes(header) as usize, original.encode().len());
+                    let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+                    host.read_exact(&mut bytes).unwrap();
+                    assert_eq!(OutboxMessage::decode(&bytes).unwrap(), original);
+                    if reply {
+                        host.write_all(&verdict).unwrap();
+                    }
+                    (
+                        header.len() + bytes.len(),
+                        if reply { verdict.len() } else { 0 },
+                    )
+                });
+                let started = Instant::now();
+                let result =
+                    forward_for_original_boot(&mut guest, &slot, &boot, &mut attempts, || Ok(150));
+                let wall = started.elapsed();
+                let (to_peer, from_peer) = t.join().unwrap();
+                assert_eq!(slot.exists(), !reply);
+                if reply {
+                    assert_eq!(result.unwrap(), signed);
+                } else {
+                    assert_eq!(result, Err(Refusal::Unavailable));
+                }
+                println!(
+                    "original-directed-uds reply={} app_bytes={} to_peer_bytes={} from_peer_bytes={} host_component_wall_ns={}",
+                    reply,
+                    msg.body.len(),
+                    to_peer,
+                    from_peer,
+                    wall.as_nanos()
+                );
             }
-            println!(
-                "original-directed-uds reply={} app_bytes={} to_peer_bytes={} from_peer_bytes={} host_component_wall_ns={}",
-                reply,
-                msg.body.len(),
-                to_peer,
-                from_peer,
-                wall.as_nanos()
-            );
-        }
+        });
     }
 }

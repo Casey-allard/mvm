@@ -502,76 +502,78 @@ mod tests {
 
     #[test]
     fn ordinal_guest_store_recovers_only_the_original_pending_and_signed_settlement() {
-        let root = tempfile::Builder::new()
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .unwrap();
-        let uid = root.path().metadata().unwrap().uid();
-        let (boot, msg, receipt, b) = fixture();
-        let h = handle(&boot, 1);
-        let key = Arc::new(Key::random());
-        let mut d =
-            OrdinalOutbox::open_for(root.path(), &boot, uid, true, Arc::clone(&key)).unwrap();
-        d.stage(h, &msg.body, 150).unwrap();
-        assert!(d.stage(h, b"changed", 150).is_err());
-        assert!(d.stage(handle(&boot, 2), b"second", 150).is_err());
-        let signed = sign_receipt(receipt, &b).unwrap();
-        let mut other = signed.receipt.clone();
-        other.ciphertext_commitment = [23; 32];
-        let conflicting = sign_receipt(other, &b).unwrap();
-        let forged =
-            sign_receipt(signed.receipt.clone(), &SigningKey::from_bytes(&[71; 32])).unwrap();
-        assert!(d.record_receipt(&forged, 150).is_err());
-        d.record_receipt(&signed, 150).unwrap();
-        assert!(d.record_receipt(&conflicting, 150).is_err());
-        assert!(
-            matches!(d.request(h,150).unwrap(),SenderRequestV1::Submit{payload,..} if payload==msg.body)
-        );
-        assert!(d.confirm(h, 1, 150).is_err());
-        drop(d);
-        assert_eq!(
-            std::fs::read(&paths(root.path(), &h.direction)[0]).unwrap(),
-            h.direction
-        );
-        assert!(
-            OrdinalOutbox::open_for(root.path(), &boot, uid, false, Arc::new(Key::random()))
-                .is_err()
-        );
-        for entry in std::fs::read_dir(root.path()).unwrap() {
+        mvm_core::util::test_env::isolated_lock_probe(|| {
+            let root = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let uid = root.path().metadata().unwrap().uid();
+            let (boot, msg, receipt, b) = fixture();
+            let h = handle(&boot, 1);
+            let key = Arc::new(Key::random());
+            let mut d =
+                OrdinalOutbox::open_for(root.path(), &boot, uid, true, Arc::clone(&key)).unwrap();
+            d.stage(h, &msg.body, 150).unwrap();
+            assert!(d.stage(h, b"changed", 150).is_err());
+            assert!(d.stage(handle(&boot, 2), b"second", 150).is_err());
+            let signed = sign_receipt(receipt, &b).unwrap();
+            let mut other = signed.receipt.clone();
+            other.ciphertext_commitment = [23; 32];
+            let conflicting = sign_receipt(other, &b).unwrap();
+            let forged =
+                sign_receipt(signed.receipt.clone(), &SigningKey::from_bytes(&[71; 32])).unwrap();
+            assert!(d.record_receipt(&forged, 150).is_err());
+            d.record_receipt(&signed, 150).unwrap();
+            assert!(d.record_receipt(&conflicting, 150).is_err());
             assert!(
-                !std::fs::read(entry.unwrap().path())
-                    .unwrap()
-                    .windows(msg.body.len())
-                    .any(|w| w == msg.body)
+                matches!(d.request(h,150).unwrap(),SenderRequestV1::Submit{payload,..} if payload==msg.body)
             );
-        }
-        let mut d =
-            OrdinalOutbox::open_for(root.path(), &boot, uid, false, Arc::clone(&key)).unwrap();
-        assert_eq!(d.status(h, 150).unwrap().as_ref(), Some(&signed));
-        let signer = SigningKey::from_bytes(&[21; 32]);
-        let digest = SenderSettlementV1::receipt_digest(&signed).unwrap();
-        assert!(d.begin_settle(h, [77; 32], &signer, 150).is_err());
-        let exact = d.begin_settle(h, digest, &signer, 150).unwrap();
-        assert_eq!(d.request(h, 200), Err(Refusal::Expired));
-        drop(d);
-        let mut d =
-            OrdinalOutbox::open_for(root.path(), &boot, uid, false, Arc::clone(&key)).unwrap();
-        assert_eq!(
-            d.request(h, 150).unwrap(),
-            SenderRequestV1::Settle {
-                statement: exact.clone()
+            assert!(d.confirm(h, 1, 150).is_err());
+            drop(d);
+            assert_eq!(
+                std::fs::read(&paths(root.path(), &h.direction)[0]).unwrap(),
+                h.direction
+            );
+            assert!(
+                OrdinalOutbox::open_for(root.path(), &boot, uid, false, Arc::new(Key::random()))
+                    .is_err()
+            );
+            for entry in std::fs::read_dir(root.path()).unwrap() {
+                assert!(
+                    !std::fs::read(entry.unwrap().path())
+                        .unwrap()
+                        .windows(msg.body.len())
+                        .any(|w| w == msg.body)
+                );
             }
-        );
-        assert!(d.confirm(h, 2, 150).is_err());
-        d.confirm(h, 1, 150).unwrap();
-        drop(d);
-        let mut d =
-            OrdinalOutbox::open_for(root.path(), &boot, uid, false, Arc::clone(&key)).unwrap();
-        assert_eq!(d.retired_prefix(), 1);
-        assert!(d.stage(h, &msg.body, 150).is_err());
-        assert_eq!(d.begin_settle(h, digest, &signer, 150).unwrap(), exact);
-        d.confirm(h, 1, 150).unwrap();
-        d.stage(handle(&boot, 2), b"second", 150).unwrap();
+            let mut d =
+                OrdinalOutbox::open_for(root.path(), &boot, uid, false, Arc::clone(&key)).unwrap();
+            assert_eq!(d.status(h, 150).unwrap().as_ref(), Some(&signed));
+            let signer = SigningKey::from_bytes(&[21; 32]);
+            let digest = SenderSettlementV1::receipt_digest(&signed).unwrap();
+            assert!(d.begin_settle(h, [77; 32], &signer, 150).is_err());
+            let exact = d.begin_settle(h, digest, &signer, 150).unwrap();
+            assert_eq!(d.request(h, 200), Err(Refusal::Expired));
+            drop(d);
+            let mut d =
+                OrdinalOutbox::open_for(root.path(), &boot, uid, false, Arc::clone(&key)).unwrap();
+            assert_eq!(
+                d.request(h, 150).unwrap(),
+                SenderRequestV1::Settle {
+                    statement: exact.clone()
+                }
+            );
+            assert!(d.confirm(h, 2, 150).is_err());
+            d.confirm(h, 1, 150).unwrap();
+            drop(d);
+            let mut d =
+                OrdinalOutbox::open_for(root.path(), &boot, uid, false, Arc::clone(&key)).unwrap();
+            assert_eq!(d.retired_prefix(), 1);
+            assert!(d.stage(h, &msg.body, 150).is_err());
+            assert_eq!(d.begin_settle(h, digest, &signer, 150).unwrap(), exact);
+            d.confirm(h, 1, 150).unwrap();
+            d.stage(handle(&boot, 2), b"second", 150).unwrap();
+        });
     }
 
     #[test]
