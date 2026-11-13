@@ -568,6 +568,22 @@ mod tests {
         feed_signature: &[u8],
         canonical: bool,
     ) -> Frame {
+        frame_with_feed(
+            kernel,
+            linux,
+            root_signature,
+            (FEED, feed_signature),
+            canonical,
+        )
+    }
+
+    fn frame_with_feed(
+        kernel: &[u8],
+        linux: &[u8],
+        root_signature: &[u8],
+        (feed, feed_signature): (&[u8], &[u8]),
+        canonical: bool,
+    ) -> Frame {
         let directory = tempfile::tempdir().unwrap();
         let archive = directory.path().join("app.mvmpkg");
         let key = SigningKey::from_bytes(&[73; 32]);
@@ -600,7 +616,7 @@ mod tests {
             ("rootfs", b"fixture workload filesystem"),
             ("linux.json", linux),
             ("linux.bundle", root_signature),
-            ("revocations.json", FEED),
+            ("revocations.json", feed),
             ("revocations.bundle", feed_signature),
         ]
         .into_iter()
@@ -831,7 +847,7 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "requires the actual pinned public kernel in MVM_TEST_CANONICAL_KERNEL; no download"]
+    #[ignore = "requires MVM_TEST_CANONICAL_KERNEL and current MVM_TEST_CANONICAL_REVOCATIONS with its adjacent signature"]
     fn genuine_owner_rejects_substitution_and_retains_failed_start_generation() {
         let kernel = std::fs::read(
             std::env::var_os("MVM_TEST_CANONICAL_KERNEL").expect("public kernel path"),
@@ -840,11 +856,17 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut env = TestEnv::new();
         env.isolate_mvm_home(home.path());
-        let frame = frame(
+        let feed_path = PathBuf::from(
+            std::env::var_os("MVM_TEST_CANONICAL_REVOCATIONS")
+                .expect("current signed revocations.json path"),
+        );
+        let feed = std::fs::read(&feed_path).unwrap();
+        let signature = std::fs::read(feed_path.with_extension("json.bundle")).unwrap();
+        let frame = frame_with_feed(
             &kernel,
             published_root::MANIFEST,
             published_root::BUNDLE,
-            FEED_SIGNATURE,
+            (&feed, &signature),
             true,
         );
         let backend = if cfg!(target_os = "linux") {
@@ -853,7 +875,7 @@ mod tests {
             BackendKind::Hvf
         };
         let owner =
-            Arc::new(prepare_with_clock(frame.capture().unwrap(), backend, inside_window).unwrap());
+            Arc::new(prepare_with_clock(frame.capture().unwrap(), backend, Utc::now).unwrap());
         let root = owner.workload_root_declaration().unwrap();
         assert_eq!(root.sha256, sha256_hex(b"fixture workload filesystem"));
         assert_eq!(root.size_bytes, b"fixture workload filesystem".len() as u64);
@@ -886,7 +908,7 @@ mod tests {
         protocols.builder_cache_contract += 1;
         assert!(owner.verify_config(&config, backend, &protocols).is_err());
         let other =
-            Arc::new(prepare_with_clock(frame.capture().unwrap(), backend, inside_window).unwrap());
+            Arc::new(prepare_with_clock(frame.capture().unwrap(), backend, Utc::now).unwrap());
         replaced = config.clone();
         replaced.canonical_kernel = Some(other);
         assert!(
