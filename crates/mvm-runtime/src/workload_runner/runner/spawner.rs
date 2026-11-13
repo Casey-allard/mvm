@@ -506,9 +506,9 @@ fn prepare_endpoint_identity(
             let material = FlowMuxIdentityMaterial::mint_from_host_signer(session_id)
                 .context("minting this boot's FlowMux identity")?;
             if let Some((original, handoff)) = registered {
-                original
-                    .check_flowmux_host_anchor(&material.host_signer_verifying_key()?.to_bytes())?;
-                handoff.observe_flowmux_guest(material.guest_verifying_key().to_bytes())?;
+                let host = material.host_signer_verifying_key()?.to_bytes();
+                original.check_flowmux_host_anchor(&host)?;
+                handoff.observe_flowmux_guest(material.guest_verifying_key().to_bytes(), host)?;
             }
             let reader_boot = mint_mailbox_reader_boot(req, material.guest_verifying_key())?;
             observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;

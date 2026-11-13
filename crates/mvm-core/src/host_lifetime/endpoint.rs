@@ -84,12 +84,13 @@ impl EndpointPartitionLimits {
 pub trait EndpointPartitionGuard: Send + Sync {
     fn check_current(&self, projection: &EndpointPartitionProjection) -> Result<()>;
 
-    /// Observe only the public key minted for the guest on this exact partition.
+    /// Observe the minted guest key and authenticated host signer on this exact partition.
     /// An observer may refuse. This notification never authorizes a peer or flow.
     fn observe_flowmux_guest(
         &self,
         _projection: &EndpointPartitionProjection,
         _guest: [u8; 32],
+        _host: [u8; 32],
     ) -> Result<()> {
         Ok(())
     }
@@ -223,13 +224,13 @@ impl PreparedEndpointHandoff {
         &self.holder
     }
 
-    /// Deliver the original public guest key to the held partition observer.
+    /// Deliver both original public verifying keys to the held partition observer.
     /// The observation confers no admission and is usable only while its owner is current.
-    pub fn observe_flowmux_guest(&self, guest: [u8; 32]) -> Result<()> {
+    pub fn observe_flowmux_guest(&self, guest: [u8; 32], host: [u8; 32]) -> Result<()> {
         self.check_current()?;
         self.partition
             .guard
-            .observe_flowmux_guest(self.partition.projection(), guest)?;
+            .observe_flowmux_guest(self.partition.projection(), guest, host)?;
         self.check_current()
     }
 
