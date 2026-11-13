@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::os::fd::FromRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -202,8 +202,35 @@ pub struct OwnedVmRegistration {
     vm: String,
     serial: u64,
     commitment: [u8; 32],
+    directories: RegisteredDirectories,
     retired: bool,
     audit: Mutex<AuditPreparation>,
+}
+
+struct RegisteredDirectories {
+    state: File,
+    socket_parent: File,
+}
+
+impl RegisteredDirectories {
+    fn capture(state: &Path, socket: &Path) -> Result<Self> {
+        let parent = socket.parent().context("registered socket parent missing")?;
+        Ok(Self {
+            state: crate::host::restore_image::open_trusted_dir(state)?,
+            socket_parent: crate::host::restore_image::open_trusted_dir(parent)?,
+        })
+    }
+
+    fn check(&self, state: &Path, socket: &Path) -> Result<()> {
+        let current = Self::capture(state, socket)?;
+        for (held, current) in [(&self.state, &current.state), (&self.socket_parent, &current.socket_parent)] {
+            let held = held.metadata()?;
+            let current = current.metadata()?;
+            ensure!((held.dev(), held.ino()) == (current.dev(), current.ino()),
+                "original registration directory changed");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -848,6 +875,26 @@ fn owned_control(
     }
 }
 impl OwnedHostAgentRegistrar {
+    /// Both handles came from the same originally held tenant agent.
+    pub fn same_original(&self, expected: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &expected.shared)
+    }
+
+    /// Compare this live tenant daemon with the holder retained by its issuer.
+    pub fn check_original_holder(&self, expected: &PreparedHostLifetimeLease) -> Result<()> {
+        self.check_current_for_tenant(&self.shared.tenant)?;
+        expected.verify_current()?;
+        let actual = &self.shared.holder;
+        ensure!(
+            actual.directory_object_id() == expected.directory_object_id()
+                && actual.holder_object_id() == expected.holder_object_id()
+                && actual.expectation() == expected.expectation(),
+            "original host agent installation holder differs"
+        );
+        expected.verify_current()?;
+        self.check_current_for_tenant(&self.shared.tenant)
+    }
+
     /// Fresh observation for installed provisioning; never a future admission grant.
     pub fn check_current_for_tenant(&self, tenant: &str) -> Result<()> {
         ensure!(tenant == self.shared.tenant, "owned helper tenant mismatch");
@@ -879,6 +926,7 @@ impl OwnedHostAgentRegistrar {
         self.shared.parent.check_registration(&params)?;
         validate_owned_host_agent_services(&params)?;
         registration_bounds(&params)?;
+        let directories = RegisteredDirectories::capture(params.state_dir, params.broker_listen_socket)?;
         let request = registration(&params, &self.shared.tenant);
         let commitment = registration_commitment(&request)?;
         self.shared.holder.verify_current()?;
@@ -924,6 +972,7 @@ impl OwnedHostAgentRegistrar {
             vm: params.vm_name.into(),
             serial,
             commitment,
+            directories,
             retired: false,
             audit: Mutex::new(AuditPreparation::default()),
         };
@@ -943,6 +992,7 @@ impl OwnedHostAgentRegistrar {
             }
             self.shared.running()
         })
+        .and_then(|()| guard.directories.check(params.state_dir, params.broker_listen_socket))
         .and_then(|()| self.shared.parent.check_registration(&params))
         .and_then(|()| self.shared.holder.verify_current());
         let mut ledger = self
@@ -982,6 +1032,13 @@ impl OwnedHostAgentRegistrar {
     }
 }
 impl OwnedVmRegistration {
+    /// Borrow both protected directory identities captured before this signed registration.
+    /// The first is the VM state directory, the second the original broker socket parent.
+    pub fn original_directories(&self, original: &OwnedHostAgentRegistrar, params: &HostAgentServicesParams<'_>) -> Result<(&File, &File)> {
+        self.check_current_for(original, params)?;
+        Ok((&self.directories.state, &self.directories.socket_parent))
+    }
+
     /// Burn this registration's single endpoint handoff before preparing any
     /// observer. Failure or Drop never permits a second independent claim.
     pub fn prepare_endpoint_audit(
@@ -1102,6 +1159,7 @@ impl OwnedVmRegistration {
         // No parent/filesystem/process observation runs under the ledger.
         self.shared.parent.check_current(&self.shared.tenant)?;
         self.shared.parent.check_registration(params)?;
+        self.directories.check(params.state_dir, params.broker_listen_socket)?;
         self.shared.holder.verify_current()?;
         self.shared.running()?;
         active()
@@ -1223,7 +1281,30 @@ impl Drop for OwnedVmRegistration {
 
 #[cfg(test)]
 mod ready_tests {
-    use super::{OwnedAuditSideband, OwnedReady};
+    use super::{OwnedAuditSideband, OwnedReady, RegisteredDirectories};
+
+    #[test]
+    fn retained_state_and_socket_directories_refuse_name_replacement() {
+        use std::os::unix::fs::DirBuilderExt;
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("state");
+        let sockets = home.path().join("sockets");
+        let socket = sockets.join("agent.sock");
+        for path in [&state, &sockets] {
+            std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        }
+        let original = RegisteredDirectories::capture(&state, &socket).unwrap();
+        original.check(&state, &socket).unwrap();
+        for path in [&state, &sockets] {
+            let saved = path.with_extension("held");
+            std::fs::rename(path, &saved).unwrap();
+            std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+            assert!(original.check(&state, &socket).is_err());
+            std::fs::remove_dir(path).unwrap();
+            std::fs::rename(saved, path).unwrap();
+            original.check(&state, &socket).unwrap();
+        }
+    }
 
     #[test]
     fn readiness_requires_an_explicit_audit_sideband_mode() {

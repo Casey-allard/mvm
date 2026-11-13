@@ -83,15 +83,8 @@ impl Preparation {
         // Capture each actual observation before any fallible post-open work.
         // This is not a pathname-to-authority constructor: the SAME original
         // parent guard validates and protects this directory before key effects.
-        let state = File::from(rustix::fs::open(
-            params.state_dir,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::NONBLOCK,
-            rustix::fs::Mode::empty(),
-        )?);
+        let (registered_state, _) = original.registration.original_directories(original.registrar, &original.params)?;
+        let state = registered_state.try_clone()?;
         custody
             .telemetry
             .as_mut()
