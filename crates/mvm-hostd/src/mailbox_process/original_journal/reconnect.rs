@@ -431,7 +431,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     fn owned_helper() -> Child {
-        std::process::Command::new("/bin/cat")
+        mvm_core::env_hygiene::helper_command("/bin/cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -235,7 +235,9 @@ impl Drop for LifetimeFixture {
     }
 }
 fn lifetime_fixture(name: &str) -> Result<LifetimeFixture> {
-    let child = std::process::Command::new("sleep").arg("40").spawn()?;
+    let child = mvm_core::env_hygiene::helper_command("sleep")
+        .arg("40")
+        .spawn()?;
     std::fs::write(
         mvm_core::config::vm_state_dir(name).join("fc.pid"),
         child.id().to_string(),
@@ -645,7 +647,7 @@ fn run_private_fixture(test_name: &str, guard_env: &str) {
     std::fs::copy(build, &helper).unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let selector = format!("mailbox_process::original_journal::paired_process_tests::{test_name}");
-    let status = std::process::Command::new(exe)
+    let status = mvm_core::env_hygiene::helper_command(exe)
         .arg(selector)
         .args(["--exact", "--ignored", "--nocapture"])
         .env(guard_env, "1")
