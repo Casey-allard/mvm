@@ -3,6 +3,23 @@ use super::stop::prepare_guest_filesystems_for_stop;
 use super::*;
 
 impl FcDriver {
+    #[cfg(target_os = "linux")]
+    pub(super) fn original_exit_report(
+        &self,
+    ) -> Result<Option<super::owned_capture::CaptureReport>> {
+        self.owned
+            .as_ref()
+            .map(|original| {
+                Ok(original
+                    .lock()
+                    .map_err(|_| anyhow!("original Firecracker custody poisoned"))?
+                    .exit_capture
+                    .as_ref()
+                    .context("original Firecracker exit worker absent")?
+                    .report())
+            })
+            .transpose()
+    }
     pub(super) fn has_original_lifetime(&self) -> bool {
         #[cfg(target_os = "linux")]
         return self.owned.is_some();
@@ -58,6 +75,8 @@ impl FcDriver {
 pub(super) struct FcRunningVm {
     #[cfg(target_os = "linux")]
     pub(super) owned: Option<std::sync::Arc<std::sync::Mutex<owned::OwnedFcState>>>,
+    #[cfg(target_os = "linux")]
+    pub(super) original_report: Option<super::owned_capture::CaptureReport>,
     pub(super) id: VmId,
     pub(super) state_dir: PathBuf,
     pub(super) pid_file: PathBuf,
@@ -83,20 +102,23 @@ impl RunningVm for FcRunningVm {
     }
 
     fn wait(&self) -> Result<VmExitStatus> {
+        self.wait_with_deadline(
+            Instant::now() + mvm_vmm::host::workload_wait::WORKLOAD_WAIT_TIMEOUT,
+        )
+    }
+
+    fn wait_with_deadline(&self, until: Instant) -> Result<VmExitStatus> {
         #[cfg(target_os = "linux")]
-        if let Some(original) = &self.owned {
-            let report = original
-                .lock()
-                .map_err(|_| anyhow!("original Firecracker custody poisoned"))?
-                .exit_capture
+        if self.owned.is_some() {
+            let report = self
+                .original_report
                 .as_ref()
-                .context("original Firecracker exit worker absent")?
-                .report();
-            return report
-                .wait(Instant::now() + mvm_vmm::host::workload_wait::WORKLOAD_WAIT_TIMEOUT);
+                .context("original Firecracker exit report absent")?;
+            return report.wait(until);
         }
-        Ok(mvm_vmm::host::workload_wait::wait_for_workload_exit(
+        Ok(mvm_vmm::host::workload_wait::wait_for_workload_exit_within(
             &self.state_dir,
+            until.saturating_duration_since(Instant::now()),
         ))
     }
 

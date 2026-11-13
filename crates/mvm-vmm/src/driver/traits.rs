@@ -387,6 +387,11 @@ pub trait RunningVm: Send {
     }
     /// Block until the VM exits; returns its status.
     fn wait(&self) -> Result<VmExitStatus>;
+    /// Observe this original handle's workload result until the supplied deadline.
+    /// Unsupported backends refuse instead of calling an unbounded wait.
+    fn wait_with_deadline(&self, _until: std::time::Instant) -> Result<VmExitStatus> {
+        anyhow::bail!("backend does not provide an original bounded workload wait")
+    }
     /// Prepare a cooperative stop while the guest is still responsive.
     fn prepare_stop(&self) -> Result<()> {
         Ok(())
