@@ -65,6 +65,37 @@ async fn machine_definitions_are_managed_with_no_cli_and_an_empty_path() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn fresh_definition_cleanup_preserves_unverified_runtime_namespaces() {
+    use mvm_core::config::{vm_socket_dir_at, vm_state_dir, vms_dir};
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("long-sdk-home-".repeat(8));
+    std::fs::create_dir(&root).unwrap();
+    let mut env = TestEnv::new();
+    env.isolate_mvm_home(&root);
+    let client = LocalBackend::with_hypervisor("mock");
+    let created = client.create_machine(definition("fresh")).await.unwrap();
+    let state = vm_state_dir("fresh");
+    let socket = vm_socket_dir_at(&state);
+    assert_ne!(state, socket);
+    let leftover = tempfile::NamedTempFile::new_in(socket.parent().unwrap())
+        .unwrap()
+        .persist_noclobber(&socket)
+        .unwrap();
+    assert!(client.remove_machine(&created.id).await.is_err());
+    assert!(socket.is_file());
+    drop(leftover);
+    std::fs::remove_file(&socket).unwrap();
+    std::os::unix::fs::symlink("missing-original", vms_dir()).unwrap();
+    assert!(client.remove_machine(&created.id).await.is_err());
+    std::fs::remove_file(vms_dir()).unwrap();
+    client.remove_machine(&created.id).await.unwrap();
+    assert!(
+        std::fs::symlink_metadata(vms_dir()).unwrap_err().kind() == std::io::ErrorKind::NotFound
+    );
+}
+
 #[tokio::test]
 async fn an_unknown_machine_is_a_typed_refusal_not_a_spawn() {
     let home = tempfile::tempdir().unwrap();

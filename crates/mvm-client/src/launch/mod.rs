@@ -1984,6 +1984,10 @@ impl LocalBackend {
 /// [`mvm_runtime::vm::reconcile::remove_runtime_dirs`].
 fn remove_vm_runtime_dirs(name: &str) -> Result<()> {
     #[cfg(unix)]
+    if crate::local::ordinary_runtime_root_absent(name).map_err(crate::local::backend_err)? {
+        return Ok(());
+    }
+    #[cfg(unix)]
     mvm_core::host_lifetime::require_no_installed_native(name)
         .map_err(crate::local::backend_err)?;
     mvm_runtime::vm::reconcile::remove_runtime_dirs(&vm_state_dir(name))

@@ -746,6 +746,45 @@ fn load_name_registry() -> Result<VmNameRegistry> {
     VmNameRegistry::load(&path).map_err(|e| backend_err(format!("loading VM name registry: {e}")))
 }
 
+/// A fresh ordinary home can hold machine definitions before its VM namespace exists.
+/// This observation authorizes no removal and supplies no installed retirement receipt.
+#[cfg(unix)]
+pub(crate) fn ordinary_runtime_root_absent(name: &str) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    mvm_core::naming::validate_vm_name(name).map_err(Error::other)?;
+    let home = mvm_core::config::mvm_home_strict()?;
+    let root = mvm_core::config::vms_dir_at(&home);
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let original = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&home)?;
+    let guard =
+        mvm_core::runtime_state_protection::RuntimeStateProtection::acquire(&home, &original)?;
+    guard.check_missing_state(&root)?;
+    let state = mvm_core::config::vm_state_dir_at(&home, name);
+    let socket = mvm_core::config::vm_socket_dir_at(&state);
+    if socket != state {
+        match std::fs::symlink_metadata(&socket) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(Error::other(
+                    "short socket namespace exists without its VM root",
+                ));
+            }
+        }
+    }
+    guard.check_missing_state(&root)?;
+    Ok(true)
+}
+
 /// Remove a stopped machine's runtime state directory.
 ///
 /// A stop that leaves it behind leaves whatever the last run put there, and a
@@ -766,6 +805,10 @@ fn load_name_registry() -> Result<VmNameRegistry> {
 /// A persistent machine — the restored-checkpoint case this exists for —
 /// reports no exit through the stop path, so it always reaps.
 pub(crate) fn remove_stopped_runtime_state(name: &str) -> Result<()> {
+    #[cfg(unix)]
+    if ordinary_runtime_root_absent(name).map_err(backend_err)? {
+        return Ok(());
+    }
     let state_dir = vm_state_dir(name);
     let transient_exit_pending = !mvm_core::config::machine_spec_path(name).exists()
         && mvm_core::exit_capture::exit_file_path(&state_dir).exists();
