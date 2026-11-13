@@ -122,6 +122,19 @@ impl RunningVm for FcRunningVm {
         ))
     }
 
+    fn original_workload_report(
+        &self,
+    ) -> Option<std::sync::Arc<dyn mvm_vmm::driver::OriginalWorkloadReport>> {
+        #[cfg(target_os = "linux")]
+        if self.owned.is_some() {
+            return self.original_report.as_ref().map(|report| {
+                std::sync::Arc::new(report.clone())
+                    as std::sync::Arc<dyn mvm_vmm::driver::OriginalWorkloadReport>
+            });
+        }
+        None
+    }
+
     fn prepare_stop(&self) -> Result<()> {
         if !self.flush_via_agent {
             return Ok(());

@@ -55,6 +55,12 @@ impl CaptureReport {
     }
 }
 
+impl mvm_vmm::driver::OriginalWorkloadReport for CaptureReport {
+    fn wait_until(&self, until: Instant) -> Result<VmExitStatus> {
+        self.wait(until)
+    }
+}
+
 /// Publish even on unwind, waking everyone with an unknown workload result.
 struct Completion {
     report: CaptureReport,
