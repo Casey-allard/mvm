@@ -212,6 +212,7 @@ pub trait VmmDriver: Send + Sync {
         spec: &VmmSpec,
         files: crate::driver::prepared_disks::PreparedBootFiles<'_>,
     ) -> Result<Box<dyn RunningVm>> {
+        files.require_no_workload_root()?;
         files.require_no_data()?;
         anyhow::ensure!(
             files.writable.is_empty(),

@@ -849,6 +849,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                                 &spec,
                                 mvm_vmm::driver::prepared_disks::PreparedBootFiles {
                                     kernel: None,
+                                    workload_root: None,
                                     writable: disks,
                                     data: None,
                                 },
