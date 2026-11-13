@@ -448,6 +448,17 @@ pub trait RunningVm: Send {
     ) -> Result<()> {
         anyhow::bail!("original Firecracker kernel owner unavailable")
     }
+    /// Open one retained original control session before activation. Unsupported
+    /// backends refuse; custody does not replace the caller's signed admission.
+    #[cfg(target_os = "linux")]
+    fn open_owned_entrypoint(
+        &self,
+        _anchor: std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        _identity: super::OriginalEntrypointIdentity,
+        _until: std::time::Instant,
+    ) -> Result<Box<dyn super::OriginalEntrypointChannel>> {
+        anyhow::bail!("original entrypoint control session unavailable")
+    }
     fn pause(&self) -> Result<()>;
     fn resume(&self) -> Result<()>;
     fn status(&self) -> Result<VmStatus>;

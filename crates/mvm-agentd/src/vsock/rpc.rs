@@ -872,8 +872,8 @@ pub fn send_exec_on_authenticated_session(
 
 /// One original entrypoint verb on an already authenticated session. Never
 /// negotiates, reopens, resets counters, or retries a partial protected frame.
-pub fn send_entrypoint_on_authenticated_session(
-    stream: &mut UnixStream,
+pub fn send_entrypoint_on_authenticated_session<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
     session: &mut AuthenticatedSession,
     request: &GuestRequest,
     mut on_event: impl FnMut(&EntrypointEvent),

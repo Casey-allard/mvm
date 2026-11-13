@@ -143,7 +143,7 @@ fn binding() -> HostLaunchBinding {
     }
 }
 
-fn state(root: &std::path::Path) -> OwnedFcState {
+pub(in crate::driver::fc) fn state(root: &std::path::Path) -> OwnedFcState {
     OwnedFcState {
         binding: binding(),
         lease: Some(lease(root)),
@@ -152,6 +152,7 @@ fn state(root: &std::path::Path) -> OwnedFcState {
         spawn_attempted: false,
         retired: false,
         authenticated: false,
+        entrypoint_opened: false,
         exit_capture: None,
     }
 }
@@ -230,7 +231,7 @@ fn child(state: &mut OwnedFcState) {
     state.record_spawn(Ok((child, original))).unwrap();
 }
 
-fn kernel_anchor(
+pub(in crate::driver::fc) fn kernel_anchor(
     lease: &PreparedHostLifetimeLease,
     binding: HostLaunchBinding,
 ) -> Arc<mvm_core::host_lifetime::HostLifetimeAnchor> {

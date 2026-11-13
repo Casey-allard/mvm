@@ -47,6 +47,8 @@ use mvm_vmm::host::boot_config::{
 
 mod config;
 mod dial;
+#[cfg(target_os = "linux")]
+mod entrypoint;
 mod kernel;
 #[cfg(target_os = "linux")]
 pub mod original;
