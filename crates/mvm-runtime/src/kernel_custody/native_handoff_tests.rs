@@ -13,6 +13,12 @@ fn prepared_owner(backend: BackendKind) -> Arc<PreparedCanonicalLinux> {
         std::env::var_os("MVM_TEST_CANONICAL_KERNEL").expect("actual pinned public kernel"),
     )
     .unwrap();
+    let revocations = std::path::PathBuf::from(
+        std::env::var_os("MVM_TEST_CANONICAL_REVOCATIONS")
+            .expect("current signed revocations.json"),
+    );
+    let feed = std::fs::read(&revocations).unwrap();
+    let signature = std::fs::read(revocations.with_extension("json.bundle")).unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[74; 32]);
     struct Publisher(ed25519_dalek::VerifyingKey);
     impl TrustStore for Publisher {
@@ -24,8 +30,8 @@ fn prepared_owner(backend: BackendKind) -> Arc<PreparedCanonicalLinux> {
         ("kernel", kernel),
         ("linux.json", published_root::MANIFEST.to_vec()),
         ("linux.bundle", published_root::BUNDLE.to_vec()),
-        ("revocations.json", include_bytes!("../../../mvm-core/tests/fixtures/image-set-revocations/revocation-list-v1/revocations.json").to_vec()),
-        ("revocations.bundle", include_bytes!("../../../mvm-core/tests/fixtures/image-set-revocations/revocation-list-v1/revocations.json.bundle").to_vec()),
+        ("revocations.json", feed),
+        ("revocations.bundle", signature),
     ];
     for name in [
         "runtime.tar.gz",
@@ -94,7 +100,7 @@ fn prepared_owner(backend: BackendKind) -> Arc<PreparedCanonicalLinux> {
 }
 
 #[test]
-#[ignore = "actual pinned public kernel required; no VM, download, or native runtime authentication"]
+#[ignore = "actual pinned public kernel and current signed revocations required; no VM, download, or native runtime authentication"]
 fn exact_final_config_and_physical_recipe_are_checked_before_native_effects() {
     // Isolate process-wide payload registration from every other test.
     const MARKER: &str = "MVM_KERNEL_HANDOFF_UNIT_CHILD";
@@ -106,6 +112,10 @@ fn exact_final_config_and_physical_recipe_are_checked_before_native_effects() {
             .env(
                 "MVM_TEST_CANONICAL_KERNEL",
                 std::env::var_os("MVM_TEST_CANONICAL_KERNEL").unwrap(),
+            )
+            .env(
+                "MVM_TEST_CANONICAL_REVOCATIONS",
+                std::env::var_os("MVM_TEST_CANONICAL_REVOCATIONS").unwrap(),
             )
             .output()
             .unwrap();
@@ -273,7 +283,7 @@ fn bound_firecracker_launch(
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires the actual pinned public kernel in MVM_TEST_CANONICAL_KERNEL; boots no VM"]
+#[ignore = "requires the actual pinned public kernel and current signed revocations; boots no VM"]
 fn observe_booted_binds_the_firecracker_process_witness_not_an_hvf_instance() {
     let home = tempfile::tempdir().unwrap();
     let mut env = TestEnv::new();
@@ -369,7 +379,7 @@ fn observe_booted_binds_the_firecracker_process_witness_not_an_hvf_instance() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires the actual pinned public kernel; no boot or external I/O"]
+#[ignore = "requires the actual pinned public kernel and current signed revocations; no boot or external I/O"]
 fn installed_release_binds_original_generation_fd_and_exact_grant() {
     use mvm_core::host_lifetime::{
         HostLaunchBinding, HostLeaseExpectation, HostLifetimeInputs, PreparedHostLifetime,
