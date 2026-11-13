@@ -68,3 +68,29 @@ fn a_successful_observer_and_original_child_are_returned_together() {
     assert_eq!(child.id(), original_id);
     assert!(status.success());
 }
+
+#[test]
+fn an_unwinding_observer_returns_its_original_child() {
+    let mut captured = None;
+    let failure = waiting_child()
+        .spawn_retained::<()>(|child| {
+            captured = Some(child.id());
+            panic!("synthetic observer failure details");
+        })
+        .unwrap_err();
+    let RetainedSpawnFailure::Spawned {
+        mut child,
+        observation,
+        error,
+    } = failure
+    else {
+        panic!("lost original spawned child on observer unwind")
+    };
+    let same_process = Some(child.id()) == captured;
+    let still_running = child.try_wait().unwrap().is_none();
+    drop(child.stdin.take());
+    let status = child.wait().unwrap();
+    assert!(same_process && still_running && status.success());
+    assert!(observation.is_none());
+    assert_eq!(error.to_string(), "original child observer panicked");
+}
