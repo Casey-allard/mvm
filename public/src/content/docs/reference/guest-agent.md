@@ -67,6 +67,14 @@ session through `ActivateEnvironment`, one non-streaming `RunEntrypoint`, and
 an optional terminal `SyncFilesystems`. The guest control key is established
 on that connection; it is separate from the FlowMux identity drive's key.
 
+For an installed direct TCP guest, the admitted plan selects ephemeral output
+and grants exactly `activate-environment` and `run-entrypoint`. After VM
+registration, the host checks its existing signing key against the registered
+public key and issues the guest-specific grant once. The host puts that grant
+and `mvm.require_grant=1` in the original boot arguments. Activation verifies
+the same envelope against the VM name, plan nonce, validity window and
+registered host. A previous launch's per-name grant file plays no role.
+
 The embedding caller still owns signed-plan admission, current authorization,
 the admitted workload entrypoint, input/environment limits, and audit routing.
 The channel grants no arbitrary command execution, shell or guest network
