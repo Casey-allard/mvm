@@ -10,6 +10,8 @@ use std::{
     time::Instant,
 };
 
+pub mod worker_terms;
+
 #[derive(Debug)]
 enum OriginalExit {
     Kernel(OwnedFd),
@@ -73,6 +75,28 @@ impl OriginalProcess {
         );
         self.require_live()?;
         peer.require_live()
+    }
+    /// Verify the actual child retained the explicitly inherited holder object.
+    /// Descriptor inheritance preserves its lock description; object identity
+    /// alone would not prove that an independently reopened file holds a lock.
+    pub fn verify_inherited_holder(&self, lease: &PreparedHostLifetimeLease) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        self.require_live()?;
+        let metadata = std::fs::metadata(format!(
+            "/proc/{}/fd/{}",
+            self.pid,
+            lease.holder().as_raw_fd()
+        ))
+        .context("original child did not retain its inherited holder")?;
+        ensure!(
+            metadata.is_file()
+                && (metadata.dev(), metadata.ino()) == lease.holder_object_id()
+                && metadata.uid() == lease.owner_uid()
+                && metadata.mode() & 0o7777 == 0o600
+                && metadata.nlink() == 1,
+            "original child holder object differs from its retained lease"
+        );
+        self.require_live()
     }
     fn signal(&self, signal: libc::c_int) -> Result<()> {
         let OriginalExit::Kernel(fd) = &self.exit else {
@@ -177,6 +201,11 @@ impl OriginalLifetime {
     }
     pub fn process(&self) -> Result<&OriginalProcess> {
         self.process
+            .as_ref()
+            .context("original lifetime already collected")
+    }
+    pub fn lease(&self) -> Result<&PreparedHostLifetimeLease> {
+        self.lease
             .as_ref()
             .context("original lifetime already collected")
     }

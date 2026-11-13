@@ -43,8 +43,16 @@ pub(super) fn require_guest_filesystem_flush(response: GuestResponse) -> Result<
 }
 
 pub(super) fn prepare_guest_filesystems_for_stop(vsock_uds: &str) -> Result<()> {
+    prepare_guest_filesystems_for_stop_with(vsock_uds, |_| Ok(()))
+}
+
+pub(super) fn prepare_guest_filesystems_for_stop_with(
+    vsock_uds: &str,
+    authenticate: impl FnOnce(&std::os::unix::net::UnixStream) -> Result<()>,
+) -> Result<()> {
     let mut stream = connect_to_port(vsock_uds, GUEST_AGENT_PORT, GUEST_STOP_DRAIN_TIMEOUT_SECS)
         .with_context(|| format!("connect to guest agent for filesystem flush via {vsock_uds}"))?;
+    authenticate(&stream)?;
     let response = send_request_stream(
         &mut stream,
         &GuestRequest::SleepPrep {

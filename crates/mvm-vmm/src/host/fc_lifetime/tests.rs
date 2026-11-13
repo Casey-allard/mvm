@@ -174,3 +174,53 @@ fn retirement_preserves_original_lease_and_can_finish_after_admission_closes() {
     assert!(proof.lease().verify_current().is_err());
     assert!(original.confirm_exit(Instant::now()).is_err());
 }
+
+#[test]
+fn an_inherited_holder_keeps_exclusion_after_every_parent_copy_is_dropped() {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let lease = lease(root.path());
+    let contender = File::options()
+        .read(true)
+        .write(true)
+        .open(root.path().join("holder.lock"))
+        .unwrap();
+    let mut command = mvm_core::env_hygiene::helper_command("/bin/cat");
+    command.stdin(Stdio::piped()).stdout(Stdio::null());
+    crate::host::restore_image::inherit_descriptors(&mut command, vec![lease.holder().as_raw_fd()]);
+    let mut child = OriginalChild(command.spawn().unwrap());
+    let original = OriginalProcess::observe(&mut child.0).unwrap();
+    original.verify_inherited_holder(&lease).unwrap();
+    drop(lease);
+    assert!(
+        rustix::fs::flock(
+            &contender,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        )
+        .is_err()
+    );
+    drop(child.0.stdin.take());
+    assert!(child.0.wait().unwrap().success());
+    assert_eq!(
+        original.wait_exit(Instant::now()).unwrap(),
+        ProcessExitWait::Exited
+    );
+    rustix::fs::flock(
+        &contender,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_uninherited_holder_is_refused_while_the_original_child_is_alive() {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let lease = lease(root.path());
+    let mut command = mvm_core::env_hygiene::helper_command("/bin/cat");
+    command.stdin(Stdio::piped()).stdout(Stdio::null());
+    let mut child = OriginalChild(command.spawn().unwrap());
+    let original = OriginalProcess::observe(&mut child.0).unwrap();
+    assert!(original.verify_inherited_holder(&lease).is_err());
+    original.require_live().unwrap();
+    drop(child.0.stdin.take());
+    assert!(child.0.wait().unwrap().success());
+}

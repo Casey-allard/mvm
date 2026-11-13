@@ -52,9 +52,12 @@ mod kernel;
 pub mod original;
 
 #[cfg(target_os = "linux")]
-mod owned;
+pub(crate) mod owned;
+#[cfg(target_os = "linux")]
+mod owned_capture;
 #[cfg(target_os = "linux")]
 pub use owned::{OriginalFcNotSpawned, OwnedFcBootFailure};
+mod running;
 mod stop;
 pub use config::FcApiPut;
 use config::fc_drive_puts;
@@ -62,7 +65,8 @@ use dial::fc_guest_dial_socket;
 #[cfg(all(test, unix))]
 use kernel::fc_descriptor_recipe;
 use kernel::resolve_fc_kernel_path;
-use stop::{bind_process_to_socket, prepare_guest_filesystems_for_stop};
+use running::FcRunningVm;
+use stop::bind_process_to_socket;
 #[cfg(test)]
 use stop::{require_guest_filesystem_flush, stop_after_guest_flush, stop_firecracker_guest};
 
@@ -112,6 +116,8 @@ const MAX_VCPUS: u32 = 32;
 pub struct FcDriver {
     #[cfg(target_os = "linux")]
     original: Option<original::LaunchObservation>,
+    #[cfg(target_os = "linux")]
+    owned: Option<std::sync::Arc<std::sync::Mutex<owned::OwnedFcState>>>,
 }
 
 impl FcDriver {
@@ -119,12 +125,15 @@ impl FcDriver {
     pub fn for_original_config(original: original::LaunchObservation) -> Self {
         Self {
             original: Some(original),
+            owned: None,
         }
     }
     pub fn new() -> Self {
         Self {
             #[cfg(target_os = "linux")]
             original: None,
+            #[cfg(target_os = "linux")]
+            owned: None,
         }
     }
 }
@@ -779,9 +788,30 @@ impl FcDriver {
         // A workload whose scope limits an idle process already carries takes
         // that process instead of starting one; anything else starts its own.
         let idle_shape = crate::fc::idle_pool::IdleShape::for_launch(spec)
-            .filter(|_| handoff.is_none() && crate::fc::idle_pool::enabled());
-        let (mut firecracker_guard, claimed) =
-            start_or_claim_firecracker(spec, &state_dir, &socket, idle_shape, handoff.as_ref())?;
+            .filter(|_| handoff.is_none() && crate::fc::idle_pool::enabled())
+            .filter(|_| !self.has_original_lifetime());
+        let (mut firecracker_guard, claimed) = {
+            #[cfg(target_os = "linux")]
+            if let Some(original) = &self.owned {
+                let mut original = original
+                    .lock()
+                    .map_err(|_| anyhow!("original Firecracker custody poisoned"))?;
+                crate::fc::daemon::start_original_firecracker(
+                    crate::fc::daemon::OriginalFirecrackerSpawn {
+                        spec,
+                        directory: &state_dir,
+                        socket: &socket,
+                        handoff: handoff.as_ref(),
+                        original: &mut original,
+                    },
+                )?;
+                (FirecrackerGuard::pending(), false)
+            } else {
+                start_or_claim_firecracker(spec, &state_dir, &socket, idle_shape, handoff.as_ref())?
+            }
+            #[cfg(not(target_os = "linux"))]
+            start_or_claim_firecracker(spec, &state_dir, &socket, idle_shape, handoff.as_ref())?
+        };
         let spawned_at = Instant::now();
         tracing::debug!(
             vm = %spec.name,
@@ -797,6 +827,31 @@ impl FcDriver {
         // Firecracker behind this socket supports. All PUTs share one
         // connection: Firecracker answers keep-alive, so reusing it saves
         // ~10 connect round trips.
+        let mut session =
+            api_session(&socket).context("opening Firecracker API session for boot config")?;
+        #[cfg(target_os = "linux")]
+        if let Some(original) = &self.owned {
+            original
+                .lock()
+                .map_err(|_| anyhow!("original Firecracker custody poisoned"))?
+                .authenticate_config(session.connected_stream())?;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(held) = self.original.as_ref() {
+            let peer = original::ConfigSessionOwner::capture(session.connected_stream())?;
+            anyhow::ensure!(
+                peer.pid() == self.boot_process_id(&abs_dir)?,
+                "original Firecracker config peer differs from held launch"
+            );
+            held.bind(peer)?;
+        }
+        #[cfg(target_os = "linux")]
+        let caps = if self.has_original_lifetime() {
+            FcCapabilities::probe_session(&mut session)?
+        } else {
+            running_fc_capabilities(&socket)
+        };
+        #[cfg(not(target_os = "linux"))]
         let caps = running_fc_capabilities(&socket);
         let vsock_uds = firecracker_vsock_uds_path(&abs_dir);
         let puts = fc_config_api_puts(
@@ -806,22 +861,27 @@ impl FcDriver {
             &abs_dir,
             caps,
         );
-        let mut session =
-            api_session(&socket).context("opening Firecracker API session for boot config")?;
-        #[cfg(target_os = "linux")]
-        if let Some(held) = self.original.as_ref() {
-            let peer = original::ConfigSessionOwner::capture(session.connected_stream())?;
-            anyhow::ensure!(
-                peer.pid() == read_firecracker_pid(&abs_dir)?,
-                "original Firecracker config peer differs from held launch"
-            );
-            held.bind(peer)?;
-        }
         for put in &puts {
             api_put_session(&mut session, &put.path, &put.body)
                 .with_context(|| format!("Firecracker API PUT {}", put.path))?;
         }
         if let Some(handoff) = handoff.as_ref() {
+            #[cfg(target_os = "linux")]
+            if let Some(original) = &self.owned {
+                let original = original
+                    .lock()
+                    .map_err(|_| anyhow!("original Firecracker custody poisoned"))?;
+                crate::fc::daemon::verify_original_writable_writer(
+                    &mut session,
+                    handoff,
+                    original.process()?,
+                )?;
+                original.check_current()?;
+            } else {
+                crate::fc::io::FirecrackerIO::new(PathBuf::from(&socket))
+                    .verify_writable_writer(handoff)?;
+            }
+            #[cfg(not(target_os = "linux"))]
             crate::fc::io::FirecrackerIO::new(PathBuf::from(&socket))
                 .verify_writable_writer(handoff)?;
         }
@@ -833,6 +893,32 @@ impl FcDriver {
         // Wire the guest-dial egress/broker bridges and bind the workload-exit
         // capture — the whole host channel set must be in place before the guest
         // boots and dials out.
+        #[cfg(target_os = "linux")]
+        if let Some(original) = &self.owned {
+            let mut original = original
+                .lock()
+                .map_err(|_| anyhow!("original Firecracker custody poisoned"))?;
+            original.check_current()?;
+            anyhow::ensure!(
+                original.exit_capture.is_none(),
+                "original exit worker already armed"
+            );
+            crate::run_sidecars::remove_stale_marker(&mvm_core::exit_capture::exit_file_path(
+                &state_dir,
+            ))?;
+            crate::run_sidecars::remove_stale_marker(&mvm_core::usage_capture::usage_file_path(
+                &state_dir,
+            ))?;
+            crate::run_sidecars::clear_prior_run(&state_dir);
+            wire_guest_dial_bridges(&spec.vsock, &runtime_dir)?;
+            original.exit_capture = Some(owned_capture::CaptureWorker::spawn(
+                &fc_guest_dial_socket(&runtime_dir, WORKLOAD_EXIT_PORT),
+                &state_dir,
+            )?);
+        } else {
+            arm_host_channels(&spec.vsock, &state_dir, &runtime_dir)?;
+        }
+        #[cfg(not(target_os = "linux"))]
         arm_host_channels(&spec.vsock, &state_dir, &runtime_dir)?;
 
         let configured_at = Instant::now();
@@ -843,6 +929,7 @@ impl FcDriver {
         );
 
         // Boot the configured instance (same session).
+        self.check_original_lifetime()?;
         api_put_session(
             &mut session,
             "/actions",
@@ -879,7 +966,13 @@ impl FcDriver {
             // rejected config) rather than waiting out the full agent deadline.
             // The console log carries the actionable detail. Probed ownership-
             // independently of who owns the process.
-            if !crate::fc::is_vm_running(&pid_file_str)? {
+            let running = if self.has_original_lifetime() {
+                self.check_original_lifetime()?;
+                true
+            } else {
+                crate::fc::is_vm_running(&pid_file_str)?
+            };
+            if !running {
                 bail!(
                     "Firecracker process for '{}' exited before its guest agent came up; see {}/console.log",
                     spec.name,
@@ -893,9 +986,10 @@ impl FcDriver {
             // no stable host event for "the guest bound this vsock port", so
             // retain this bounded compatibility poll with one CONNECT attempt
             // per probe and verify VMM identity on every pass above.
-            if connect_to_port_once(&vsock_uds, GUEST_AGENT_PORT, AGENT_READY_PROBE_TIMEOUT_SECS)
-                .is_ok()
+            if let Ok(stream) =
+                connect_to_port_once(&vsock_uds, GUEST_AGENT_PORT, AGENT_READY_PROBE_TIMEOUT_SECS)
             {
+                self.authenticate_original_channel(&stream)?;
                 break;
             }
             if Instant::now() >= deadline {
@@ -922,15 +1016,18 @@ impl FcDriver {
             crate::fc::idle_pool::refill_in_background(shape);
         }
 
+        self.check_original_lifetime()?;
         let vm = Box::new(FcRunningVm {
             id: VmId(spec.name.clone()),
             state_dir,
             pid_file,
-            pid: Some(read_firecracker_pid(&abs_dir).with_context(|| {
+            pid: Some(self.boot_process_id(&abs_dir).with_context(|| {
                 format!("capture Firecracker pid for '{}' after boot", spec.name)
             })?),
             vsock_uds,
             flush_via_agent: spec.serves_guest_agent(),
+            #[cfg(target_os = "linux")]
+            owned: self.owned.clone(),
         });
         firecracker_guard.defuse();
         Ok(vm)
@@ -938,6 +1035,21 @@ impl FcDriver {
 }
 
 impl VmmDriver for FcDriver {
+    fn supports_host_lifetime(&self) -> bool {
+        cfg!(target_os = "linux")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn boot_custodied_with_host_lifetime(
+        &self,
+        spec: &VmmSpec,
+        files: mvm_vmm::driver::prepared_disks::PreparedBootFiles<'_>,
+        lease: mvm_core::host_lifetime::PreparedHostLifetimeLease,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<Box<dyn RunningVm>> {
+        owned::boot(self, spec, files, lease, binding)
+    }
+
     fn name(&self) -> &str {
         "firecracker"
     }
@@ -1307,6 +1419,7 @@ impl VmmDriver for FcDriver {
     }
 
     fn attach(&self, id: &VmId) -> Result<Box<dyn RunningVm>> {
+        mvm_core::host_lifetime::require_no_installed_native(&id.0)?;
         // The handle is entirely disk-backed (the fc.pid marker + the persisted
         // workload-exit code under the VM's state dir), so reattaching is just
         // re-deriving those paths — no live boot state to recover.
@@ -1332,6 +1445,8 @@ impl VmmDriver for FcDriver {
             // A reattached handle cannot see the boot spec; keep the flush,
             // which is what every workload guest needs.
             flush_via_agent: true,
+            #[cfg(target_os = "linux")]
+            owned: None,
         }))
     }
 
@@ -1341,129 +1456,6 @@ impl VmmDriver for FcDriver {
 
     fn host_dial_route(&self, state_dir: &Path, _port: u32) -> Option<HostDialRoute> {
         Some(dial::mux_route(state_dir))
-    }
-}
-
-/// A live Firecracker VM: the detached `firecracker` daemon tracked by its PID
-/// file, with the workload's exit code persisted under its state dir and the
-/// vsock mux UDS for host→guest dials.
-struct FcRunningVm {
-    id: VmId,
-    state_dir: PathBuf,
-    pid_file: PathBuf,
-    /// Process identity captured while attaching, before any sidecar teardown
-    /// can remove the recovery marker. `None` represents an already-stopped VM.
-    pid: Option<u32>,
-    /// The single host-side vsock mux UDS (`<state_dir>/runtime/v.sock`); the
-    /// host dials guest ports through the CONNECT handshake on this socket.
-    vsock_uds: String,
-    /// Whether stopping asks the guest agent to flush filesystems first. False
-    /// for a guest booted without an agent port (a builder or Stage 0 guest),
-    /// which has no agent to ask and flushes its own disks before halting.
-    flush_via_agent: bool,
-}
-
-impl RunningVm for FcRunningVm {
-    fn id(&self) -> &VmId {
-        &self.id
-    }
-
-    fn host_process_id(&self) -> Option<u32> {
-        self.pid
-    }
-
-    fn wait(&self) -> Result<VmExitStatus> {
-        Ok(mvm_vmm::host::workload_wait::wait_for_workload_exit(
-            &self.state_dir,
-        ))
-    }
-
-    fn prepare_stop(&self) -> Result<()> {
-        if !self.flush_via_agent {
-            return Ok(());
-        }
-        let Some(pid) = self.pid else {
-            return Ok(());
-        };
-        if !crate::fc::is_firecracker_pid_running(pid)? {
-            return Ok(());
-        }
-        let started = Instant::now();
-        let result = prepare_guest_filesystems_for_stop(&self.vsock_uds);
-        tracing::debug!(
-            ms = started.elapsed().as_secs_f64() * 1000.0,
-            ok = result.is_ok(),
-            "fc stop: guest filesystem flush"
-        );
-        result
-    }
-
-    fn kill(&self) -> Result<()> {
-        // Firecracker runs as the invoking user, so the signal is a plain
-        // kill; liveness is probed via /proc/<pid>/comm so a recycled pid is
-        // not mistaken for the VMM. The escalation is SIGTERM → grace →
-        // SIGKILL, mirroring the raw stop path.
-        let Some(pid) = self.pid else {
-            return Ok(());
-        };
-        if !crate::fc::is_firecracker_pid_running(pid)? {
-            remove_pid_marker_if_matches(&self.pid_file, pid);
-            return Ok(());
-        }
-        terminate_firecracker_pid(&self.id.0, pid, &self.pid_file)
-    }
-
-    fn process_identity(&self) -> Result<Option<mvm_vmm::host::process_identity::ProcessIdentity>> {
-        let Some(pid) = self.pid else {
-            return Ok(None);
-        };
-        let socket = crate::fc::fc_api_socket_path(&self.state_dir.to_string_lossy());
-        bind_process_to_socket(
-            &self.id.0,
-            pid,
-            |pid| crate::fc::is_firecracker_for_socket(pid, Path::new(&socket)),
-            mvm_vmm::host::process_identity::ProcessIdentity::capture,
-        )
-    }
-
-    fn pause(&self) -> Result<()> {
-        // Firecracker exposes vCPU pause via the control API; reuse the existing
-        // FC control helper (PATCH /vm InstanceState) keyed by the VM name.
-        crate::fc::pause_vm(&self.id.0)
-    }
-
-    fn resume(&self) -> Result<()> {
-        crate::fc::resume_vm(&self.id.0)
-    }
-
-    fn status(&self) -> Result<VmStatus> {
-        // Probe via /proc/<pid>/comm, reusing FC's own liveness helper, so a
-        // recycled pid is not mistaken for the VMM.
-        firecracker_status_with(self.pid, crate::fc::is_firecracker_pid_running)
-    }
-
-    fn vsock_connect(&self, guest_port: u32) -> Result<Box<dyn DuplexStream>> {
-        // Firecracker multiplexes every host→guest connection over the single
-        // vsock UDS, selecting the destination port via the `CONNECT <port>\n`
-        // handshake. Restricted to agent, telemetry and dev-only console data
-        // ports (a sealed prod boot registers no console listeners), mirroring
-        // the other drivers' allow-list.
-        if !super::host_dialable_port(guest_port) {
-            bail!(
-                "Firecracker driver vsock_connect supports only the agent port \
-                 ({GUEST_AGENT_PORT}), telemetry and dev console data ports ({}..={}); got {guest_port}",
-                CONSOLE_PORT_BASE + 1,
-                CONSOLE_PORT_BASE + 128,
-            );
-        }
-        let stream = connect_to_port(&self.vsock_uds, guest_port, VSOCK_CONNECT_TIMEOUT_SECS)
-            .with_context(|| {
-                format!(
-                    "connect to Firecracker vsock port {guest_port} via {}",
-                    self.vsock_uds
-                )
-            })?;
-        Ok(Box::new(stream))
     }
 }
 
@@ -1517,7 +1509,11 @@ mod tests {
         );
     }
 
-    fn spec_with(kernel: KernelImage, vsock: Vec<VsockPort>, blocks: Vec<BlockDev>) -> VmmSpec {
+    pub(super) fn spec_with(
+        kernel: KernelImage,
+        vsock: Vec<VsockPort>,
+        blocks: Vec<BlockDev>,
+    ) -> VmmSpec {
         VmmSpec {
             name: "w".into(),
             kernel,
@@ -2421,6 +2417,8 @@ mod tests {
             pid: Some(4242),
             vsock_uds: "/state/gone-vm/runtime/v.sock".into(),
             flush_via_agent: true,
+            #[cfg(target_os = "linux")]
+            owned: None,
         };
         let _guard = mvm_vmm::host::shell::mock::install_handler(|script| {
             if script.starts_with("cat ") {
@@ -2444,6 +2442,8 @@ mod tests {
             pid: None,
             vsock_uds: "/state/never-started-vm/runtime/v.sock".into(),
             flush_via_agent: true,
+            #[cfg(target_os = "linux")]
+            owned: None,
         };
         vm.prepare_stop().expect("there is no guest to flush");
     }
@@ -2457,6 +2457,8 @@ mod tests {
             pid: Some(4242),
             vsock_uds: "/state/measured-vm/runtime/v.sock".into(),
             flush_via_agent: true,
+            #[cfg(target_os = "linux")]
+            owned: None,
         };
         assert_eq!(vm.host_process_id(), Some(4242));
     }
@@ -2698,6 +2700,8 @@ mod tests {
             pid: None,
             vsock_uds: "/nonexistent/runtime/v.sock".into(),
             flush_via_agent: true,
+            #[cfg(target_os = "linux")]
+            owned: None,
         };
         // In range but no listener ⇒ a connect error (not an allow-list refusal).
         let in_range = vm
@@ -2978,6 +2982,8 @@ mod tests {
                 pid: None,
                 vsock_uds: vsock.to_string_lossy().into_owned(),
                 flush_via_agent: true,
+                #[cfg(target_os = "linux")]
+                owned: None,
             };
 
             let mut s = vm.vsock_connect(port).unwrap();
