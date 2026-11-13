@@ -82,6 +82,7 @@ fn a_wrong_original_shape_is_refused_with_the_unchanged_unspawned_lease() {
         super::super::tests::spec_with(mvm_vmm::driver::spec::KernelImage::Bundled, vec![], vec![]);
     let files = PreparedBootFiles {
         kernel: None,
+        workload_root: None,
         writable: PreparedWritableDisks::empty(),
         data: None,
     };
@@ -109,6 +110,7 @@ fn original_custody_survives_a_kernel_recipe_refusal_before_spawn() {
         super::super::tests::spec_with(mvm_vmm::driver::spec::KernelImage::Bundled, vec![], vec![]);
     let files = PreparedBootFiles {
         kernel: None,
+        workload_root: None,
         writable: PreparedWritableDisks::empty(),
         data: None,
     };
