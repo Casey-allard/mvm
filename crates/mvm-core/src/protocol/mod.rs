@@ -1,7 +1,7 @@
 //! Wire protocol, signing, routing, and the VmBackend trait contract.
 
-pub mod broker_control;
 pub mod audit_inventory;
+pub mod broker_control;
 pub mod handler;
 pub mod hvf_control;
 #[allow(clippy::module_inception)]

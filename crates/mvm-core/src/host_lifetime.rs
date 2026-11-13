@@ -350,10 +350,16 @@ impl DirectNetworkBinding {
         if config.network_policy.payload_mapping().is_none() {
             return Ok(None);
         }
-        ensure!(plan.ingress.is_empty() && plan.secrets.is_empty(),
-            "selected direct endpoint does not serve requested ingress or secrets");
+        ensure!(
+            plan.ingress.is_empty() && plan.secrets.is_empty(),
+            "selected direct endpoint does not serve requested ingress or secrets"
+        );
         Ok(Some(Self {
-            plan: crate::policy::direct_plan::AdmittedNetworkPlan::from_plan(plan, &config.name, &config.network_policy)?,
+            plan: crate::policy::direct_plan::AdmittedNetworkPlan::from_plan(
+                plan,
+                &config.name,
+                &config.network_policy,
+            )?,
             limits: plan.effective_network_limits()?,
             redaction: plan.redaction.clone(),
         }))
@@ -409,10 +415,13 @@ impl HostLifetimeAnchor {
     /// Match retained native disposal evidence after the grant has closed.
     /// Freshness is a launch/dispatch check. Disposal compares held objects.
     pub fn check_original_lease(&self, lease: &PreparedHostLifetimeLease) -> Result<()> {
-        ensure!(self.lease.directory_object_id() == lease.directory_object_id()
-            && self.lease.holder_object_id() == lease.holder_object_id()
-            && self.lease.owner_uid() == lease.owner_uid()
-            && self.lease.expectation() == lease.expectation(), "native disposal belongs to a different original holder");
+        ensure!(
+            self.lease.directory_object_id() == lease.directory_object_id()
+                && self.lease.holder_object_id() == lease.holder_object_id()
+                && self.lease.owner_uid() == lease.owner_uid()
+                && self.lease.expectation() == lease.expectation(),
+            "native disposal belongs to a different original holder"
+        );
         Ok(())
     }
 

@@ -119,7 +119,9 @@ impl ProcessExitObserver {
     /// Duplicate the existing kernel observation without looking up the PID again.
     /// The original Child remains with its owner for collection.
     pub fn duplicate_event_descriptor(&self) -> io::Result<Option<std::os::fd::OwnedFd>> {
-        self.event_fd().map(|event| event.try_clone_to_owned()).transpose()
+        self.event_fd()
+            .map(|event| event.try_clone_to_owned())
+            .transpose()
     }
 
     /// Arm an observer for `pid`.

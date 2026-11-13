@@ -124,8 +124,12 @@ impl Preparation {
             .records
             .as_ref()
             .expect("original records observation");
-        let projection =
-            records::RecordsProjection::from_original(params.state_dir, state, registered_socket, records)?;
+        let projection = records::RecordsProjection::from_original(
+            params.state_dir,
+            state,
+            registered_socket,
+            records,
+        )?;
         current(handoff, audit, original, params, deadline)?;
         handoff.bind_retained_telemetry_files(
             params.state_dir,

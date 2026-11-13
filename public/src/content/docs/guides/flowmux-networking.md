@@ -13,14 +13,28 @@ service available; omitting it leaves networking closed. Retired raw-stack
 fields and packet-tunnel plan values are rejected with migration guidance
 instead of silently selecting another path.
 
-In this contributor build, an optional `payload_mapping` on the network policy
-identifies a cooperating TCP peer by host, port, TLS name, public-key pin and
-mapping profile. Admission binds the complete policy to the signed plan. Every
-connection still requires an ordinary egress grant. The current launcher
-refuses a required mapping before VM startup because it cannot hand the
-endpoint an original reservation for the codec workers and cache. Configuring
-the endpoint subprocess directly also refuses the selection before it binds a
-socket. Ordinary FlowMux networking uses a policy with the field omitted.
+The contributor SDK exposes an opt-in direct TCP payload mapping through
+`LocalBackend::try_launch_with_host_lifetime_and_direct_policy`. The operator
+provides an externally signed plan for a local portable bundle, the cooperating
+peer mapping and routes covered by its signed `network_policy` digest, and an
+installation owner that funds the endpoint. A mapped `OpenTcp` first passes
+the ordinary destination and protocol checks. The installed endpoint authenticates
+the enrolled peer on that same TCP connection before exchanging object data.
+Omitting the mapping keeps the ordinary FlowMux path.
+
+The selected endpoint uses the original registration's audit signer and bounded
+worker and cache allocation. On Linux, the process address-space limit must fit
+within the reservation. A failed peer handshake closes that connection and
+returns the stream reservation. Guest ingress, UDP, typed HTTP, secret
+substitution and delegated proxies have no selected mapping in this profile.
+Starting the endpoint binary alone cannot select it.
+
+The SDK checks the native backend's lifetime support before launch. Releasing a
+VM reservation requires the original owner's proof of disposal or a proved
+pre-spawn refusal. A successful endpoint shutdown settles its own allocation.
+For a Linux VMM that has started, the kernel exit observation must match both
+the launch binding and the held installation lease. A missing process ID or
+socket cannot settle the VM reservation.
 
 ```sh
 mvmctl machine run \

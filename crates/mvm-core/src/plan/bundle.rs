@@ -115,6 +115,8 @@ pub use declarations::{
 };
 #[cfg(feature = "host-state")]
 pub use lookup::existing_local_build_key;
+#[cfg(feature = "host-state")]
+pub use lookup::read_exact_bundle_archive;
 pub use lookup::{
     BundleResolveError, BundleResolver, FsBundleResolver, FsTrustStore, LocalBundleTrustStore,
     TrustStore,
@@ -122,8 +124,6 @@ pub use lookup::{
 pub use signer::ManifestSigner;
 #[cfg(feature = "host-state")]
 pub(crate) use stream::archive_sha256;
-#[cfg(feature = "host-state")]
-pub use lookup::read_exact_bundle_archive;
 // The streaming archive I/O half of the bundle surface (seal/verify/install)
 // is host-state; the captured-canonical-inputs type stays because
 // `canonical_linux::PreparedCanonicalLinux` holds one and is named by

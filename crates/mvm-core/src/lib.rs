@@ -23,11 +23,10 @@ pub mod runtime_catalog;
 // The `MvmClient` machine-driving facade (trait + DTOs + mock + remote gateway).
 // Off by default so the runtime-free closure never pulls `async-trait`; enabled
 // by `mvm-client`, which adds the in-process `LocalBackend`.
+pub mod bounded_owned_json;
 /// The denylist for environment variables that change what a process loads or
 /// runs, applied to guest env passthrough and to every host helper spawn.
 pub mod bounded_run;
-pub mod bounded_owned_json;
-pub mod runtime_state_protection;
 #[cfg(feature = "client")]
 pub mod client;
 pub mod cold_build;
@@ -82,6 +81,7 @@ pub mod launch_trace;
 pub mod mailbox;
 /// Shared backoff for polls that wait on a condition.
 pub mod poll_backoff;
+pub mod runtime_state_protection;
 /// Per-VM host bounds on a VMM process through a transient systemd scope on
 /// the user's own manager — the one mechanism that both places an unprivileged
 /// process under cgroup v2 CPU, memory and task limits and reports back what is

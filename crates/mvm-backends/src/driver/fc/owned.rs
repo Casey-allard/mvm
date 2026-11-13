@@ -43,18 +43,27 @@ pub(super) struct OwnedFcState {
 impl OwnedFcState {
     fn observe_original(&mut self) -> Result<()> {
         if self.lifetime.is_none() {
-            let child = self.child.as_mut().context("original spawned child absent")?;
+            let child = self
+                .child
+                .as_mut()
+                .context("original spawned child absent")?;
             let process = OriginalProcess::observe(child)?;
             let lease = self.lease.take().context("original process lease absent")?;
             self.lifetime = Some(OriginalLifetime::from_observed(
-                self.binding.clone(), lease, process,
+                self.binding.clone(),
+                lease,
+                process,
             ));
         }
         Ok(())
     }
     pub fn stop_original(&mut self, until: Instant) -> Result<()> {
         self.observe_original()?;
-        let process = self.lifetime.as_ref().context("original lifetime absent")?.process()?;
+        let process = self
+            .lifetime
+            .as_ref()
+            .context("original lifetime absent")?
+            .process()?;
         if process.wait_exit(Instant::now())? != ProcessExitWait::Exited {
             process.terminate()?;
             let grace = until.min(Instant::now() + crate::driver::libkrun_process::STOP_TIMEOUT);
@@ -65,13 +74,19 @@ impl OwnedFcState {
                 }
             }
         }
-        let child = self.child.as_mut().context("original child custody absent")?;
+        let child = self
+            .child
+            .as_mut()
+            .context("original child custody absent")?;
         collect_after_exit_event(until, || child.try_wait())?;
         Ok(())
     }
     pub fn collect_original(&mut self, until: Instant) -> Result<ConfirmedExit> {
         self.stop_original(until)?;
-        self.lifetime.as_mut().context("original lifetime absent")?.confirm_exit(until)
+        self.lifetime
+            .as_mut()
+            .context("original lifetime absent")?
+            .confirm_exit(until)
     }
 }
 
@@ -84,14 +99,19 @@ pub struct OwnedFcBootFailure {
 }
 impl OwnedFcBootFailure {
     pub fn collect_original(&mut self, until: Instant) -> Result<ConfirmedExit> {
-        self.original.get_mut()
+        self.original
+            .get_mut()
             .map_err(|_| anyhow::anyhow!("original Firecracker custody poisoned"))?
             .collect_original(until)
     }
 }
 impl fmt::Display for OwnedFcBootFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "original Firecracker boot custody retained: {}", self.error)
+        write!(
+            f,
+            "original Firecracker boot custody retained: {}",
+            self.error
+        )
     }
 }
 impl std::error::Error for OwnedFcBootFailure {

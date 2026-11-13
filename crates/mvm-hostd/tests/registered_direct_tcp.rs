@@ -184,7 +184,9 @@ impl mvm_vmm::host::host_agent_spawn::RegisteredEndpointOwner for ArchiveRetry {
         let key = file.verifying_key();
         let opening = mvm_core::protocol::audit_inventory::verify(file.signed_registered(), &key)?;
         let closing = mvm_core::protocol::audit_inventory::verify(
-            file.signed_terminal().ok_or_else(|| anyhow::anyhow!("missing signed closing inventory"))?, &key,
+            file.signed_terminal()
+                .ok_or_else(|| anyhow::anyhow!("missing signed closing inventory"))?,
+            &key,
         )?;
         ensure!(&opening == file.registered() && &closing == ended);
         ensure!(opening.same_registration(&closing));

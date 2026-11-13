@@ -73,7 +73,12 @@ fn object(metadata: &rustix::fs::Stat) -> (u64, u64) {
 }
 
 impl RecordsProjection {
-    pub(super) fn from_original(state_path: &Path, state: &File, socket: &File, records: &File) -> Result<Self> {
+    pub(super) fn from_original(
+        state_path: &Path,
+        state: &File,
+        socket: &File,
+        records: &File,
+    ) -> Result<Self> {
         let directory = state.metadata().map_err(|_| refused())?;
         let socket = socket.metadata().map_err(|_| refused())?;
         let file = check_file(records.as_fd())?;
@@ -173,11 +178,15 @@ impl InstalledTelemetryRecords {
     pub fn open_original_directories(&self) -> Result<(File, File)> {
         self.lease.check_current()?;
         let state = check_state(
-            &self.projection.state_path, self.projection.state_device, self.projection.state_inode,
+            &self.projection.state_path,
+            self.projection.state_device,
+            self.projection.state_inode,
         )?;
-        let socket = self.projection.open_registered_socket_at(
-            &mvm_core::config::vm_socket_dir_at(&self.projection.state_path),
-        )?;
+        let socket =
+            self.projection
+                .open_registered_socket_at(&mvm_core::config::vm_socket_dir_at(
+                    &self.projection.state_path,
+                ))?;
         Ok((state, socket))
     }
 

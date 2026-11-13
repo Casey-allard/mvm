@@ -266,12 +266,25 @@ impl PreparedEndpointHandoff {
     }
 
     /// Verify the network inputs against the opaque admission held by this handoff.
-    pub fn check_direct_network(&self, plan: &crate::policy::direct_plan::AdmittedNetworkPlan, limits: &crate::plan::NetworkLimits, redaction: &crate::policy::RedactionPolicy) -> Result<()> {
+    pub fn check_direct_network(
+        &self,
+        plan: &crate::policy::direct_plan::AdmittedNetworkPlan,
+        limits: &crate::plan::NetworkLimits,
+        redaction: &crate::policy::RedactionPolicy,
+    ) -> Result<()> {
         self.check_current()?;
-        let admission = self.anchor.admitted.lock().map_err(|_| anyhow::anyhow!("original admission poisoned"))?;
+        let admission = self
+            .anchor
+            .admitted
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original admission poisoned"))?;
         ensure!(
-            admission.as_ref().and_then(|record| record.direct.as_ref()).is_some_and(|direct|
-                &direct.plan == plan && &direct.limits == limits && &direct.redaction == redaction),
+            admission
+                .as_ref()
+                .and_then(|record| record.direct.as_ref())
+                .is_some_and(|direct| &direct.plan == plan
+                    && &direct.limits == limits
+                    && &direct.redaction == redaction),
             "network inputs differ from original selected admission"
         );
         Ok(())

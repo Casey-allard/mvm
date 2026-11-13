@@ -185,8 +185,10 @@ impl SignerHelper {
             let audit = mvm_core::config::workload_audit_path(&self.tenant_id, &req.vm_id);
             let state = mvm_core::config::vm_state_dir(&req.vm_id);
             let head = state.join(mvm_vmm::host::broker_services_spawn::AUDIT_SIGNER_HEAD_FILE);
-            anyhow::ensure!(workload_chain_path == audit && chain_head_secondary_path == head,
-                "funded audit paths differ from original registration");
+            anyhow::ensure!(
+                workload_chain_path == audit && chain_head_secondary_path == head,
+                "funded audit paths differ from original registration"
+            );
             mvm_core::private_fs::create_owned_private_dir(&mvm_core::config::mvm_audit_dir())?;
             mvm_vmm::host::restore_image::open_trusted_dir(&state)?;
         } else {
@@ -575,12 +577,21 @@ mod tests {
         let mut helper = SignerHelper::new("local", Some(key_path(dir.path())))
             .with_owned_resource_limits()
             .with_audit_chain_bytes(std::num::NonZeroU64::new(65536));
-        let SignerHelperRequest::RegisterVm(mut req) = register_req(dir.path(), "vm-1", "local") else {
+        let SignerHelperRequest::RegisterVm(mut req) = register_req(dir.path(), "vm-1", "local")
+        else {
             unreachable!()
         };
-        assert!(matches!(helper.dispatch(SignerHelperRequest::RegisterVm(req.clone())), SignerHelperResponse::Err { .. }));
-        req.workload_chain_path = mvm_core::config::workload_audit_path("local", "vm-1").to_string_lossy().into_owned();
-        req.chain_head_secondary_path = state.join(mvm_vmm::host::broker_services_spawn::AUDIT_SIGNER_HEAD_FILE).to_string_lossy().into_owned();
+        assert!(matches!(
+            helper.dispatch(SignerHelperRequest::RegisterVm(req.clone())),
+            SignerHelperResponse::Err { .. }
+        ));
+        req.workload_chain_path = mvm_core::config::workload_audit_path("local", "vm-1")
+            .to_string_lossy()
+            .into_owned();
+        req.chain_head_secondary_path = state
+            .join(mvm_vmm::host::broker_services_spawn::AUDIT_SIGNER_HEAD_FILE)
+            .to_string_lossy()
+            .into_owned();
         let original = match helper.dispatch(SignerHelperRequest::RegisterVm(req)) {
             SignerHelperResponse::FundedInventory { inventory, .. } => inventory,
             other => panic!("missing original inventory: {other:?}"),
