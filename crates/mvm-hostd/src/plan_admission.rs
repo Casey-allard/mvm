@@ -4681,6 +4681,17 @@ mod tests {
         let envelope = held.issue(&signer.verifying.to_bytes()).unwrap();
         assert!(held.issue(&signer.verifying.to_bytes()).is_err());
         assert!(issue().issue(&[1; 32]).is_err());
+        input.agent_verbs.as_mut().unwrap().pop();
+        let activation_only = admit_for_run(
+            &input,
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(&keys),
+            None,
+            RunPosture::on_backend(Variant::Dev, BackendKind::Firecracker),
+        )
+        .unwrap();
+        assert!(verb_grant_sidecar::installed_issuer(&activation_only, "vm-original").is_err());
         let plan = admitted.plan();
         envelope
             .grant
@@ -4691,7 +4702,7 @@ mod tests {
                 chrono::Utc::now(),
             )
             .unwrap();
-        assert_eq!(Some(envelope.grant.verbs.clone()), input.agent_verbs);
+        assert_eq!(Some(&envelope.grant.verbs), plan.agent_verbs.as_ref());
         assert_eq!(envelope.grant.not_after, plan.valid_until);
         assert!(
             envelope

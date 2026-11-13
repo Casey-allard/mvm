@@ -337,8 +337,9 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
     let stale = state_dir.join("verb-grant.json");
     std::fs::write(&stale, b"predecessor").unwrap();
     assert!(render(&config).contains("mvm.require_grant=1"));
-    assert!(
-        !render(&injected_config).contains("mvm.require_grant="),
+    assert_eq!(
+        render(&injected_config).contains("mvm.require_grant="),
+        cfg!(not(target_os = "linux")),
         "an installed boot inherited the predecessor grant by VM name"
     );
     std::fs::remove_file(stale).unwrap();

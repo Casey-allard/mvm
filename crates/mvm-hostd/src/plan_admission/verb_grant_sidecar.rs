@@ -152,12 +152,27 @@ pub(super) fn installed_issuer(
     vm_name: &str,
 ) -> Result<Option<std::sync::Arc<dyn mvm_core::vm_backend::RegisteredBootGrant>>> {
     let plan = admitted.plan();
-    Ok(grant_scope(plan, vm_name)?.map(|scope| {
-        std::sync::Arc::new(InstalledIssuer {
-            scope: std::sync::Mutex::new(Some(scope)),
-            valid_from: plan.valid_from,
-        }) as _
-    }))
+    let Some(scope) = grant_scope(plan, vm_name)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        scope.verbs.len() == 2
+            && scope
+                .verbs
+                .iter()
+                .any(|v| v.as_str() == "activate-environment")
+            && scope.verbs.iter().any(|v| v.as_str() == "run-entrypoint")
+            && plan.agent_verbs.as_deref() == Some(scope.verbs.as_slice())
+            && scope.authority.drive.is_none()
+            && scope.authority.application_terminal.is_none()
+            && plan.stream_edges.is_empty()
+            && !plan.stream_retention.persists(),
+        "registered entrypoint requires only the two admitted ephemeral verbs"
+    );
+    Ok(Some(std::sync::Arc::new(InstalledIssuer {
+        scope: std::sync::Mutex::new(Some(scope)),
+        valid_from: plan.valid_from,
+    })))
 }
 
 /// The verbs a minted grant carries, or `None` when the plan needs no grant.

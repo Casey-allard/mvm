@@ -347,7 +347,9 @@ fn find_block_device(blocks: &[mvm_vmm::driver::spec::BlockDev], source: &str) -
 }
 
 fn build_activation_environment(config: &VmStartConfig) -> Result<ActivateEnvironment> {
-    let grant = if mvm_vmm::host::cmdline::uses_installed_payload_anchor(config) {
+    let grant = if cfg!(target_os = "linux")
+        && mvm_vmm::host::cmdline::uses_installed_payload_anchor(config)
+    {
         anyhow::ensure!(
             mvm_core::plan::plan_from_admitted_json(
                 config

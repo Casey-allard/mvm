@@ -128,6 +128,8 @@ pub fn factory_parent_config(
         // dropped for the same reason and its enablement half re-derived from
         // `spec` below — a parent boots whether the guest runs an egress client,
         // never which destinations one may reach.
+        #[cfg(target_os = "linux")]
+            registered_boot_grant: _,
         name: _,
         template_id: _,
         rootfs_path: _,
@@ -207,6 +209,8 @@ pub fn factory_parent_config(
     }
 
     let parent = VmStartConfig {
+        #[cfg(target_os = "linux")]
+        registered_boot_grant: None,
         name: spec.id.clone(),
         template_id: spec.template_id.clone(),
         rootfs_path: image.to_string(),

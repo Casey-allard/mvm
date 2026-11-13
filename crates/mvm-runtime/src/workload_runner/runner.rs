@@ -600,11 +600,12 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         anyhow::ensure!(
             !cmdline::uses_installed_payload_anchor(inputs.config)
                 || (mvm_agentd::vsock::host_signer_pub_token(&inputs.cmdline).is_none()
-                    && !inputs
-                        .cmdline
-                        .split_ascii_whitespace()
-                        .any(|token| token.starts_with("mvm.verb_grant=")
-                            || token.starts_with("mvm.require_grant="))),
+                    && (!cfg!(target_os = "linux")
+                        || !inputs
+                            .cmdline
+                            .split_ascii_whitespace()
+                            .any(|token| token.starts_with("mvm.verb_grant=")
+                                || token.starts_with("mvm.require_grant=")))),
             "installed workload cmdline contains an unbound host signer anchor"
         );
         #[cfg(unix)]
