@@ -172,6 +172,23 @@ pub trait VmmDriver: Send + Sync {
     /// Boot the VM described by `spec`, returning a live handle.
     fn boot(&self, spec: &VmmSpec) -> Result<Box<dyn RunningVm>>;
 
+    /// Only concrete backends with original holder/child custody opt in.
+    #[cfg(unix)]
+    fn supports_host_lifetime(&self) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn boot_custodied_with_host_lifetime(
+        &self,
+        _spec: &VmmSpec,
+        _files: crate::driver::prepared_disks::PreparedBootFiles<'_>,
+        _lease: mvm_core::host_lifetime::PreparedHostLifetimeLease,
+        _binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<Box<dyn RunningVm>> {
+        anyhow::bail!("backend does not support original installed host lifetime")
+    }
+
     /// Consume the same verified, unlinked kernel descriptor, never reopen
     /// the spec's diagnostic pathname. Unsupported drivers refuse explicitly.
     #[cfg(unix)]
@@ -385,6 +402,8 @@ pub trait RunningVm: Send {
     /// be deleted. Backends without such evidence return `None`.
     fn terminate_with_kernel_exit(&self) -> Result<KernelStopOutcome> {
         Ok(KernelStopOutcome {
+            #[cfg(target_os = "linux")]
+            fc_exit: None,
             timing: self.terminate_with_timing()?,
             #[cfg(unix)]
             hvf_exit: None,
@@ -411,6 +430,8 @@ pub trait RunningVm: Send {
 
 /// In-process driver outcome, not a serialized receipt or author assertion.
 pub struct KernelStopOutcome {
+    #[cfg(target_os = "linux")]
+    pub fc_exit: Option<crate::host::fc_lifetime::ConfirmedExit>,
     pub timing: Option<RunningVmStopTiming>,
     #[cfg(unix)]
     pub hvf_exit: Option<crate::host::hvf_stop::ConfirmedExit>,

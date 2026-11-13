@@ -50,16 +50,7 @@ mod telemetry {
             tokio::time::timeout(timeout, async {
                 let transcript = handshake_signing_bytes(hello, ack, host_key)?;
                 let request_id = hello.session_id.clone();
-                let request = SignerHelperRequest::SignHost(SignerHelperSignHost {
-                    request_id: request_id.clone(),
-                    request: SignRequest::SignTelemetryHandshake {
-                        request_id: request_id.clone(),
-                        handshake: Box::new(TelemetryHandshake {
-                            hello: hello.clone(),
-                            ack: ack.clone(),
-                        }),
-                    },
-                });
+                let request = telemetry_request(hello, ack);
                 let mut stream = tokio::net::UnixStream::connect(&self.uds_path)
                     .await
                     .map_err(|_| TelemetryError::Authentication)?;
@@ -75,6 +66,41 @@ mod telemetry {
             .await
             .map_err(|_| TelemetryError::Authentication)?
         }
+
+        pub(crate) fn sign_owned_telemetry_handshake(
+            &self,
+            audit: &mvm_vmm::host::network_endpoint_spawn::InstalledEndpointAudit,
+            hello: &SessionHello,
+            ack: &SessionHelloAck,
+            host_key: &VerifyingKey,
+            deadline: std::time::Instant,
+        ) -> Result<Signature, TelemetryError> {
+            if self.uds_path != audit.socket()
+                || self.original_child != Some(audit.signer_pid())
+                || self.max_frame_bytes > super::DEFAULT_HELPER_MAX_FRAME_BYTES
+            {
+                audit.fence();
+                return Err(TelemetryError::Authentication);
+            }
+            let transcript = handshake_signing_bytes(hello, ack, host_key)?;
+            let response = self
+                .send_until_inner(&telemetry_request(hello, ack), deadline, None, Some(audit))
+                .map_err(|_| TelemetryError::Authentication)?;
+            verified_signature(response, &hello.session_id, &transcript, host_key)
+        }
+    }
+
+    fn telemetry_request(hello: &SessionHello, ack: &SessionHelloAck) -> SignerHelperRequest {
+        SignerHelperRequest::SignHost(SignerHelperSignHost {
+            request_id: hello.session_id.clone(),
+            request: SignRequest::SignTelemetryHandshake {
+                request_id: hello.session_id.clone(),
+                handshake: Box::new(TelemetryHandshake {
+                    hello: hello.clone(),
+                    ack: ack.clone(),
+                }),
+            },
+        })
     }
 
     fn verified_signature(
@@ -113,10 +139,12 @@ mod telemetry {
         Ok(signature)
     }
 }
+
 #[derive(Debug, Clone)]
 pub struct SignerHelperClient {
     uds_path: PathBuf,
     max_frame_bytes: usize,
+    original_child: Option<u32>,
 }
 
 impl SignerHelperClient {
@@ -124,6 +152,7 @@ impl SignerHelperClient {
         Self {
             uds_path: uds_path.into(),
             max_frame_bytes: DEFAULT_HELPER_MAX_FRAME_BYTES,
+            original_child: None,
         }
     }
 
@@ -134,6 +163,111 @@ impl SignerHelperClient {
 
     pub fn send(&self, req: &SignerHelperRequest) -> Result<SignerHelperResponse> {
         send_helper_request(&self.uds_path, req, self.max_frame_bytes)
+    }
+
+    pub(crate) fn with_original_child(mut self, child: u32) -> Self {
+        self.original_child = Some(child);
+        self
+    }
+
+    /// Same canonical exchange with one deadline across connection and all bytes.
+    pub fn send_until(
+        &self,
+        req: &SignerHelperRequest,
+        deadline: std::time::Instant,
+    ) -> Result<SignerHelperResponse> {
+        self.send_until_inner(req, deadline, None, None)
+    }
+
+    pub(crate) fn send_until_current(
+        &self,
+        req: &SignerHelperRequest,
+        deadline: std::time::Instant,
+        admission: &crate::owned_resources::registered::RegistrationAdmission,
+    ) -> Result<SignerHelperResponse> {
+        self.send_until_inner(req, deadline, Some(admission), None)
+    }
+
+    /// The actual installed endpoint's original kernel observations accompany
+    /// every trust-boundary step; metadata alone cannot construct this guard.
+    pub(crate) fn send_until_endpoint(
+        &self,
+        req: &SignerHelperRequest,
+        deadline: std::time::Instant,
+        audit: &mvm_vmm::host::network_endpoint_spawn::InstalledEndpointAudit,
+    ) -> Result<SignerHelperResponse> {
+        let result = (|| {
+            let SignerHelperRequest::AppendEntry(entry) = req else {
+                bail!("installed endpoint only appends audit entries")
+            };
+            anyhow::ensure!(
+                self.uds_path == audit.socket()
+                    && self.original_child == Some(audit.signer_pid())
+                    && self.max_frame_bytes <= DEFAULT_HELPER_MAX_FRAME_BYTES
+                    && entry.vm_id == audit.vm()
+                    && entry.workload_id == audit.vm()
+                    && entry.tenant_id == audit.tenant(),
+                "installed audit original target differs"
+            );
+            self.send_until_inner(req, deadline, None, Some(audit))
+        })();
+        if result.is_err() {
+            audit.fence();
+        }
+        result
+    }
+
+    fn send_until_inner(
+        &self,
+        req: &SignerHelperRequest,
+        deadline: std::time::Instant,
+        admission: Option<&crate::owned_resources::registered::RegistrationAdmission>,
+        endpoint: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledEndpointAudit>,
+    ) -> Result<SignerHelperResponse> {
+        if let Some(endpoint) = endpoint {
+            endpoint.check_current()?;
+        }
+        if let Some(admission) = admission {
+            admission.check()?;
+        }
+        anyhow::ensure!(
+            self.max_frame_bytes > 0 && u32::try_from(self.max_frame_bytes).is_ok(),
+            "invalid signer frame cap"
+        );
+        let mut stream =
+            mvm_vmm::host::hvf_control_transport::connect_path(&self.uds_path, deadline)?;
+        if let Some(child) = self.original_child {
+            anyhow::ensure!(
+                u32::try_from(mvm_vmm::host::uds_peer::connected_peer_pid(&stream)?)? == child,
+                "signer peer is not the original child"
+            );
+        }
+        if let Some(admission) = admission {
+            admission.check()?;
+        }
+        if let Some(endpoint) = endpoint {
+            endpoint.check_current()?;
+        }
+        mvm_vmm::host::hvf_control_transport::write_frame_with_limit(
+            &mut stream,
+            req,
+            deadline,
+            self.max_frame_bytes,
+        )?;
+        let response: SignerHelperResponse =
+            mvm_vmm::host::hvf_control_transport::read_frame_with_limit(
+                &mut stream,
+                deadline,
+                self.max_frame_bytes,
+            )?;
+        anyhow::ensure!(
+            response.request_id() == req.request_id(),
+            "signer response request identity mismatch"
+        );
+        if let Some(endpoint) = endpoint {
+            endpoint.check_current()?;
+        }
+        Ok(response)
     }
 
     pub fn sign_host(&self, req: SignRequest) -> Result<SignResponse> {
@@ -197,6 +331,29 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn owned_signer_deadline_refuses_expired_request_before_connect() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("signer.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = SignerHelperClient::new(path);
+        assert!(
+            client
+                .send_until(
+                    &SignerHelperRequest::Probe {
+                        request_id: "expired".into()
+                    },
+                    std::time::Instant::now()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 
     async fn spawn_mock(
         path: PathBuf,

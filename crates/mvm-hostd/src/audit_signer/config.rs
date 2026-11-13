@@ -52,6 +52,14 @@ pub struct SignerHelperConfig {
     pub max_frame_bytes: usize,
 }
 
+/// Private stdin for the original installed signer, outside ordinary signer config.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedSignerSetup {
+    pub config: SignerHelperConfig,
+    pub audit_chain_bytes: Option<std::num::NonZeroU64>,
+}
+
 pub fn parse_signer_helper(bytes: &[u8]) -> Result<SignerHelperConfig, serde_json::Error> {
     serde_json::from_slice(bytes)
 }

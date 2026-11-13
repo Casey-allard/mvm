@@ -3,6 +3,7 @@
 //! in from the former `mvm-policy` crate.
 
 pub mod audit;
+pub mod direct_plan;
 /// Strict DNS answer filtering for SSRF and rebinding defense. Lives in
 /// `mvm-contract` so the registry client in `mvm-fs` can share it.
 pub use mvm_contract::policy::dns_guard;

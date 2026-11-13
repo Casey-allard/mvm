@@ -243,6 +243,78 @@ pub fn send_connect(stream: &mut impl Write, port: u32) -> std::io::Result<()> {
     stream.flush()
 }
 
+/// Complete the canonical mux handshake on an already-owned stream. Callers
+/// retain cancellation/deadline custody; this helper opens no socket or thread.
+/// The assigned host port has the same strict semantics as existing dialers.
+pub fn complete_connect_handshake(stream: &mut (impl Read + Write), port: u32) -> Result<u32> {
+    send_connect(stream, port).map_err(|_| anyhow::anyhow!("vsock CONNECT write failed"))?;
+    let response = read_connect_response_line(stream)
+        .map_err(|_| anyhow::anyhow!("vsock CONNECT response incomplete"))?;
+    parse_connect_ack(&response)
+        .map_err(|_| anyhow::anyhow!("vsock CONNECT acknowledgement refused"))
+}
+
+#[cfg(test)]
+mod owned_connect_handshake_tests {
+    use std::io::{self, Cursor, Read, Write};
+
+    struct Stream {
+        incoming: Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl Read for Stream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.incoming.read(bytes)
+        }
+    }
+    impl Write for Stream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn canonical_connect_handshake_reuses_existing_assigned_port_and_exact_wire() {
+        // Canonical syntax accepts every decimal u32 host-assigned port;
+        // this is deliberately neither a nonzero nor guest-port assertion.
+        for assigned in [0, 12345, u32::MAX] {
+            let mut stream = Stream {
+                incoming: Cursor::new(format!("OK {assigned}\n").into_bytes()),
+                written: Vec::new(),
+            };
+            assert_eq!(
+                super::complete_connect_handshake(&mut stream, 5252).unwrap(),
+                assigned
+            );
+            assert_eq!(stream.written, b"CONNECT 5252\n");
+        }
+    }
+
+    #[test]
+    fn canonical_connect_handshake_keeps_strict_ack_validation_without_echoing_peer_data() {
+        for bytes in [
+            b"OK +0\n".as_slice(),
+            b"OK -0\n",
+            b"OK 4294967296\n",
+            b"OK 1 extra\n",
+            b"OK 2\r\n",
+            b"PRIVATE_SYNTHETIC_REPLY\n",
+            b"OK 2",
+        ] {
+            let mut stream = Stream {
+                incoming: Cursor::new(bytes.to_vec()),
+                written: Vec::new(),
+            };
+            let error = super::complete_connect_handshake(&mut stream, 5252).unwrap_err();
+            assert!(!format!("{error:#}").contains("PRIVATE_SYNTHETIC_REPLY"));
+        }
+    }
+}
+
 /// Make one connection attempt and perform the Firecracker CONNECT handshake.
 ///
 /// Callers that already own a bounded readiness loop use this entry point so

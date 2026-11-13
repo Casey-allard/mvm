@@ -31,24 +31,32 @@ pub mod startup_budget;
 mod tests;
 mod transient;
 mod unbooted;
+#[cfg(unix)]
+mod host_lifetime_preflight;
+#[cfg(unix)]
+pub use host_lifetime_preflight::{HostLifetimeLaunchFailure, UnusedHostLifetimePreparation};
 
 use mvm_hostd::mailbox_process::original_journal::PairedBootReservation;
 use unbooted::DefinitionOrigin;
 
 pub use request::{
-    AccessMode, LaunchNetworkPolicy, LaunchRequest, LaunchRequestBuilder, LaunchSource,
+    AccessMode, HostLifetimeIntent, LaunchNetworkPolicy, LaunchRequest, LaunchRequestBuilder, LaunchSource,
     LaunchVolumeSpec, LifecycleMode, MachineSecretRef,
 };
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use mvm_contract::policy::network_policy::CooperatingPayloadPolicy;
 use mvm_core::client::dto::{MachineId, MachineState, MachineStatus};
 use mvm_core::client::{MvmError, Result};
 use mvm_core::config::{machine_spec_path, machine_state_dir, machine_state_root, vm_state_dir};
 use mvm_core::domain::instance::InstanceReadiness;
 use mvm_core::plan::ExecutionPlan;
 use mvm_core::protocol::vm_backend::{VmId, VmStatus};
+#[cfg(unix)]
+use mvm_core::rootfs_source::RootfsSource;
 use mvm_hostd::audit::emitter::{AuditEmitter, ExitRecord};
 pub(crate) use mvm_hostd::audit::unsealed::{UnsealedEnd, UnsealedReason, record_unsealed_end};
 use mvm_hostd::plan_admission::{AdmittedPlan, InMemoryNonceLedger, StartedMachine, SystemClock};
@@ -72,6 +80,10 @@ const LOCAL_TENANT: &str = "local";
 /// admitted plan identity (for correlation with the chain-signed audit log).
 #[derive(Debug)]
 pub struct LaunchOutcome {
+    #[cfg(unix)]
+    pub(crate) host_lifetime: Option<Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
+    #[cfg(unix)]
+    retirement: std::sync::Mutex<Option<mvm_runtime::workload_runner::OwnedRetirement>>,
     pub machine: MachineState,
     /// Content-addressed id of the admitted plan.
     pub plan_id: String,
@@ -104,6 +116,33 @@ impl LaunchOutcome {
         mvm_hostd::mailbox_launch::object_pair::InstalledParticipant::from_original_firecracker(
             &self.admitted,
         )
+    }
+}
+
+#[cfg(unix)]
+impl LaunchOutcome {
+    /// Move the sealed endpoint owner once, without keeping the VM receipt
+    /// mutex held during the parent's original disk cleanup.
+    pub fn take_endpoint_retirement(&self) -> Result<Option<crate::EndpointRetirement>> {
+        let mut guard = self.retirement.try_lock().map_err(crate::local::backend_err)?;
+        let receipt = guard.as_mut().ok_or_else(|| {
+            crate::local::backend_err("original outcome has no positive owned retirement")
+        })?;
+        Ok(receipt.take_endpoint_retirement())
+    }
+
+    /// Borrow the sealed positive cleanup receipt without cloning or exporting
+    /// ownership. The callback only validates/retires already-drained parent
+    /// owners: never await, perform endpoint I/O or clean disk under this lock.
+    pub fn with_owned_retirement<R>(
+        &self,
+        inspect: impl FnOnce(&mvm_runtime::workload_runner::OwnedRetirement) -> R,
+    ) -> Result<R> {
+        let guard = self.retirement.try_lock().map_err(crate::local::backend_err)?;
+        let receipt = guard.as_ref().ok_or_else(|| {
+            crate::local::backend_err("original outcome has no positive owned retirement")
+        })?;
+        Ok(inspect(receipt))
     }
 }
 
@@ -456,6 +495,12 @@ impl LocalBackend {
     /// (state-dir marker), falling back to this client's backend so the
     /// hermetic mock stays observable.
     fn machine_running(&self, name: &str) -> bool {
+        #[cfg(unix)]
+        if mvm_core::host_lifetime::require_no_installed_native(name).is_err() {
+            // Occupied/uncertain is a refusal here, never a positive running
+            // or exit receipt reconstructed from this marker.
+            return true;
+        }
         let status = match AnyBackend::for_started_vm(name) {
             Some(owner) => owner.status(&VmId(name.to_string())),
             None => self.backend.status(&VmId(name.to_string())),
@@ -499,6 +544,10 @@ impl std::ops::Deref for BackendHandle<'_> {
 /// The resolved inputs for one admitted boot — the shared core both
 /// lifecycle modes (and the trait's `run_machine`) reach.
 pub(crate) struct BootParams {
+    #[cfg(unix)]
+    pub(crate) host_lifetime: Option<Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
+    #[cfg(unix)]
+    pub(crate) installed_payload_mapping: Option<CooperatingPayloadPolicy>,
     pub(crate) name: String,
     pub(crate) source: LaunchSource,
     pub(crate) profile: String,
@@ -547,11 +596,27 @@ impl LocalBackend {
         // stale substitution-endpoint socket) make the fresh endpoint die
         // binding it before its ready handshake; a non-running machine owns
         // no live state there, so recover by starting from an empty dir.
-        if !self.machine_running(&params.name) {
+        #[cfg(unix)]
+        let installed = params.host_lifetime.is_some();
+        #[cfg(not(unix))]
+        let installed = false;
+        #[cfg(unix)]
+        if !installed && params.installed_payload_mapping.is_some() {
+            return Err(MvmError::InvalidSpec {
+                reason: "installed payload mapping requires its original host lifetime".into(),
+            });
+        }
+        if !installed && !self.machine_running(&params.name) {
             remove_vm_runtime_dirs(&params.name)?;
         }
         let (rootfs, kernel_path, verity_path, roothash, registry_pack_image) = match &params.source
         {
+            #[cfg(unix)]
+            LaunchSource::Image(RootfsSource::LocalPath(path))
+                if params.installed_payload_mapping.is_some() =>
+            {
+                (path.clone(), None, None, None, None)
+            }
             LaunchSource::Image(image) => {
                 let rootfs = crate::local::resolve_local_rootfs(image, &params.name).await?;
                 let (verity, hash) = crate::local::host_verity_sidecars(&rootfs);
@@ -638,6 +703,19 @@ impl LocalBackend {
             (None, _) => None,
         };
 
+        #[cfg(unix)]
+        if let Some(owner) = params.host_lifetime {
+            let context = LocalRunContext {
+                clock: &clock,
+                ledger: &ledger,
+                host_signer_keys_dir: None,
+                emitter: emitter.as_deref(),
+                assurance: campaign.as_ref(),
+            };
+            let mapping = params.installed_payload_mapping.as_ref().ok_or_else(|| MvmError::InvalidSpec { reason: "installed launch requires its signed direct mapping".into() })?;
+            let started = mvm_hostd::run::admit_and_boot_local_with_installed_mapping(&backend, &req, context, mvm_hostd::run::SelectedLocalMapping { owner, mapping });
+            return started.map_err(|e| crate::local::backend_err(format!("{e:#}")));
+        }
         admit_and_boot_local(
             &backend,
             &req,
@@ -762,6 +840,9 @@ impl LocalBackend {
     /// persisted definition (that name is managed via the persistent verbs)
     /// or by a live VM.
     fn ensure_transient_name_free(&self, name: &str) -> Result<()> {
+        #[cfg(unix)]
+        mvm_core::host_lifetime::require_no_installed_native(name)
+            .map_err(crate::local::backend_err)?;
         if machine_spec_path(name).exists() {
             return Err(MvmError::Conflict {
                 reason: format!(
@@ -788,6 +869,9 @@ impl LocalBackend {
         request: &LaunchRequest,
         name: &str,
     ) -> Result<(mp::MachineSpec, DefinitionOrigin)> {
+        #[cfg(unix)]
+        mvm_core::host_lifetime::require_no_installed_native(name)
+            .map_err(crate::local::backend_err)?;
         let desired = persisted_spec_from_request(request, name);
         let existing = if machine_spec_path(name).exists() {
             Some(mp::load_machine_spec(name).map_err(crate::local::backend_err)?)
@@ -849,6 +933,182 @@ impl LocalBackend {
         result.map(|_| ()).map_err(|error| {
             crate::local::backend_err(format!("stopping machine {name:?}: {error:#}"))
         })
+    }
+
+    /// Retain one original installation lifetime through the canonical launch.
+    /// This owner is resource custody; canonical signed admission still runs.
+    #[cfg(unix)]
+    pub async fn launch_with_host_lifetime(
+        &self,
+        request: LaunchRequest,
+        lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
+    ) -> Result<LaunchOutcome> {
+        self.try_launch_with_host_lifetime(request, lifetime)
+            .await
+            .map_err(HostLifetimeLaunchFailure::into_error)
+    }
+
+    /// Launch an installed portable bundle with the FlowMux mapping bound by
+    /// its signed plan and the original prepared host lifetime.
+    #[cfg(unix)]
+    pub async fn try_launch_with_host_lifetime_and_mapping(
+        &self,
+        mut request: LaunchRequest,
+        lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
+        mapping: CooperatingPayloadPolicy,
+    ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
+        if request.signed_plan.is_none()
+            || !matches!(
+                &request.source,
+                LaunchSource::Image(RootfsSource::LocalPath(_))
+            )
+        {
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "installed payload mapping requires a signed local bundle launch"
+                        .into(),
+                },
+                lifetime,
+            ));
+        }
+        request.installed_payload_mapping = Some(mapping);
+        self.try_launch_with_host_lifetime(request, lifetime).await
+    }
+
+    /// Preserve the same unused preparation only on the four direct pure
+    /// preflight refusals. Conversion and every later error remain uncertain.
+    #[cfg(unix)]
+    pub async fn try_launch_with_host_lifetime(
+        &self,
+        mut request: LaunchRequest,
+        lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
+    ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
+        if request.mode != LifecycleMode::Transient || request.name.is_none() {
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "installed host lifetime requires an explicitly named transient launch"
+                        .into(),
+                },
+                lifetime,
+            ));
+        }
+        if request
+            .backend
+            .as_deref()
+            .is_some_and(|name| name != self.backend.name())
+        {
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "installed host lifetime requires the original LocalBackend".into(),
+                },
+                lifetime,
+            ));
+        }
+        if let Err(error) = mvm_hostd::host_lifetime_parent::require_installed() {
+            return Err(HostLifetimeLaunchFailure::unused(
+                crate::local::backend_err(error),
+                lifetime,
+            ));
+        }
+        if !self.backend.supports_host_lifetime() {
+            return Err(HostLifetimeLaunchFailure::unused(
+                MvmError::InvalidSpec {
+                    reason: "backend has no original installed native lifetime".into(),
+                },
+                lifetime,
+            ));
+        }
+        let intent = request.host_lifetime_intent();
+        let anchor = lifetime.into_anchor();
+        let mut shape = mvm_core::vm_backend::VmStartConfig {
+            name: intent.name.ok_or_else(|| {
+                HostLifetimeLaunchFailure::converted(MvmError::InvalidSpec {
+                    reason: "installed name missing".into(),
+                })
+            })?,
+            cpus: intent.cpus,
+            memory_mib: intent.memory_mib,
+            ..Default::default()
+        };
+        if anchor.binding().backend != self.backend.kind() {
+            return Err(HostLifetimeLaunchFailure::converted(
+                MvmError::InvalidSpec {
+                    reason: "installed lifetime backend differs".into(),
+                },
+            ));
+        }
+        anchor.bind_to_config(&mut shape).map_err(|error| {
+            HostLifetimeLaunchFailure::converted(crate::local::backend_err(error))
+        })?;
+        request.host_lifetime = Some(anchor);
+        self.launch(request)
+            .await
+            .map_err(HostLifetimeLaunchFailure::converted)
+    }
+    /// Install the original owned host-agent registrar before any installed launch.
+    #[cfg(unix)]
+    pub fn with_installed_host_agent(
+        self,
+        registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
+    ) -> Result<Self> {
+        self.install_owned_host_agent(registrar)?;
+        Ok(self)
+    }
+
+    /// Bind the original registrar without moving or replacing this backend.
+    /// The underlying runner retains its install-once and no-active-launch guard.
+    #[cfg(unix)]
+    pub fn install_owned_host_agent(
+        &self,
+        registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
+    ) -> Result<()> {
+        self.backend
+            .install_owned_host_agent(registrar)
+            .map_err(crate::local::backend_err)
+    }
+
+    /// Stop only the retained original native owner. No backend reconstruction.
+    #[cfg(unix)]
+    pub async fn stop_owned(&self, outcome: &LaunchOutcome) -> Result<()> {
+        let anchor = outcome
+            .host_lifetime
+            .as_ref()
+            .ok_or_else(|| MvmError::InvalidSpec {
+                reason: "launch outcome has no original installed owner".into(),
+            })?;
+        if anchor.binding().vm_name != outcome.machine.id.0
+            || anchor.binding().backend != self.backend.kind()
+        {
+            return Err(MvmError::InvalidSpec {
+                reason: "installed launch outcome substituted".into(),
+            });
+        }
+        let mut retirement = outcome.retirement.try_lock().map_err(crate::local::backend_err)?;
+        if retirement.is_some() {
+            return Ok(());
+        }
+        let id = VmId(outcome.machine.id.0.clone());
+        self.backend.stop_owned(&id, anchor).map_err(crate::local::backend_err)?;
+        let receipt = self.backend.take_owned_retirement(&id, anchor)
+            .map_err(crate::local::backend_err)?;
+        *retirement = Some(receipt);
+        Ok(())
+    }
+
+    /// Recover failed launch cleanup only through this original backend's
+    /// retained native record. Keep the linear receipt through parent release.
+    /// Unknown/consumed records never become successful cleanup by absence.
+    #[cfg(unix)]
+    pub async fn stop_owned_pending(&self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding)
+        -> Result<mvm_runtime::workload_runner::OwnedRetirement> {
+        if binding.backend != self.backend.kind() {
+            return Err(MvmError::InvalidSpec {
+                reason: "pending installed backend differs from original".into(),
+            });
+        }
+        self.backend.stop_owned_pending(binding).map_err(crate::local::backend_err)?;
+        self.backend.take_owned_retirement_pending(binding).map_err(crate::local::backend_err)
     }
 
     /// Launch a machine from a fully-validated typed request. Transient
@@ -976,6 +1236,10 @@ impl LocalBackend {
         }
         let plan = started.admitted.plan().clone();
         let outcome = LaunchOutcome {
+            #[cfg(unix)]
+            host_lifetime: None,
+            #[cfg(unix)]
+            retirement: std::sync::Mutex::new(None),
             machine: MachineState {
                 id: MachineId(name.to_string()),
                 name: name.to_string(),
@@ -1069,10 +1333,15 @@ impl LocalBackend {
                 outcome.process = Some(token);
                 Ok(outcome)
             }
-            Err(command) => Err(CommandStartFailure {
-                command,
-                stop: self.stop_for_recreate(&name),
-            }),
+            Err(command) => {
+                #[cfg(unix)]
+                if let Some(anchor) = &outcome.host_lifetime {
+                    return Err(CommandStartFailure { command,
+                        stop:self.backend.stop_owned(&VmId(name),anchor)
+                            .map_err(crate::local::backend_err) });
+                }
+                Err(CommandStartFailure { command, stop:self.stop_for_recreate(&name) })
+            }
         }
     }
 
@@ -1143,6 +1412,10 @@ impl LocalBackend {
         };
         let started = self
             .boot_admitted(BootParams {
+                #[cfg(unix)]
+                host_lifetime: request.host_lifetime.clone(),
+                #[cfg(unix)]
+                installed_payload_mapping: request.installed_payload_mapping.clone(),
                 name: name.to_string(),
                 source: request.source.clone(),
                 profile: request.profile.clone(),
@@ -1193,6 +1466,10 @@ impl LocalBackend {
     ) -> LaunchOutcome {
         let plan = started.admitted.plan().clone();
         LaunchOutcome {
+            #[cfg(unix)]
+            host_lifetime: request.host_lifetime.clone(),
+            #[cfg(unix)]
+            retirement: std::sync::Mutex::new(None),
             machine: MachineState {
                 id: MachineId(started.vm_id.0.clone()),
                 name: name.to_string(),
@@ -1386,6 +1663,9 @@ impl LocalBackend {
     /// attachments, attachment leases (re-sealing just-in-time unlocks),
     /// secret-reference sidecar, name-registry entry. Idempotent.
     fn release_session_resources(&self, name: &str) -> Result<()> {
+        #[cfg(unix)]
+        mvm_core::host_lifetime::require_no_installed_native(name)
+            .map_err(crate::local::backend_err)?;
         let service = LocalVolumeService::new();
         match service.list_attachments(name) {
             Ok(attachments) => {
@@ -1428,6 +1708,9 @@ impl LocalBackend {
         reservation
             .require_name(name)
             .map_err(crate::local::backend_err)?;
+        #[cfg(unix)]
+        mvm_core::host_lifetime::require_no_installed_native(name)
+            .map_err(crate::local::backend_err)?;
         if self.machine_running(name) {
             self.stop_for_recreate(name)?;
         }
@@ -1458,6 +1741,10 @@ impl LocalBackend {
         poll: std::time::Duration,
         timeout: std::time::Duration,
     ) -> Result<ExitReport> {
+        #[cfg(unix)]
+        if outcome.host_lifetime.is_some() {
+            return Err(crate::local::backend_err("installed wait requires the original resident lifecycle; no name-based exit observation"));
+        }
         let name = outcome.machine.name.clone();
         let deadline = std::time::Instant::now() + timeout;
         while self.machine_running(&name) {
@@ -1476,6 +1763,10 @@ impl LocalBackend {
     /// chain-signed `plan.exited` entry, and (for a transient) run the
     /// idempotent cleanup.
     pub fn report_exit(&self, outcome: &LaunchOutcome) -> Result<ExitReport> {
+        #[cfg(unix)]
+        if outcome.host_lifetime.is_some() {
+            return Err(crate::local::backend_err("installed exit reporting requires original native retirement; sidecars are not an exit proof"));
+        }
         let name = outcome.machine.name.as_str();
         let state_dir = vm_state_dir(name);
         let exit_code = mvm_core::exit_capture::read_captured(&state_dir);
@@ -1528,6 +1819,9 @@ impl LocalBackend {
 /// Drop a VM's runtime state *and* the directory its sockets live in; see
 /// [`mvm_runtime::vm::reconcile::remove_runtime_dirs`].
 fn remove_vm_runtime_dirs(name: &str) -> Result<()> {
+    #[cfg(unix)]
+    mvm_core::host_lifetime::require_no_installed_native(name)
+        .map_err(crate::local::backend_err)?;
     mvm_runtime::vm::reconcile::remove_runtime_dirs(&vm_state_dir(name))
         .map_err(|e| crate::local::backend_err(format!("removing runtime state of {name:?}: {e}")))
 }

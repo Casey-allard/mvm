@@ -17,7 +17,6 @@
 
 use std::io::Read;
 use std::net::{IpAddr, TcpStream};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -108,7 +107,7 @@ pub(super) struct TcpRelayParams {
     pub(super) stream_id: u32,
     pub(super) upstream: FlowSocket,
     pub(super) session: Arc<Mutex<Session>>,
-    pub(super) writer: Arc<Mutex<UnixStream>>,
+    pub(super) writer: Arc<super::wire::SharedWriter>,
     pub(super) registry: Arc<Mutex<StreamRegistry>>,
     pub(super) validator: Arc<Mutex<SessionValidator>>,
     pub(super) host_half_closed: Arc<AtomicBool>,

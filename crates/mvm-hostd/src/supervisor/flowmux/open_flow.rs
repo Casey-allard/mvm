@@ -42,6 +42,16 @@ struct AdmittedFlow {
     /// The admitted port, which the gate may have chosen rather than taken
     /// from the target.
     port: u16,
+    requested_port: u16,
+}
+
+enum RelayAdmission {
+    Proceed(Option<OwnedRelayAdmission>),
+    Refused,
+}
+struct OwnedRelayAdmission {
+    reservation: super::owned_relays::RelayReservation,
+    deadline: std::time::Instant,
 }
 
 impl AdmittedFlow {
@@ -53,6 +63,16 @@ impl AdmittedFlow {
     /// The audit-label form of the route.
     fn route_label(&self) -> String {
         self.route.as_str().to_string()
+    }
+
+    fn allowed_tcp_labels(&self, stream_id: u32) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("stream_id".to_string(), stream_id.to_string()),
+            ("class".to_string(), "tcp".to_string()),
+            ("route".to_string(), self.route_label()),
+            ("target".to_string(), self.target.clone()),
+            ("resolved_ips".to_string(), self.resolved_ips()),
+        ])
     }
 
     /// Whether this flow may be served by terminating it on the host.
@@ -79,6 +99,37 @@ fn termination_label(mode: TerminationMode) -> &'static str {
 }
 
 impl FlowMuxSession {
+    fn reserve_owned_tcp_relay(
+        &mut self,
+        stream_id: u32,
+        flow: &AdmittedFlow,
+    ) -> Result<RelayAdmission, FlowMuxError> {
+        let reservation = self
+            .owned_tcp_relays
+            .as_ref()
+            .map(|owned| {
+                let deadline = std::time::Instant::now()
+                    .checked_add(self.connect_timeout)
+                    .ok_or_else(|| std::io::Error::other("owned flow deadline overflow"))?;
+                owned
+                    .reserve_until(deadline)
+                    .map(|reservation| OwnedRelayAdmission {
+                        reservation,
+                        deadline,
+                    })
+            })
+            .transpose();
+        match reservation {
+            Ok(reservation) => Ok(RelayAdmission::Proceed(reservation)),
+            Err(_) => {
+                let _ = lock_registry(&self.registry).retire(stream_id);
+                self.send_refused(stream_id, "owned relay capacity unavailable")?;
+                self.deny_flow(stream_id, flow, "relay_capacity_unavailable");
+                Ok(RelayAdmission::Refused)
+            }
+        }
+    }
+
     /// Serve one guest `OpenTcp`.
     ///
     /// Admission first — rate, then the claim-10 gate, which is the single
@@ -129,6 +180,18 @@ impl FlowMuxSession {
             }
             return self.open_opaque_flow(stream_id, &flow);
         };
+        if self
+            .payload_mapping
+            .as_ref()
+            .is_some_and(|mapping| mapping.selects(&flow.host, flow.requested_port))
+        {
+            self.send_refused(
+                stream_id,
+                "selected payload profile does not support this terminated transform path",
+            )?;
+            self.deny_flow(stream_id, &flow, "payload_transform_unsupported");
+            return Ok(());
+        }
         self.open_terminated_flow(stream_id, &flow, mode)
     }
 
@@ -183,6 +246,7 @@ impl FlowMuxSession {
             route: decision.route,
             ips: Vec::new(),
             port: requested_port,
+            requested_port,
         };
         match decision.verdict {
             EgressVerdict::Allow { ips, port } => {
@@ -209,11 +273,79 @@ impl FlowMuxSession {
         stream_id: u32,
         flow: &AdmittedFlow,
     ) -> Result<(), FlowMuxError> {
+        // The selected installed profile requires its original cooperating
+        // mapping. A policy admission alone cannot select an implicit raw
+        // transport. General/legacy FlowMux retains its existing behavior.
+        if self.installed_audit.is_some()
+            && !self
+                .payload_mapping
+                .as_ref()
+                .is_some_and(|mapping| mapping.selects(&flow.host, flow.requested_port))
+        {
+            self.send_refused(stream_id, "selected installed payload mapping required")?;
+            self.deny_flow(stream_id, flow, "installed_payload_unmapped");
+            return Ok(());
+        }
         if !self.reserve_stream(stream_id, flow)? {
             return Ok(());
         }
+        let owned = match self.reserve_owned_tcp_relay(stream_id, flow)? {
+            RelayAdmission::Proceed(owned) => owned,
+            RelayAdmission::Refused => return Ok(()),
+        };
+        let owned_deadline = owned.as_ref().map(|owned| owned.deadline);
+        let reservation = owned.map(|owned| owned.reservation);
 
-        let upstream = match connect_first_admitted(&flow.ips, flow.port, self.connect_timeout) {
+        let selected_mapping = if let Some(mapping) = self
+            .payload_mapping
+            .as_ref()
+            .filter(|mapping| mapping.selects(&flow.host, flow.requested_port))
+        {
+            let deadline = if let Some(deadline) = owned_deadline {
+                deadline
+            } else {
+                std::time::Instant::now()
+                    .checked_add(self.connect_timeout)
+                    .ok_or_else(|| std::io::Error::other("payload setup deadline overflow"))?
+            };
+            Some((Arc::clone(mapping), deadline))
+        } else {
+            None
+        };
+
+        let prepared_audit = if self.installed_audit.is_some() {
+            self.check_installed_audit()?;
+            let recorder = self.recorder.as_ref().ok_or_else(|| {
+                FlowMuxError::FrameRefused("original installed recorder missing".into())
+            })?;
+            let deadline = owned_deadline.ok_or_else(|| {
+                FlowMuxError::FrameRefused("original installed flow deadline missing".into())
+            })?;
+            Some(
+                recorder
+                    .preflight_installed_unbound(
+                        EventCategory::Host,
+                        "host.flow.allowed",
+                        deadline,
+                        || flow.allowed_tcp_labels(stream_id),
+                    )
+                    .map_err(|_| {
+                        FlowMuxError::FrameRefused("installed flow audit preflight refused".into())
+                    })?,
+            )
+        } else {
+            None
+        };
+        let timeout = owned_deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or_else(|| {
+                selected_mapping
+                    .as_ref()
+                    .map_or(self.connect_timeout, |(_, deadline)| {
+                        deadline.saturating_duration_since(std::time::Instant::now())
+                    })
+            });
+        let upstream = match connect_first_admitted(&flow.ips, flow.port, timeout) {
             Some(stream) => stream,
             None => {
                 warn!(stream_id, target = %flow.target, "FlowMux TCP connect failed");
@@ -223,24 +355,104 @@ impl FlowMuxSession {
                 return Ok(());
             }
         };
+        if let Some(prepared) = prepared_audit {
+            let appended = (|| {
+                self.check_installed_audit()?;
+                let recorder = self.recorder.as_ref().ok_or_else(|| {
+                    FlowMuxError::FrameRefused("original installed recorder missing".into())
+                })?;
+                let runtime = self.runtime_handle.as_ref().ok_or_else(|| {
+                    FlowMuxError::FrameRefused("installed audit runtime missing".into())
+                })?;
+                runtime
+                    .block_on(recorder.record_installed_prepared(prepared))
+                    .map_err(|_| {
+                        FlowMuxError::FrameRefused("installed flow audit append refused".into())
+                    })?;
+                self.check_installed_audit()
+            })();
+            if let Err(error) = appended {
+                let _ = upstream.shutdown(std::net::Shutdown::Both);
+                if let Some(audit) = &self.installed_audit {
+                    audit.fence();
+                }
+                return Err(error);
+            }
+        }
+        if let Some(reservation) = &reservation {
+            let guest = self
+                .owned_guest_control
+                .clone()
+                .ok_or_else(|| std::io::Error::other("owned guest control missing"))?;
+            reservation.bind_setup(&upstream, guest)?;
+        }
 
+        let upstream = if let Some((mapping, deadline)) = selected_mapping {
+            let guest_key = self
+                .session
+                .lock()
+                .map_err(|_| std::io::Error::other("session poisoned"))?
+                .peer_verifying_key()
+                .to_bytes();
+            let facts = super::payload_mapping::AdmittedTcpFacts {
+                session_id: self.session_id(),
+                guest_key,
+                stream_id,
+                requested_host: flow.host.clone(),
+                requested_port: flow.requested_port,
+                route: flow.route.as_str(),
+                deadline,
+                owned_relay: reservation
+                    .as_ref()
+                    .map(|reservation| reservation.witness())
+                    .transpose()?,
+            };
+            match mapping.map(upstream, facts) {
+                Ok(payload) => FlowSocket::mapped(payload),
+                Err(error) => {
+                    // A peer EOF alone is not evidence of an orderly local stop.
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+                        && let Some(stopped) = self
+                            .installed_session_control
+                            .as_ref()
+                            .and_then(|control| control.stop_error())
+                        && let Some(reservation) = &reservation
+                        && reservation.setup_was_stopped()?
+                    {
+                        return Err(stopped.into());
+                    }
+                    warn!(stream_id,error=%error,"required payload mapping refused");
+                    let _ = lock_registry(&self.registry).retire(stream_id);
+                    self.send_refused(
+                        stream_id,
+                        "required authenticated payload mapping unavailable",
+                    )?;
+                    self.deny_flow(stream_id, flow, "payload_mapping_unavailable");
+                    return Ok(());
+                }
+            }
+        } else {
+            FlowSocket::from(upstream)
+        };
+        if owned_deadline.is_some_and(|until| std::time::Instant::now() >= until) {
+            let _ = upstream.shutdown(std::net::Shutdown::Both);
+            let _ = lock_registry(&self.registry).retire(stream_id);
+            self.send_refused(stream_id, "owned flow setup deadline")?;
+            self.deny_flow(stream_id, flow, "owned_setup_deadline");
+            return Ok(());
+        }
         if !self.confirm_stream(stream_id)? {
             return Ok(());
         }
-
         self.send_opened(stream_id)?;
-        self.spawn_tcp_relay(stream_id, FlowSocket::from(upstream))?;
-        self.emit_audit(
-            EventCategory::Host,
-            "host.flow.allowed",
-            BTreeMap::from([
-                ("stream_id".to_string(), stream_id.to_string()),
-                ("class".to_string(), "tcp".to_string()),
-                ("route".to_string(), flow.route_label()),
-                ("target".to_string(), flow.target.clone()),
-                ("resolved_ips".to_string(), flow.resolved_ips()),
-            ]),
-        );
+        self.spawn_tcp_relay(stream_id, upstream, reservation)?;
+        if self.installed_audit.is_none() {
+            self.emit_audit(
+                EventCategory::Host,
+                "host.flow.allowed",
+                flow.allowed_tcp_labels(stream_id),
+            );
+        }
         Ok(())
     }
 
@@ -264,6 +476,10 @@ impl FlowMuxSession {
             self.send_refused(stream_id, "termination unavailable on this endpoint")?;
             self.deny_flow(stream_id, flow, "termination_unavailable");
             return Ok(());
+        };
+        let reservation = match self.reserve_owned_tcp_relay(stream_id, flow)? {
+            RelayAdmission::Proceed(owned) => owned.map(|owned| owned.reservation),
+            RelayAdmission::Refused => return Ok(()),
         };
 
         // Claimed before anything is built, and held by the flow's thread for
@@ -321,7 +537,7 @@ impl FlowMuxSession {
         }
 
         self.send_opened(stream_id)?;
-        self.spawn_tcp_relay(stream_id, FlowSocket::from(endpoint_side))?;
+        self.spawn_tcp_relay(stream_id, FlowSocket::from(endpoint_side), reservation)?;
         let mut labels = BTreeMap::from([
             ("stream_id".to_string(), stream_id.to_string()),
             ("class".to_string(), "tcp".to_string()),
@@ -449,6 +665,730 @@ mod tests {
         tcp_echo_server, write_frame,
     };
     use crate::supervisor::flowmux::{FlowMuxAccept, FlowMuxVmResources};
+
+    #[test]
+    fn authenticated_canonical_tcp_preserves_shared_whole_warm_runtime_and_combined() {
+        use crate::supervisor::flowmux::{
+            PayloadArtifact, PayloadScopeController, PreparedPayloadSession,
+            SpiralCorePayloadFactory, accept_enrolled_payload,
+        };
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use mvm_contract::peer::{PeerBinding, PeerName};
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, NetworkPolicy, PayloadMappingProfile,
+        };
+        use spiralcore_mvm_flowmux::{
+            Role,
+            scope::{PinnedScopePolicy, ScopeFacts},
+            tls::{PinnedIdentity, TlsCarrier},
+        };
+        use spiralcore_transfer::{
+            endpoint::Limits,
+            shared_runtime::{OutputKind, Recipe, State},
+            shared_transfer::PreparedPrediction,
+            v1::{NegotiatedProfile, ObjectEndpoint, ObjectMode, ObjectSender},
+        };
+        use std::{
+            io::{Read, Write},
+            time::{Duration, Instant},
+        };
+        fn prediction() -> PreparedPrediction {
+            PreparedPrediction::new(
+                &State::seeded(48)
+                    .expect("state")
+                    .encode()
+                    .expect("checkpoint"),
+                &Recipe {
+                    steps: 16,
+                    payload: 1.25,
+                    output: OutputKind::Trace,
+                },
+            )
+            .expect("prediction")
+        }
+        fn limits() -> Limits {
+            Limits {
+                max_active: 1,
+                max_states: 8,
+                max_publications: 64,
+                resident_bytes: 128 << 20,
+                namespace_bytes: 128 << 20,
+                cache_bytes: 16 << 20,
+                graph_cache_bytes: 16 << 20,
+                ..Limits::default()
+            }
+        }
+        #[derive(Debug)]
+        struct Controller {
+            mode: ObjectMode,
+            pool: crate::supervisor::flowmux::PayloadResourcePool,
+            root: std::path::PathBuf,
+            receiver: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<PreparedPayloadSession>>>,
+        }
+        impl PayloadScopeController for Controller {
+            fn prepare(
+                &self,
+                request: &crate::supervisor::flowmux::AdmittedTcpPayload,
+                facts: &ScopeFacts,
+                profile: NegotiatedProfile,
+                deadline: Instant,
+            ) -> std::io::Result<PreparedPayloadSession> {
+                assert!(Instant::now() < deadline);
+                assert_eq!(facts.plan_id, request.plan().plan_id.0);
+                assert_eq!(facts.requested_port, 443);
+                assert_ne!(
+                    facts.actual_peer.port(),
+                    443,
+                    "canonical peer route must retain its translated admitted TCP port"
+                );
+                let error = |e: spiralcore_transfer::Error| std::io::Error::other(e.to_string());
+                let mapping_error =
+                    |e: spiralcore_mvm_flowmux::Error| std::io::Error::other(e.to_string());
+                // This General functional fixture explicitly reserves two
+                // local engines before codec/storage setup. It is outside the
+                // separate8MiB DEV envelope, not a production host grant.
+                let left_resources = self.pool.reserve_shared_sender(self.mode)?;
+                let right_resources = self.pool.reserve_shared_sender(ObjectMode::Whole)?;
+                let policy = PinnedScopePolicy::new(2).map_err(mapping_error)?;
+                policy
+                    .enroll(
+                        facts,
+                        facts.acceptor_spki,
+                        Role::Initiator,
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .map_err(mapping_error)?;
+                policy
+                    .enroll(
+                        facts,
+                        facts.initiator_spki,
+                        Role::Acceptor,
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .map_err(mapping_error)?;
+                let left = policy
+                    .authorize_scope(facts, facts.acceptor_spki, Role::Initiator)
+                    .map_err(mapping_error)?;
+                let right = policy
+                    .authorize_scope(facts, facts.initiator_spki, Role::Acceptor)
+                    .map_err(mapping_error)?;
+                let schema =
+                    spiralcore_transfer::schema::fit(&[b"{\"value\":0}\n"]).map_err(error)?;
+                let (sender, artifacts) = match self.mode {
+                    ObjectMode::Whole => (
+                        ObjectSender::new_with_profile(
+                            ObjectMode::Whole,
+                            left.context(),
+                            None,
+                            profile,
+                        )
+                        .map_err(error)?,
+                        Vec::new(),
+                    ),
+                    ObjectMode::Warm => (
+                        ObjectSender::new_with_profile(
+                            ObjectMode::Warm,
+                            left.context(),
+                            Some(&schema),
+                            profile,
+                        )
+                        .map_err(error)?,
+                        vec![
+                            PayloadArtifact::Schema,
+                            PayloadArtifact::Base(
+                                (0..8192).map(|i| ((i * 173 + i / 7) % 251) as u8).collect(),
+                            ),
+                        ],
+                    ),
+                    ObjectMode::Runtime => (
+                        ObjectSender::with_runtime_profile(left.context(), prediction(), profile)
+                            .map_err(error)?,
+                        vec![PayloadArtifact::Checkpoint],
+                    ),
+                    ObjectMode::Combined => (
+                        ObjectSender::with_combined_policy_and_profile(
+                            left.context(),
+                            prediction(),
+                            &schema,
+                            spiralcore_transfer::session::SelectionPolicy::Exhaustive,
+                            profile,
+                        )
+                        .map_err(error)?,
+                        vec![PayloadArtifact::Checkpoint, PayloadArtifact::Schema],
+                    ),
+                    ObjectMode::Raw => unreachable!("fixture selects four intended shared modes"),
+                };
+                let right_sender = ObjectSender::new_with_profile(
+                    ObjectMode::Whole,
+                    right.context(),
+                    None,
+                    profile,
+                )
+                .map_err(error)?;
+                let right_endpoint = ObjectEndpoint::open(
+                    &self.root.join("right"),
+                    limits(),
+                    right.clone(),
+                    profile,
+                )
+                .map_err(error)?;
+                let right = PreparedPayloadSession::new(
+                    right,
+                    right_sender,
+                    right_endpoint,
+                    right_resources.with_owned_store(self.root.join("right"))?,
+                )?;
+                self.receiver
+                    .lock()
+                    .expect("controller mutex")
+                    .take()
+                    .expect("one actual stream")
+                    .send(right)
+                    .map_err(|_| std::io::Error::other("receiver enrollment disappeared"))?;
+                let endpoint =
+                    ObjectEndpoint::open(&self.root.join("left"), limits(), left.clone(), profile)
+                        .map_err(error)?;
+                PreparedPayloadSession::new(
+                    left,
+                    sender,
+                    endpoint,
+                    left_resources.with_owned_store(self.root.join("left"))?,
+                )?
+                .with_artifacts(artifacts)
+            }
+        }
+        for mode in [
+            ObjectMode::Whole,
+            ObjectMode::Warm,
+            ObjectMode::Runtime,
+            ObjectMode::Combined,
+        ] {
+            let stores = tempfile::tempdir().expect("stores");
+            let server_key = ed25519_dalek::SigningKey::from_bytes(&[75; 32]);
+            let server_identity = PinnedIdentity::from_pkcs8(
+                server_key
+                    .to_pkcs8_der()
+                    .expect("PKCS8")
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("identity");
+            let client_key = ed25519_dalek::SigningKey::from_bytes(&[76; 32]);
+            let client_identity = PinnedIdentity::from_pkcs8(
+                client_key
+                    .to_pkcs8_der()
+                    .expect("PKCS8")
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("identity");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let address = listener.local_addr().expect("address");
+            let target = "cooperator.mvm.peer";
+            let policy = NetworkPolicy::deny_all()
+                .with_peers(vec![PeerBinding {
+                    name: PeerName::parse(target).expect("name"),
+                    port: 443,
+                    host_addr: address.ip().to_string(),
+                    host_port: address.port(),
+                }])
+                .with_payload_mapping(Some(
+                    CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                        host: target.into(),
+                        port: 443,
+                        server_name: target.into(),
+                        spki_sha256: server_identity.spki_sha256(),
+                        profile: PayloadMappingProfile::SpiralCoreObjectStreamV1,
+                    }])
+                    .expect("policy"),
+                ));
+            let binding = mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan {
+                plan_id: mvm_core::plan::PlanId(format!("actual-{mode:?}-plan")),
+                plan_version: 3,
+                plan_nonce: mvm_core::plan::Nonce::from_bytes([10; 16]),
+                bundle_sha256: "c".repeat(64),
+                tenant_id: "tenant".into(),
+                instance_id: "instance".into(),
+                policy_sha256: mvm_core::policy::network_policy::content_sha256(&policy),
+            };
+            let (receiver_tx, receiver_rx) = std::sync::mpsc::sync_channel(1);
+            let controller = Arc::new(Controller {
+                mode,
+                pool: crate::supervisor::flowmux::PayloadResourcePool::for_qualification(
+                    crate::supervisor::flowmux::PayloadResourceLimits {
+                        max_active: 2,
+                        resident_bytes: 2 << 30,
+                        disk_bytes: 5 << 30,
+                    },
+                )
+                .expect("explicit General functional ledger"),
+                root: stores.path().to_owned(),
+                receiver: std::sync::Mutex::new(Some(receiver_tx)),
+            });
+            let factory = Arc::new(
+                SpiralCorePayloadFactory::from_host_key(&client_key, controller.clone())
+                    .expect("factory"),
+            );
+            let mapping = Arc::new(
+                crate::supervisor::flowmux::PayloadMappingConfig::new(&policy, binding)
+                    .expect("config")
+                    .with_factory(factory),
+            );
+            let gate = crate::supervisor::network_endpoint::build_egress_gate(&policy);
+            let mut bytes = if matches!(mode, ObjectMode::Runtime | ObjectMode::Combined) {
+                prediction().prediction().to_vec()
+            } else {
+                (0..8192).map(|i| ((i * 173 + i / 7) % 251) as u8).collect()
+            };
+            let n = bytes.len();
+            bytes[n / 2] ^= 7;
+            let expected = bytes.clone();
+            thread::scope(|scope| {
+                let peer = scope.spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let (socket, _) = loop {
+                        match listener.accept() {
+                            Ok(pair) => break pair,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline);
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(e) => panic!("accept:{e}"),
+                        }
+                    };
+                    let tls = TlsCarrier::accept(
+                        socket,
+                        &server_identity,
+                        client_identity.spki_sha256(),
+                        deadline,
+                    )
+                    .expect("TLS");
+                    let prepared = receiver_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("explicit receiver enrollment");
+                    let mut stream = accept_enrolled_payload(tls, prepared, deadline)
+                        .expect("enrolled acceptor");
+                    let mut received = Vec::new();
+                    stream.read_to_end(&mut received).expect("application read");
+                    assert_eq!(
+                        received, expected,
+                        "artifact bytes cannot leak into application"
+                    );
+                    stream.write_all(&received).expect("reverse");
+                    stream
+                        .shutdown(std::net::Shutdown::Write)
+                        .expect("reverse FIN");
+                    received.len()
+                });
+                let (mut guest, mut session, host) =
+                    run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
+                        FlowMuxAccept::new(id, key, anchor, limits, gate)
+                            .with_payload_mapping(Some(mapping))
+                    });
+                guest
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("timeout");
+                write_frame(
+                    &mut guest,
+                    &mut session,
+                    Opcode::OpenTcp,
+                    1,
+                    b"cooperator.mvm.peer:443",
+                );
+                let opened = read_flowmux_frame(&mut guest, &mut session);
+                assert_eq!(
+                    opened.0,
+                    Opcode::Opened,
+                    "{mode:?}:{}",
+                    String::from_utf8_lossy(&opened.2)
+                );
+                assert_eq!(
+                    controller.pool.snapshot().expect("live resources").active,
+                    2,
+                    "each local engine holds its reservation across mapped I/O clones"
+                );
+                write_frame(&mut guest, &mut session, Opcode::Data, 1, &bytes);
+                write_frame(&mut guest, &mut session, Opcode::HalfClose, 1, b"");
+                let mut actual = Vec::new();
+                loop {
+                    let (opcode, id, data) = read_flowmux_frame(&mut guest, &mut session);
+                    assert_eq!(id, 1);
+                    match opcode {
+                        Opcode::WindowUpdate => {}
+                        Opcode::Data => actual.extend_from_slice(&data),
+                        Opcode::HalfClose => break,
+                        other => panic!(
+                            "{mode:?}:unexpected{other:?}:{}",
+                            String::from_utf8_lossy(&data)
+                        ),
+                    }
+                }
+                assert_eq!(actual, bytes);
+                drop(guest);
+                host.join().expect("host join").expect("serve");
+                assert_eq!(peer.join().expect("peer join"), bytes.len());
+            });
+            assert_eq!(
+                controller.pool.snapshot().expect("joined resources").active,
+                0
+            );
+            assert!(!stores.path().join("left").exists());
+            assert!(!stores.path().join("right").exists());
+        }
+    }
+
+    #[test]
+    fn authenticated_payload_peer_without_enrolled_scope_is_refused_before_application() {
+        use crate::supervisor::flowmux::{
+            PayloadScopeController, PreparedPayloadSession, SpiralCorePayloadFactory,
+        };
+        use mvm_contract::peer::{PeerBinding, PeerName};
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, NetworkPolicy, PayloadMappingProfile,
+        };
+        use spiralcore_mvm_flowmux::{
+            scope::ScopeFacts,
+            tls::{PinnedIdentity, TlsCarrier},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct DenyController(Arc<AtomicUsize>);
+        impl PayloadScopeController for DenyController {
+            fn prepare(
+                &self,
+                _: &crate::supervisor::flowmux::AdmittedTcpPayload,
+                _: &ScopeFacts,
+                _: spiralcore_transfer::v1::NegotiatedProfile,
+                _: std::time::Instant,
+            ) -> std::io::Result<PreparedPayloadSession> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "scope not enrolled",
+                ))
+            }
+        }
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        let server_key = ed25519_dalek::SigningKey::from_bytes(&[73; 32]);
+        let server_identity = PinnedIdentity::from_pkcs8(
+            server_key
+                .to_pkcs8_der()
+                .expect("PKCS8")
+                .as_bytes()
+                .to_vec(),
+        )
+        .expect("server TLS identity");
+        let client_key = ed25519_dalek::SigningKey::from_bytes(&[74; 32]);
+        let client_identity = PinnedIdentity::from_pkcs8(
+            client_key
+                .to_pkcs8_der()
+                .expect("PKCS8")
+                .as_bytes()
+                .to_vec(),
+        )
+        .expect("client TLS identity");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let address = listener.local_addr().expect("address");
+        let target = "cooperator.mvm.peer";
+        let policy = NetworkPolicy::deny_all()
+            .with_peers(vec![PeerBinding {
+                name: PeerName::parse(target).expect("peer"),
+                port: 443,
+                host_addr: address.ip().to_string(),
+                host_port: address.port(),
+            }])
+            .with_payload_mapping(Some(
+                CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                    host: target.into(),
+                    port: 443,
+                    server_name: target.into(),
+                    spki_sha256: server_identity.spki_sha256(),
+                    profile: PayloadMappingProfile::SpiralCoreObjectStreamV1,
+                }])
+                .expect("policy"),
+            ));
+        let binding = mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan {
+            plan_id: mvm_core::plan::PlanId("actual-plan".into()),
+            plan_version: 1,
+            plan_nonce: mvm_core::plan::Nonce::from_bytes([9; 16]),
+            bundle_sha256: "b".repeat(64),
+            tenant_id: "tenant".into(),
+            instance_id: "instance".into(),
+            policy_sha256: mvm_core::policy::network_policy::content_sha256(&policy),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(
+            SpiralCorePayloadFactory::from_host_key(
+                &client_key,
+                Arc::new(DenyController(calls.clone())),
+            )
+            .expect("factory"),
+        );
+        let mapping = Arc::new(
+            crate::supervisor::flowmux::PayloadMappingConfig::new(&policy, binding)
+                .expect("binding")
+                .with_factory(factory),
+        );
+        let gate = crate::supervisor::network_endpoint::build_egress_gate(&policy);
+        thread::scope(|scope| {
+            let peer = scope.spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let (socket, _) = loop {
+                    match listener.accept() {
+                        Ok(pair) => break pair,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                };
+                let mut tls = TlsCarrier::accept(
+                    socket,
+                    &server_identity,
+                    client_identity.spki_sha256(),
+                    deadline,
+                )
+                .expect("mutual TLS");
+                tls.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .expect("timeout");
+                match std::io::Read::read(&mut tls, &mut [0; 1]) {
+                    Ok(0) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) => {}
+                    other => panic!("denied scope must close without application bytes: {other:?}"),
+                }
+            });
+            let (mut guest, mut session, host) =
+                run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
+                    FlowMuxAccept::new(id, key, anchor, limits, gate)
+                        .with_payload_mapping(Some(mapping))
+                });
+            guest
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("timeout");
+            write_frame(
+                &mut guest,
+                &mut session,
+                Opcode::OpenTcp,
+                1,
+                b"cooperator.mvm.peer:443",
+            );
+            let observed = read_flowmux_frame(&mut guest, &mut session).0;
+            drop(guest);
+            host.join().expect("host join").expect("serve");
+            peer.join().expect("peer join");
+            assert_eq!(observed, Opcode::Refused);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "real authenticated peer reached explicit scope authority exactly once"
+            );
+        });
+    }
+
+    fn selected_mapping(target: &str) -> Arc<crate::supervisor::flowmux::PayloadMappingConfig> {
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, NetworkPolicy, PayloadMappingProfile,
+        };
+        let policy = NetworkPolicy::deny_all().with_payload_mapping(Some(
+            CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                host: target.into(),
+                port: 443,
+                server_name: target.into(),
+                spki_sha256: [7; 32],
+                profile: PayloadMappingProfile::SpiralCoreObjectStreamV1,
+            }])
+            .expect("mapping"),
+        ));
+        let binding = mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan {
+            plan_id: mvm_core::plan::PlanId("full-admitted-plan".into()),
+            plan_version: 1,
+            plan_nonce: mvm_core::plan::Nonce::from_bytes([9; 16]),
+            bundle_sha256: "b".repeat(64),
+            tenant_id: "test-tenant".into(),
+            instance_id: "test-instance".into(),
+            policy_sha256: mvm_core::policy::network_policy::content_sha256(&policy),
+        };
+        Arc::new(
+            crate::supervisor::flowmux::PayloadMappingConfig::new(&policy, binding)
+                .expect("mapping config"),
+        )
+    }
+    #[test]
+    fn selected_payload_mapping_never_bypasses_required_tcp_termination() {
+        let target = "bound.example";
+        let (service, _secrets) = substitution_binding(target, true);
+        let gate = gate_pinning_name(target, local_test_ip(), 443);
+        let mapping = selected_mapping(target);
+        let (mut guest, mut session, host) =
+            run_session_on_runtime(move |id, key, anchor, limits| {
+                FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_substitution(Some(service))
+                    .with_payload_mapping(Some(mapping))
+            });
+        guest
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("timeout");
+        write_frame(
+            &mut guest,
+            &mut session,
+            Opcode::OpenTcp,
+            1,
+            b"bound.example:443",
+        );
+        let observed = read_flowmux_frame(&mut guest, &mut session).0;
+        drop(guest);
+        host.join().expect("join").expect("serve");
+        assert_eq!(
+            observed,
+            Opcode::Refused,
+            "selected required profile cannot silently become a plain terminated leg"
+        );
+    }
+    #[test]
+    fn selected_payload_mapping_never_bypasses_required_typed_http_mapping() {
+        let target = "bound.example";
+        let (service, _secrets) = substitution_binding(target, true);
+        let gate = gate_pinning_name(target, local_test_ip(), 443);
+        let mapping = selected_mapping(target);
+        let (mut guest, mut session, host) =
+            run_session_on_runtime(move |id, key, anchor, limits| {
+                FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_substitution(Some(service))
+                    .with_payload_mapping(Some(mapping))
+            });
+        guest
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("timeout");
+        write_frame(&mut guest, &mut session, Opcode::OpenHttp, 1, b"");
+        assert_eq!(
+            read_flowmux_frame(&mut guest, &mut session).0,
+            Opcode::Opened
+        );
+        let head = mvm_core::substitution_wire::HttpFlowHead {
+            method: "GET".into(),
+            url: "https://bound.example/path".into(),
+            headers: Vec::new(),
+            body_len: 0,
+        };
+        write_frame(
+            &mut guest,
+            &mut session,
+            Opcode::HttpRequestHead,
+            1,
+            &serde_json::to_vec(&head).expect("head"),
+        );
+        let observed = read_flowmux_frame(&mut guest, &mut session).0;
+        drop(guest);
+        host.join().expect("join").expect("serve");
+        assert_eq!(
+            observed,
+            Opcode::Reset,
+            "typed selected profile must refuse before an ordinary forward task"
+        );
+    }
+
+    #[test]
+    fn payload_mapping_required_unavailable_peer_never_falls_back_to_raw() {
+        use crate::supervisor::flowmux::PayloadMappingConfig;
+        use mvm_contract::peer::{PeerBinding, PeerName};
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, NetworkPolicy, PayloadMappingProfile,
+        };
+        use mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let target = "cooperator.mvm.peer";
+        let policy = NetworkPolicy::deny_all()
+            .with_peers(vec![PeerBinding {
+                name: PeerName::parse(target).expect("name"),
+                port: 443,
+                host_addr: address.ip().to_string(),
+                host_port: address.port(),
+            }])
+            .with_payload_mapping(Some(
+                CooperatingPayloadPolicy::new(vec![CooperatingTcpPeer {
+                    host: target.into(),
+                    port: 443,
+                    server_name: target.into(),
+                    spki_sha256: [7; 32],
+                    profile: PayloadMappingProfile::SpiralCoreObjectStreamV1,
+                }])
+                .expect("mapping"),
+            ));
+        let binding = AdmittedNetworkPlan {
+            plan_id: mvm_core::plan::PlanId("full-admitted-plan".into()),
+            plan_version: 1,
+            plan_nonce: mvm_core::plan::Nonce::from_bytes([9; 16]),
+            bundle_sha256: "b".repeat(64),
+            tenant_id: "test-tenant".into(),
+            instance_id: "test-instance".into(),
+            policy_sha256: mvm_core::policy::network_policy::content_sha256(&policy),
+        };
+        let mapping =
+            Arc::new(PayloadMappingConfig::new(&policy, binding).expect("matching full policy"));
+        let gate = crate::supervisor::network_endpoint::build_egress_gate(&policy);
+        thread::scope(|scope| {
+            let peer = scope.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                runtime.block_on(async move {
+                    use tokio::io::AsyncReadExt;
+                    let listener = tokio::net::TcpListener::from_std(listener).expect("listener");
+                    let (mut stream, _) =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                            .await
+                            .expect("bounded accept")
+                            .expect("accept");
+                    let mut byte = [0; 1];
+                    assert_eq!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            stream.read(&mut byte)
+                        )
+                        .await
+                        .expect("bounded read")
+                        .expect("read"),
+                        0,
+                        "required peer gets neither raw nor encoded payload without authentication"
+                    );
+                });
+            });
+            let (mut guest, mut session, host) =
+                run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
+                    FlowMuxAccept::new(id, key, anchor, limits, gate)
+                        .with_payload_mapping(Some(mapping))
+                });
+            guest
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("read deadline");
+            write_frame(
+                &mut guest,
+                &mut session,
+                Opcode::OpenTcp,
+                1,
+                b"cooperator.mvm.peer:443",
+            );
+            assert_eq!(
+                read_flowmux_frame(&mut guest, &mut session).0,
+                Opcode::Refused
+            );
+            drop(guest);
+            host.join().expect("join host").expect("serve");
+            peer.join().expect("join peer");
+        });
+    }
 
     #[test]
     fn open_tcp_to_unknown_host_is_refused_by_default_deny_gate() {

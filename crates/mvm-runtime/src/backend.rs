@@ -842,6 +842,10 @@ impl AnyBackend {
     /// has no activation step to hold the workload behind, so it waits before
     /// it starts anything.
     pub fn start(&self, config: &VmStartConfig) -> Result<VmId> {
+        #[cfg(unix)]
+        if config.host_lifetime.is_some() {
+            anyhow::ensure!(self.supports_host_lifetime(),"backend has no original installed native lifetime");
+        }
         if !self.activation_waits_for_admission() {
             config.wait_for_admission_durability()?;
         }
@@ -884,6 +888,68 @@ impl AnyBackend {
             .with_original_object_observation(observation.clone())
             .start_custodied(config, images)?;
         Ok((id, OriginalObjectFirecracker { observation }))
+    }
+
+    #[cfg(unix)]
+    pub fn supports_host_lifetime(&self)->bool {
+        match self {
+            Self::Firecracker(runner)=>runner.supports_host_lifetime(),
+            Self::Hvf(runner)=>runner.supports_host_lifetime(),
+            _=>false,
+        }
+    }
+
+    /// No name/marker fallback can manufacture original installed ownership.
+    #[cfg(unix)]
+    pub fn install_owned_host_agent(&self,
+        registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar) -> Result<()> {
+        match self {
+            Self::Firecracker(runner) => runner.install_owned_host_agent(registrar),
+            Self::Hvf(runner) => runner.install_owned_host_agent(registrar),
+            _ => anyhow::bail!("installed host agent requires an original native runner"),
+        }
+    }
+
+    /// No name/marker fallback can manufacture original installed ownership.
+    #[cfg(unix)]
+    pub fn stop_owned(&self,id:&VmId,
+        owner:&std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>)->Result<()> {
+        match self {
+            Self::Firecracker(runner) => runner.stop_owned(id, owner),
+            Self::Hvf(runner) => runner.stop_owned(id, owner),
+            _ => anyhow::bail!("original installed native owner unavailable"),
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn stop_owned_pending(&self,binding:&mvm_core::host_lifetime::HostLaunchBinding)->Result<()> {
+        match self {
+            Self::Firecracker(runner) => runner.stop_owned_pending(binding),
+            Self::Hvf(runner) => runner.stop_owned_pending(binding),
+            _ => anyhow::bail!("original installed startup unavailable"),
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn take_owned_retirement(&self, id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>)
+        -> Result<crate::workload_runner::OwnedRetirement> {
+        match self {
+            Self::Firecracker(runner) => runner.take_owned_retirement(id, owner),
+            Self::Hvf(runner) => runner.take_owned_retirement(id, owner),
+            _ => anyhow::bail!("original installed retirement unavailable"),
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn take_owned_retirement_pending(&self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding)
+        -> Result<crate::workload_runner::OwnedRetirement> {
+        match self {
+            Self::Firecracker(runner) => runner.take_owned_retirement_pending(binding),
+            Self::Hvf(runner) => runner.take_owned_retirement_pending(binding),
+            _ => anyhow::bail!("original pending retirement unavailable"),
+        }
     }
 
     /// Start with original writable-image custody transferred to the final writer.

@@ -32,6 +32,12 @@ use crate::host::broker_services_spawn::{
     resolve_subprocess_bin_to_spawn, spawn_detached_with_config,
 };
 
+pub const OWNED_ASYNC_WORKERS_PER_PROCESS: usize = 2;
+pub const OWNED_BLOCKING_WORKERS_PER_PROCESS: usize = 2;
+/// Daemon and signer each have one main and one bounded Tokio runtime.
+pub const OWNED_TENANT_MAX_THREADS: usize =
+    2 * (1 + OWNED_ASYNC_WORKERS_PER_PROCESS + OWNED_BLOCKING_WORKERS_PER_PROCESS);
+
 mod owned;
 pub(crate) use owned::require_live_event;
 pub use owned::{

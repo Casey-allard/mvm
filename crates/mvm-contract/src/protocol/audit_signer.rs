@@ -14,6 +14,7 @@
 //! to know the live `EventCategory` enum from `mvm-supervisor`; the
 //! audit-signer's typed schema lives in its own crate.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 
 use serde::{Deserialize, Serialize};
@@ -246,6 +247,40 @@ impl SignerHelperRequest {
     }
 }
 
+/// Snapshot of the original funded chain at an authenticated registration transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditInventoryPhase { Registered, Deregistered }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditInventory {
+    pub phase: AuditInventoryPhase,
+    pub generation: [u8; 32],
+    pub tenant: String,
+    pub vm: String,
+    pub workload: String,
+    pub dev: u64,
+    pub ino: u64,
+    pub length: u64,
+    pub head: String,
+}
+
+impl AuditInventory {
+    pub fn same_registration(&self, other: &Self) -> bool {
+        self.generation == other.generation && self.tenant == other.tenant
+            && self.vm == other.vm && self.workload == other.workload
+            && (self.dev,self.ino) == (other.dev,other.ino)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedAuditInventory {
+    pub key: [u8;32],
+    pub envelope: super::signed_config::SignedConfigEnvelope,
+}
+
 /// Response from the resident per-tenant signer helper.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -258,6 +293,8 @@ pub enum SignerHelperResponse {
     },
     /// VM deregistration succeeded. Unknown VMs are idempotently accepted.
     Deregistered { request_id: String, vm_id: String },
+    /// Original funded chain snapshot from the exclusively held signer.
+    FundedInventory { request_id: String, inventory: Box<SignedAuditInventory> },
     /// Append succeeded.
     Ok {
         request_id: String,
@@ -287,6 +324,7 @@ impl SignerHelperResponse {
             SignerHelperResponse::Registered { request_id, .. }
             | SignerHelperResponse::Deregistered { request_id, .. }
             | SignerHelperResponse::Ok { request_id, .. }
+            | SignerHelperResponse::FundedInventory { request_id, .. }
             | SignerHelperResponse::HostSigned { request_id, .. }
             | SignerHelperResponse::Pong { request_id }
             | SignerHelperResponse::Err { request_id, .. } => request_id,

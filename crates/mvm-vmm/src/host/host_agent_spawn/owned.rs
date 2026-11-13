@@ -25,6 +25,14 @@ pub(crate) use audit_capability::require_live_event;
 /// Trusted installed DI retaining the actual aggregate helper reservation.
 pub trait HostAgentParentPermit: Send + Sync {
     fn check_current(&self, tenant: &str) -> Result<()>;
+    /// Per-process address-space reservation for the original daemon and its one signer.
+    fn owned_process_address_space_limit(&self, _tenant: &str) -> Result<Option<std::num::NonZeroU64>> {
+        Ok(None)
+    }
+    /// Funded bytes retained for each VM's original signed audit JSONL.
+    fn owned_audit_chain_bytes(&self, _tenant: &str) -> Result<Option<std::num::NonZeroU64>> {
+        Ok(None)
+    }
     fn check_registration(&self, params: &HostAgentServicesParams<'_>) -> Result<()>;
     /// Borrow the captured settings under this original permit's lifetime.
     /// An installed consumer cannot keep the snapshot after its owner.
@@ -127,6 +135,8 @@ impl OwnedAuditSideband {
 }
 
 struct Shared {
+    audit_chain_bytes: Option<std::num::NonZeroU64>,
+    address_space_limit: Option<std::num::NonZeroU64>,
     tenant: String,
     control_socket: PathBuf,
     signer_socket: PathBuf,
@@ -464,6 +474,10 @@ fn signing_key() -> Result<Zeroizing<[u8; 32]>> {
 }
 
 impl OwnedHostAgent {
+    pub const fn supports_process_address_space_limit() -> bool {
+        cfg!(target_os = "linux")
+    }
+
     pub fn spawn(inputs: OwnedHostAgentInputs) -> Result<Self> {
         let audit_sideband = OwnedAuditSideband::supported()?;
         mvm_core::naming::validate_vm_name(&inputs.tenant)?;
@@ -477,6 +491,9 @@ impl OwnedHostAgent {
         );
         inputs.parent.check_current(&inputs.tenant)?;
         inputs.holder.verify_current()?;
+        let audit_chain_bytes = inputs.parent.owned_audit_chain_bytes(&inputs.tenant)?;
+        let address_space_limit = inputs.parent.owned_process_address_space_limit(&inputs.tenant)?;
+        ensure!(address_space_limit.is_none() || Self::supports_process_address_space_limit(), "funded daemon and signer require native address-space enforcement");
         require_owned_child_custody()?;
         refuse_existing(&inputs.tenant)?;
         let directory = mvm_core::config::host_agent_dir(&inputs.tenant);
@@ -506,7 +523,7 @@ impl OwnedHostAgent {
         )?;
         let nonce: [u8; 16] = rand::random();
         let bytes = Zeroizing::new(serde_json::to_vec(
-            &serde_json::json!({ "config": config(&inputs.tenant), "nonce":nonce }),
+            &serde_json::json!({ "config": config(&inputs.tenant), "nonce":nonce, "audit_chain_bytes": audit_chain_bytes }),
         )?);
         ensure!(
             bytes.len() <= CONTROL_MAX_FRAME_BYTES,
@@ -538,6 +555,10 @@ impl OwnedHostAgent {
         }
         inputs.parent.check_current(&inputs.tenant)?;
         inputs.holder.verify_current()?;
+        #[cfg(target_os = "linux")]
+        if let Some(limit) = address_space_limit {
+            crate::host::network_endpoint_spawn::limit_original_address_space(&mut command, limit.get())?;
+        }
         let mut child = command.spawn().context("spawn original host-agent child")?;
         drop(descriptors);
         let owner = child.stdin.take();
@@ -545,6 +566,8 @@ impl OwnedHostAgent {
         let signer_socket = mvm_core::config::host_agent_signer_helper_socket(&inputs.tenant);
         let mut agent = Self {
             shared: Arc::new(Shared {
+                address_space_limit,
+                audit_chain_bytes,
                 tenant: inputs.tenant,
                 control_socket: socket,
                 signer_socket,
@@ -884,6 +907,15 @@ fn owned_control(
     }
 }
 impl OwnedHostAgentRegistrar {
+    pub fn audit_chain_bytes(&self) -> Option<std::num::NonZeroU64> {
+        self.shared.audit_chain_bytes
+    }
+
+    /// Pre-exec ceiling inherited by the signer, subject to stricter host limits.
+    pub fn process_address_space_limit(&self) -> Option<std::num::NonZeroU64> {
+        self.shared.address_space_limit
+    }
+
     /// Attach the original resource owner before passing this registrar to the runner.
     /// The underlying tenant daemon and its signed registration protocol stay the same.
     pub fn with_registration_owner(mut self, owner: Arc<dyn RegisteredEndpointOwner>) -> Result<Self> {

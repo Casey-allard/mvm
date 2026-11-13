@@ -67,13 +67,33 @@ pub trait StreamRedactor: Send + Sync {
 /// an empty ruleset satisfies [`StreamRedactor`] exactly as well as the real
 /// one, so a broker constructed from a bare seam can be silently
 /// non-redacting. Wrapping the seam in a type whose field is private and
-/// whose only production constructor is [`StreamRedaction::curated`] moves
+/// whose production constructors are [`StreamRedaction::curated`] and the
+/// fallible owned-profile [`StreamRedaction::curated_owned`] moves
 /// that from a convention nobody can see broken into something the compiler
 /// refuses to build. `xtask check-stream-redaction-seam` pins the same
 /// property at the call sites.
 pub struct StreamRedaction(Box<dyn StreamRedactor>);
 
 impl StreamRedaction {
+    /// Read-only construction controls, not a total allocation quote. The
+    /// original collector must prepay its accepted scanner workspace separately.
+    pub fn owned_pii_requirements(
+        policy: &RedactionPolicy,
+    ) -> Result<mvm_core::pii::OwnedPiiRequirements, RedactionFailed> {
+        PiiRedactor::owned_pii_requirements(&policy.default.pii)
+            .map_err(|_| RedactionFailed::new("owned PII policy unsupported"))
+    }
+
+    /// Curated transcript rules with explicit owned-profile compiler/cache
+    /// controls. Failure refuses construction; it never installs a legacy or
+    /// empty scanner. Disabled explicitly uses the canonical full safety set.
+    pub fn curated_owned(policy: &RedactionPolicy) -> Result<Self, RedactionFailed> {
+        Self::owned_pii_requirements(policy)?;
+        let scanner = PiiRedactor::curated_owned(&policy.default.pii)
+            .map_err(|_| RedactionFailed::new("owned PII construction refused"))?;
+        Ok(Self(Box::new(scanner)))
+    }
+
     /// The shipped ruleset, read through the workload's own redaction policy.
     /// The only way to obtain a `StreamRedaction` outside this crate's own
     /// tests.
@@ -234,6 +254,42 @@ struct RedactionFailureMarker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_curated_stream_matches_legacy_and_disabled_is_explicit_full_rules() {
+        let body = b"mail a@b.com card 4111111111111111";
+        for mode in [None, Some("disabled"), Some("redact")] {
+            let mut policy = RedactionPolicy::default();
+            policy.default.pii.mode = mode.map(str::to_owned);
+            let controls = StreamRedaction::owned_pii_requirements(&policy).unwrap();
+            assert_eq!(controls.rule_count, 5);
+            assert_eq!(controls.regex_objects, 6);
+            assert_eq!(
+                StreamRedaction::curated_owned(&policy)
+                    .unwrap()
+                    .redact(body)
+                    .unwrap(),
+                StreamRedaction::curated(&policy).redact(body).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_stream_unknown_policy_refuses_instead_of_legacy_fallback() {
+        let mut policy = RedactionPolicy::default();
+        policy.default.pii.categories = vec!["unknown-private-value".into()];
+        assert!(StreamRedaction::owned_pii_requirements(&policy).is_err());
+        let error = StreamRedaction::curated_owned(&policy).err().unwrap();
+        assert!(!error.reason.contains("unknown-private-value"));
+        // Legacy fallback remains its existing, independently specified API.
+        assert!(
+            StreamRedaction::curated(&policy)
+                .redact(b"a@b.com")
+                .unwrap()
+                .rules_fired
+                .contains(&"email")
+        );
+    }
 
     /// A Luhn-valid test card number; the curated ruleset masks it.
     const TEST_CARD: &[u8] = b"4111111111111111";

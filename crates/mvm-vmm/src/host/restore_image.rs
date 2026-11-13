@@ -439,7 +439,7 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RestoreImageError> {
     Ok(file)
 }
 
-pub(crate) fn open_trusted_dir(path: &Path) -> Result<File, RestoreImageError> {
+pub fn open_trusted_dir(path: &Path) -> Result<File, RestoreImageError> {
     open_trusted_dir_with(path, &host_dir_facts)
 }
 

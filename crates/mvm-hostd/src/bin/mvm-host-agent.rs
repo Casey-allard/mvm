@@ -19,6 +19,7 @@
 //! signer-helper child. The moat (keyless parser / key-holding signer) is
 //! preserved; this is the keyless half.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -144,7 +145,7 @@ async fn spawn_worker(raw_cfg: &[u8]) -> Result<Child> {
     Ok(child)
 }
 
-async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<Child> {
+async fn spawn_signer_helper(cfg: &HostAgentConfig, audit_chain_bytes: Option<std::num::NonZeroU64>) -> Result<Child> {
     let bin = signer_helper_bin_path()?;
     let helper_cfg = SignerHelperConfig {
         tenant_id: cfg.tenant_id.clone(),
@@ -152,9 +153,18 @@ async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<Child> {
         software_chain_key_path: Some(cfg.software_chain_key_path.clone()),
         max_frame_bytes: cfg.max_frame_bytes,
     };
-    let mut child = Command::from(mvm_core::env_hygiene::helper_command(&bin))
+    let mut command = Command::from(mvm_core::env_hygiene::helper_command(&bin));
+    let owned = std::env::args_os().any(|arg| arg == "--installed-owned");
+    if owned {
+        command.arg("--installed-owned");
+    }
+    #[cfg(target_os = "macos")]
+    let stdout = if owned { Stdio::piped() } else { Stdio::null() };
+    #[cfg(not(target_os = "macos"))]
+    let stdout = Stdio::null();
+    let mut child = command
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
@@ -164,7 +174,9 @@ async fn spawn_signer_helper(cfg: &HostAgentConfig) -> Result<Child> {
         .take()
         .context("mvm-signer-helper stdin was not piped")?;
     stdin
-        .write_all(&serde_json::to_vec(&helper_cfg)?)
+        .write_all(&if owned {
+            serde_json::to_vec(&mvm_hostd::audit_signer::config::OwnedSignerSetup { config: helper_cfg, audit_chain_bytes })?
+        } else { serde_json::to_vec(&helper_cfg)? })
         .await
         .context("pipe SignerHelperConfig to mvm-signer-helper")?;
     drop(stdin);
@@ -210,7 +222,7 @@ async fn supervise_signer_helper(
 ) {
     let mut first_ready = Some(first_ready);
     loop {
-        match spawn_signer_helper(&cfg).await {
+        match spawn_signer_helper(&cfg, None).await {
             Ok(mut child) => {
                 let rebound = {
                     let daemon = daemon.lock().await;
@@ -403,16 +415,65 @@ fn main() -> Result<()> {
         .json()
         .init();
 
-    let raw = mvm_hostd::read_launch_config("mvm-host-agent")?;
-    let cfg: HostAgentConfig =
-        serde_json::from_slice(&raw).context("mvm-host-agent config parse failed")?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let owned = std::env::args_os().skip(1).eq([std::ffi::OsString::from("--installed-owned")]);
+    #[cfg(target_os = "macos")]
+    if owned {
+        mvm_vmm::host::owned_liveness::prepare_stdout_writer()
+            .context("prepare original daemon liveness writer")?;
+    }
+    if owned {
+        mvm_hostd::parent_death::bound_owned_main_stack()
+            .context("bound owned host-agent main stack")?;
+    }
+    let (raw, cfg, owned_nonce) = if owned {
+        let mut stdin = std::io::stdin().lock();
+        let mut length = [0; 4];
+        stdin.read_exact(&mut length)?;
+        let length = usize::try_from(u32::from_be_bytes(length))?;
+        anyhow::ensure!(
+            (1..=65536).contains(&length),
+            "owned host-agent config limit"
+        );
+        let mut bytes = vec![0; length];
+        stdin.read_exact(&mut bytes)?;
+        mvm_hostd::owned_resources::validate_shape(&bytes)?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Startup {
+            config: HostAgentConfig,
+            nonce: [u8; 16],
+            #[serde(default)]
+            audit_chain_bytes: Option<std::num::NonZeroU64>,
+        }
+        let startup: Startup =
+            serde_json::from_slice(&bytes).context("owned host-agent config parse failed")?;
+        (Vec::new(), startup.config, Some((startup.nonce, startup.audit_chain_bytes)))
+    } else {
+        let raw = mvm_hostd::read_launch_config("mvm-host-agent")?;
+        let cfg: HostAgentConfig =
+            serde_json::from_slice(&raw).context("mvm-host-agent config parse failed")?;
+        (raw, cfg, None)
+    };
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .enable_all()
         .worker_threads(2)
-        .thread_name("mvm-host-agent")
+        .thread_name("mvm-host-agent");
+    if owned {
+        builder.worker_threads(mvm_vmm::host::host_agent_spawn::OWNED_ASYNC_WORKERS_PER_PROCESS);
+        builder.thread_stack_size(2 * 1024 * 1024);
+        builder.max_io_events_per_tick(16);
+        builder.max_blocking_threads(mvm_vmm::host::host_agent_spawn::OWNED_BLOCKING_WORKERS_PER_PROCESS);
+    }
+    let runtime = builder
         .build()
         .context("mvm-host-agent supervisor tokio runtime build failed")?;
-    if is_worker_mode() {
+    if let Some((nonce, audit_chain_bytes)) = owned_nonce {
+        runtime.block_on(async move {
+            let signer = spawn_signer_helper(&cfg, audit_chain_bytes).await?;
+            HostAgentDaemon::run_owned(cfg, nonce, signer).await
+        })?;
+    } else if is_worker_mode() {
         runtime.block_on(run_worker_once(cfg))?;
     } else {
         runtime.block_on(supervise_worker(cfg, raw))?;

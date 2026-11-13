@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mvm_contract::protocol::network_flow::{Direction, Opcode, SessionValidator};
 use mvm_core::net::session::Session;
@@ -28,7 +28,7 @@ pub(super) type SharedUdpAssociations = Arc<Mutex<BTreeMap<u32, UdpAssociationHa
 #[derive(Clone)]
 pub struct FlowMuxIngressHandle {
     pub(super) session: Arc<Mutex<Session>>,
-    pub(super) writer: Arc<Mutex<UnixStream>>,
+    pub(super) writer: Arc<super::wire::SharedWriter>,
     pub(super) validator: Arc<Mutex<SessionValidator>>,
     pub(super) registry: Arc<Mutex<StreamRegistry>>,
     pub(super) streams: Arc<Mutex<BTreeMap<u32, TcpStreamHandle>>>,
@@ -39,6 +39,8 @@ pub struct FlowMuxIngressHandle {
     pub(super) udp_associations: SharedUdpAssociations,
     pub(super) udp_idle_timeout: Duration,
     pub(super) max_udp_peers: usize,
+    pub(super) owned_tcp_relays: Option<Arc<super::OwnedTcpRelays>>,
+    pub(super) owned_guest_control: Option<Arc<UnixStream>>,
 }
 
 impl FlowMuxIngressHandle {
@@ -65,6 +67,27 @@ impl FlowMuxIngressHandle {
     }
 
     fn open_tcp_inner(&self, mapping_id: u16, external: TcpStream) -> Result<(), FlowMuxError> {
+        let owned = self
+            .owned_tcp_relays
+            .as_ref()
+            .map(|owned| {
+                let until = Instant::now()
+                    .checked_add(Duration::from_secs(5))
+                    .ok_or_else(|| std::io::Error::other("owned ingress deadline overflow"))?;
+                owned
+                    .reserve_until(until)
+                    .map(|reservation| (reservation, until))
+            })
+            .transpose()?;
+        let owned_deadline = owned.as_ref().map(|(_, deadline)| *deadline);
+        let reservation = owned.map(|(reservation, _)| reservation);
+        if let Some(reservation) = &reservation {
+            let guest = self
+                .owned_guest_control
+                .clone()
+                .ok_or_else(|| std::io::Error::other("owned guest control missing"))?;
+            reservation.bind_setup(&external, guest)?;
+        }
         let stream_id = lock_registry(&self.registry)
             .alloc_host(registry::FlowClass::Tcp)
             .map_err(|error| FlowMuxError::FrameRefused(error.to_string()))?;
@@ -118,8 +141,23 @@ impl FlowMuxIngressHandle {
             return Err(error);
         }
 
-        match receiver.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => self.spawn_tcp_relay(stream_id, FlowSocket::from(external)),
+        let wait = owned_deadline.map_or(Duration::from_secs(5), |until| {
+            until.saturating_duration_since(Instant::now())
+        });
+        let response = receiver.recv_timeout(wait);
+        if owned_deadline.is_some_and(|until| Instant::now() >= until) {
+            lock_pending_ingress(&self.pending).remove(&stream_id);
+            if let Some(handle) = lock_tcp_streams(&self.streams).remove(&stream_id) {
+                let _ = handle.upstream.shutdown(std::net::Shutdown::Both);
+            }
+            let _ = lock_registry(&self.registry).retire(stream_id);
+            return Err(FlowMuxError::Transport(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "owned ingress deadline",
+            )));
+        }
+        match response {
+            Ok(Ok(())) => self.spawn_tcp_relay(stream_id, FlowSocket::from(external), reservation),
             Ok(Err(reason)) => {
                 if let Some(handle) = lock_tcp_streams(&self.streams).remove(&stream_id) {
                     let _ = handle.upstream.shutdown(std::net::Shutdown::Both);
@@ -288,6 +326,7 @@ impl FlowMuxIngressHandle {
         &self,
         stream_id: u32,
         upstream: FlowSocket,
+        reservation: Option<super::owned_relays::RelayReservation>,
     ) -> Result<(), FlowMuxError> {
         let upstream_read = upstream.try_clone()?;
         let host_half_closed = Arc::new(AtomicBool::new(false));
@@ -300,22 +339,44 @@ impl FlowMuxIngressHandle {
         let validator = Arc::clone(&self.validator);
         let credit_wait = self.credit_wait;
 
-        std::thread::Builder::new()
-            .name(format!("flowmux-ingress-tcp-{stream_id}"))
-            .spawn(move || {
-                run_tcp_relay(TcpRelayParams {
-                    stream_id,
-                    upstream: upstream_read,
-                    session,
-                    writer,
-                    registry,
-                    validator,
-                    host_half_closed: relay_flag,
-                    retired: retired_flag,
-                    credit_wait,
-                })
+        let wake = if reservation.is_some() {
+            Some(super::owned_relays::RelayWake {
+                upstream: Mutex::new(upstream.try_clone()?),
+                guest: self.owned_guest_control.clone().ok_or_else(|| {
+                    std::io::Error::other("owned relay original guest transport missing")
+                })?,
+                retired: retired.clone(),
             })
-            .map_err(FlowMuxError::Transport)?;
+        } else {
+            None
+        };
+        let run = move || {
+            run_tcp_relay(TcpRelayParams {
+                stream_id,
+                upstream: upstream_read,
+                session,
+                writer,
+                registry,
+                validator,
+                host_half_closed: relay_flag,
+                retired: retired_flag,
+                credit_wait,
+            })
+        };
+        match (reservation, wake) {
+            (Some(reservation), Some(wake)) => reservation.spawn(wake, run)?,
+            (None, None) => {
+                std::thread::Builder::new()
+                    .name(format!("flowmux-ingress-tcp-{stream_id}"))
+                    .spawn(run)
+                    .map_err(FlowMuxError::Transport)?;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(FlowMuxError::Transport(std::io::Error::other(
+                    "owned relay custody incomplete",
+                )));
+            }
+        }
 
         lock_tcp_streams(&self.streams).insert(
             stream_id,

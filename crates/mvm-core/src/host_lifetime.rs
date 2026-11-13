@@ -329,12 +329,35 @@ impl PreparedHostLifetime {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq)]
 struct AdmissionBinding {
     plan_id: PlanId,
     nonce: Nonce,
     body_sha256: [u8; 32],
+    direct: Option<DirectNetworkBinding>,
     legacy_portable: bool,
+}
+
+#[derive(PartialEq)]
+struct DirectNetworkBinding {
+    plan: crate::policy::direct_plan::AdmittedNetworkPlan,
+    limits: crate::plan::NetworkLimits,
+    redaction: crate::policy::RedactionPolicy,
+}
+
+impl DirectNetworkBinding {
+    fn from_plan(config: &VmStartConfig, plan: &ExecutionPlan) -> Result<Option<Self>> {
+        if config.network_policy.payload_mapping().is_none() {
+            return Ok(None);
+        }
+        ensure!(plan.ingress.is_empty() && plan.secrets.is_empty(),
+            "selected direct endpoint does not serve requested ingress or secrets");
+        Ok(Some(Self {
+            plan: crate::policy::direct_plan::AdmittedNetworkPlan::from_plan(plan, &config.name, &config.network_policy)?,
+            limits: plan.effective_network_limits()?,
+            redaction: plan.redaction.clone(),
+        }))
+    }
 }
 
 /// Shared one-shot owner, never a serializable permission or exit receipt.
@@ -383,6 +406,16 @@ impl fmt::Debug for HostLifetimeAnchor {
 }
 
 impl HostLifetimeAnchor {
+    /// Match retained native disposal evidence after the grant has closed.
+    /// Freshness is a launch/dispatch check. Disposal compares held objects.
+    pub fn check_original_lease(&self, lease: &PreparedHostLifetimeLease) -> Result<()> {
+        ensure!(self.lease.directory_object_id() == lease.directory_object_id()
+            && self.lease.holder_object_id() == lease.holder_object_id()
+            && self.lease.owner_uid() == lease.owner_uid()
+            && self.lease.expectation() == lease.expectation(), "native disposal belongs to a different original holder");
+        Ok(())
+    }
+
     /// The archive length fixed by the original preparation for this pin.
     pub fn portable_archive_bytes(&self, pin: &PlanArtifact) -> Result<NonZeroU64> {
         let (original, bytes) = self
@@ -516,6 +549,7 @@ impl HostLifetimeAnchor {
             plan_id: plan.plan_id.clone(),
             nonce: plan.nonce.clone(),
             body_sha256: Sha256::digest(serde_jcs::to_vec(plan)?).into(),
+            direct: DirectNetworkBinding::from_plan(config, plan)?,
             legacy_portable: config.legacy_portable_runtime.is_some(),
         };
         ensure!(
@@ -556,6 +590,7 @@ impl HostLifetimeAnchor {
             plan_id: plan.plan_id.clone(),
             nonce: plan.nonce.clone(),
             body_sha256: Sha256::digest(serde_jcs::to_vec(&plan)?).into(),
+            direct: DirectNetworkBinding::from_plan(config, &plan)?,
             legacy_portable: config.legacy_portable_runtime.is_some(),
         })
     }

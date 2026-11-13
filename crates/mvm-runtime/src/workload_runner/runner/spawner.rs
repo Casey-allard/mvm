@@ -55,12 +55,31 @@ pub struct SpawnedEndpoint {
     pub identity_drive: Option<PathBuf>,
 }
 
+#[cfg(unix)]
+pub struct InstalledSpawnedEndpoint {
+    pub(crate) egress_uds: Option<PathBuf>,
+    pub(crate) identity_drive: Option<PathBuf>,
+    pub(crate) owner: Option<mvm_vmm::host::network_endpoint_spawn::OwnedEndpoint>,
+    pub(crate) telemetry: bool,
+}
+
 /// Stand up the per-VM gating endpoint. The one host-side egress bridge
 /// (claim-10 gate + claims 12/13 substitution).
 pub trait NetworkEndpointSpawner: Send + Sync {
     fn spawn(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<SpawnedEndpoint>;
     /// Provision authentication without starting an endpoint or granting egress.
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>>;
+    #[cfg(unix)]
+    fn supports_registered_installed_endpoint(&self) -> bool { false }
+    #[cfg(unix)]
+    fn spawn_installed(
+        &self,
+        _req: &NetworkEndpointSpawnRequest<'_>,
+        _config: &VmStartConfig,
+        _original: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
+    ) -> Result<InstalledSpawnedEndpoint> {
+        anyhow::bail!("original installed endpoint spawner unavailable")
+    }
     /// For a boot with no endpoint, start its VM-lifetime telemetry collector
     /// on its own and record whether the boot is provisioned for it. Never
     /// fails a launch: a collector that cannot start costs telemetry only.
@@ -202,6 +221,53 @@ pub(super) fn prepare_standby_identity(
 }
 
 impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
+    #[cfg(unix)]
+    fn supports_registered_installed_endpoint(&self) -> bool {
+        cfg!(target_os = "linux")
+    }
+    #[cfg(unix)]
+    fn spawn_installed(
+        &self,
+        req: &NetworkEndpointSpawnRequest<'_>,
+        config: &VmStartConfig,
+        original: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
+    ) -> Result<InstalledSpawnedEndpoint> {
+        use mvm_vmm::host::network_endpoint_spawn::{
+            AdmittedNetworkPlan, EndpointLifetime, spawn_network_endpoint_installed_registered,
+        };
+
+        let original = original.context("installed direct endpoint requires signed host-service registration")?;
+        original.check_endpoint_binding(req.vm_name, req.tenant, req.state_dir)?;
+        let anchor = config.host_lifetime.as_ref().context("installed direct endpoint original lifetime missing")?;
+        anyhow::ensure!(self.supports_registered_installed_endpoint()
+            && anchor.binding().backend == BackendKind::Firecracker
+            && req.network_policy == &config.network_policy
+            && req.network_policy.payload_mapping().is_some()
+            && req.secrets.is_empty() && req.ingress.is_empty()
+            && matches!(req.identity, FlowMuxIdentitySource::Mint),
+            "unsupported original direct TCP endpoint launch");
+        anchor.check_parent_current(config, BackendKind::Firecracker)?;
+        let plan = mvm_core::plan::plan_from_admitted_json(config.plan_json.as_deref().context("original admitted plan missing")?)?;
+        let facts = AdmittedNetworkPlan::from_plan(&plan, req.vm_name, req.network_policy)?;
+        let handoff = anchor.prepare_endpoint_handoff(config, BackendKind::Firecracker)?;
+        handoff.check_direct_network(&facts, &req.network_limits, req.redaction)?;
+        let session = hex::encode(handoff.partition().projection().session);
+        let uds = vm_network_endpoint_socket(req.vm_name);
+        let (identity, drive) = prepare_endpoint_identity(req, None, &BootEgressCa(None), &session, Some(original))?;
+        mvm_vmm::host::telemetry_registration::register_telemetry_boot(
+            req.state_dir, req.vm_name, &identity.guest_verifying_key_base64)?;
+        mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(req.state_dir, true)?;
+        let endpoint = spawn_network_endpoint_installed_registered(SubstitutionSpawnParams {
+            vm_name: req.vm_name, state_dir: req.state_dir, lifetime: EndpointLifetime::Launcher,
+            telemetry: true, tenant: req.tenant, secrets: req.secrets, redaction: req.redaction,
+            transport: EndpointTransport::Uds { path: uds.clone() }, egress_proxy: None,
+            session_marker: None, tls_intermediate: None, admitted_network_plan: Some(facts),
+            network_policy: Some(req.network_policy), network_limits: req.network_limits, ingress: req.ingress,
+            resolver_remote: None, binding_store_dir: None, flowmux_identity: Some(identity),
+        }, handoff, original)?;
+        Ok(InstalledSpawnedEndpoint { egress_uds: Some(uds), identity_drive: drive, owner: Some(endpoint), telemetry: true })
+    }
+
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>> {
         prepare_local_identity(req, None)
     }
@@ -321,56 +387,9 @@ fn spawn_local_endpoint(
     req: &NetworkEndpointSpawnRequest<'_>,
     capture: Option<&Capture>,
 ) -> Result<SpawnedEndpoint> {
-    use mvm_vmm::host::flowmux_identity::{
-        FlowMuxIdentityMaterial, IDENTITY_DRIVE_FILE, IdentityDriveContents,
-        load_inheritable_identity,
-    };
-    use mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig;
-
     let uds = vm_network_endpoint_socket(req.vm_name);
     let egress_ca = BootEgressCa::resolve(req)?;
-    let (identity, identity_drive) = match req.identity {
-        FlowMuxIdentitySource::Mint => {
-            let material = FlowMuxIdentityMaterial::mint_from_host_signer(req.vm_name)
-                .context("minting this boot's FlowMux identity")?;
-            let reader_boot = mint_mailbox_reader_boot(req, material.guest_verifying_key())?;
-            observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
-            let drive = req.state_dir.join(IDENTITY_DRIVE_FILE);
-            material.write_drive_with(
-                &drive,
-                &IdentityDriveContents {
-                    ingress: req.ingress,
-                    egress_ca_cert_pem: egress_ca.guest_cert_pem(),
-                    mailbox_ack_key: reader_boot.as_ref().map(|(key, _)| key),
-                    mailbox_reader_boot: reader_boot.as_ref().map(|(_, binding)| binding),
-                },
-            )?;
-            persist_mailbox_reader_boot(req, reader_boot.as_ref().map(|(_, binding)| binding))?;
-            // Persisted so a warm child claimed from this VM pins the key
-            // its restored guest actually holds.
-            material.persist_inheritable(req.state_dir)?;
-            (material.spawn_config().clone(), Some(drive))
-        }
-        FlowMuxIdentitySource::InheritFrom(parent_state_dir) => {
-            clear_mailbox_reader_boot(req.state_dir)?;
-            let inherited = load_inheritable_identity(parent_state_dir)?.with_context(|| {
-                format!(
-                    "parent at {} persisted no FlowMux identity, so a claimed child's \
-                         endpoint has no key to pin — refusing rather than minting one the \
-                         restored guest does not hold",
-                    parent_state_dir.display()
-                )
-            })?;
-            (
-                FlowMuxIdentitySpawnConfig {
-                    session_id: inherited.session_id,
-                    host_signing_key_base64: host_signer_key_base64()?,
-                    guest_verifying_key_base64: inherited.guest_verifying_key_base64,
-                },
-                None,
-            )
-        }
-    };
+    let (identity, identity_drive) = prepare_endpoint_identity(req, capture, &egress_ca, req.vm_name, None)?;
 
     // Same seam for minted and inherited identities: the boot the endpoint
     // authenticates is the boot the telemetry dialer must expect.
@@ -414,6 +433,67 @@ fn spawn_local_endpoint(
     Ok(SpawnedEndpoint {
         egress_uds: uds,
         identity_drive,
+    })
+}
+
+/// Mint or inherit the identity once for the existing gated endpoint and guest drive.
+fn prepare_endpoint_identity(
+    req: &NetworkEndpointSpawnRequest<'_>,
+    capture: Option<&Capture>,
+    egress_ca: &BootEgressCa,
+    session_id: &str,
+    registered: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
+) -> Result<(mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig, Option<PathBuf>)> {
+    use mvm_vmm::host::flowmux_identity::{
+        FlowMuxIdentityMaterial, IDENTITY_DRIVE_FILE, IdentityDriveContents,
+        load_inheritable_identity,
+    };
+    use mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig;
+
+    Ok(match req.identity {
+        FlowMuxIdentitySource::Mint => {
+            let material = FlowMuxIdentityMaterial::mint_from_host_signer(session_id)
+                .context("minting this boot's FlowMux identity")?;
+            if let Some(original) = registered {
+                original.check_flowmux_host_anchor(&material.host_signer_verifying_key()?.to_bytes())?;
+            }
+            let reader_boot = mint_mailbox_reader_boot(req, material.guest_verifying_key())?;
+            observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
+            let drive = req.state_dir.join(IDENTITY_DRIVE_FILE);
+            material.write_drive_with(
+                &drive,
+                &IdentityDriveContents {
+                    ingress: req.ingress,
+                    egress_ca_cert_pem: egress_ca.guest_cert_pem(),
+                    mailbox_ack_key: reader_boot.as_ref().map(|(key, _)| key),
+                    mailbox_reader_boot: reader_boot.as_ref().map(|(_, binding)| binding),
+                },
+            )?;
+            persist_mailbox_reader_boot(req, reader_boot.as_ref().map(|(_, binding)| binding))?;
+            // Persisted so a warm child claimed from this VM pins the key
+            // its restored guest actually holds.
+            material.persist_inheritable(req.state_dir)?;
+            (material.spawn_config().clone(), Some(drive))
+        }
+        FlowMuxIdentitySource::InheritFrom(parent_state_dir) => {
+            clear_mailbox_reader_boot(req.state_dir)?;
+            let inherited = load_inheritable_identity(parent_state_dir)?.with_context(|| {
+                format!(
+                    "parent at {} persisted no FlowMux identity, so a claimed child's \
+                         endpoint has no key to pin — refusing rather than minting one the \
+                         restored guest does not hold",
+                    parent_state_dir.display()
+                )
+            })?;
+            (
+                FlowMuxIdentitySpawnConfig {
+                    session_id: inherited.session_id,
+                    host_signing_key_base64: host_signer_key_base64()?,
+                    guest_verifying_key_base64: inherited.guest_verifying_key_base64,
+                },
+                None,
+            )
+        }
     })
 }
 

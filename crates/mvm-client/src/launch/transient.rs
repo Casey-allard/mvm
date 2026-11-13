@@ -46,6 +46,13 @@ impl LocalBackend {
         match result {
             Ok(outcome) => Ok(outcome),
             Err(e) => {
+                #[cfg(unix)]
+                if request.host_lifetime.is_some() {
+                    // Original runner/native owners retain uncertain effects.
+                    // Name-based cleanup cannot establish installed exit.
+                    Record::new(phase).emit();
+                    return Err(e);
+                }
                 observe_then_cleanup(Record::new(phase), Record::emit, || {
                     // Idempotent rollback of everything this session recorded.
                     if let Err(cleanup) = self.cleanup_transient_reserved(&name, &reservation) {

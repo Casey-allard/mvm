@@ -9,7 +9,10 @@
 //! which is the audit point we want.
 
 use crate::jailer::{ConfinementSpec, JailerError};
-use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+use seccompiler::{
+    SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    TargetArch,
+};
 use std::collections::BTreeMap;
 
 #[cfg(target_arch = "x86_64")]
@@ -339,6 +342,29 @@ fn syscall_name_to_nr(name: &str) -> Option<libc::c_long> {
 /// First installs the refusal reporter, so a call the filter refuses is named
 /// on stderr before the process dies of it rather than silently.
 pub fn apply(spec: &ConfinementSpec) -> Result<(), JailerError> {
+    apply_inner(spec, false, false, None)
+}
+
+#[cfg(test)]
+fn apply_with_owned_store(spec: &ConfinementSpec) -> Result<(), JailerError> {
+    apply_with_owned_files(spec, true, false, None)
+}
+
+pub(crate) fn apply_with_owned_files(
+    spec: &ConfinementSpec,
+    store: bool,
+    records: bool,
+    runtime_state: Option<std::os::fd::RawFd>,
+) -> Result<(), JailerError> {
+    apply_inner(spec, store, records, runtime_state)
+}
+
+fn apply_inner(
+    spec: &ConfinementSpec,
+    owned_store: bool,
+    owned_records: bool,
+    runtime_state: Option<std::os::fd::RawFd>,
+) -> Result<(), JailerError> {
     crate::jailer::refusal_report::install(process_label())?;
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for name in &spec.allowed_syscalls {
@@ -348,6 +374,88 @@ pub fn apply(spec: &ConfinementSpec) -> Result<(), JailerError> {
             ))
         })?;
         rules.insert(nr, vec![]);
+    }
+    if owned_store || owned_records {
+        // Current-owner verification reads the effective UID after confinement.
+        rules.insert(libc::SYS_geteuid, vec![]);
+    }
+    if let Some(directory) = runtime_state {
+        // x86_64's legacy profile admits rename, not renameat. Permit only
+        // descriptor-relative sidecar publication within this held state.
+        // On aarch64 the existing rename rule already maps to renameat.
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            rules.entry(libc::SYS_renameat)
+        {
+            let conditions = [0, 2]
+                .into_iter()
+                .map(|argument| {
+                    SeccompCondition::new(
+                        argument,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Eq,
+                        directory as u64,
+                    )
+                    .map_err(|error| JailerError::SeccompInstall(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            entry.insert(vec![SeccompRule::new(conditions)
+                .map_err(|error| JailerError::SeccompInstall(error.to_string()))?]);
+        }
+    }
+    if owned_records {
+        // Records freshness reopens/checks the original state directory using
+        // the canonical local-filesystem probe. Store-only freshness currently
+        // needs metadata/current-owner, so it receives no extra FS query.
+        rules.insert(libc::SYS_fstatfs, vec![]);
+        // The canonical FD ACL check only queries presence/length. It does
+        // not read xattr bytes: require the actual NULL buffer and zero size.
+        // BPF cannot validate the attribute-name string; the original opaque
+        // writer's namespace/identity/owner/flags/ACL checks remain mandatory.
+        let conditions = [2, 3]
+            .into_iter()
+            .map(|argument| {
+                SeccompCondition::new(argument, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                    .map_err(|error| JailerError::SeccompInstall(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let presence = SeccompRule::new(conditions)
+            .map_err(|error| JailerError::SeccompInstall(error.to_string()))?;
+        rules.insert(libc::SYS_fgetxattr, vec![presence]);
+        if !owned_store && rules.contains_key(&libc::SYS_unlinkat) {
+            // AArch64's canonical file cleanup uses unlinkat. The records-only
+            // role's unlinkat allowance removes status temp files, without
+            // the explicit directory-removal flag. Preserve
+            // the legacy rule while narrowing only this selected owned role.
+            let files_only = SeccompRule::new(vec![
+                SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                    .map_err(|error| JailerError::SeccompInstall(error.to_string()))?,
+            ])
+            .map_err(|error| JailerError::SeccompInstall(error.to_string()))?;
+            rules.insert(libc::SYS_unlinkat, vec![files_only]);
+        }
+    }
+    if owned_store {
+        // Store retirement removes only directories within its Landlock grant.
+        #[cfg(target_arch = "x86_64")]
+        {
+            rules.insert(libc::SYS_rmdir, vec![]);
+            // Rust's descriptor-relative remove_dir_all uses unlinkat for
+            // files and directories. Permit only those exact native flags;
+            // Qword comparison also rejects unknown upper argument bits.
+            let removals = [0, libc::AT_REMOVEDIR as u64]
+                .into_iter()
+                .map(|flags| {
+                    let condition =
+                        SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, flags)
+                            .map_err(|error| JailerError::SeccompInstall(error.to_string()))?;
+                    SeccompRule::new(vec![condition])
+                        .map_err(|error| JailerError::SeccompInstall(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            rules.insert(libc::SYS_unlinkat, removals);
+        }
+        #[cfg(target_arch = "aarch64")]
+        rules.insert(libc::SYS_unlinkat, vec![]);
     }
     // SeccompAction::Trap (vs Errno(EACCES)) is intentional: the
     // bridge sidecar is expected to be killed by SIGSYS on a forbidden
@@ -440,3 +548,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "seccomp_owned_store_tests.rs"]
+mod owned_store_tests;

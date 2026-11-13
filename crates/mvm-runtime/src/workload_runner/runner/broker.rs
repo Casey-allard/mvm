@@ -7,6 +7,16 @@ use super::{BrokerGuard, BrokerRegisterRequest, BrokerRegistrar};
 pub struct RealBrokerRegistrar;
 
 impl BrokerRegistrar for RealBrokerRegistrar {
+    #[cfg(unix)]
+    fn register_installed(
+        &self,
+        req: &BrokerRegisterRequest<'_>,
+        original: &mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
+    ) -> Result<BrokerGuard> {
+        let registration = original.register(req.host_agent_params()?)?;
+        Ok(BrokerGuard::from_owned_registration(registration))
+    }
+
     fn register(&self, req: &BrokerRegisterRequest<'_>) -> Result<BrokerGuard> {
         if req.services.is_empty() {
             return Ok(BrokerGuard::defused());

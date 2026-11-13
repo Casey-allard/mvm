@@ -159,14 +159,25 @@ impl KernelBoundLaunch {
     ) -> Result<Box<dyn RunningVm>> {
         self.before_boot(spec)?;
         disks.validate_spec(spec)?;
-        driver.boot_custodied(
-            spec,
-            mvm_vmm::driver::prepared_disks::PreparedBootFiles {
-                kernel: self.kernel.as_ref(),
-                writable: disks,
-                data: None,
-            },
-        )
+        let files = mvm_vmm::driver::prepared_disks::PreparedBootFiles {
+            kernel: self.kernel.as_ref(),
+            writable: disks,
+            data: None,
+        };
+        if let Some(owner) = &self.config.host_lifetime {
+            anyhow::ensure!(
+                driver.supports_host_lifetime(),
+                "backend has no original installed native lifetime"
+            );
+            let lease = owner.claim_for_native(&self.config, driver.kind())?;
+            return driver.boot_custodied_with_host_lifetime(
+                spec,
+                files,
+                lease,
+                owner.binding(),
+            );
+        }
+        driver.boot_custodied(spec, files)
     }
 
     /// Validate the physical recipe passed to the driver, not a reconstructed

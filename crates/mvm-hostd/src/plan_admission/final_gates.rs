@@ -21,12 +21,19 @@ pub(super) fn run_post_admission_gates(
             &config.network_policy,
         )
         .map_err(|error| ("direct-network-policy", error))?;
-        return Err((
-            "direct-network-resources",
-            anyhow::anyhow!(
-                "selected direct TCP payload mapping requires original launcher resources"
-            ),
-        ));
+        #[cfg(unix)]
+        {
+            let bound = admitted.direct_owner.as_ref().and_then(std::sync::Weak::upgrade);
+            if !(cfg!(target_os = "linux") && backend == BackendKind::Firecracker && bound.as_ref().zip(config.host_lifetime.as_ref()).is_some_and(|(original, supplied)| std::sync::Arc::ptr_eq(original, supplied))) {
+                return Err(("direct-network-resources", anyhow::anyhow!("selected direct TCP payload mapping requires original launcher resources")));
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(("direct-network-resources", anyhow::anyhow!("selected direct TCP unavailable on this host")));
+    }
+    #[cfg(unix)]
+    if admitted.direct_owner.is_some() && config.network_policy.payload_mapping().is_none() {
+        return Err(("direct-network-policy", anyhow::anyhow!("original direct mapping removed before launch")));
     }
     if let Err(error) = populate_audit_substrate(&mut config, admitted, policy_bundle) {
         return Err(("audit-substrate", error));
@@ -55,6 +62,9 @@ pub(super) fn run_post_admission_gates(
     }
     let runtime = prepare_built_pack_start(admitted, &mut config, backend)
         .map_err(|error| ("registry-pack-boot", error))?;
+    #[cfg(unix)]
+    crate::host_lifetime_parent::bind_current(admitted, &config, backend)
+        .map_err(|error| ("original-resources", error))?;
     Ok((config, runtime))
 }
 

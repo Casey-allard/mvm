@@ -59,7 +59,33 @@
 //! model-backed detector behind the same `Inspector` trait without
 //! changing the chain.
 
-use regex::bytes::{Regex, RegexSet};
+use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
+
+/// Enforced engine controls for one owned collector scanner. These approximate
+/// regex limits are not a total heap, compiler-workspace or RSS measurement.
+/// The installed caller separately prepays its accepted pinned-source model
+/// and permits only one simultaneous search on its fixed receive thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedPiiRequirements {
+    pub rule_count: usize,
+    pub regex_objects: usize,
+    /// Approximate construction cap supplied to the single combined RegexSet.
+    /// Also the maximum per-engine cap in this selected profile; not a sum
+    /// or aggregate scanner heap/RSS bound.
+    pub nfa_size_limit_bytes: usize,
+    pub dfa_cache_limit_bytes: usize,
+    pub nest_limit: u32,
+    pub max_concurrent_searches: usize,
+    /// Uniform approximate NFA cap supplied to each canonical individual Regex.
+    /// No category-specific exception or fallback changes this control.
+    pub rule_nfa_size_limit_bytes: usize,
+}
+
+struct OwnedSelection {
+    mode: Mode,
+    indices: [usize; 5],
+    len: usize,
+}
 
 /// One PII detection rule. Same shape as `SecretRule` so a future
 /// generic-rule abstraction can dedupe them, but kept separate today
@@ -166,6 +192,113 @@ pub struct PiiMatch {
 }
 
 impl PiiRedactor {
+    /// Validate the bounded curated selection without compiling or copying the
+    /// policy. Reserve the separately accepted workspace before constructing.
+    pub fn owned_pii_requirements(
+        policy: &crate::policy::PiiPolicy,
+    ) -> Result<OwnedPiiRequirements, PiiPolicyError> {
+        let selected = Self::owned_selection(policy)?;
+        Ok(OwnedPiiRequirements {
+            rule_count: selected.len,
+            regex_objects: selected.len + 1,
+            nfa_size_limit_bytes: 512 * 1024,
+            dfa_cache_limit_bytes: 256 * 1024,
+            nest_limit: 64,
+            max_concurrent_searches: 1,
+            rule_nfa_size_limit_bytes: 128 * 1024,
+        })
+    }
+
+    /// Build only canonical rules with explicit owned-profile engine controls.
+    /// Disabled selects the full transcript safety rules by definition; unknown
+    /// policy or compilation/limit failure returns Err without legacy fallback.
+    /// The limits do not account for all compiled/search/construction memory.
+    pub fn curated_owned(policy: &crate::policy::PiiPolicy) -> Result<Self, PiiPolicyError> {
+        let requirements = Self::owned_pii_requirements(policy)?;
+        let selected = Self::owned_selection(policy)?;
+        Self::build_owned(selected, requirements)
+    }
+
+    fn owned_selection(
+        policy: &crate::policy::PiiPolicy,
+    ) -> Result<OwnedSelection, PiiPolicyError> {
+        if DEFAULT_RULES.len() != 5 {
+            return Err(PiiPolicyError::OwnedPolicy(
+                "owned canonical rule profile changed",
+            ));
+        }
+        let (mode, full) = match policy.mode.as_deref() {
+            None | Some("detect") => (Mode::Detect, false),
+            Some("redact") => (Mode::Redact, false),
+            Some("refuse") => (Mode::Block, false),
+            Some("disabled") => (Mode::Detect, true),
+            Some(_) => return Err(PiiPolicyError::OwnedPolicy("unknown owned PII mode")),
+        };
+        if policy.categories.len() > DEFAULT_RULES.len() {
+            return Err(PiiPolicyError::OwnedPolicy("too many owned PII categories"));
+        }
+        let mut indices = [0; 5];
+        let mut seen = [false; 5];
+        for (slot, category) in policy.categories.iter().enumerate() {
+            let index = DEFAULT_RULES
+                .iter()
+                .position(|rule| rule.name == category)
+                .ok_or(PiiPolicyError::OwnedPolicy("unknown owned PII category"))?;
+            if seen[index] {
+                return Err(PiiPolicyError::OwnedPolicy("duplicate owned PII category"));
+            }
+            seen[index] = true;
+            indices[slot] = index;
+        }
+        let len = if full || policy.categories.is_empty() {
+            for (index, selected) in indices.iter_mut().enumerate() {
+                *selected = index;
+            }
+            DEFAULT_RULES.len()
+        } else {
+            policy.categories.len()
+        };
+        Ok(OwnedSelection { mode, indices, len })
+    }
+
+    fn build_owned(
+        selected: OwnedSelection,
+        requirements: OwnedPiiRequirements,
+    ) -> Result<Self, PiiPolicyError> {
+        let rules: Vec<PiiRule> = selected.indices[..selected.len]
+            .iter()
+            .map(|&index| DEFAULT_RULES[index])
+            .collect();
+        let patterns: Vec<&str> = rules.iter().map(|rule| rule.pattern).collect();
+        let failed =
+            |_| PiiPolicyError::OwnedPolicy("owned PII regex controls refused construction");
+        let set = RegexSetBuilder::new(&patterns)
+            .unicode(true)
+            .size_limit(requirements.nfa_size_limit_bytes)
+            .dfa_size_limit(requirements.dfa_cache_limit_bytes)
+            .nest_limit(requirements.nest_limit)
+            .build()
+            .map_err(failed)?;
+        let regexes = patterns
+            .iter()
+            .map(|pattern| {
+                RegexBuilder::new(pattern)
+                    .unicode(true)
+                    .size_limit(requirements.rule_nfa_size_limit_bytes)
+                    .dfa_size_limit(requirements.dfa_cache_limit_bytes)
+                    .nest_limit(requirements.nest_limit)
+                    .build()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(failed)?;
+        Ok(Self {
+            set,
+            rules,
+            regexes,
+            mode: selected.mode,
+        })
+    }
+
     /// Build from a custom rule list. Returns `Err` if any pattern
     /// fails to compile.
     pub fn new(rules: &[PiiRule], mode: Mode) -> Result<Self, regex::Error> {
@@ -267,6 +400,9 @@ pub const PII_CATEGORY_NAMES: &[&str] = &["email", "us_ssn", "credit_card", "e16
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PiiPolicyError {
+    /// Static detector-side reason; never includes unknown policy text or data.
+    #[error("owned PII policy refused: {0}")]
+    OwnedPolicy(&'static str),
     #[error(
         "pii.mode = {value:?} is not recognised; valid values are {valid:?} \
          (or omit the field for default detect-only)"
@@ -448,6 +584,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owned_curated_controls_and_all_five_rules_preserve_canonical_redaction() {
+        let policy = crate::policy::PiiPolicy {
+            mode: Some("redact".into()),
+            categories: Vec::new(),
+        };
+        let requirements = PiiRedactor::owned_pii_requirements(&policy).unwrap();
+        assert_eq!(requirements.rule_count, 5);
+        assert_eq!(requirements.regex_objects, 6);
+        assert_eq!(requirements.nfa_size_limit_bytes, 512 * 1024);
+        assert_eq!(requirements.rule_nfa_size_limit_bytes, 128 * 1024);
+        assert_eq!(requirements.dfa_cache_limit_bytes, 256 * 1024);
+        assert_eq!(requirements.nest_limit, 64);
+        assert_eq!(requirements.max_concurrent_searches, 1);
+        let owned = PiiRedactor::curated_owned(&policy).unwrap();
+        let canonical = PiiRedactor::from_policy(&policy).unwrap().unwrap();
+        let body = b"mail a@b.com ssn 123-45-6789 card 4111111111111111 phone +14155552671 iban GB82WEST12345698765432";
+        assert_eq!(owned.redact(body), canonical.redact(body));
+        assert_eq!(owned.scan(body), canonical.scan(body));
+        assert_eq!(owned.match_spans(body), canonical.match_spans(body));
+        for name in PII_CATEGORY_NAMES {
+            assert!(
+                owned.scan(body).contains(name),
+                "missing canonical rule {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_subsets_modes_and_unicode_preserve_canonical_policy() {
+        let body = "ssn 12٣-45-6789 mail a@b.com card 4111111111111111".as_bytes();
+        for mode in [None, Some("detect"), Some("redact"), Some("refuse")] {
+            let policy = crate::policy::PiiPolicy {
+                mode: mode.map(str::to_owned),
+                categories: vec!["credit_card".into(), "us_ssn".into(), "email".into()],
+            };
+            let owned = PiiRedactor::curated_owned(&policy).unwrap();
+            let canonical = PiiRedactor::from_policy(&policy).unwrap().unwrap();
+            assert_eq!(owned.mode(), canonical.mode());
+            assert_eq!(owned.redact(body), canonical.redact(body));
+            assert_eq!(owned.match_spans(body), canonical.match_spans(body));
+            assert_eq!(owned.scan(body), ["credit_card", "us_ssn", "email"]);
+            assert_eq!(
+                PiiRedactor::owned_pii_requirements(&policy)
+                    .unwrap()
+                    .regex_objects,
+                4
+            );
+        }
+        let disabled = crate::policy::PiiPolicy {
+            mode: Some("disabled".into()),
+            categories: vec!["email".into()],
+        };
+        let full = PiiRedactor::curated_owned(&disabled).unwrap();
+        assert_eq!(
+            PiiRedactor::owned_pii_requirements(&disabled)
+                .unwrap()
+                .rule_count,
+            5
+        );
+        assert_eq!(
+            full.redact(body),
+            PiiRedactor::with_default_rules().redact(body)
+        );
+    }
+
+    #[test]
+    fn owned_invalid_policy_and_tiny_compile_limit_refuse_without_fallback() {
+        for policy in [
+            crate::policy::PiiPolicy {
+                mode: Some("private-invalid-mode".into()),
+                categories: vec![],
+            },
+            crate::policy::PiiPolicy {
+                mode: None,
+                categories: vec!["private-unknown-category".into()],
+            },
+            crate::policy::PiiPolicy {
+                mode: None,
+                categories: vec!["email".into(), "email".into()],
+            },
+            crate::policy::PiiPolicy {
+                mode: None,
+                categories: vec!["email".into(); 6],
+            },
+        ] {
+            let error = PiiRedactor::owned_pii_requirements(&policy).unwrap_err();
+            assert!(!error.to_string().contains("private-"));
+            assert!(PiiRedactor::curated_owned(&policy).is_err());
+        }
+        let policy = crate::policy::PiiPolicy {
+            mode: None,
+            categories: vec![],
+        };
+        let mut controls = PiiRedactor::owned_pii_requirements(&policy).unwrap();
+        controls.nfa_size_limit_bytes = 1;
+        controls.rule_nfa_size_limit_bytes = 1;
+        assert!(
+            PiiRedactor::build_owned(PiiRedactor::owned_selection(&policy).unwrap(), controls)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn redact_masks_validated_matches_and_leaves_non_validated() {
         let r = PiiRedactor::with_default_rules();
         // email (no validator), a Luhn-valid card, and a Luhn-INVALID 16-digit
@@ -580,3 +819,11 @@ mod tests {
         assert!(!luhn_valid(b"4111-1111-1111-1111"));
     }
 }
+
+#[cfg(test)]
+#[path = "owned_capacity_tests.rs"]
+mod owned_capacity_tests;
+
+#[cfg(test)]
+#[path = "owned_dual_tests.rs"]
+mod owned_dual_tests;

@@ -22,6 +22,9 @@ use sha2::{Digest, Sha256};
 
 use crate::audit_signer::canonical::CanonicalEntry;
 
+#[path = "chain/owned.rs"]
+mod owned;
+
 /// The full on-disk JSONL line. `canonical` is the JCS-canonical entry
 /// bytes (base64); `sig` is the chain key's signature over those
 /// bytes; `sig_alg` is one of [`SIG_ALG_ED25519`] etc.
@@ -49,6 +52,8 @@ pub struct Chain {
     /// Set when an append failed partway. The next append re-seeds the head
     /// from the on-disk tail rather than trusting memory — see [`Chain::append`].
     resync_needed: bool,
+    owned: bool,
+    retained_bytes: Option<std::num::NonZeroU64>,
 }
 
 impl Chain {
@@ -69,7 +74,46 @@ impl Chain {
         secondary_head_path: &Path,
         software_chain_key_path: Option<&Path>,
     ) -> Result<Self> {
+        Self::open_profile(
+            jsonl_path,
+            secondary_head_path,
+            software_chain_key_path,
+            false,
+            None,
+        )
+    }
+
+    /// Installed profile: fixed key/head reads and bounded canonical tail scan.
+    pub fn open_owned(
+        jsonl_path: &Path,
+        secondary_head_path: &Path,
+        software_chain_key_path: Option<&Path>,
+    ) -> Result<Self> {
+        Self::open_profile(
+            jsonl_path,
+            secondary_head_path,
+            software_chain_key_path,
+            true,
+            None,
+        )
+    }
+
+    pub fn open_owned_bounded(jsonl_path: &Path, secondary_head_path: &Path, software_chain_key_path: Option<&Path>, limit: std::num::NonZeroU64) -> Result<Self> {
+        Self::open_profile(jsonl_path, secondary_head_path, software_chain_key_path, true, Some(limit))
+    }
+
+    fn open_profile(
+        jsonl_path: &Path,
+        secondary_head_path: &Path,
+        software_chain_key_path: Option<&Path>,
+        owned: bool,
+        retained_bytes: Option<std::num::NonZeroU64>,
+    ) -> Result<Self> {
         let signing_key = match software_chain_key_path {
+            Some(path) if owned => {
+                let bytes = crate::owned_resources::read_key(path)?;
+                SigningKey::from_bytes(&bytes)
+            }
             Some(p) => {
                 let bytes = std::fs::read(p).with_context(|| {
                     format!("mvm-audit-signer chain key read failed: {}", p.display())
@@ -96,7 +140,13 @@ impl Chain {
         let jsonl_file = OpenOptions::new()
             .create(true)
             .append(true)
+            .read(owned)
             .mode(0o600)
+            .custom_flags(if owned {
+                libc::O_NOFOLLOW | libc::O_NONBLOCK
+            } else {
+                0
+            })
             .open(jsonl_path)
             .with_context(|| {
                 format!(
@@ -105,6 +155,13 @@ impl Chain {
                 )
             })?;
 
+        if owned {
+            anyhow::ensure!(
+                jsonl_file.metadata()?.is_file(),
+                "owned audit chain is not regular"
+            );
+        }
+
         lock_sole_writer(&jsonl_file).with_context(|| {
             format!(
                 "mvm-audit-signer chain already held by another writer: {}",
@@ -112,7 +169,14 @@ impl Chain {
             )
         })?;
 
-        let head = recover_head(jsonl_path, secondary_head_path)?;
+        if let Some(limit) = retained_bytes {
+            anyhow::ensure!(jsonl_file.metadata()?.len() <= limit.get(), "existing audit chain exceeds retained reservation");
+        }
+        let head = if owned {
+            owned::recover_head(&jsonl_file, secondary_head_path)?
+        } else {
+            recover_head(jsonl_path, secondary_head_path)?
+        };
 
         Ok(Self {
             signing_key,
@@ -122,7 +186,21 @@ impl Chain {
             jsonl_path: jsonl_path.to_path_buf(),
             secondary_head_path: secondary_head_path.to_path_buf(),
             resync_needed: false,
+            owned,
+            retained_bytes,
         })
+    }
+
+    pub(super) fn inventory(&self, phase: mvm_core::protocol::audit_signer::AuditInventoryPhase, generation:[u8;32], tenant:&str, vm:&str, workload:&str) -> Result<mvm_core::protocol::audit_signer::SignedAuditInventory> {
+        use std::os::unix::fs::MetadataExt;
+        let limit = self.retained_bytes.context("original funded reservation missing")?;
+        anyhow::ensure!(!self.resync_needed, "audit chain has unresolved writes");
+        self.jsonl_file.sync_all()?;
+        let stat = self.jsonl_file.metadata()?;
+        anyhow::ensure!(stat.is_file() && stat.nlink() == 1 && stat.mode() & 0o077 == 0 && stat.len() <= limit.get(), "original audit file or reservation changed");
+        mvm_core::protocol::audit_inventory::sign(&mvm_core::protocol::audit_signer::AuditInventory{
+            phase,generation,tenant:tenant.into(),vm:vm.into(),workload:workload.into(),dev:stat.dev(),ino:stat.ino(),head:self.head.clone(),length:stat.len(),
+        },&self.signing_key)
     }
 
     /// Current head hash (hex). For tests + supervisor inspection.
@@ -143,6 +221,23 @@ impl Chain {
         if !crate::audit_signer::category::is_allowed(&entry.category) {
             return Err(AuditSignerErrorCode::InvalidRequest);
         }
+        if self.owned {
+            let text = [
+                &entry.category,
+                &entry.correlation_id,
+                &entry.prev_hash,
+                &entry.session_id,
+                &entry.tenant_id,
+                &entry.ts,
+                &entry.workload_id,
+            ];
+            if text.iter().any(|text| text.len() > 128)
+                || crate::owned_resources::validate_value(&entry.fields).is_err()
+                || crate::owned_resources::encoded_len(&entry, 16 * 1024).is_err()
+            {
+                return Err(AuditSignerErrorCode::InvalidRequest);
+            }
+        }
         // An earlier append failed after it had begun writing. Whether its
         // line reached the file is not knowable from here, so believe the file
         // rather than memory: a head left behind the tail would hand this
@@ -150,8 +245,12 @@ impl Chain {
         // our own recovery path. The caller's stale prev_hash then fails the
         // drift check below, which is the correct fail-closed answer.
         if self.resync_needed {
-            self.head = recover_head(&self.jsonl_path, &self.secondary_head_path)
-                .map_err(|_| AuditSignerErrorCode::InternalError)?;
+            self.head = if self.owned {
+                owned::recover_head(&self.jsonl_file, &self.secondary_head_path)
+            } else {
+                recover_head(&self.jsonl_path, &self.secondary_head_path)
+            }
+            .map_err(|_| AuditSignerErrorCode::InternalError)?;
             self.resync_needed = false;
         }
         // Cross-check the caller's prev_hash matches our in-memory head.
@@ -164,6 +263,9 @@ impl Chain {
         let canonical_bytes = entry
             .jcs_bytes()
             .map_err(|_| AuditSignerErrorCode::InternalError)?;
+        if self.owned && canonical_bytes.len() > 65536 {
+            return Err(AuditSignerErrorCode::InvalidRequest);
+        }
         // entry_hash = SHA256(prev_hash || canonical_bytes).
         let entry_hash = compute_entry_hash(&entry.prev_hash, &canonical_bytes);
         // Sign the canonical bytes.
@@ -183,6 +285,12 @@ impl Chain {
         // The exclusive lock this chain holds rules that out, but a single
         // write costs nothing and keeps the guarantee local to this function.
         line.push('\n');
+        if let Some(limit) = self.retained_bytes {
+            let previous = self.jsonl_file.metadata().map_err(|_| AuditSignerErrorCode::InternalError)?.len();
+            if line.len() as u64 > limit.get().saturating_sub(previous) {
+                return Err(AuditSignerErrorCode::InvalidRequest);
+            }
+        }
         if let Err(e) = self.write_line(line.as_bytes()) {
             // Part of the line may be on disk. Don't trust the in-memory head
             // again until it has been re-derived from the file.
@@ -190,7 +298,12 @@ impl Chain {
             return Err(e);
         }
         self.head = entry_hash.clone();
-        if std::fs::write(&self.secondary_head_path, &self.head).is_err() {
+        let stored = if self.owned {
+            owned::write_head(&self.secondary_head_path, &self.head)
+        } else {
+            std::fs::write(&self.secondary_head_path, &self.head).map_err(anyhow::Error::from)
+        };
+        if stored.is_err() {
             self.resync_needed = true;
             return Err(AuditSignerErrorCode::FsyncFailed);
         }
@@ -330,6 +443,27 @@ mod tests {
             ts: "2026-05-27T22:30:00Z".into(),
             workload_id: "wl-001".into(),
         }
+    }
+
+    #[test]
+    fn funded_chain_reopen_counts_existing_bytes_and_refuses_overflow_without_writing() {
+        let dir = tempdir().unwrap();
+        let jsonl = dir.path().join("audit.jsonl");
+        let head = dir.path().join("HEAD");
+        {
+            let mut original = Chain::open_owned(&jsonl, &head, None).unwrap();
+            original.append(sample_entry(original.head().into())).unwrap();
+        }
+        let original = std::fs::read(&jsonl).unwrap();
+        let limit = std::num::NonZeroU64::new(original.len() as u64).unwrap();
+        let mut reopened = Chain::open_owned_bounded(&jsonl, &head, None, limit).unwrap();
+        let expected = reopened.head().to_owned();
+        assert!(reopened.append(sample_entry(expected.clone())).is_err());
+        assert_eq!(reopened.head(), expected);
+        assert_eq!(std::fs::read(&jsonl).unwrap(), original);
+        drop(reopened);
+        let smaller = std::num::NonZeroU64::new(limit.get() - 1).unwrap();
+        assert!(Chain::open_owned_bounded(&jsonl, &head, None, smaller).is_err());
     }
 
     #[test]

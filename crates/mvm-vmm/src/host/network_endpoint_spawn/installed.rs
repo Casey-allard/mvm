@@ -166,6 +166,7 @@ pub fn spawn_network_endpoint_installed(
         .as_ref()
         .context("installed endpoint original admitted facts missing")?;
     plan.validate_for(policy, params.tenant, params.vm_name)?;
+    handoff.check_direct_network(plan, &params.network_limits, params.redaction)?;
     if plan.plan_id.0 != projection.admitted_plan_id || policy.payload_mapping().is_none() {
         bail!("installed endpoint differs from original admitted mapping")
     }
@@ -249,6 +250,8 @@ pub fn spawn_network_endpoint_installed_registered(
     owned::require_child_custody()?;
     handoff.check_current()?;
     original.check_endpoint(&params)?;
+    anyhow::ensure!(original.registrar.process_address_space_limit().is_some() && original.registrar.audit_chain_bytes().is_some(), "original daemon, signer and retained audit chain require funded limits");
+
     let projection = handoff.partition().projection();
     if params.lifetime != EndpointLifetime::Launcher
         || params.vm_name != projection.binding.vm_name
@@ -311,6 +314,7 @@ pub fn spawn_network_endpoint_installed_registered(
     // The canonical digest and proxy parser run only after the original
     // partition has passed the bounded config's full instance requirement.
     plan.validate_for(policy, params.tenant, params.vm_name)?;
+    handoff.check_direct_network(plan, &params.network_limits, params.redaction)?;
     if let Some(proxy) = &params.egress_proxy {
         proxy.resolve()?;
     }
@@ -347,6 +351,11 @@ pub fn spawn_network_endpoint_installed_registered(
             log,
         );
         command.arg("--installed-partition");
+        #[cfg(target_os = "linux")]
+        {
+            let original = preparation.custody().handoff.partition().projection();
+            limit_original_address_space(&mut command, original.limits.host_resident_bytes()?)?;
+        }
         let mut fds = vec![
             preparation
                 .custody()
@@ -399,6 +408,29 @@ pub fn spawn_network_endpoint_installed_registered(
         }
     })();
     startup.map_err(|reason| preparation.error(reason))
+}
+
+/// Bound the selected worker and all its threads before the loader or any
+/// user code runs. Preserve a stricter limit inherited from the host.
+#[cfg(target_os = "linux")]
+pub(crate) fn limit_original_address_space(command: &mut std::process::Command, bytes: u64) -> Result<()> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    use std::os::unix::process::CommandExt;
+    anyhow::ensure!(bytes > 0, "original endpoint address space is unfunded");
+    // SAFETY: after fork the closure reads and sets only kernel rlimits,
+    // using copied integers. It does not allocate, log, or acquire a lock.
+    unsafe {
+        command.pre_exec(move || {
+            let inherited = getrlimit(Resource::As);
+            let limit = [Some(bytes), inherited.current, inherited.maximum]
+                .into_iter()
+                .flatten()
+                .min();
+            setrlimit(Resource::As, Rlimit { current: limit, maximum: limit })?;
+            Ok(())
+        });
+    }
+    Ok(())
 }
 
 fn complete_start<C: Serialize>(

@@ -456,3 +456,29 @@ fn control_prefix_partial_deadline_and_encode_limit_preserve_bounds() {
         std::io::ErrorKind::WouldBlock
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_child_keeps_the_stricter_original_address_space_limit() {
+    use rustix::process::{getrlimit, Resource};
+    const PROBE: &str = "MVM_TEST_ORIGINAL_ADDRESS_LIMIT";
+    if let Some(expected) = std::env::var_os(PROBE) {
+        let expected: u64 = expected.to_str().unwrap().parse().unwrap();
+        let limit = getrlimit(Resource::As);
+        assert_eq!(limit.current, Some(expected));
+        assert_eq!(limit.maximum, Some(expected));
+        return;
+    }
+    let inherited = getrlimit(Resource::As);
+    for (first, second) in [(512_u64 << 20, 256_u64 << 20), (256_u64 << 20, 512_u64 << 20)] {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        let expected = [Some(first), Some(second), inherited.current, inherited.maximum].into_iter().flatten().min().unwrap();
+        child.args(["--exact", concat!(module_path!(), "::selected_child_keeps_the_stricter_original_address_space_limit").split_once("::").unwrap().1])
+            .env(PROBE, expected.to_string());
+        limit_original_address_space(&mut child, first).unwrap();
+        limit_original_address_space(&mut child, second).unwrap();
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+}

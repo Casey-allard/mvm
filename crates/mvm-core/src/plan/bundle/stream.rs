@@ -781,11 +781,54 @@ pub fn verify_bundle_file(
     trust_store: &dyn TrustStore,
 ) -> Result<VerifiedBundleFile, BundleVerifyError> {
     let (manifest, key_id, _, signature) = verify_head(path, trust_store)?;
+    verify_streamed_bundle(manifest, key_id, signature, open_archive(path)?, || {
+        archive_sha256(path)
+    })
+}
+
+/// Verify the installed archive within its quoted length using the same
+/// immutable bytes for the original digest, manifest, and artifact passes.
+#[cfg(feature = "host-state")]
+pub fn verify_exact_bundle_file(
+    path: &Path,
+    trust_store: &dyn TrustStore,
+    pin: &super::PlanArtifact,
+    bytes: std::num::NonZeroU64,
+) -> Result<VerifiedBundleFile, BundleVerifyError> {
+    let archive = super::read_exact_bundle_archive(path, bytes)
+        .map_err(|e| BundleVerifyError::ManifestParse(format!("reading quoted bundle: {e}")))?;
+    let digest = super::sha256_hex(&archive);
+    if digest != pin.bundle_sha256 {
+        return Err(BundleVerifyError::ManifestParse(
+            "quoted bundle differs from signed archive digest".into(),
+        ));
+    }
+    let (manifest_bytes, signature) = read_manifest_entries(archive.as_slice())?;
+    let (manifest, key_id) = verify_signed_manifest(&manifest_bytes, &signature, trust_store)?;
+    let verified = verify_streamed_bundle(manifest, key_id, signature, archive.as_slice(), || {
+        Ok(digest)
+    })?;
+    if &verified.plan_artifact() != pin {
+        return Err(BundleVerifyError::ManifestParse(
+            "quoted bundle differs from signed bundle pin".into(),
+        ));
+    }
+    Ok(verified)
+}
+
+#[cfg(feature = "host-state")]
+fn verify_streamed_bundle(
+    manifest: BundleManifest,
+    key_id: KeyId,
+    signature: Vec<u8>,
+    archive: impl Read,
+    digest: impl FnOnce() -> Result<String, BundleVerifyError>,
+) -> Result<VerifiedBundleFile, BundleVerifyError> {
     let manifest_signature = signature.try_into().map_err(|_| {
         BundleVerifyError::ManifestParse("verified manifest signature has invalid length".into())
     })?;
     let capture = image_set_manifest_paths(&manifest);
-    let captured = stream_artifacts(open_archive(path)?, &manifest, |artifact| {
+    let captured = stream_artifacts(archive, &manifest, |artifact| {
         if capture.contains(&artifact.path) {
             Destination::Capture
         } else {
@@ -795,7 +838,7 @@ pub fn verify_bundle_file(
     let embedded_image_sets = verify_embedded_image_sets(&manifest, &InMemoryArtifacts(&captured))?;
     let boot_assets = super::verify_boot_assets(&manifest, &InMemoryArtifacts(&captured))?;
     Ok(VerifiedBundleFile {
-        bundle_sha256: archive_sha256(path)?,
+        bundle_sha256: digest()?,
         manifest,
         key_id,
         embedded_image_sets,

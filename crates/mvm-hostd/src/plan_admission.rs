@@ -166,6 +166,8 @@ pub struct AdmittedPlan {
     extensions: Vec<AdmittedExtension>,
     assurance_runtime: Option<AssuranceRuntimeBinding>,
     canonical_kernel: Option<std::sync::Arc<canonical_kernel::AdmittedKernel>>,
+    #[cfg(unix)]
+    direct_owner: Option<std::sync::Weak<mvm_core::host_lifetime::HostLifetimeAnchor>>,
     backend: Option<BackendKind>,
     /// Set once the backend has been started under this admission. An
     /// admission authorizes one launch; the plan is handed back on
@@ -349,6 +351,8 @@ impl AdmittedPlan {
             extensions: Vec::new(),
             assurance_runtime: None,
             canonical_kernel: None,
+            #[cfg(unix)]
+            direct_owner: None,
             backend: None,
             dispatched: false,
             #[cfg(target_os = "linux")]
@@ -560,6 +564,15 @@ pub fn admit_signed_plan_for_run(
     bundle_ctx: Option<&BundleAdmissionContext<'_>>,
     posture: RunPosture,
 ) -> Result<AdmittedPlan> {
+    verify_external_plan(signed)?.admit(clock, ledger, bundle_ctx, posture)
+}
+
+pub(crate) struct VerifiedExternalPlan<'a> {
+    body: ExecutionPlan,
+    signed: &'a SignedExecutionPlan,
+}
+
+pub(crate) fn verify_external_plan(signed: &SignedExecutionPlan) -> Result<VerifiedExternalPlan<'_>> {
     let trusted = host_trusted_plan_signers()?;
     if trusted.is_empty() {
         anyhow::bail!(
@@ -571,8 +584,16 @@ pub fn admit_signed_plan_for_run(
         trusted.iter().map(|(id, key)| (id.as_str(), key)).collect();
     let verified =
         verify_plan(signed, &trusted_refs).context("verifying externally-signed plan")?;
-    let signer_id = signed.0.signer_id.clone();
+    Ok(VerifiedExternalPlan { body: verified, signed })
+}
 
+impl VerifiedExternalPlan<'_> {
+    pub(crate) fn plan(&self) -> &ExecutionPlan { &self.body }
+
+    pub(crate) fn admit(self, clock: &dyn Clock, ledger: &InMemoryNonceLedger, bundle_ctx: Option<&BundleAdmissionContext<'_>>, posture: RunPosture) -> Result<AdmittedPlan> {
+        let verified = self.body;
+        let signed = self.signed;
+        let signer_id = signed.0.signer_id.clone();
     posture.verify_runtime()?;
     let assurance_runtime = posture.assurance_runtime(&verified)?;
     validate_extension_bindings(&verified)?;
@@ -601,6 +622,7 @@ pub fn admit_signed_plan_for_run(
         ledger,
         bundle_ctx,
     })
+    }
 }
 
 /// Everything the shared post-verification tail of admission needs.
@@ -753,6 +775,8 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         extensions,
         assurance_runtime,
         canonical_kernel,
+        #[cfg(unix)]
+        direct_owner: posture.direct_owner.map(std::sync::Arc::downgrade),
         backend,
         dispatched: false,
         #[cfg(target_os = "linux")]
@@ -955,6 +979,8 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
+    #[cfg(unix)]
+    direct_owner: Option<&'a std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     object_worker: Option<
         &'a crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<'a>,
@@ -974,6 +1000,8 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
+            #[cfg(unix)]
+            direct_owner: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             object_worker: None,
             object_plan: None,
@@ -995,6 +1023,8 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
+            #[cfg(unix)]
+            direct_owner: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             object_worker: None,
             object_plan: None,
@@ -1007,6 +1037,17 @@ impl<'a> RunPosture<'a> {
     #[must_use]
     pub fn with_runtime(mut self, runtime_config: Option<&'a VmStartConfig>) -> Self {
         self.runtime_config = runtime_config;
+        self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_selected_direct_owner(
+        mut self,
+        config: &'a VmStartConfig,
+        owner: &'a std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Self {
+        self.runtime_config = Some(config);
+        self.direct_owner = Some(owner);
         self
     }
 

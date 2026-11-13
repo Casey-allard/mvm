@@ -150,11 +150,16 @@ pub use drive::{DriveError, LocalDrive};
 pub use grants::{enforced_grants_of, record_enforced_grants};
 pub use inventory::{MachineInventoryRecord, WorkloadPosture};
 pub use launch::{
-    AccessMode, ExitReport, LaunchNetworkPolicy, LaunchOutcome, LaunchRequest,
+    AccessMode, ExitReport, HostLifetimeIntent, LaunchNetworkPolicy, LaunchOutcome, LaunchRequest,
     LaunchRequestBuilder, LaunchSource, LaunchVolumeSpec, LifecycleMode, MachineSecretRef,
     RemoveOptions,
 };
 pub use local::{LocalBackend, auto_selected_backend_name, default_vcpus};
+#[cfg(unix)]
+pub use launch::{HostLifetimeLaunchFailure, UnusedHostLifetimePreparation};
+#[cfg(unix)]
+pub use mvm_runtime::workload_runner::OwnedRetirement;
+
 pub use mvm_hostd::parent_death::exit_when_orphaned;
 pub use mvm_hostd::supervisor::secrets_scanner::SecretsScanner;
 pub use mvm_runtime::agent_session::replay_input;

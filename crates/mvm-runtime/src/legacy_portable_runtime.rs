@@ -2,8 +2,7 @@
 
 use anyhow::{Context, Result, ensure};
 use mvm_core::plan::bundle::{
-    ArtifactRole, BundleResolveError, BundleResolver, FsTrustStore, VerifiedBundle,
-    select_boot_asset_members, verify_plan_bundle,
+    ArtifactRole, FsTrustStore, VerifiedBundle, select_boot_asset_members, verify_plan_bundle_bytes,
 };
 use mvm_core::vm_backend::VmStartConfig;
 use std::path::Path;
@@ -12,17 +11,75 @@ use std::path::Path;
 pub struct VerifiedLegacyPortableRuntime {
     archive: Vec<u8>,
     rootfs: Vec<u8>,
+    workload_verity: Option<WorkloadVerity>,
     kernel: Vec<u8>,
     overlay: Vec<u8>,
     verity: Vec<u8>,
     initrd: Vec<u8>,
 }
 
-struct OriginalArchive(Vec<u8>);
+#[derive(Debug)]
+struct WorkloadVerity {
+    roothash: String,
+    sha256: String,
+    bytes: Vec<u8>,
+}
 
-impl BundleResolver for OriginalArchive {
-    fn resolve(&self, _: &str) -> Result<Vec<u8>, BundleResolveError> {
-        Ok(self.0.clone())
+impl WorkloadVerity {
+    fn from_bundle(bundle: &VerifiedBundle) -> Result<Option<Self>> {
+        let Some(info) = &bundle.manifest.verity else {
+            return Ok(None);
+        };
+        mvm_core::packs::Sha256Hex::new(&info.roothash)
+            .context("invalid portable workload verity root")?;
+        let artifact = bundle
+            .manifest
+            .find_by_name(&info.sidecar_artifact)
+            .context("signed portable workload verity sidecar missing")?;
+        ensure!(
+            artifact.role == ArtifactRole::VerityHashSidecar,
+            "signed portable workload verity sidecar has the wrong role"
+        );
+        let bytes = bundle
+            .artifacts
+            .get(&artifact.path)
+            .context("signed portable workload verity bytes missing")?;
+        Ok(Some(Self {
+            roothash: info.roothash.clone(),
+            sha256: artifact.sha256.clone(),
+            bytes: bytes.clone(),
+        }))
+    }
+
+    fn verify_selection(&self, config: &VmStartConfig) -> Result<()> {
+        use std::io::Read;
+
+        ensure!(
+            config.roothash.as_deref() == Some(self.roothash.as_str()),
+            "selected portable workload verity root differs from signed bundle"
+        );
+        let path = config
+            .verity_path
+            .as_deref()
+            .context("selected portable workload verity sidecar missing")?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        let size = self.bytes.len() as u64;
+        ensure!(
+            metadata.is_file()
+                && metadata.len() == size
+                && mvm_core::crypto::image_verify::sha256_reader(file.take(size + 1))?
+                    == self.sha256,
+            "selected portable workload verity sidecar differs from signed bundle"
+        );
+        Ok(())
     }
 }
 
@@ -51,7 +108,13 @@ impl VerifiedLegacyPortableRuntime {
             ("overlay.ext4", &self.overlay),
             ("overlay.verity", &self.verity),
             ("initramfs.cpio.gz", &self.initrd),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            self.workload_verity
+                .as_ref()
+                .map(|verity| ("rootfs.verity", &verity.bytes)),
+        ) {
             let path = generation.path().join(name);
             mvm_core::util::atomic_io::write_private_new(&path, bytes)?;
             mvm_core::private_fs::set_mode(&path, 0o400)?;
@@ -65,6 +128,17 @@ impl VerifiedLegacyPortableRuntime {
             .context("portable proof missing")?
             .archive = generation.path().join("bundle.mvmpkg");
         bound.rootfs_path = generation.path().join("rootfs").display().to_string();
+        bound.verity_path = self.workload_verity.as_ref().map(|_| {
+            generation
+                .path()
+                .join("rootfs.verity")
+                .display()
+                .to_string()
+        });
+        bound.roothash = self
+            .workload_verity
+            .as_ref()
+            .map(|verity| verity.roothash.clone());
         bound.kernel_path = Some(generation.path().join("kernel").display().to_string());
         bound.runtime_overlay_path =
             Some(generation.path().join("overlay.ext4").display().to_string());
@@ -106,6 +180,14 @@ pub(crate) fn verify(
         )? == verified.kernel,
         "selected portable kernel differs from signed bundle"
     );
+    if let Some(verity) = &verified.workload_verity {
+        verity.verify_selection(config)?;
+    } else {
+        ensure!(
+            config.verity_path.is_none() && config.roothash.is_none(),
+            "selected portable workload verity is absent from signed bundle"
+        );
+    }
     Ok(verified)
 }
 
@@ -130,8 +212,19 @@ pub(crate) fn verify_retained(
         proof.arch == mvm_core::arch::GuestArch::host(),
         "portable guest architecture mismatch"
     );
-    let original = OriginalArchive(mvm_core::plan::bundle::read_bundle_archive(&proof.archive)?);
-    let bundle = verify_plan_bundle(&proof.pin, &original, &FsTrustStore::default_path()?)?;
+    #[cfg(unix)]
+    let exact_bytes = config
+        .host_lifetime
+        .as_ref()
+        .map(|owner| owner.portable_archive_bytes(&proof.pin))
+        .transpose()?;
+    #[cfg(not(unix))]
+    let exact_bytes = None;
+    let original = match exact_bytes {
+        Some(bytes) => mvm_core::plan::bundle::read_exact_bundle_archive(&proof.archive, bytes)?,
+        None => mvm_core::plan::bundle::read_bundle_archive(&proof.archive)?,
+    };
+    let bundle = verify_plan_bundle_bytes(&proof.pin, &original, &FsTrustStore::default_path()?)?;
     ensure!(
         matches!(bundle.manifest.schema_version, 4 | 5)
             && bundle.manifest.members.iter().any(|member| {
@@ -237,8 +330,9 @@ pub(crate) fn verify_retained(
     }
     Ok(VerifiedLegacyPortableRuntime {
         rootfs: role_bytes(&bundle, ArtifactRole::Rootfs)?.to_vec(),
+        workload_verity: WorkloadVerity::from_bundle(&bundle)?,
         kernel: role_bytes(&bundle, ArtifactRole::Kernel)?.to_vec(),
-        archive: original.0,
+        archive: original,
         overlay: overlay_bytes,
         verity: verity_bytes,
         initrd: initrd_bytes,
@@ -289,6 +383,16 @@ pub(crate) mod fixtures {
         wrong_role: bool,
         schema: u32,
     ) -> std::result::Result<VmStartConfig, mvm_core::plan::BundleVerifyError> {
+        fixture_with_verity(home, protocol, wrong_role, schema, false)
+    }
+
+    pub(super) fn fixture_with_verity(
+        home: &Path,
+        protocol: Option<u32>,
+        wrong_role: bool,
+        schema: u32,
+        workload_verity: bool,
+    ) -> std::result::Result<VmStartConfig, mvm_core::plan::BundleVerifyError> {
         let arch = GuestArch::host();
         let version = "99.2.3";
         let overlay = boot_asset_fixture::runtime_overlay_archive_bytes(
@@ -326,7 +430,7 @@ pub(crate) mod fixtures {
             mvm_build::builder_vm::GuestSidecar::for_oci_run("hybrid", true, false);
         baked_metadata.agent_binary = "real".into();
         baked_metadata.protocol_version = 2;
-        let payloads = vec![
+        let mut payloads = vec![
             (
                 mvm_core::guest_sidecar::SIDECAR_FILENAME,
                 ArtifactRole::Other,
@@ -347,6 +451,17 @@ pub(crate) mod fixtures {
             ("kernel", ArtifactRole::Kernel, b"signed kernel".to_vec()),
             ("initrd", ArtifactRole::Initrd, initrd),
         ];
+        let verity = workload_verity.then(|| {
+            payloads.push((
+                "workload.verity",
+                ArtifactRole::VerityHashSidecar,
+                b"signed workload sidecar".to_vec(),
+            ));
+            mvm_core::plan::bundle::VerityInfo {
+                roothash: "d".repeat(64),
+                sidecar_artifact: "workload.verity".into(),
+            }
+        });
         let key = SigningKey::from_bytes(&[83; 32]);
         let key_id = key_id_from_pubkey(&key.verifying_key());
         let mut manifest = BundleManifest {
@@ -372,7 +487,7 @@ pub(crate) mod fixtures {
             members: vec![BundleMember::EmbeddedBootAssets {
                 manifest_artifact: "image-set.json".into(),
             }],
-            verity: None,
+            verity: verity.clone(),
             resources: None,
         };
         if schema == 5 {
@@ -426,6 +541,10 @@ pub(crate) mod fixtures {
         Ok(VmStartConfig {
             name: "portable-fixture".into(),
             rootfs_path: home.join("rootfs").display().to_string(),
+            verity_path: verity
+                .as_ref()
+                .map(|info| home.join(&info.sidecar_artifact).display().to_string()),
+            roothash: verity.map(|info| info.roothash),
             kernel_path: Some(home.join("kernel").display().to_string()),
             initrd_path: Some(ramdisk.image_path.display().to_string()),
             runtime_overlay_path: Some(overlay.overlay_ext4.display().to_string()),
@@ -468,6 +587,41 @@ mod tests {
             overlay_roothash: config.runtime_overlay_roothash.clone().unwrap(),
             version: config.runtime_overlay_version.clone().unwrap(),
         }
+    }
+
+    #[test]
+    fn quoted_portable_attachment_checks_length_and_the_same_signed_bytes() {
+        use mvm_core::plan::bundle::verify_exact_bundle_file;
+        use std::num::NonZeroU64;
+
+        let home = tempfile::tempdir().unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        let config = fixture(home.path(), Some(2), false, 4).unwrap();
+        let proof = config.legacy_portable_runtime.unwrap();
+        let trust = FsTrustStore::default_path().unwrap();
+        let mut archive = std::fs::read(&proof.archive).unwrap();
+        let length = NonZeroU64::new(archive.len() as u64).unwrap();
+        let verified =
+            verify_exact_bundle_file(&proof.archive, &trust, &proof.pin, length).unwrap();
+        assert_eq!(verified.plan_artifact(), proof.pin);
+        let short_quote = NonZeroU64::new(length.get() - 1).unwrap();
+        let error = verify_exact_bundle_file(&proof.archive, &trust, &proof.pin, short_quote)
+            .err()
+            .expect("wrong archive length refused");
+        assert!(
+            error.to_string().contains("quoted archive length"),
+            "{error}"
+        );
+        *archive.last_mut().unwrap() ^= 1;
+        std::fs::write(&proof.archive, archive).unwrap();
+        let error = verify_exact_bundle_file(&proof.archive, &trust, &proof.pin, length)
+            .err()
+            .expect("same-length substitution refused");
+        assert!(
+            error.to_string().contains("signed archive digest"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -525,8 +679,17 @@ mod tests {
             proof
         );
         for field in [
-            "pin", "manifest", "arch", "overlay", "verity", "initrd", "root", "kernel", "version",
+            "pin",
+            "manifest",
+            "arch",
+            "overlay",
+            "verity",
+            "initrd",
+            "root",
+            "kernel",
+            "version",
             "conflict",
+            "undeclared_workload_verity",
         ] {
             let mut changed = config.clone();
             match field {
@@ -563,6 +726,10 @@ mod tests {
                 "kernel" => changed.kernel_path = Some(config.rootfs_path.clone()),
                 "version" => changed.runtime_overlay_version = Some("different".into()),
                 "conflict" => changed.source_runtime_archive_sha256 = Some("a".repeat(64)),
+                "undeclared_workload_verity" => {
+                    changed.verity_path = config.runtime_overlay_verity_path.clone();
+                    changed.roothash = config.runtime_overlay_roothash.clone();
+                }
                 _ => unreachable!(),
             }
             assert!(verify_runtime_for_launch(&changed, 2).is_err(), "{field}");
@@ -626,6 +793,61 @@ mod tests {
         std::fs::write(archive, b"tampered").unwrap();
         mvm_core::private_fs::set_mode(archive, 0o400).unwrap();
         assert!(verify_runtime_binding(&record).is_err());
+    }
+
+    #[test]
+    fn portable_launch_uses_the_retained_signed_workload_verity() {
+        let home = tempfile::tempdir().unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        let config = fixtures::fixture_with_verity(home.path(), Some(2), false, 4, true).unwrap();
+        let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
+        let bound = lease.bind(&config).unwrap();
+        let sidecar = Path::new(bound.verity_path.as_deref().unwrap());
+        let generation = bound
+            .legacy_portable_runtime
+            .as_ref()
+            .unwrap()
+            .archive
+            .parent()
+            .unwrap();
+        assert_eq!(
+            sidecar.parent(),
+            Some(generation),
+            "launch still uses ambient sidecar"
+        );
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"signed workload sidecar");
+        assert_eq!(bound.roothash, config.roothash);
+        let args =
+            mvm_vmm::host::cmdline::runner_cmdline(&bound, home.path(), |_| "console=hvc0".into());
+        let spec = mvm_vmm::host::spec_map::workload_device_spec(
+            &bound,
+            &args,
+            &home.path().join("console"),
+        );
+        assert!(mvm_vmm::host::cmdline::verity_enabled(&bound));
+        assert_eq!(spec.blocks[1].source, sidecar);
+        assert!(spec.blocks[1].read_only);
+        assert_eq!(
+            mvm_core::private_fs::mode_bits(sidecar, &std::fs::metadata(sidecar).unwrap()).unwrap(),
+            0o400
+        );
+
+        let original = config.verity_path.as_deref().unwrap();
+        std::fs::write(original, b"replacement").unwrap();
+        assert!(verify_runtime_for_launch(&config, 2).is_err());
+        assert!(verify_runtime_for_launch(&bound, 2).is_ok());
+
+        for (path, hash) in [
+            (None, None),
+            (bound.verity_path.clone(), Some("e".repeat(64))),
+            (Some(original.to_owned()), bound.roothash.clone()),
+        ] {
+            let mut changed = bound.clone();
+            changed.verity_path = path;
+            changed.roothash = hash;
+            assert!(lease.bind(&changed).is_err());
+        }
     }
 
     #[test]

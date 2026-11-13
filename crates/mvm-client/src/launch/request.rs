@@ -38,6 +38,18 @@ pub enum LifecycleMode {
     Persistent,
 }
 
+/// Read-only launch shape for bounded parent reservation planning.
+/// Values from an external signed envelope are unverified hints here. This
+/// projection contains no admitted plan, parent permit, descriptor or grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLifetimeIntent {
+    pub name: Option<String>,
+    pub mode: LifecycleMode,
+    pub cpus: u32,
+    pub memory_mib: u32,
+    pub backend: Option<String>,
+}
+
 /// Untyped network policy for the launch. Superseded by the egress grant on
 /// [`LaunchRequestBuilder::allow_egress`], which is derived into the policy the
 /// gate reads and is covered by the plan's signature.
@@ -146,6 +158,11 @@ impl std::fmt::Display for LaunchSource {
 /// A fully-validated launch request. Construct via [`LaunchRequest::builder`].
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
+    #[cfg(unix)]
+    pub(crate) host_lifetime: Option<std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
+    #[cfg(unix)]
+    pub(crate) installed_payload_mapping:
+        Option<mvm_contract::policy::network_policy::CooperatingPayloadPolicy>,
     pub(crate) name: Option<String>,
     pub(crate) mode: LifecycleMode,
     pub(crate) source: LaunchSource,
@@ -188,6 +205,21 @@ pub struct LaunchRequest {
     /// persistent one would silently re-admit under the host key on its next
     /// start.
     pub(crate) signed_plan: Option<mvm_core::plan::SignedExecutionPlan>,
+}
+
+impl LaunchRequest {
+    /// Copy the builder's original shape without I/O, signing or admission.
+    /// The builder already projects raw signed-body sizing over request defaults;
+    /// the canonical admission path must still verify and rederive those values.
+    pub fn host_lifetime_intent(&self) -> HostLifetimeIntent {
+        HostLifetimeIntent {
+            name: self.name.clone(),
+            mode: self.mode,
+            cpus: self.cpus,
+            memory_mib: self.memory_mib,
+            backend: self.backend.clone(),
+        }
+    }
 }
 
 /// Build the persisted declarative spec a persistent launch writes.
@@ -628,6 +660,10 @@ impl LaunchRequestBuilder {
             None => (self.cpus, self.memory_mib),
         };
         Ok(LaunchRequest {
+            #[cfg(unix)]
+            host_lifetime: None,
+            #[cfg(unix)]
+            installed_payload_mapping: None,
             name: self.name,
             mode: self.mode,
             source: self.source,

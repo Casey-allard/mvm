@@ -127,7 +127,7 @@ impl LossCounters {
 /// them, so a secret completed after the hold still withholds the chunk that
 /// completes it. What the hold buys is that the *first* part of the secret is
 /// not written either when the rest follows within it.
-pub(crate) const STDIO_HOLD: Duration = Duration::from_millis(500);
+const STDIO_HOLD: Duration = Duration::from_millis(500);
 
 /// Stdio streams with records held back at once. A guest has a handful of
 /// producers; past this the stream held longest is released early (its scan
@@ -350,13 +350,12 @@ impl<S: RecordSink> ScrubbingSink<S> {
         stream.held_bytes += bytes.len();
         // The oldest chunk goes once the chunks after it cover the carry.
         let mut released = Vec::new();
-        while let Some(front_len) = stream.chunks.front().map(|(f, _)| stdio_bytes(f).len()) {
+        while let Some((front, _)) = stream.chunks.front() {
+            let front_len = stdio_bytes(front).len();
             if stream.held_bytes - front_len < carry {
                 break;
             }
-            let Some((front, _)) = stream.chunks.pop_front() else {
-                break;
-            };
+            let (front, _) = stream.chunks.pop_front().expect("front exists");
             stream.held_bytes -= front_len;
             released.push(front);
         }
@@ -594,6 +593,27 @@ pub struct QueuedSink {
 }
 
 impl QueuedSink {
+    /// Installed-only ownership: the caller retains and joins the original
+    /// writer. The sink moved to the receive worker cannot detach that handle.
+    pub(super) fn spawn_owned(
+        name: &str,
+        inner: impl RecordSink + 'static,
+        losses: Arc<LossCounters>,
+    ) -> std::io::Result<(Self, std::thread::JoinHandle<()>)> {
+        let (tx, rx) = sync_channel(WRITE_QUEUE_RECORDS);
+        let writer = std::thread::Builder::new()
+            .name(format!("mvm-telemetry-writer-{name}"))
+            .stack_size(super::owned::OWNED_COLLECTOR_STACK_BYTES)
+            .spawn(move || drain(rx, inner, &losses))?;
+        Ok((
+            Self {
+                tx: Some(tx),
+                writer: None,
+            },
+            writer,
+        ))
+    }
+
     /// Start the writer thread over `inner`, with room for `capacity` records.
     pub fn spawn(
         name: &str,
@@ -665,6 +685,15 @@ impl RecordFile for std::fs::File {
     }
 }
 
+impl RecordFile for mvm_vmm::host::network_endpoint_spawn::InstalledTelemetryRecords {
+    fn current_len(&self) -> std::io::Result<u64> {
+        Self::current_len(self)
+    }
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<()> {
+        self.rollback_to(len)
+    }
+}
+
 /// A size-capped JSONL sink: each record appends as one sealed line — the
 /// record inside the served envelope, stamped with the host receive time,
 /// encrypted under the records data key — until the cap, then sheds. A line
@@ -725,7 +754,7 @@ impl<F: RecordFile> RecordSink for CappedJsonlSink<F> {
         if self.written.saturating_add(line.len() as u64) > self.cap {
             return IngestOutcome::Shed(LossClass::CapReached);
         }
-        match self.file.write_all(&line) {
+        match self.file.write_all(&line).and_then(|()| self.file.flush()) {
             Ok(()) => {
                 self.written += line.len() as u64;
                 IngestOutcome::Ingested

@@ -61,6 +61,10 @@ pub mod host_agent_sessions;
 pub mod host_signer;
 #[cfg(unix)]
 pub mod host_lifetime_parent;
+#[cfg(unix)]
+pub mod installed_endpoint;
+#[cfg(unix)]
+pub mod owned_resources;
 pub mod jailer;
 /// Secret keyholder — the `SecretRef` → credential boundary: the
 /// [`keyholder::SecretResolver`] trait + the single-host

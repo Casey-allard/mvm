@@ -10,6 +10,22 @@
 mod http_flow;
 mod ingress;
 mod open_flow;
+mod owned_relays;
+#[cfg(all(test, unix))]
+mod installed_carrier_tests;
+pub use owned_relays::{OWNED_TCP_RELAY_STACK_BYTES, OwnedTcpRelays};
+mod payload_mapping;
+mod spiralcore_payload;
+pub use payload_mapping::{
+    AdmittedTcpPayload, AuthenticatedTcpPayloadFactory, AuthenticatedTcpPayloadIo,
+    PayloadMappingConfig,
+};
+pub use spiralcore_payload::{
+    EnrolledPayloadStream, ParentPayloadReservation, PayloadArtifact, PayloadPoolSnapshot,
+    PayloadResourceCharge, PayloadResourceLimits, PayloadResourcePermit, PayloadResourcePool,
+    PayloadScopeController, PreparedPayloadSession, SpiralCorePayloadFactory,
+    accept_enrolled_payload,
+};
 pub mod registry;
 mod resources;
 mod socket;
@@ -52,7 +68,10 @@ use self::udp_relay::{
     UdpAssociationHandle, UdpPeerAdmission, UdpRelayParams, UdpSendMsg, decode_udp_addr,
     run_udp_relay, udp_event_sources,
 };
-use self::wire::{is_peer_disconnect, lock_registry, lock_session, lock_validator, write_frame_to};
+use self::wire::{
+    SharedWriter, is_peer_disconnect, lock_registry, lock_session, lock_validator, write_frame_to,
+};
+use mvm_vmm::host::network_endpoint_spawn::InstalledEndpointAudit;
 
 use crate::supervisor::audit_recorder::{EventCategory, Recorder};
 use crate::supervisor::dns_resolver::resolve_hostname_ips;
@@ -88,7 +107,7 @@ pub struct FlowMuxSession {
     reader: UnixStream,
     /// The write half, shared with per-stream relay threads so they can send
     /// `Data`/`HalfClose`/`Reset` frames back to the guest.
-    writer: Arc<Mutex<UnixStream>>,
+    writer: Arc<SharedWriter>,
     /// The authenticated session is shared between the main thread (for
     /// opening inbound frames) and relay threads (for sealing outbound frames).
     /// Both directions use independent sequence counters inside one session.
@@ -146,6 +165,11 @@ pub struct FlowMuxSession {
     /// client that reconnects per request does not pay for a leaf each time.
     /// Shared per VM for the same reason the budget is.
     leaves: Arc<terminator::flow::LeafCache>,
+    payload_mapping: Option<Arc<PayloadMappingConfig>>,
+    owned_tcp_relays: Option<Arc<OwnedTcpRelays>>,
+    owned_guest_control: Option<Arc<UnixStream>>,
+    installed_audit: Option<InstalledEndpointAudit>,
+    installed_session_control: Option<Arc<crate::installed_endpoint::InstalledSessionControl>>,
 }
 
 impl std::fmt::Debug for FlowMuxSession {
@@ -189,6 +213,29 @@ pub struct FlowMuxAccept {
     substitution: Option<Arc<crate::supervisor::network_endpoint_proxy::SubstitutionService>>,
     vm_resources: Option<Arc<FlowMuxVmResources>>,
     ingress_mappings: Vec<(u16, IngressFlowKind)>,
+    payload_mapping: Option<Arc<PayloadMappingConfig>>,
+    owned_tcp_relays: Option<Arc<OwnedTcpRelays>>,
+    installed_audit: Option<InstalledEndpointAudit>,
+    installed_session_control: Option<Arc<crate::installed_endpoint::InstalledSessionControl>>,
+}
+
+struct PendingInstalledAudit(Option<InstalledEndpointAudit>);
+impl PendingInstalledAudit {
+    fn check_current(&self) -> Result<(), FlowMuxError> {
+        if let Some(audit) = &self.0 {
+            audit.check_current().map_err(|_| {
+                FlowMuxError::FrameRefused("installed audit authority unavailable".into())
+            })?;
+        }
+        Ok(())
+    }
+}
+impl Drop for PendingInstalledAudit {
+    fn drop(&mut self) {
+        if let Some(audit) = &self.0 {
+            audit.fence();
+        }
+    }
 }
 
 impl FlowMuxAccept {
@@ -224,6 +271,10 @@ impl FlowMuxAccept {
             substitution: None,
             vm_resources: None,
             ingress_mappings: Vec::new(),
+            payload_mapping: None,
+            owned_tcp_relays: None,
+            installed_audit: None,
+            installed_session_control: None,
         }
     }
 
@@ -231,6 +282,34 @@ impl FlowMuxAccept {
     #[must_use]
     pub fn with_recorder(mut self, recorder: Option<Arc<Recorder>>) -> Self {
         self.recorder = recorder;
+        self
+    }
+
+    #[must_use]
+    pub fn with_owned_tcp_relays(mut self, owned: Option<Arc<OwnedTcpRelays>>) -> Self {
+        self.owned_tcp_relays = owned;
+        self
+    }
+
+    /// Bind the original private child audit capability. Acceptance requires
+    /// the same actual resource partition, recorder, group and payload factory.
+    #[must_use]
+    pub fn with_installed_audit(mut self, audit: InstalledEndpointAudit) -> Self {
+        self.installed_audit = Some(audit);
+        self
+    }
+
+    pub(crate) fn with_installed_session_control(
+        mut self,
+        control: Arc<crate::installed_endpoint::InstalledSessionControl>,
+    ) -> Self {
+        self.installed_session_control = Some(control);
+        self
+    }
+
+    #[must_use]
+    pub fn with_payload_mapping(mut self, mapping: Option<Arc<PayloadMappingConfig>>) -> Self {
+        self.payload_mapping = mapping;
         self
     }
 
@@ -279,6 +358,26 @@ impl FlowMuxAccept {
 
 impl Drop for FlowMuxSession {
     fn drop(&mut self) {
+        if let Some(audit) = &self.installed_audit {
+            audit.fence();
+        }
+        if self.payload_mapping.is_some() {
+            let mapped = {
+                let mut streams = lock_tcp_streams(&self.streams);
+                let ids: Vec<_> = streams
+                    .iter()
+                    .filter(|(_, handle)| handle.upstream.is_mapped())
+                    .map(|(id, _)| *id)
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| streams.remove(&id))
+                    .collect::<Vec<_>>()
+            };
+            for handle in mapped {
+                handle.retired.store(true, Ordering::Release);
+                let _ = handle.upstream.shutdown(std::net::Shutdown::Both);
+            }
+        }
         let mut cancellations = self
             .http_cancellations
             .lock()
@@ -311,6 +410,8 @@ impl FlowMuxSession {
             udp_associations: Arc::clone(&self.udp_associations),
             udp_idle_timeout: self.limits.udp_idle_timeout,
             max_udp_peers: self.limits.max_udp_peers,
+            owned_tcp_relays: self.owned_tcp_relays.clone(),
+            owned_guest_control: self.owned_guest_control.clone(),
         }
     }
 
@@ -353,20 +454,116 @@ impl FlowMuxSession {
             substitution,
             vm_resources,
             ingress_mappings,
+            payload_mapping,
+            owned_tcp_relays,
+            installed_audit,
+            installed_session_control,
         } = params;
         let session_id = session_id.as_str();
+        let runtime_handle = tokio::runtime::Handle::try_current().ok();
+        if owned_tcp_relays.is_some() && installed_audit.is_none() {
+            return Err(FlowMuxError::FrameRefused(
+                "original installed audit capability required".into(),
+            ));
+        }
+        match (&owned_tcp_relays, &payload_mapping) {
+            (Some(group), Some(mapping)) => mapping
+                .check_owned_tcp_relays(
+                    group,
+                    session_id,
+                    host_key.verifying_key().to_bytes(),
+                    guest_anchor.to_bytes(),
+                )
+                .map_err(|error| FlowMuxError::FrameRefused(error.to_string()))?,
+            (Some(_), None) => {
+                return Err(FlowMuxError::FrameRefused(
+                    "owned relay factory missing".into(),
+                ));
+            }
+            (None, Some(mapping)) if mapping.requires_owned_tcp_relays() => {
+                return Err(FlowMuxError::FrameRefused(
+                    "original installed relay group required".into(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(audit) = &installed_audit {
+            if !recorder
+                .as_ref()
+                .is_some_and(|recorder| recorder.has_installed_origin(audit))
+                || substitution.is_some()
+                || !runtime_handle.as_ref().is_some_and(|handle| {
+                    handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+                })
+            {
+                return Err(FlowMuxError::FrameRefused(
+                    "installed audit recorder or profile unavailable".into(),
+                ));
+            }
+            owned_tcp_relays
+                .as_ref()
+                .ok_or_else(|| {
+                    FlowMuxError::FrameRefused("original installed relay group required".into())
+                })?
+                .check_installed_audit(audit)
+                .map_err(|_| {
+                    FlowMuxError::FrameRefused("original installed audit partition refused".into())
+                })?;
+            audit.bind_guest_transport(&stream).map_err(|_| {
+                FlowMuxError::FrameRefused("original guest cancellation refused".into())
+            })?;
+        }
+        if let Some(control) = &installed_session_control {
+            if !installed_audit
+                .as_ref()
+                .is_some_and(|audit| control.matches(audit))
+            {
+                control.fail();
+                return Err(FlowMuxError::FrameRefused(
+                    "original session stop partition differs".into(),
+                ));
+            }
+            if let Some(stopped) = control.stop_error() {
+                return Err(stopped.into());
+            }
+        }
+        let mut pending_audit = PendingInstalledAudit(installed_audit);
         // Split the socket into independent read/write descriptors so the
         // main thread can block on guest frames while relay threads emit
         // upstream data back to the guest.
         let writer = stream.try_clone()?;
-        let (session, _peer_key) = Session::host(&mut stream, session_id, host_key)
-            .map_err(|e| FlowMuxError::Handshake(e.to_string()))?;
+        let (session, _peer_key) =
+            Session::host(&mut stream, session_id, host_key).map_err(|error| {
+                if let Some(control) = &installed_session_control {
+                    if error.is_peer_hangup()
+                        && let Some(stopped) = control.stop_error()
+                    {
+                        return FlowMuxError::Transport(stopped);
+                    }
+                    control.fail();
+                }
+                FlowMuxError::Handshake(error.to_string())
+            })?;
 
         if session.peer_verifying_key() != &guest_anchor {
             return Err(FlowMuxError::Handshake(
                 "guest identity does not match pinned anchor".to_string(),
             ));
         }
+        if let Some(control) = &installed_session_control
+            && let Some(stopped) = control.stop_error()
+        {
+            return Err(stopped.into());
+        }
+        pending_audit.check_current().inspect_err(|_| {
+            if let Some(control) = &installed_session_control {
+                control.fail();
+            }
+        })?;
+        let owned_guest_control = owned_tcp_relays
+            .as_ref()
+            .map(|_| stream.try_clone().map(Arc::new))
+            .transpose()?;
 
         info!(session_id, "FlowMux handshake complete");
 
@@ -374,7 +571,7 @@ impl FlowMuxSession {
             .unwrap_or_else(|| Arc::new(FlowMuxVmResources::from_registry_limits(limits)));
         Ok(Self {
             reader: stream,
-            writer: Arc::new(Mutex::new(writer)),
+            writer: Arc::new(SharedWriter::new(writer, pending_audit.0.clone())),
             session: Arc::new(Mutex::new(session)),
             validator: Arc::new(Mutex::new(SessionValidator::new(ingress_mappings))),
             registry: Arc::new(Mutex::new(StreamRegistry::with_budget(
@@ -393,10 +590,15 @@ impl FlowMuxSession {
             limits,
             connect_timeout: Duration::from_secs(30),
             recorder,
-            runtime_handle: tokio::runtime::Handle::try_current().ok(),
+            runtime_handle,
             rate_limiter: Arc::clone(&resources.rate_limiter),
             terminated_flows: Arc::clone(&resources.terminated_flows),
             leaves: Arc::clone(&resources.leaves),
+            payload_mapping,
+            owned_tcp_relays,
+            owned_guest_control,
+            installed_audit: pending_audit.0.take(),
+            installed_session_control,
         })
     }
 
@@ -518,11 +720,34 @@ impl FlowMuxSession {
                 stream_id,
                 payload_len,
             )) {
+                if let Some(control) = &self.installed_session_control {
+                    control.fail();
+                }
                 warn!(error = %e, "FlowMux frame refused by session validator");
                 self.send_goaway(&e.to_string())?;
                 return Ok(());
             }
 
+            self.check_installed_audit()?;
+            if self.installed_audit.is_some()
+                && !matches!(
+                    opcode,
+                    Opcode::Hello
+                        | Opcode::OpenTcp
+                        | Opcode::Data
+                        | Opcode::HalfClose
+                        | Opcode::Reset
+                        | Opcode::WindowUpdate
+                        | Opcode::Resolve
+                )
+            {
+                // The selected owned profile admits Object-TCP and the same
+                // canonical policy-gated DNS path. It has no owned UDP/ICMP,
+                // HTTP, tool or host-ingress worker budget. Refuse before any
+                // such handler can allocate/connect/spawn; legacy is unchanged.
+                self.send_goaway("installed Object-TCP opcode unsupported")?;
+                return Ok(());
+            }
             match opcode {
                 Opcode::Hello => {
                     // A second Hello is illegal after the session is established;
@@ -530,6 +755,14 @@ impl FlowMuxSession {
                 }
                 Opcode::OpenTcp => {
                     if let Err(e) = self.handle_open_tcp(stream_id, payload_len) {
+                        if let FlowMuxError::Transport(error) = &e
+                            && self
+                                .installed_session_control
+                                .as_ref()
+                                .is_some_and(|control| control.is_stop_error(error))
+                        {
+                            return Err(e);
+                        }
                         warn!(error = %e, stream_id, "FlowMux TCP open failed");
                         self.send_reset(stream_id, "host error")?;
                     }
@@ -900,8 +1133,10 @@ impl FlowMuxSession {
         &mut self,
         stream_id: u32,
         upstream: FlowSocket,
+        reservation: Option<owned_relays::RelayReservation>,
     ) -> Result<(), FlowMuxError> {
-        self.ingress_handle().spawn_tcp_relay(stream_id, upstream)
+        self.ingress_handle()
+            .spawn_tcp_relay(stream_id, upstream, reservation)
     }
 
     fn handle_guest_data(&mut self, stream_id: u32, payload_len: u32) -> Result<(), FlowMuxError> {
@@ -929,14 +1164,30 @@ impl FlowMuxSession {
             }
         }
 
-        if let Err(e) = handle
-            .upstream
-            .write_all(&payload)
-            .and_then(|_| handle.upstream.flush())
-        {
-            warn!(error = %e, stream_id, "write to upstream failed");
-            drop(streams);
-            return self.reset_host_stream(stream_id, "upstream write failed");
+        match handle.upstream.mapped_clone() {
+            Ok(Some(mut mapped)) => {
+                drop(streams);
+                if let Err(error) = mapped.write_all(&payload).and_then(|_| mapped.flush()) {
+                    warn!(error=%error,stream_id,"mapped upstream write failed");
+                    return self.reset_host_stream(stream_id, "upstream write failed");
+                }
+            }
+            Ok(None) => {
+                if let Err(e) = handle
+                    .upstream
+                    .write_all(&payload)
+                    .and_then(|_| handle.upstream.flush())
+                {
+                    warn!(error=%e,stream_id,"write to upstream failed");
+                    drop(streams);
+                    return self.reset_host_stream(stream_id, "upstream write failed");
+                }
+            }
+            Err(error) => {
+                warn!(error=%error,stream_id,"mapped upstream clone failed");
+                drop(streams);
+                return self.reset_host_stream(stream_id, "upstream unavailable");
+            }
         }
 
         // Replenish the consumed credit so the guest can keep sending.
@@ -963,6 +1214,25 @@ impl FlowMuxSession {
             return Ok(());
         };
 
+        match handle.upstream.mapped_clone() {
+            Ok(Some(mapped)) => {
+                let closed = Arc::clone(&handle.host_half_closed);
+                drop(streams);
+                if mapped.shutdown(std::net::Shutdown::Write).is_err() {
+                    return self.reset_host_stream(stream_id, "upstream half-close failed");
+                }
+                if closed.load(Ordering::Relaxed) {
+                    return self.reset_host_stream(stream_id, "stream complete");
+                }
+                let _ = lock_registry(&self.registry).half_close(stream_id);
+                return Ok(());
+            }
+            Err(_) => {
+                drop(streams);
+                return self.reset_host_stream(stream_id, "upstream unavailable");
+            }
+            Ok(None) => {}
+        }
         let _ = handle.upstream.shutdown(std::net::Shutdown::Write);
 
         if handle.host_half_closed.load(Ordering::Relaxed) {
@@ -1074,6 +1344,21 @@ impl FlowMuxSession {
             let request = flow
                 .accept_head(&payload)
                 .map_err(|e| FlowMuxError::FrameRefused(e.to_string()))?;
+            if let Some(mapping) = self.payload_mapping.as_ref() {
+                let url = url::Url::parse(&request.head.url).map_err(|_| {
+                    FlowMuxError::FrameRefused("invalid typed HTTP destination".into())
+                })?;
+                if url
+                    .host_str()
+                    .zip(url.port_or_known_default())
+                    .is_some_and(|(host, port)| mapping.selects(host, port))
+                {
+                    return Err(FlowMuxError::FrameRefused(
+                        "selected payload profile does not support this typed transform path"
+                            .into(),
+                    ));
+                }
+            }
             let (Some(service), Some(handle)) = (&self.substitution, &self.runtime_handle) else {
                 return Err(FlowMuxError::FrameRefused(
                     "no runtime to forward the http flow on".to_string(),
@@ -1207,7 +1492,8 @@ impl FlowMuxSession {
     }
 
     fn remove_stream(&mut self, stream_id: u32) {
-        if let Some(handle) = lock_tcp_streams(&self.streams).remove(&stream_id) {
+        let handle = lock_tcp_streams(&self.streams).remove(&stream_id);
+        if let Some(handle) = handle {
             handle.retired.store(true, Ordering::Relaxed);
             let _ = handle.upstream.shutdown(std::net::Shutdown::Both);
         }
@@ -1328,6 +1614,52 @@ impl FlowMuxSession {
     /// The session layer encrypts each frame; this helper reads the encrypted
     /// envelope, opens it, and decodes the inner FlowMux header.
     fn read_frame(&mut self) -> Result<Option<(Opcode, u32, u32)>, FlowMuxError> {
+        self.check_installed_audit()?;
+        let result = self.read_frame_inner();
+        if let Some(control) = &self.installed_session_control {
+            if let Err(error) = &result {
+                if let FlowMuxError::Transport(error) = error {
+                    if control.is_stop_error(error) {
+                        return result;
+                    }
+                    if (error.kind() == std::io::ErrorKind::UnexpectedEof
+                        || is_peer_disconnect(error))
+                        && let Some(stopped) = control.stop_error()
+                    {
+                        return Err(stopped.into());
+                    }
+                }
+                // Protocol/crypto/unknown errors retain their actual cause even
+                // when a later stop has already reached this thread.
+                control.fail();
+                return result;
+            }
+            if let Some(stopped) = control.stop_error() {
+                return Err(stopped.into());
+            }
+        }
+        self.check_installed_audit()?;
+        result
+    }
+
+    fn check_installed_audit(&self) -> Result<(), FlowMuxError> {
+        if let Some(control) = &self.installed_session_control
+            && let Some(stopped) = control.stop_error()
+        {
+            return Err(stopped.into());
+        }
+        if let Some(audit) = &self.installed_audit {
+            audit.check_current().map_err(|_| {
+                if let Some(control) = &self.installed_session_control {
+                    control.fail();
+                }
+                FlowMuxError::FrameRefused("installed audit authority unavailable".into())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn read_frame_inner(&mut self) -> Result<Option<(Opcode, u32, u32)>, FlowMuxError> {
         let mut len_buf = [0u8; 4];
         match self.reader.read_exact(&mut len_buf) {
             Ok(()) => {}
@@ -1344,6 +1676,7 @@ impl FlowMuxSession {
                 "FlowMux sealed frame length {sealed_len} exceeds 1 MiB"
             )));
         }
+        self.check_installed_audit()?;
         let mut sealed_buf = vec![0u8; sealed_len];
         if let Err(e) = self.reader.read_exact(&mut sealed_buf) {
             if is_peer_disconnect(&e) {
@@ -1351,6 +1684,8 @@ impl FlowMuxSession {
             }
             return Err(e.into());
         }
+
+        self.check_installed_audit()?;
 
         let sealed = mvm_core::net::session::SealedFrame::decode(&sealed_buf)
             .map_err(|e| FlowMuxError::FrameRefused(e.to_string()))?;
