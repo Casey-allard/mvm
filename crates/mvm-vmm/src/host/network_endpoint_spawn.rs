@@ -46,8 +46,6 @@ pub use egress_tls::{
     load_egress_tls_delivery, persist_egress_tls_delivery,
 };
 mod installed;
-#[cfg(target_os = "linux")]
-pub(crate) use installed::limit_original_address_space;
 mod owned;
 pub use installed::{
     INSTALLED_BOOTSTRAP_MIN_BYTES, INSTALLED_CONTROL_BUFFER_BYTES, InstalledEndpointAudit,

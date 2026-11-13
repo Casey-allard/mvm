@@ -3,6 +3,8 @@
 //! typed handoff and the child adopts its original inherited holder.
 
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::host::process_limits::limit_original_address_space;
 use crate::host::{
     host_agent_spawn::{HostAgentServicesParams, OwnedHostAgentRegistrar, OwnedVmRegistration},
     process_exit::{ProcessExitObserver, ProcessExitWait},
@@ -412,38 +414,6 @@ pub fn spawn_network_endpoint_installed_registered(
         }
     })();
     startup.map_err(|reason| preparation.error(reason))
-}
-
-/// Bound the selected worker and all its threads before the loader or any
-/// user code runs. Preserve a stricter limit inherited from the host.
-#[cfg(target_os = "linux")]
-pub(crate) fn limit_original_address_space(
-    command: &mut std::process::Command,
-    bytes: u64,
-) -> Result<()> {
-    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-    use std::os::unix::process::CommandExt;
-    anyhow::ensure!(bytes > 0, "original endpoint address space is unfunded");
-    // SAFETY: after fork the closure reads and sets only kernel rlimits,
-    // using copied integers. It does not allocate, log, or acquire a lock.
-    unsafe {
-        command.pre_exec(move || {
-            let inherited = getrlimit(Resource::As);
-            let limit = [Some(bytes), inherited.current, inherited.maximum]
-                .into_iter()
-                .flatten()
-                .min();
-            setrlimit(
-                Resource::As,
-                Rlimit {
-                    current: limit,
-                    maximum: limit,
-                },
-            )?;
-            Ok(())
-        });
-    }
-    Ok(())
 }
 
 fn complete_start<C: Serialize>(
