@@ -72,6 +72,31 @@ impl PreparedWorkloadRoot {
         Ok(())
     }
 
+    /// Check for the inherited root and the opened drive in the live writer.
+    /// The caller verifies original process identity around this observation.
+    #[cfg(target_os = "linux")]
+    pub fn verify_writer_descriptors(&self, pid: u32) -> Result<()> {
+        let fds = std::path::PathBuf::from(format!("/proc/{pid}/fd"));
+        self.verify_writer_descriptor_objects(&writer_descriptor_inventory(&fds)?)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn verify_writer_descriptor_objects(
+        &self,
+        observed: &std::collections::BTreeMap<(u64, u64), usize>,
+    ) -> Result<()> {
+        let metadata = self.file().metadata()?;
+        ensure!(
+            observed
+                .get(&(metadata.dev(), metadata.ino()))
+                .copied()
+                .unwrap_or(0)
+                >= 2,
+            "actual writer is missing its second reference to the original workload root"
+        );
+        Ok(())
+    }
+
     pub fn file(&self) -> &std::fs::File {
         self.sealed.file()
     }
@@ -141,24 +166,7 @@ impl LaunchWritableHandoff {
 
     #[cfg(any(target_os = "linux", test))]
     fn verify_writer_descriptors_at(&self, fd_dir: &std::path::Path) -> Result<()> {
-        let mut actual = std::collections::BTreeMap::new();
-        for entry in std::fs::read_dir(fd_dir)
-            .with_context(|| format!("reading actual writer descriptors at {}", fd_dir.display()))?
-        {
-            let entry = entry?;
-            // proc fd entries are magic symlinks. metadata follows them to the
-            // open object; a pathname match would not detect ABA substitution.
-            let metadata = std::fs::metadata(entry.path()).with_context(|| {
-                format!(
-                    "inspecting actual writer descriptor {}",
-                    entry.path().display()
-                )
-            })?;
-            *actual
-                .entry((metadata.dev(), metadata.ino()))
-                .or_insert(0usize) += 1;
-        }
-        self.verify_writer_descriptor_objects(&actual)
+        self.verify_writer_descriptor_objects(&writer_descriptor_inventory(fd_dir)?)
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -199,6 +207,30 @@ impl LaunchWritableHandoff {
     pub fn projected(&self) -> &VmmSpec {
         &self.projected
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn writer_descriptor_inventory(
+    fd_dir: &std::path::Path,
+) -> Result<std::collections::BTreeMap<(u64, u64), usize>> {
+    let mut actual = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(fd_dir)
+        .with_context(|| format!("reading actual writer descriptors at {}", fd_dir.display()))?
+    {
+        let entry = entry?;
+        // proc fd entries are magic symlinks. metadata follows them to the
+        // open object; a pathname match would not detect ABA substitution.
+        let metadata = std::fs::metadata(entry.path()).with_context(|| {
+            format!(
+                "inspecting actual writer descriptor {}",
+                entry.path().display()
+            )
+        })?;
+        *actual
+            .entry((metadata.dev(), metadata.ino()))
+            .or_insert(0usize) += 1;
+    }
+    Ok(actual)
 }
 
 impl PreparedWritableDisks {
@@ -780,6 +812,24 @@ mod tests {
         std::fs::remove_file(fds.join("1001")).unwrap();
         std::os::unix::fs::symlink(&replacement, fds.join("1001")).unwrap();
         assert!(handoff.verify_writer_descriptors_at(&fds).is_err());
+    }
+
+    #[test]
+    fn workload_root_requires_two_original_descriptor_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = kernel(dir.path(), b"original root");
+        let source = dir.path().join("rootfs");
+        let mut root_slot = block(&source, 0);
+        root_slot.read_only = true;
+        let root = PreparedWorkloadRoot::bind(&spec(vec![root_slot]), &source, sealed).unwrap();
+        let original = root.file().metadata().unwrap();
+        let identity = (original.dev(), original.ino());
+        let other = writable(&source).metadata().unwrap();
+        let mut observed =
+            std::collections::BTreeMap::from([(identity, 1), ((other.dev(), other.ino()), 2)]);
+        assert!(root.verify_writer_descriptor_objects(&observed).is_err());
+        observed.insert(identity, 2);
+        root.verify_writer_descriptor_objects(&observed).unwrap();
     }
 
     #[test]
