@@ -673,6 +673,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         } else {
             None
         };
+        let mut boot_cmdline = inputs.cmdline.clone();
         #[cfg(unix)]
         let endpoint = if let Some(slot) = &installed {
             let id = VmId(inputs.config.name.clone());
@@ -712,6 +713,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                     &registration,
                     request.host_agent_params()?,
                 )?;
+                original.append_host_signer_cmdline(&mut boot_cmdline)?;
                 slot.begin_endpoint_start()?;
                 guards.spawn_endpoint_installed(
                     &id,
@@ -742,7 +744,6 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         let endpoint = Some(endpoint);
         trace.mark("endpoint_spawn");
 
-        let mut boot_cmdline = inputs.cmdline.clone();
         if let Some(token) =
             mvm_vmm::host::egress_bridge::telemetry_cmdline_token(&inputs.config.name)
         {

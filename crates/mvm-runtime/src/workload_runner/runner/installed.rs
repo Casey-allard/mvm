@@ -56,6 +56,8 @@ struct Custody {
     endpoint: Option<crate::workload_runner::claim::EndpointHandle>,
     endpoint_start_entered: bool,
     native_dispatch_entered: bool,
+    #[cfg(target_os = "linux")]
+    installed_kernel_released: bool,
     endpoint_retirement: Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement>,
     broker: Option<BrokerGuard>,
     launch: Option<(
@@ -95,6 +97,8 @@ impl InstalledSlots {
                 endpoint: None,
                 endpoint_start_entered: false,
                 native_dispatch_entered: false,
+                #[cfg(target_os = "linux")]
+                installed_kernel_released: false,
                 endpoint_retirement: None,
                 broker: None,
                 launch: None,
@@ -325,7 +329,7 @@ impl InstalledSlot {
     }
 
     fn stop_custody(&self, state: &mut Custody, streamer: &dyn ConsoleStreamer) -> Result<()> {
-        let (lifecycle, _) = state
+        let (lifecycle, _kernel) = state
             .launch
             .as_ref()
             .context("installed launch custody unavailable")?;
@@ -334,6 +338,21 @@ impl InstalledSlot {
                 state.failure.is_some() && state.vm.is_none() && state.exit.is_none(),
                 "original pre-dispatch failure proof unavailable"
             );
+            #[cfg(target_os = "linux")]
+            if self.binding().backend == BackendKind::Firecracker
+                && self.owner.canonical_kernel().is_some()
+            {
+                if !state.installed_kernel_released {
+                    _kernel.release_installed_kernel(lifecycle)?;
+                    state.installed_kernel_released = true;
+                }
+            } else {
+                anyhow::ensure!(
+                    !crate::kernel_custody::has_retained_kernel(lifecycle)?,
+                    "pre-dispatch kernel custody still requires native exit proof"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
             anyhow::ensure!(
                 !crate::kernel_custody::has_retained_kernel(lifecycle)?,
                 "pre-dispatch kernel custody still requires native exit proof"
@@ -445,15 +464,30 @@ impl InstalledSlot {
             broker.shutdown_owned()?;
         }
         streamer.stop(&self.id.0);
-        let (lifecycle, _) = state
+        let (lifecycle, _kernel) = state
             .launch
             .as_ref()
             .context("original installed launch missing")?;
         let has_kernel = crate::kernel_custody::has_retained_kernel(lifecycle)?;
-        anyhow::ensure!(
-            !never_spawned || !has_kernel,
-            "generation has recorded native effects despite pre-spawn proof"
-        );
+        #[cfg(target_os = "linux")]
+        if self.binding().backend == BackendKind::Firecracker
+            && self.owner.canonical_kernel().is_some()
+            && !state.installed_kernel_released
+        {
+            anyhow::ensure!(
+                !state.native_dispatch_entered
+                    || never_spawned
+                    || state
+                        .exit
+                        .as_ref()
+                        .is_some_and(|exit| exit.fc_exit.is_some()),
+                "original Firecracker disposal proof unavailable"
+            );
+            _kernel.release_installed_kernel(lifecycle)?;
+            state.installed_kernel_released = true;
+        }
+        #[cfg(target_os = "linux")]
+        let has_kernel = has_kernel && !state.installed_kernel_released;
         if has_kernel {
             let stopped = state
                 .exit
@@ -587,6 +621,11 @@ impl RunningVm for InstalledVmView {
         &self,
     ) -> Result<Option<mvm_core::protocol::hvf_control::HvfInstance>> {
         self.0.with_vm(|vm| vm.authenticated_hvf_instance())
+    }
+    #[cfg(target_os = "linux")]
+    fn check_original_firecracker_kernel(&self, anchor: &HostLifetimeAnchor) -> Result<()> {
+        self.0
+            .with_vm(|vm| vm.check_original_firecracker_kernel(anchor))
     }
     fn process_identity(&self) -> Result<Option<mvm_vmm::host::process_identity::ProcessIdentity>> {
         self.0.with_vm(|vm| vm.process_identity())

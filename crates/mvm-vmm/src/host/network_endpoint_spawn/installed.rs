@@ -78,6 +78,23 @@ impl<'a> InstalledHostServices<'a> {
         self.check_endpoint_binding(params.vm_name, params.tenant, params.state_dir)
     }
 
+    /// Project the original registered signer's public key into this guest's boot arguments.
+    pub fn append_host_signer_cmdline(&self, cmdline: &mut String) -> Result<()> {
+        if mvm_agentd::vsock::host_signer_pub_token(cmdline).is_some() {
+            bail!("installed boot arguments already contain a host signer");
+        }
+        let key = self
+            .registration
+            .original_host_public_key(self.registrar, &self.params)?;
+        if !cmdline.is_empty() {
+            cmdline.push(' ');
+        }
+        cmdline.push_str(mvm_agentd::vsock::HOST_SIGNER_PUB_CMDLINE_KEY);
+        cmdline.push('=');
+        cmdline.push_str(&hex::encode(key));
+        Ok(())
+    }
+
     pub fn check_flowmux_host_anchor(&self, candidate: &[u8; 32]) -> Result<()> {
         self.registration
             .check_flowmux_host_anchor(self.registrar, &self.params, candidate)

@@ -16,6 +16,8 @@ struct KernelUse {
     version: u32,
     vm: String,
     generation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installed: Option<mvm_core::host_lifetime::HostLaunchBinding>,
     device: u64,
     inode: u64,
     #[cfg(unix)]
@@ -154,6 +156,11 @@ impl KernelBoundLaunch {
                 .to_owned();
             let (device, inode) = directory_identity(owner.generation_dir())?;
             let pending = KernelUse {
+                installed: config
+                    .host_lifetime
+                    .as_ref()
+                    .filter(|_| backend == BackendKind::Firecracker)
+                    .map(|anchor| anchor.binding().clone()),
                 version: 1,
                 vm: config.name.clone(),
                 generation,
@@ -277,6 +284,24 @@ impl KernelBoundLaunch {
         #[cfg(unix)]
         {
             if self.backend == BackendKind::Firecracker {
+                #[cfg(target_os = "linux")]
+                if let Some(anchor) = &self.config.host_lifetime {
+                    vm.check_original_firecracker_kernel(anchor)?;
+                    self.check_installed_kernel_record(&read_record(&self.record)?)?;
+                    let generation = self
+                        .config
+                        .canonical_kernel
+                        .as_ref()
+                        .context("original generation missing")?;
+                    let named = directory_identity(generation.generation_dir())?;
+                    use std::os::unix::fs::MetadataExt;
+                    let held = generation.generation_directory_file().metadata()?;
+                    ensure!(
+                        named == (held.dev(), held.ino()),
+                        "original kernel directory changed before observation"
+                    );
+                    return vm.check_original_firecracker_kernel(anchor);
+                }
                 let process = vm
                     .process_identity()?
                     .context("started VM has no observable process identity; kernel retained")?;
@@ -289,6 +314,80 @@ impl KernelBoundLaunch {
         }
         #[cfg(not(unix))]
         anyhow::bail!("canonical kernel lifetime observation unsupported")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_installed_kernel_record(&self, record: &KernelUse) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let anchor = self
+            .config
+            .host_lifetime
+            .as_ref()
+            .context("original kernel anchor missing")?;
+        let generation = self
+            .config
+            .canonical_kernel
+            .as_ref()
+            .context("original kernel generation missing")?;
+        let held = generation.generation_directory_file().metadata()?;
+        ensure!(
+            self.backend == BackendKind::Firecracker
+                && anchor.binding().backend == self.backend
+                && anchor
+                    .canonical_kernel()
+                    .is_some_and(|original| std::sync::Arc::ptr_eq(original, generation))
+                && record.version == 1
+                && record.vm == self.config.name
+                && record.installed.as_ref() == Some(anchor.binding())
+                && record.instance.is_none()
+                && record.process.is_none()
+                && generation
+                    .generation_dir()
+                    .file_name()
+                    .is_some_and(|name| name == record.generation.as_str())
+                && (record.device, record.inode) == (held.dev(), held.ino()),
+            "kernel record differs from original installed generation"
+        );
+        Ok(())
+    }
+
+    /// Only the installed slot with confirmed original exit or proved non-dispatch calls this.
+    #[cfg(target_os = "linux")]
+    pub(super) fn release_installed_kernel(&self, lifecycle: &RuntimeLifecycleLease) -> Result<()> {
+        ensure!(
+            self.record == lifecycle.canonical_kernel_record(),
+            "original kernel index changed"
+        );
+        use std::os::unix::fs::MetadataExt;
+        let owner = self
+            .config
+            .canonical_kernel
+            .as_ref()
+            .context("original installed kernel missing")?;
+        let check_location = || {
+            let held = owner.generation_directory_file().metadata()?;
+            match std::fs::symlink_metadata(owner.generation_dir()) {
+                Ok(_) => ensure!(
+                    directory_identity(owner.generation_dir())? == (held.dev(), held.ino()),
+                    "installed kernel generation was replaced"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && held.nlink() == 0 => {
+                    ()
+                }
+                Err(error) => {
+                    return Err(error)
+                        .context("original kernel generation was moved or unavailable");
+                }
+            }
+            Ok(())
+        };
+        self.check_installed_kernel_record(&read_record(&self.record)?)?;
+        release_matching(
+            lifecycle,
+            &self.config.name,
+            |record| self.check_installed_kernel_record(record).is_ok(),
+            check_location,
+        )
     }
 
     #[cfg(unix)]
@@ -305,7 +404,8 @@ impl KernelBoundLaunch {
         );
         let mut record = read_record(&self.record)?;
         ensure!(
-            record.process.is_none()
+            record.installed.is_none()
+                && record.process.is_none()
                 && record.instance.as_ref().is_none_or(|held| held == instance),
             "kernel generation is already bound to another native instance"
         );
@@ -342,7 +442,8 @@ impl KernelBoundLaunch {
         );
         let mut record = read_record(&self.record)?;
         ensure!(
-            record.instance.is_none()
+            record.installed.is_none()
+                && record.instance.is_none()
                 && record.process.as_ref().is_none_or(|held| held == &process),
             "kernel generation is already bound to another instance"
         );
@@ -444,7 +545,11 @@ fn release_process_generation(
     release_matching(
         lifecycle,
         &exited.vm_id,
-        |record| record.instance.is_none() && record.process.as_ref() == Some(exited),
+        |record| {
+            record.installed.is_none()
+                && record.instance.is_none()
+                && record.process.as_ref() == Some(exited)
+        },
         recheck_exit,
     )
 }
@@ -461,7 +566,11 @@ fn release_generation(
     release_matching(
         lifecycle,
         &exited.vm_id,
-        |record| record.process.is_none() && record.instance.as_ref() == Some(exited),
+        |record| {
+            record.installed.is_none()
+                && record.process.is_none()
+                && record.instance.as_ref() == Some(exited)
+        },
         recheck_exit,
     )
 }
@@ -619,6 +728,7 @@ mod tests {
         let lease = RuntimeLifecycleLease::acquire("kernel-retention-unit").unwrap();
         let record = lease.canonical_kernel_record();
         let pending = KernelUse {
+            installed: None,
             version: 1,
             vm: "kernel-retention-unit".into(),
             generation: "kernel-unit".into(),
@@ -711,6 +821,7 @@ mod tests {
                 boot_nonce: [8; 32],
             };
             let record = KernelUse {
+                installed: None,
                 version: 1,
                 vm: instance.vm_id.clone(),
                 generation: "kernel-partial".into(),
@@ -764,6 +875,7 @@ mod tests {
             boot_nonce: [3; 32],
         };
         let mut record = KernelUse {
+            installed: None,
             version: 1,
             vm: instance.vm_id.clone(),
             generation: "kernel-unit".into(),
@@ -816,6 +928,7 @@ mod tests {
         std::fs::write(generation.join("selected-kernel"), b"unit payload").unwrap();
         let (device, inode) = directory_identity(&generation).unwrap();
         let record = KernelUse {
+            installed: None,
             version: 1,
             vm: "kernel-fc-unit".into(),
             generation: "kernel-fc".into(),

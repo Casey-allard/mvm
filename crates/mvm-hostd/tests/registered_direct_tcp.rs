@@ -521,6 +521,22 @@ mod registered_prepare {
                 service_proxies: &[],
             },
         )?;
+        let actual = fixture.host_signer.verifying_key().to_bytes();
+        assert!(original.check_flowmux_host_anchor(&[0xff; 32]).is_err());
+        let mut bootargs = "console=ttyS0".to_owned();
+        original.append_host_signer_cmdline(&mut bootargs)?;
+        assert_eq!(
+            mvm_agentd::vsock::host_signer_pub_token(&bootargs),
+            Some(hex::encode(actual).as_str())
+        );
+        assert!(original.append_host_signer_cmdline(&mut bootargs).is_err());
+        let mut conflicting = "mvm.host_signer_pub=invalid".to_owned();
+        assert!(
+            original
+                .append_host_signer_cmdline(&mut conflicting)
+                .is_err()
+        );
+        assert_eq!(conflicting, "mvm.host_signer_pub=invalid");
         use mvm_contract::peer::{PeerBinding, PeerName};
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;

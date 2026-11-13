@@ -1322,15 +1322,24 @@ impl OwnedVmRegistration {
         params: &HostAgentServicesParams<'_>,
         candidate: &[u8; 32],
     ) -> Result<()> {
-        self.check_current_for(original, params)?;
-        let original_anchor = ed25519_dalek::SigningKey::from_bytes(&self.shared.key)
-            .verifying_key()
-            .to_bytes();
         ensure!(
-            candidate == &original_anchor,
+            candidate == &self.original_host_public_key(original, params)?,
             "installed FlowMux host anchor differs from original registered signer"
         );
         self.check_current_for(original, params)
+    }
+
+    pub(crate) fn original_host_public_key(
+        &self,
+        original: &OwnedHostAgentRegistrar,
+        params: &HostAgentServicesParams<'_>,
+    ) -> Result<[u8; 32]> {
+        self.check_current_for(original, params)?;
+        let public = ed25519_dalek::SigningKey::from_bytes(&self.shared.key)
+            .verifying_key()
+            .to_bytes();
+        self.check_current_for(original, params)?;
+        Ok(public)
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
