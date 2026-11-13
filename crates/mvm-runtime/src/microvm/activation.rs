@@ -528,7 +528,7 @@ mod tests {
         plan.agent_verbs = Some(verbs.clone());
         assert!(verify_original_verb_grant(&env, "vm-late", &plan, &key.verifying_key()).is_err());
         let mut envelope = grant_until(plan.valid_until);
-        envelope.plan_nonce_hex = plan.nonce.as_hex();
+        envelope.plan_nonce_hex = plan.nonce.as_hex().to_owned();
         envelope.grant.plan_nonce = plan.nonce.clone();
         envelope.grant.verbs = verbs;
         envelope.grant.sig = key
