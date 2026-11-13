@@ -33,6 +33,13 @@ impl RunningVm for NativeVm {
     fn wait(&self) -> Result<VmExitStatus> {
         self.inner.wait()
     }
+    fn wait_with_deadline(&self, until: std::time::Instant) -> Result<VmExitStatus> {
+        anyhow::ensure!(std::time::Instant::now() < until, "expired fixture wait");
+        Ok(VmExitStatus {
+            code: Some(19),
+            success: false,
+        })
+    }
     fn kill(&self) -> Result<()> {
         self.inner.kill()
     }
@@ -394,6 +401,17 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
     assert!(
         other.status(&id).is_err(),
         "a different runner cannot attach through an installed marker"
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    assert!(other.wait_owned_until(&id, &anchor, until).is_err());
+    assert!(
+        runner
+            .wait_owned_until(&id, &anchor, std::time::Instant::now())
+            .is_err()
+    );
+    assert_eq!(
+        runner.wait_owned_until(&id, &anchor, until).unwrap().code,
+        Some(19)
     );
     assert!(other.stop_owned(&id, &anchor).is_err());
     assert_eq!(attached.load(Ordering::SeqCst), 0);

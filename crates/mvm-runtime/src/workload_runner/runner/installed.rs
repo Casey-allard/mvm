@@ -490,7 +490,7 @@ impl InstalledSlot {
         Ok(())
     }
 
-    fn with_vm<T>(&self, action: impl FnOnce(&dyn RunningVm) -> Result<T>) -> Result<T> {
+    pub(super) fn with_vm<T>(&self, action: impl FnOnce(&dyn RunningVm) -> Result<T>) -> Result<T> {
         let guard = self.access()?;
         let state = guard.as_ref().context("installed custody unavailable")?;
         anyhow::ensure!(!state.retired, "installed VM has retired");

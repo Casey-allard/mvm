@@ -915,6 +915,20 @@ impl AnyBackend {
         }
     }
 
+    /// Wait for the original workload's bounded report using the live launch owner.
+    #[cfg(unix)]
+    pub fn wait_owned_until(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: std::time::Instant,
+    ) -> Result<mvm_core::vm_backend::VmExitStatus> {
+        match self {
+            Self::Firecracker(runner) => runner.wait_owned_until(id, owner, until),
+            _ => anyhow::bail!("bounded original workload observation unavailable"),
+        }
+    }
+
     /// No name/marker fallback can manufacture original installed ownership.
     #[cfg(unix)]
     pub fn stop_owned(

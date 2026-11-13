@@ -1133,9 +1133,25 @@ impl LocalBackend {
             .map_err(crate::local::backend_err)
     }
 
-    /// Stop only the retained original native owner. No backend reconstruction.
+    /// Wait until the absolute deadline for this original guest's workload exit report.
+    /// The report is separate from stopping and collecting its VMM and endpoint.
     #[cfg(unix)]
-    pub async fn stop_owned(&self, outcome: &LaunchOutcome) -> Result<()> {
+    pub fn wait_owned_until(
+        &self,
+        outcome: &LaunchOutcome,
+        until: std::time::Instant,
+    ) -> Result<mvm_core::vm_backend::VmExitStatus> {
+        let anchor = self.original_outcome_anchor(outcome)?;
+        self.backend
+            .wait_owned_until(&VmId(outcome.machine.id.0.clone()), anchor, until)
+            .map_err(crate::local::backend_err)
+    }
+
+    #[cfg(unix)]
+    fn original_outcome_anchor<'a>(
+        &self,
+        outcome: &'a LaunchOutcome,
+    ) -> Result<&'a Arc<mvm_core::host_lifetime::HostLifetimeAnchor>> {
         let anchor = outcome
             .host_lifetime
             .as_ref()
@@ -1149,6 +1165,13 @@ impl LocalBackend {
                 reason: "installed launch outcome substituted".into(),
             });
         }
+        Ok(anchor)
+    }
+
+    /// Stop only the retained original native owner. No backend reconstruction.
+    #[cfg(unix)]
+    pub async fn stop_owned(&self, outcome: &LaunchOutcome) -> Result<()> {
+        let anchor = self.original_outcome_anchor(outcome)?;
         let mut retirement = outcome
             .retirement
             .try_lock()

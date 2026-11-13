@@ -172,11 +172,11 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
     }
 
     #[cfg(unix)]
-    pub fn stop_owned(
+    fn original_installed_slot(
         &self,
         id: &VmId,
         owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
-    ) -> Result<()> {
+    ) -> Result<Arc<installed::InstalledSlot>> {
         let slot = self
             .installed
             .find(id)?
@@ -185,7 +185,29 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
             slot.matches(owner),
             "foreign original installed native owner"
         );
-        slot.stop(&*self.console_streamer)
+        Ok(slot)
+    }
+
+    /// Observe only the originally retained native workload, until the supplied deadline.
+    #[cfg(unix)]
+    pub fn wait_owned_until(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: std::time::Instant,
+    ) -> Result<VmExitStatus> {
+        self.original_installed_slot(id, owner)?
+            .with_vm(|vm| vm.wait_with_deadline(until))
+    }
+
+    #[cfg(unix)]
+    pub fn stop_owned(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<()> {
+        self.original_installed_slot(id, owner)?
+            .stop(&*self.console_streamer)
     }
 
     /// Select retained failed startup custody in this runner only. This exact
