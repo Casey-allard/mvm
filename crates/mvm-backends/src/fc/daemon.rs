@@ -60,6 +60,34 @@ pub(crate) fn verify_original_writable_writer(
     original.require_live()
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_original_workload_root(
+    session: &mut crate::fc::fc_api::FcSession,
+    root: &mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot,
+    original: &mvm_vmm::host::fc_lifetime::OriginalProcess,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    original.authenticate_config(session.connected_stream())?;
+    let config: WriterConfig = serde_json::from_str(&session.call("GET", "/vm/config", None)?)?;
+    let mut roots = config
+        .drives
+        .iter()
+        .filter(|drive| drive.drive_id == format!("blk{}", root.slot()));
+    let drive = roots
+        .next()
+        .context("original workload root not configured")?;
+    anyhow::ensure!(
+        roots.next().is_none()
+            && drive.is_read_only
+            && drive.path_on_host
+                == std::path::PathBuf::from(format!("/proc/self/fd/{}", root.file().as_raw_fd())),
+        "original workload root configuration differs"
+    );
+    original.require_live()?;
+    root.verify_writer_descriptors(original.pid())?;
+    original.require_live()
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn verify_writable_writer(
     _abs_dir: &str,
@@ -166,6 +194,7 @@ pub(crate) struct OriginalFirecrackerSpawn<'a> {
     pub directory: &'a std::path::Path,
     pub socket: &'a str,
     pub handoff: Option<&'a mvm_vmm::driver::prepared_disks::LaunchWritableHandoff>,
+    pub workload_root: Option<&'a mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot>,
     pub original: &'a mut crate::driver::fc::owned::OwnedFcState,
 }
 
@@ -200,6 +229,9 @@ pub(crate) fn start_original_firecracker(start: OriginalFirecrackerSpawn<'_>) ->
         .context("original Firecracker lease absent")?;
     let holder = lease.holder().as_raw_fd();
     let mut descriptors = vec![holder];
+    if let Some(root) = start.workload_root {
+        descriptors.push(root.file().as_raw_fd());
+    }
     if let Some(disks) = start.handoff {
         for descriptor in disks.first()..=disks.last() {
             descriptors.push(i32::try_from(descriptor)?);

@@ -725,7 +725,12 @@ impl FcDriver {
         &self,
         spec: &VmmSpec,
         handoff: Option<mvm_vmm::driver::prepared_disks::LaunchWritableHandoff>,
+        workload_root: Option<&mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot>,
     ) -> Result<Box<dyn RunningVm>> {
+        anyhow::ensure!(
+            workload_root.is_none() || self.has_original_lifetime(),
+            "original workload root requires the original native owner"
+        );
         if !spec.shares.is_empty() {
             bail!(
                 "Firecracker does not support virtio-fs shares ({} requested);                  use the HVF or libkrun backend",
@@ -802,6 +807,7 @@ impl FcDriver {
                         directory: &state_dir,
                         socket: &socket,
                         handoff: handoff.as_ref(),
+                        workload_root,
                         original: &mut original,
                     },
                 )?;
@@ -864,6 +870,21 @@ impl FcDriver {
         for put in &puts {
             api_put_session(&mut session, &put.path, &put.body)
                 .with_context(|| format!("Firecracker API PUT {}", put.path))?;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(root) = workload_root {
+            let original = self
+                .owned
+                .as_ref()
+                .context("original native owner absent")?
+                .lock()
+                .map_err(|_| anyhow!("original Firecracker custody poisoned"))?;
+            crate::fc::daemon::verify_original_workload_root(
+                &mut session,
+                root,
+                original.process()?,
+            )?;
+            original.check_current()?;
         }
         if let Some(handoff) = handoff.as_ref() {
             #[cfg(target_os = "linux")]
@@ -1379,7 +1400,7 @@ impl VmmDriver for FcDriver {
     }
 
     fn boot(&self, spec: &VmmSpec) -> Result<Box<dyn RunningVm>> {
-        self.boot_with_handoff(spec, None)
+        self.boot_with_handoff(spec, None, None)
     }
 
     #[cfg(unix)]
@@ -1397,25 +1418,42 @@ impl VmmDriver for FcDriver {
         spec: &VmmSpec,
         files: mvm_vmm::driver::prepared_disks::PreparedBootFiles<'_>,
     ) -> Result<Box<dyn RunningVm>> {
-        files.require_no_workload_root()?;
         files.require_no_data()?;
+        anyhow::ensure!(
+            files.workload_root.is_none() || self.has_original_lifetime(),
+            "original workload root requires the original native owner"
+        );
         let mvm_vmm::driver::prepared_disks::PreparedBootFiles {
             kernel,
+            workload_root,
             writable: disks,
             ..
         } = files;
         disks.validate_spec(spec)?;
+        let root_recipe = workload_root
+            .as_ref()
+            .map(|root| kernel::fc_root_recipe(spec, root))
+            .transpose()?;
+        let spec = root_recipe.as_ref().unwrap_or(spec);
         if disks.is_empty() {
             return match kernel {
-                Some(kernel) => kernel::boot_descriptor(self, spec, kernel),
-                None => self.boot_with_handoff(spec, None),
+                Some(kernel) => {
+                    kernel::boot_descriptor_with_root(self, spec, kernel, workload_root.as_ref())
+                }
+                None => self.boot_with_handoff(spec, None, workload_root.as_ref()),
             };
         }
         let handoff = disks.into_launch_handoff(spec)?;
         let projected = handoff.projected().clone();
         match kernel {
-            Some(kernel) => kernel::boot_descriptor_custodied(self, &projected, kernel, handoff),
-            None => self.boot_with_handoff(&projected, Some(handoff)),
+            Some(kernel) => kernel::boot_descriptor_custodied(
+                self,
+                &projected,
+                kernel,
+                handoff,
+                workload_root.as_ref(),
+            ),
+            None => self.boot_with_handoff(&projected, Some(handoff), workload_root.as_ref()),
         }
     }
 
