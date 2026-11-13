@@ -52,9 +52,7 @@ impl ObjectWorkerBootstrapV1 {
         now: i64,
     ) -> Result<(), JournalError> {
         let signer = SigningKey::from_bytes(&self.secrets.local_authority);
-        if journal.local_compaction_due(now)? {
-            journal.compact_local(now, &signer, anchor)?;
-        }
+        journal.maintain_local_checkpoint(now, &signer, anchor)?;
         crate::mailbox_service::durable::settle_expired_at(journal, now, &signer, |tip| {
             anchor.advance(tip)
         })

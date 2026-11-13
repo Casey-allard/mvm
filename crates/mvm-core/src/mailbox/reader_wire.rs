@@ -11,8 +11,8 @@ use std::io::{Read, Write};
 
 use base64::Engine as _;
 use mvm_contract::protocol::mailbox::{
-    ContentType, SignedDestinationReceipt, SignedMailboxCapability, SignedMailboxDeliveryAck, SignedMailboxDeliveryLease,
-    SignedMailboxGuestReaderEnrollment,
+    ContentType, SignedDestinationReceipt, SignedMailboxCapability, SignedMailboxDeliveryAck,
+    SignedMailboxDeliveryLease, SignedMailboxGuestReaderEnrollment,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -363,7 +363,10 @@ pub(super) mod payload_base64 {
     use super::*;
     use serde::{Deserializer, Serializer, de::Error as _};
 
-    pub(in crate::mailbox) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(in crate::mailbox) fn serialize<S: Serializer>(
+        bytes: &[u8],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 

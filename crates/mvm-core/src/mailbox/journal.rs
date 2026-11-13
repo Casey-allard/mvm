@@ -368,6 +368,8 @@ pub struct MailboxJournal {
     tip: JournalTip,
     bytes: u64,
     records: usize,
+    // Retry a space-limited snapshot once another signed identity can be retired.
+    deferred_retirees: Option<usize>,
     seen: BTreeMap<ReplayIdentity, Seen>,
     order: Vec<ReplayIdentity>,
     used_challenges: BTreeMap<[u8; 32], ReplayIdentity>,
@@ -2638,6 +2640,174 @@ mod anchor_tests {
         assert_eq!(
             receipts[0].receipt.message_id,
             MessageId::from_bytes([1; 32])
+        );
+    }
+
+    #[test]
+    fn full_opportunistic_checkpoint_preserves_live_receipts_and_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (envelope, capability, mut context, key, sender, signer) = message();
+        let (reference, custody) = versioned_custody();
+        let anchor =
+            FileJournalAnchor::open(&dir.path().join("anchor/tip"), address(), [22; 32]).unwrap();
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                signer.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
+                local_retention(),
+            )
+            .unwrap()
+        };
+        let mut journal = open(limits());
+        let original = || admission(&envelope, &capability, &context, &key, &sender, &signer);
+        let receipt = journal.admit_local(original(), &anchor).unwrap();
+        let (other, cap, ctx, dek, a, b) = message_at(3, 2, context.now_unix_ms);
+        journal
+            .admit_local(admission(&other, &cap, &ctx, &dek, &a, &b), &anchor)
+            .unwrap();
+        let retained_tip = anchor.tip();
+        // A checkpoint needs temporary space beside the complete retained prefix.
+        let quota = JournalLimits {
+            max_records: 100,
+            max_bytes: journal.bytes + 1,
+        };
+        drop(journal);
+        let mut journal = open(quota);
+        assert!(journal.local_compaction_due(context.now_unix_ms).unwrap());
+        journal
+            .maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor)
+            .unwrap();
+        assert!(!journal.local_compaction_due(context.now_unix_ms).unwrap());
+        assert!(matches!(
+            journal.compact_local(context.now_unix_ms, &signer, &anchor),
+            Err(JournalError::Full)
+        ));
+        assert_eq!(journal.admit_local(original(), &anchor).unwrap(), receipt);
+        let (next, cap, ctx, dek, a, b) = message_at(2, 2, context.now_unix_ms);
+        assert!(matches!(
+            journal.admit_local(admission(&next, &cap, &ctx, &dek, &a, &b), &anchor),
+            Err(JournalError::Full)
+        ));
+        assert_eq!(anchor.tip(), retained_tip);
+        assert!(record_path(&root, 1).exists());
+        drop(journal);
+        let mut journal = open(quota);
+        journal
+            .maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor)
+            .unwrap();
+        assert_eq!(journal.admit_local(original(), &anchor).unwrap(), receipt);
+        // A pre-publication capacity refusal must never mask anchor disagreement.
+        let mut wrong = retained_tip;
+        wrong.cursor += 1;
+        anchor.advance(wrong).unwrap();
+        context.now_unix_ms += 1;
+        assert!(matches!(
+            journal.maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor),
+            Err(JournalError::Rollback)
+        ));
+    }
+
+    #[test]
+    fn deferred_checkpoint_retries_after_one_acknowledged_horizon() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let (old, send, context, key, sender, signer) = message();
+        let anchor =
+            FileJournalAnchor::open(&dir.path().join("anchor/tip"), address(), [22; 32]).unwrap();
+        let retention = local_retention();
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                signer.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
+                retention,
+            )
+            .unwrap()
+        };
+        let mut journal = open(limits());
+        journal
+            .admit_local(
+                admission(&old, &send, &context, &key, &sender, &signer),
+                &anchor,
+            )
+            .unwrap();
+        let mut grant = send.grant.clone();
+        grant.subject = address().recipient;
+        grant.capability_id = CapabilityId::from_bytes([31; 32]);
+        grant.operations = CapabilityOperations::from_operations(&[MailboxOperation::Receive]);
+        let receive = super::super::sign_capability(grant, &signer).unwrap();
+        let mut reader = context.clone();
+        reader.acting_principal = address().recipient;
+        reader.required_operation = MailboxOperation::Receive;
+        let old_id = journal.order[0];
+        journal
+            .acknowledge(
+                old_id,
+                JournalReceive {
+                    capability: &receive,
+                    context: &reader,
+                    encryption_key: &key,
+                    sender_key: &sender,
+                },
+                |tip| anchor.advance(tip),
+            )
+            .unwrap();
+
+        let horizon = retention
+            .retained_until(old.routing.expires_at_unix_ms)
+            .unwrap();
+        let (active, cap, mut ctx, dek, a, b) = message_at(3, 2, horizon - 1);
+        let original = journal
+            .admit_local(admission(&active, &cap, &ctx, &dek, &a, &b), &anchor)
+            .unwrap();
+        let active_id = journal.order[1];
+        // Room for one checkpoint entry plus its signed wrapper, but not both retained identities.
+        let one = serde_json::to_vec(&journal.seen[&active_id]).unwrap().len() as u64;
+        let quota = JournalLimits {
+            max_records: 100,
+            max_bytes: journal.bytes + one + 3000,
+        };
+        drop(journal);
+        let mut journal = open(quota);
+        let before = anchor.tip();
+        assert!(journal.local_compaction_due(horizon).unwrap());
+        journal
+            .maintain_local_checkpoint(horizon, &signer, &anchor)
+            .unwrap();
+        assert_eq!(anchor.tip(), before);
+        assert_eq!(journal.deferred_retirees, Some(0));
+        for _ in 0..64 {
+            assert!(!journal.local_compaction_due(horizon).unwrap());
+            journal
+                .maintain_local_checkpoint(horizon, &signer, &anchor)
+                .unwrap();
+        }
+        assert!(journal.seen.contains_key(&old_id));
+        ctx.now_unix_ms = horizon + 1;
+        assert!(journal.local_compaction_due(ctx.now_unix_ms).unwrap());
+        journal
+            .maintain_local_checkpoint(ctx.now_unix_ms, &signer, &anchor)
+            .unwrap();
+        assert_eq!(anchor.tip().cursor, before.cursor + 1);
+        assert_eq!(journal.records, 1);
+        assert!(!journal.seen.contains_key(&old_id));
+        drop(journal);
+        let mut recovered = open(quota);
+        assert_eq!(recovered.seen.len(), 1);
+        assert_eq!(
+            recovered
+                .admit_local(admission(&active, &cap, &ctx, &dek, &a, &b), &anchor)
+                .unwrap(),
+            original
         );
     }
 

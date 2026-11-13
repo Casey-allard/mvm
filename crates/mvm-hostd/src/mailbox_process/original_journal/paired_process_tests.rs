@@ -235,7 +235,9 @@ impl Drop for LifetimeFixture {
     }
 }
 fn lifetime_fixture(name: &str) -> Result<LifetimeFixture> {
-    let child = std::process::Command::new("sleep").arg("40").spawn()?;
+    let child = mvm_core::env_hygiene::helper_command("sleep")
+        .arg("40")
+        .spawn()?;
     std::fs::write(
         mvm_core::config::vm_state_dir(name).join("fc.pid"),
         child.id().to_string(),
@@ -467,6 +469,19 @@ fn run(ordinal: bool, reconnect: bool) -> Result<()> {
                 );
             }
             if reconnect && turn == 1 {
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    let error = a
+                        .restart_helper(super::JournalHelper::Source, deadline)
+                        .expect_err("unsupported controlled restart");
+                    ensure!(error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::Unsupported)
+                    }));
+                    ensure!(a.source.try_wait()?.is_none());
+                    ensure!(b.lock().unwrap().child.try_wait()?.is_none());
+                }
                 // Repeat an already-receipted immutable envelope after each
                 // originally owned helper has exited, leaving both VMs alive.
                 let which = super::JournalHelper::Source;
@@ -490,7 +505,7 @@ fn run(ordinal: bool, reconnect: bool) -> Result<()> {
                         .any(|cause| cause.kind() == std::io::ErrorKind::WouldBlock)),
                     "fresh launch unexpectedly bypassed the original ownership fence"
                 );
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
                     // This backend cannot pin a stale socket vnode. The
                     // fixture models a clean original release only after
@@ -505,13 +520,32 @@ fn run(ordinal: bool, reconnect: bool) -> Result<()> {
                         &mvm_core::config::vm_state_dir("journal-b"),
                     ))?;
                 }
+                // Reopen A before mutating its state directory. On Darwin any
+                // entry mutation fences the present helper's socket watch.
+                ensure!(a.reconnect_helper(which, deadline)? == old_a);
                 let denied = crate::mailbox_process::reader::revocations_path(&a_state);
                 mvm_core::atomic_io::write_private(
                     &denied,
                     &serde_json::to_vec(&[incoming.source_scope.grant.revocation_id])?,
                 )?;
-                ensure!(a.reconnect_helper(which, deadline).is_err());
+                ensure!(
+                    a.reconnect_helper(super::JournalHelper::Destination, deadline)
+                        .is_err()
+                );
                 std::fs::remove_file(denied)?;
+                #[cfg(target_os = "macos")]
+                {
+                    let socket_parent = mvm_core::config::vm_socket_dir_at(&a_state);
+                    let changed = socket_parent.join("fixture-directory-change");
+                    std::fs::write(&changed, b"")?;
+                    std::fs::remove_file(changed)?;
+                    let refusal = a
+                        .restart_helper(which, deadline)
+                        .expect_err("changed watch must fence before kill");
+                    ensure!(format!("{refusal:#}").contains("socket directory changed"));
+                    ensure!(a.source.try_wait()?.is_none());
+                    a.require_ready()?;
+                }
                 let (anchor, original_pid) = {
                     let b = b.lock().unwrap();
                     let retained = crate::mailbox_custody::RetainedMailboxKeys::open_existing(
@@ -542,7 +576,6 @@ fn run(ordinal: bool, reconnect: bool) -> Result<()> {
                     a.reconnect_helper(super::JournalHelper::Destination, deadline)?
                         == failed_status
                 );
-                ensure!(a.reconnect_helper(which, deadline)? == old_a);
                 ensure!(a_vm.try_wait()?.is_none() && b_vm.try_wait()?.is_none());
                 eprintln!(
                     "ORIGINAL_RECONNECT both_predecessors_collected=true both_original_vms_live=true current_revocation_refused=true"
@@ -632,7 +665,7 @@ fn run_private_fixture(test_name: &str, guard_env: &str) {
     std::fs::copy(build, &helper).unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let selector = format!("mailbox_process::original_journal::paired_process_tests::{test_name}");
-    let status = std::process::Command::new(exe)
+    let status = mvm_core::env_hygiene::helper_command(exe)
         .arg(selector)
         .args(["--exact", "--ignored", "--nocapture"])
         .env(guard_env, "1")

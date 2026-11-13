@@ -15,12 +15,17 @@ pub(crate) struct Aggregate {
     state: Mutex<(u64, GuestStreamCounts)>,
 }
 impl Aggregate {
-    pub(crate) fn create(dir: &Path) -> io::Result<Self> {
+    pub(crate) fn create(dir: &Path, replacement: bool) -> io::Result<Self> {
+        let name = if replacement {
+            "ordinal-guest-total-replacement-v1.counts"
+        } else {
+            FILE
+        };
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
-            .open(dir.join(FILE))?;
+            .open(dir.join(name))?;
         file.write_all(HEADER)?;
         Ok(Self {
             file,
@@ -65,9 +70,29 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Read};
     #[test]
+    fn one_replacement_meter_preserves_both_originals_and_refuses_a_third_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Aggregate::create(dir.path(), false).unwrap();
+        let b = Aggregate::create(dir.path(), true).unwrap();
+        for replacement in [false, true] {
+            assert!(Aggregate::create(dir.path(), replacement).is_err());
+        }
+        drop(b);
+        assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), HEADER);
+        drop(a);
+        for filename in [FILE, "ordinal-guest-total-replacement-v1.counts"] {
+            assert!(
+                std::fs::read(dir.path().join(filename))
+                    .unwrap()
+                    .ends_with(b"finish 0 0 0 0 0 false\n")
+            );
+        }
+    }
+
+    #[test]
     fn counts_all_completed_original_turns_in_constant_space() {
         let d = tempfile::tempdir().unwrap();
-        let m = Aggregate::create(d.path()).unwrap();
+        let m = Aggregate::create(d.path(), false).unwrap();
         for _ in 0..2050 {
             let mut io = Cursor::new(vec![0; 3]);
             m.observe(&mut io, |s| {
@@ -76,7 +101,7 @@ mod tests {
                 s.write_all(b"fixed").unwrap()
             });
         }
-        assert!(Aggregate::create(d.path()).is_err());
+        assert!(Aggregate::create(d.path(), false).is_err());
         assert_eq!(std::fs::read(d.path().join(FILE)).unwrap(), HEADER);
         drop(m);
         let result = std::fs::read_to_string(d.path().join(FILE)).unwrap();
@@ -89,9 +114,10 @@ mod tests {
     #[test]
     fn torn_turn_preserves_protocol_error_and_cannot_close_observation() {
         let d = tempfile::tempdir().unwrap();
-        let m = Aggregate::create(d.path()).unwrap();
-        let panic =
-            std::panic::catch_unwind(|| m.observe(Cursor::new(Vec::<u8>::new()), |_| panic!("interrupted")));
+        let m = Aggregate::create(d.path(), false).unwrap();
+        let panic = std::panic::catch_unwind(|| {
+            m.observe(Cursor::new(Vec::<u8>::new()), |_| panic!("interrupted"))
+        });
         assert!(panic.is_err());
         drop(m);
         assert_eq!(std::fs::read(d.path().join(FILE)).unwrap(), HEADER);
