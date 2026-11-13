@@ -371,9 +371,7 @@ impl KernelBoundLaunch {
                     directory_identity(owner.generation_dir())? == (held.dev(), held.ino()),
                     "installed kernel generation was replaced"
                 ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound && held.nlink() == 0 => {
-                    ()
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && held.nlink() == 0 => {}
                 Err(error) => {
                     return Err(error)
                         .context("original kernel generation was moved or unavailable");
