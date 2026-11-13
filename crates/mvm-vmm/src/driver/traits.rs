@@ -437,6 +437,17 @@ pub trait RunningVm: Send {
     fn process_identity(&self) -> Result<Option<crate::host::process_identity::ProcessIdentity>> {
         Ok(None)
     }
+    /// Check the held original Firecracker owner before binding its canonical
+    /// generation. This observes custody only; the caller must separately verify
+    /// canonical files, current parent admission and activation policy.
+    /// No process-table identity is substituted for unavailable original custody.
+    #[cfg(target_os = "linux")]
+    fn check_original_firecracker_kernel(
+        &self,
+        _anchor: &mvm_core::host_lifetime::HostLifetimeAnchor,
+    ) -> Result<()> {
+        anyhow::bail!("original Firecracker kernel owner unavailable")
+    }
     fn pause(&self) -> Result<()>;
     fn resume(&self) -> Result<()>;
     fn status(&self) -> Result<VmStatus>;
