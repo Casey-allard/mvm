@@ -57,6 +57,26 @@ builder protocols, raw channels and their availability restrictions.
 
 Boot-binding file authority and local journal storage currently require the supported Unix filesystem checks. Portable clients can verify mailbox signatures and receipts on Windows. Loading a host or guest boot-binding file on an unsupported platform returns an explicit unsupported-operation error.
 
+### Original Firecracker entrypoint control
+
+The Linux Firecracker driver can open one `OriginalEntrypointChannel` from its
+retained `RunningVm` and original host-lifetime anchor. It binds the connected
+vsock multiplexer to the held VMM process and inherited lease, checks the
+original registered host identity, and retains the authenticated control
+session through `ActivateEnvironment`, one non-streaming `RunEntrypoint`, and
+an optional terminal `SyncFilesystems`. The guest control key is established
+on that connection; it is separate from the FlowMux identity drive's key.
+
+The embedding caller still owns signed-plan admission, current authorization,
+the admitted workload entrypoint, input/environment limits, and audit routing.
+The channel grants no arbitrary command execution, shell or guest network
+interface. Unsupported backends refuse this API. A failed or unwound operation
+closes its actual stream and spends the session; reconnecting cannot retry an
+activation or entrypoint whose outcome is uncertain. Socket operations share
+an absolute deadline without a separate watchdog thread. The caller must bound
+its synchronous output observer; the socket deadline cannot interrupt arbitrary
+callback code or guarantee filesystem and scheduler latency.
+
 The installed Linux or macOS controller can interrupt and replace one of its owned mailbox helpers through `OriginalJournalSourceHost::restart_helper`. It retains the original guest boots, launch claims and signed credentials. Readiness is fenced before interruption, the original child is collected through its exit observer, and replacement revalidates current authority before readiness. Retry an unsettled operation with its original identity. Controlled live restart returns `Unsupported` on other platforms before interrupting a helper. `reconnect_helper` remains available for an already-collected helper whose original socket can be retired safely.
 
 ### Original mailbox sender settlement

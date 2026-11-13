@@ -47,6 +47,7 @@ pub(crate) struct OwnedFcState {
     pub spawn_attempted: bool,
     pub retired: bool,
     pub authenticated: bool,
+    pub(super) entrypoint_opened: bool,
     pub(super) exit_capture: Option<super::owned_capture::CaptureWorker>,
 }
 
@@ -65,6 +66,7 @@ pub(super) fn boot(
         spawn_attempted: false,
         retired: false,
         authenticated: false,
+        entrypoint_opened: false,
         exit_capture: None,
     }));
     let launch = || {
@@ -89,6 +91,35 @@ pub(super) fn boot(
     launch().map_err(|error| boot_failure(original, error))
 }
 impl OwnedFcState {
+    pub(super) fn check_kernel_anchor(
+        &self,
+        anchor: &mvm_core::host_lifetime::HostLifetimeAnchor,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.authenticated && self.spawn_attempted && !self.retired,
+            "original Firecracker is not an authenticated active launch"
+        );
+        anyhow::ensure!(
+            &self.binding == anchor.binding(),
+            "canonical kernel belongs to a different original launch"
+        );
+        anchor.verify_current()?;
+        self.check_current()?;
+        let lifetime = self.lifetime.as_ref().context("original lifetime absent")?;
+        let process = lifetime.process()?;
+        let lease = lifetime.lease()?;
+        anchor.check_original_lease(lease)?;
+        anyhow::ensure!(
+            self.child
+                .as_ref()
+                .is_some_and(|child| child.id() == process.pid()),
+            "original Firecracker child differs from its held process"
+        );
+        process.verify_inherited_holder(lease)?;
+        self.check_current()?;
+        anchor.verify_current()
+    }
+
     pub fn check_current(&self) -> Result<()> {
         match &self.lifetime {
             Some(original) => {
@@ -325,4 +356,4 @@ impl std::error::Error for OwnedFcBootFailure {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::driver::fc) mod tests;
