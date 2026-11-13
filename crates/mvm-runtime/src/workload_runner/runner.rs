@@ -691,16 +691,14 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 };
                 let broker = match self.broker.register_installed(&request, registrar) {
                     Ok(broker) => broker,
-                    Err(error) => match error
-                        .downcast::<mvm_vmm::host::host_agent_spawn::OwnedRegistrationError>()
-                    {
-                        Ok(failed) => {
-                            let (reason, registration) = failed.into_parts();
-                            slot.retain_broker(BrokerGuard::from_owned_registration(registration))?;
-                            return Err(reason);
-                        }
-                        Err(error) => return Err(error),
-                    },
+                    Err(error) => {
+                        let failed = error
+                            .downcast::<mvm_vmm::host::host_agent_spawn::OwnedRegistrationError>(
+                        )?;
+                        let (reason, registration) = failed.into_parts();
+                        slot.retain_broker(BrokerGuard::from_owned_registration(registration))?;
+                        return Err(reason);
+                    }
                 };
                 trace.degrade_unless("host_services", broker.services_healthy(&services));
                 slot.retain_broker(broker)?;

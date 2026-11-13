@@ -548,10 +548,10 @@ impl Drop for InstalledSlot {
             .state
             .get_mut()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(state) = guard.take() {
-            if !state.retired {
-                std::mem::forget((state, Arc::clone(&self.owner)));
-            }
+        if let Some(state) = guard.take()
+            && !state.retired
+        {
+            std::mem::forget((state, Arc::clone(&self.owner)));
         }
     }
 }
