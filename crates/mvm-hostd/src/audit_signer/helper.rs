@@ -182,18 +182,17 @@ impl SignerHelper {
         let workload_chain_path = Path::new(&req.workload_chain_path);
         let chain_head_secondary_path = Path::new(&req.chain_head_secondary_path);
         if self.chain_bytes.is_some() {
-            let original_parent = workload_chain_path
-                .parent()
-                .context("funded audit parent absent")?;
-            anyhow::ensure!(
-                Some(original_parent) == chain_head_secondary_path.parent(),
-                "funded audit head outside original directory"
-            );
-            mvm_core::private_fs::create_owned_private_dir(original_parent)?;
+            let audit = mvm_core::config::workload_audit_path(&self.tenant_id, &req.vm_id);
+            let state = mvm_core::config::vm_state_dir(&req.vm_id);
+            let head = state.join(mvm_vmm::host::broker_services_spawn::AUDIT_SIGNER_HEAD_FILE);
+            anyhow::ensure!(workload_chain_path == audit && chain_head_secondary_path == head,
+                "funded audit paths differ from original registration");
+            mvm_core::private_fs::create_owned_private_dir(&mvm_core::config::mvm_audit_dir())?;
+            mvm_vmm::host::restore_image::open_trusted_dir(&state)?;
         } else {
             ensure_parent(workload_chain_path)?;
+            ensure_parent(chain_head_secondary_path)?;
         }
-        ensure_parent(chain_head_secondary_path)?;
         if let Some(limit) = self.chain_bytes {
             anyhow::ensure!(
                 self.owned,
@@ -569,10 +568,20 @@ mod tests {
     fn funded_original_signer_seals_genesis_and_exact_terminal_head() {
         use mvm_core::protocol::audit_signer::AuditInventoryPhase;
         let dir = tempfile::tempdir().unwrap();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.set("MVM_HOME", dir.path());
+        let state = mvm_core::config::vm_state_dir("vm-1");
+        mvm_core::config::create_private_dir(&state).unwrap();
         let mut helper = SignerHelper::new("local", Some(key_path(dir.path())))
             .with_owned_resource_limits()
             .with_audit_chain_bytes(std::num::NonZeroU64::new(65536));
-        let original = match helper.dispatch(register_req(dir.path(), "vm-1", "local")) {
+        let SignerHelperRequest::RegisterVm(mut req) = register_req(dir.path(), "vm-1", "local") else {
+            unreachable!()
+        };
+        assert!(matches!(helper.dispatch(SignerHelperRequest::RegisterVm(req.clone())), SignerHelperResponse::Err { .. }));
+        req.workload_chain_path = mvm_core::config::workload_audit_path("local", "vm-1").to_string_lossy().into_owned();
+        req.chain_head_secondary_path = state.join(mvm_vmm::host::broker_services_spawn::AUDIT_SIGNER_HEAD_FILE).to_string_lossy().into_owned();
+        let original = match helper.dispatch(SignerHelperRequest::RegisterVm(req)) {
             SignerHelperResponse::FundedInventory { inventory, .. } => inventory,
             other => panic!("missing original inventory: {other:?}"),
         };

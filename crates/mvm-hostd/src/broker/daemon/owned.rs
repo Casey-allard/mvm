@@ -78,16 +78,10 @@ fn fresh_signer_capability(
     original: &ProcessExitObserver,
     admission: &crate::owned_resources::registered::RegistrationAdmission,
 ) -> Result<SignerCapability> {
+    anyhow::ensure!(signer.id().is_some(), "original signer child absent");
     signer_current(original, admission)?;
     #[cfg(not(target_os = "macos"))]
-    let event = ProcessExitObserver::arm(
-        signer
-            .id()
-            .context("original signer child ID missing")?
-            .try_into()?,
-    )?
-    .duplicate_event_descriptor()?
-    .context("original signer event absent")?;
+    let event = original.duplicate_event_descriptor()?.context("original signer event absent")?;
     #[cfg(target_os = "macos")]
     let event = mvm_vmm::host::owned_liveness::duplicate_read_pipe(
         signer
