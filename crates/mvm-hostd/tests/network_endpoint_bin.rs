@@ -621,6 +621,7 @@ fn a_flowmux_endpoint_refuses_zero_limits_decoded_from_config() {
 /// Shared passive endpoint fixture data; each caller selects its transport and mode.
 fn test_config(transport: EndpointTransport) -> EndpointConfig {
     EndpointConfig {
+        admitted_network_plan: None,
         tenant_id: "local".into(),
         instance_id: "test".into(),
         secrets: vec![],

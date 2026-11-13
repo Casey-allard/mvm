@@ -159,7 +159,13 @@ impl SignerHelper {
         }
         let workload_chain_path = Path::new(&req.workload_chain_path);
         let chain_head_secondary_path = Path::new(&req.chain_head_secondary_path);
-        ensure_parent(workload_chain_path)?;
+        if self.chain_bytes.is_some() {
+            let original_parent = workload_chain_path.parent().context("funded audit parent absent")?;
+            anyhow::ensure!(Some(original_parent)==chain_head_secondary_path.parent(), "funded audit head outside original directory");
+            mvm_core::private_fs::create_owned_private_dir(original_parent)?;
+        } else {
+            ensure_parent(workload_chain_path)?;
+        }
         ensure_parent(chain_head_secondary_path)?;
         if let Some(limit) = self.chain_bytes {
             anyhow::ensure!(self.owned, "funded audit chain requires original owned signer");

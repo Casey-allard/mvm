@@ -42,7 +42,7 @@ mod owned;
 pub(crate) use owned::require_live_event;
 pub use owned::{
     HostAgentParentPermit, OwnedAuditSideband, OwnedHostAgent, OwnedHostAgentInputs, OwnedHostAgentRegistrar,
-    OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration, PreparedEndpointAudit, RegisteredEndpointOwner,
+    OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration, PreparedEndpointAudit, RegisteredEndpointOwner, RegisteredAuditFile,
     owned_host_agent_service, validate_owned_host_agent_services,
 };
 
