@@ -34,14 +34,13 @@ use std::process::Command;
 
 use crate::rust_source::{CommentSyntax, blank_comments};
 
-// The c0f15d82 upstream and f7536f65 mailbox integration measured 1,037,073
-// SLOC and 1,307,270 physical lines. Of the SLOC, 901,168 first-party lines
-// include inline tests, 87,200 belong to tests and benches, 48,329 are
-// vendored and 376 generated. Keep all coverage and round up to 100.
+// CI witness, overclaim, snapshot-owner, Yocto importer, and CLI option-source
+// tests remain measured; the library health/signing path adds regressions.
+// Leave room for main changes; physical lines have operator-approved headroom.
 /// Ceiling on total SLOC, all categories.
-const MAX_TOTAL_SLOC: usize = 1_037_100;
+const MAX_TOTAL_SLOC: usize = 991_000;
 /// Ceiling on total physical lines, all categories.
-const MAX_TOTAL_PHYSICAL: usize = 1_307_300;
+const MAX_TOTAL_PHYSICAL: usize = 1_259_000;
 /// How far under a ceiling the tree may sit before the ceiling must drop.
 const SLACK: usize = 10_000;
 
