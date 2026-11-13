@@ -494,6 +494,8 @@ mod tests {
 
     fn cfg(name: &str) -> VmStartConfig {
         VmStartConfig {
+            #[cfg(target_os = "linux")]
+            registered_boot_grant: None,
             name: name.to_string(),
             template_id: None,
             kernel_path: None,
