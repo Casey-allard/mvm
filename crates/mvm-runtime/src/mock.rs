@@ -538,6 +538,7 @@ mod tests {
             gpu: false,
             gpu_device: None,
             admission_durability: None,
+            host_lifetime: None,
         }
     }
 

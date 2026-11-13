@@ -3181,7 +3181,6 @@ mod tests {
                 verbs: vec![VerbId::new("run-entrypoint").unwrap()],
                 drive: None,
                 application_terminal: None,
-                owner_access: None,
                 sig: vec![0u8; 64],
             },
         };
@@ -4541,7 +4540,6 @@ mod tests {
                 verbs: vec![mvm_core::plan::VerbId::new(&"a".repeat(4000)).unwrap()],
                 drive: None,
                 application_terminal: None,
-                owner_access: None,
                 sig: vec![0u8; 64],
             },
         };
@@ -5612,7 +5610,6 @@ mod tests {
                     verbs,
                     drive,
                     application_terminal: None,
-                    owner_access: None,
                     sig: vec![3u8; 64],
                 },
             }))
