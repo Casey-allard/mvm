@@ -1577,7 +1577,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3200,7 +3200,7 @@ name = "io-extras"
 version = "0.19.0"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3245,7 +3245,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3492,7 +3492,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libkrun-sys"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "libc",
  "mvm-agentd",
@@ -3689,7 +3689,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-agentd"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3720,7 +3720,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-backends"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -3741,7 +3741,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-build"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3780,7 +3780,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-builder-guest"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "hex",
@@ -3800,7 +3800,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-bundler"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3814,7 +3814,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-capture"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "chrono",
  "hex",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-cli"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3886,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-client"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3929,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-compiler"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "flate2",
  "globset",
@@ -3950,7 +3950,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-conformance"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3984,7 +3984,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-contract"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4004,7 +4004,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-core"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -4059,7 +4059,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-fs"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "am-fs-ext4",
  "async-trait",
@@ -4089,7 +4089,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-gpu"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "libc",
  "mvm-contract",
@@ -4099,7 +4099,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-host-services"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "mvm-agentd",
  "mvm-core",
@@ -4109,7 +4109,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-hostd"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4168,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-hostlib"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-http"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4209,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-macho-sign"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "plist",
  "sha1",
@@ -4218,7 +4218,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-net"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "mvm-contract",
  "mvm-core",
@@ -4227,7 +4227,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-runtime"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4271,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-sdk"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -4297,14 +4297,14 @@ dependencies = [
 
 [[package]]
 name = "mvm-setpriv"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "mvm-vmm"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4339,7 +4339,7 @@ dependencies = [
 
 [[package]]
 name = "mvmctl"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -5198,16 +5198,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5438,7 +5438,7 @@ checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
 
 [[package]]
 name = "runmvm-client"
-version = "0.28.0-rc.2"
+version = "0.28.0-rc.3"
 dependencies = [
  "libloading",
  "serde_json",
@@ -5487,7 +5487,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5556,7 +5556,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6400,7 +6400,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7744,7 +7744,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
