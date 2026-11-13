@@ -107,6 +107,7 @@ impl RecordsProjection {
         if self.version != 2 || self.descriptor <= 2 || existing.contains(&self.descriptor) {
             return Err(refused());
         }
+        // SAFETY: zero is valid for the fields of libc::stat; fstat fills this output before the fd is borrowed.
         let mut raw: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: raw query only; a closed/unrecognized number refuses before
         // BorrowedFd's validity contract or an ownership conversion is used.

@@ -23,6 +23,7 @@ pub(super) fn require_supported_platform() -> io::Result<()> {
     // SAFETY: libc's constant geometry functions access no memory. Refuse an
     // unqualified cmsghdr/int layout rather than applying this decoder to it.
     let base = unsafe { libc::CMSG_LEN(0) } as usize;
+    // SAFETY: the fixed 512-int payload fits u32 with header and padding; CMSG_SPACE only computes its size.
     let expected = unsafe { libc::CMSG_SPACE((MAX_FDS * mem::size_of::<i32>()) as u32) } as usize;
     if !cfg!(target_arch = "aarch64")
         || mem::size_of::<usize>() != 8
@@ -35,14 +36,13 @@ pub(super) fn require_supported_platform() -> io::Result<()> {
     }
     // This finite-envelope profile is qualified only on the recorded native
     // build. Public XNU source corroboration is not runtime kernel identity.
-    // SAFETY: each sysctl writes at most the initialized fixed buffer capacity;
-    // name strings are static NUL-terminated, no setting is requested.
     for (name, expected) in [
         (c"kern.osrelease", b"27.0.0\0".as_slice()),
         (c"kern.osversion", b"26A5378n\0".as_slice()),
     ] {
         let mut value = [0u8; 32];
         let mut length = value.len();
+        // SAFETY: name is a static C string; length describes writable value, and null/0 requests no update.
         let result = unsafe {
             libc::sysctlbyname(
                 name.as_ptr(),

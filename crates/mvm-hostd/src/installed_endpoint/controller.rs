@@ -19,8 +19,8 @@ pub struct OwnedEndpointRuntimeRequirements {
 pub fn owned_endpoint_runtime_requirements() -> Result<OwnedEndpointRuntimeRequirements> {
     const MAIN_STACK: u64 = 8 * 1024 * 1024;
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    // SAFETY: one writable native rlimit value, queried without changing limits.
     ensure!(
+        // SAFETY: limit points to writable, aligned storage for one rlimit; getrlimit fills it on success.
         unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) } == 0,
         "installed main stack query refused"
     );

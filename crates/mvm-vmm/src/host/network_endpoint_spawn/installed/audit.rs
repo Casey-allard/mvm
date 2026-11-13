@@ -26,6 +26,7 @@ impl AuditProjection {
             bail!("installed audit descriptor identity differs")
         }
         for fd in self.descriptors() {
+            // SAFETY: libc::stat accepts all-zero fields as an initial output buffer for this fd query.
             let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
             // SAFETY: metadata query only, before borrowing or adopting the fd.
             if fd <= 2 || existing.contains(&fd) || unsafe { libc::fstat(fd, &mut metadata) } != 0 {

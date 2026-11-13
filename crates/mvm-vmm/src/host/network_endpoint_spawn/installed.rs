@@ -690,6 +690,7 @@ impl InstalledEndpointChild {
     pub fn from_stdio() -> Result<Self> {
         let deadline = Instant::now() + STARTUP_LIMIT;
         for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO] {
+            // SAFETY: libc::stat has a valid zero representation; st_mode is read only after fstat succeeds.
             let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
             // SAFETY: metadata inspection only of the fixed live stdio descriptor.
             if unsafe { libc::fstat(fd, &mut metadata) } != 0
@@ -748,15 +749,16 @@ impl InstalledEndpointChild {
             .chain(records_descriptor)
             .chain(audit_descriptors.into_iter().flatten())
         {
+            // SAFETY: zero initializes a valid libc::stat output buffer for each candidate descriptor.
             let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
             // Linux process descriptors are checked by live kernel PID below,
             // even when the host represents them with a shared anonymous inode.
             let process_event = cfg!(target_os = "linux")
                 && audit_descriptors
                     .is_some_and(|audit| audit.contains(&fd) || fd == descriptors[4]);
-            // SAFETY: raw metadata query only, before any inherited fd is adopted.
             if fd <= 2
                 || !raw_namespace.insert(fd)
+                // SAFETY: fstat accepts the raw fd and writes into metadata; on error no fields are consumed.
                 || unsafe { libc::fstat(fd, &mut metadata) } != 0
                 || (!process_event && !object_namespace.insert((metadata.st_dev, metadata.st_ino)))
                 || (fd == prepared.directory && metadata.st_mode & libc::S_IFMT != libc::S_IFDIR)

@@ -51,6 +51,7 @@ impl SourceConfiguration {
         source_state: &Path,
         until: Instant,
     ) -> Result<UnixStream, Refusal> {
+        // SAFETY: getppid takes no arguments and returns the calling process's current parent PID.
         let original_parent = || unsafe { libc::getppid() } as u32;
         if self.parent <= 1 || original_parent() != self.parent {
             return Err(Refusal::NotAuthorized);
