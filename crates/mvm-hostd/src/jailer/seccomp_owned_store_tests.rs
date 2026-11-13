@@ -4,7 +4,6 @@ use super::*;
 use std::{
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const CHILD: &str = "jailer::seccomp::owned_store_tests::filter_child";
@@ -56,7 +55,7 @@ fn run(case: &str, root: &Path) -> std::process::Output {
     if case == "cleanup" {
         std::fs::write(store.join("original"), b"owned").unwrap();
     }
-    Command::new(std::env::current_exe().unwrap())
+    mvm_core::env_hygiene::helper_command(std::env::current_exe().unwrap())
         .args(["--exact", CHILD, "--test-threads=1"])
         .env(CASE, case)
         .env(ROOT, root)

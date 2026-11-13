@@ -210,7 +210,7 @@ mod tests {
     use super::*;
     use std::{
         os::fd::IntoRawFd,
-        process::{Child, Command, Stdio},
+        process::{Child, Stdio},
     };
 
     struct OriginalChild(Child);
@@ -222,7 +222,7 @@ mod tests {
     }
     fn original() -> OriginalChild {
         OriginalChild(
-            Command::new("/bin/sh")
+            mvm_core::env_hygiene::helper_command("/bin/sh")
                 .args(["-c", "read item"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
