@@ -724,7 +724,8 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 crate::microvm::activation::append_registered_boot_grant(
                     inputs.config,
                     &mut boot_cmdline,
-                )?;
+                )
+                .context(installed::StartupStage::RegisteredBootGrant)?;
                 slot.begin_endpoint_start()?;
                 guards.spawn_endpoint_installed(
                     &id,
@@ -899,7 +900,14 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             vm
         };
         if let Some(kernel) = kernel {
-            kernel.observe_booted(&*vm)?;
+            let observation = kernel.observe_booted(&*vm);
+            #[cfg(unix)]
+            let observation = if installed.is_some() {
+                observation.context(installed::StartupStage::KernelObservation)
+            } else {
+                observation
+            };
+            observation?;
         }
         trace.mark("console_stream_start");
 
@@ -917,15 +925,22 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             trace.mark("admission_durable");
             #[cfg(target_os = "linux")]
             let retained = if let Some(slot) = installed.as_ref() {
-                slot.activate_entrypoint(&*vm, inputs.config, &spec.cmdline)?
+                slot.activate_entrypoint(&*vm, inputs.config, &spec.cmdline)
+                    .context(installed::StartupStage::GuestActivation)?
             } else {
                 false
             };
             #[cfg(not(target_os = "linux"))]
             let retained = false;
             if !retained {
-                crate::microvm::activate_workload(&*vm, inputs.config)
-                    .context("activate workload after boot")?;
+                let activation = crate::microvm::activate_workload(&*vm, inputs.config);
+                #[cfg(unix)]
+                let activation = if installed.is_some() {
+                    activation.context(installed::StartupStage::GuestActivation)
+                } else {
+                    activation
+                };
+                activation.context("activate workload after boot")?;
             }
         }
         trace.mark("activate_workload");
