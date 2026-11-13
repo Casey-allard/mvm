@@ -438,6 +438,23 @@ fn apply_inner(
         // Store retirement removes only directories within its Landlock grant.
         #[cfg(target_arch = "x86_64")]
         {
+            // Namespace FDs are opened after confinement. Admit native dirfd
+            // shapes for publication; Landlock enforces the filesystem grants.
+            let dirfds = [0, 2]
+                .into_iter()
+                .map(|arg| {
+                    SeccompCondition::new(
+                        arg,
+                        SeccompCmpArgLen::Qword,
+                        SeccompCmpOp::Le,
+                        i32::MAX as u64,
+                    )
+                    .map_err(|error| JailerError::SeccompInstall(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let publish = SeccompRule::new(dirfds)
+                .map_err(|error| JailerError::SeccompInstall(error.to_string()))?;
+            rules.insert(libc::SYS_renameat, vec![publish]);
             rules.insert(libc::SYS_rmdir, vec![]);
             // Rust's descriptor-relative remove_dir_all uses unlinkat for
             // files and directories. Permit only those exact native flags;

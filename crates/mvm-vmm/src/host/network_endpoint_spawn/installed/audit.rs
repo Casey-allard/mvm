@@ -157,6 +157,11 @@ impl InstalledEndpointAudit {
     pub fn fence(&self) {
         self.lease.fence();
     }
+    /// Close ordinary session admission and wake its original guest transport.
+    /// Cleanup still verifies the same live parent and audit processes.
+    pub fn close_admission_only(&self) {
+        self.lease.close_admission_only();
+    }
     /// Original capability continuity only; copied projection facts cannot
     /// substitute for the same private child authority.
     pub fn same_endpoint(&self, lease: &InstalledEndpointLease) -> bool {

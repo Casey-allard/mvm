@@ -35,12 +35,12 @@ use std::process::Command;
 use crate::rust_source::{CommentSyntax, blank_comments};
 
 // Count first-party, generated, vendored, and test source in this total.
-// Dependency compatibility fixes stay visible in the same measurement.
+// Confined store and cleanup lifecycle regression controls stay visible here.
 // Tight ceilings keep future source growth explicit without removing tests.
 /// Ceiling on total SLOC, all categories.
-const MAX_TOTAL_SLOC: usize = 1_039_300;
+const MAX_TOTAL_SLOC: usize = 1_039_600;
 /// Ceiling on total physical lines, all categories.
-const MAX_TOTAL_PHYSICAL: usize = 1_310_150;
+const MAX_TOTAL_PHYSICAL: usize = 1_310_500;
 /// How far under a ceiling the tree may sit before the ceiling must drop.
 const SLACK: usize = 10_000;
 

@@ -467,6 +467,10 @@ pub trait ParentPayloadReservation: Send + Sync + fmt::Debug {
         session: &str,
     ) -> io::Result<()>;
     fn check_current(&self) -> io::Result<()>;
+    /// Destruction of a store already held by this original reservation.
+    fn check_store_cleanup(&self) -> io::Result<()> {
+        self.check_current()
+    }
 }
 pub use mvm_vmm::host::network_endpoint_spawn::PayloadResourceLimits;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,6 +726,15 @@ impl PoolInner {
         }
         Ok(())
     }
+    fn check_store_cleanup(&self) -> io::Result<()> {
+        if self.fenced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(invalid("payload pool fenced"));
+        }
+        if let Some(parent) = &self.parent {
+            parent.check_store_cleanup()?;
+        }
+        Ok(())
+    }
     fn retain_uncertain(self: &Arc<Self>) {
         self.fenced
             .store(true, std::sync::atomic::Ordering::Release);
@@ -811,14 +824,14 @@ impl InstalledPayloadStore {
         Ok(self.lease.insert(lease))
     }
     fn cleanup(&mut self, authority: &PoolInner) -> io::Result<()> {
-        authority.check_current()?;
+        authority.check_store_cleanup()?;
         self.check_child()?;
         self.lease
             .as_mut()
             .ok_or_else(|| invalid("original store claim missing"))?
             .retire_contents()
             .map_err(invalid)?;
-        authority.check_current()?;
+        authority.check_store_cleanup()?;
         self.check_child()?;
         rustix::fs::unlinkat(
             self.parent.as_ref(),
@@ -827,7 +840,9 @@ impl InstalledPayloadStore {
         )?;
         self.parent.sync_all()?;
         match self.named() {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => authority.check_current(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                authority.check_store_cleanup()
+            }
             _ => Err(invalid("installed store retirement not confirmed")),
         }
     }

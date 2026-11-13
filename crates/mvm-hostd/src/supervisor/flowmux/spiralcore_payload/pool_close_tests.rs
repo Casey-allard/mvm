@@ -175,3 +175,35 @@ fn uncertain_disk_capture_never_becomes_drained_after_close() {
     assert!(!pool.drained().unwrap());
     assert_eq!(std::fs::read(path).unwrap(), b"must remain intact");
 }
+
+#[test]
+fn cleanup_only_parent_cannot_reserve_and_local_uncertainty_blocks_retirement() {
+    #[derive(Debug)]
+    struct ClosingParent;
+    impl ParentPayloadReservation for ClosingParent {
+        fn limits(&self) -> PayloadResourceLimits {
+            limits()
+        }
+        fn authorize(
+            &self,
+            _: &mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan,
+            _: &str,
+        ) -> io::Result<()> {
+            self.check_current()
+        }
+        fn check_current(&self) -> io::Result<()> {
+            Err(invalid("fixture stopped accepting new work"))
+        }
+        fn check_store_cleanup(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let pool = PayloadResourcePool::new(limits(), Some(Arc::new(ClosingParent)), 0).unwrap();
+    assert!(pool.reserve_charge(charge()).is_err());
+    assert_eq!(pool.snapshot().unwrap(), PayloadPoolSnapshot::default());
+    pool.inner.check_store_cleanup().unwrap();
+    pool.inner.retain_uncertain();
+    assert!(pool.inner.check_store_cleanup().is_err());
+    pool.close_admission().unwrap();
+    assert!(!pool.drained().unwrap());
+}

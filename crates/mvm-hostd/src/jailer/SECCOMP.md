@@ -117,3 +117,11 @@ folded into `openat` and `renameat`. The fold happens inside
 `CONFINED_ROLE_SYSCALLS` so the
 policy layer stays arch-agnostic — `ConfinementSpec` mentions only
 names, never numbers.
+
+The x86_64 owned-store role also admits `renameat` for namespace directories
+opened after confinement. Both directory arguments must be nonnegative native
+file descriptors. This scalar check does not establish directory identity or
+inspect pathnames: Landlock still restricts filesystem access to the existing
+grants, and the store verifies its held namespace descriptors. Records-only
+roles retain the exact source/destination runtime-state descriptor rule. The
+base x86_64 profile does not gain `renameat`; AArch64 keeps its existing mapping.

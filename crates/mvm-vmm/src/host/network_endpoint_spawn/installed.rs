@@ -21,7 +21,7 @@ use std::{
     process::{ChildStdin, ChildStdout},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Instant,
 };
@@ -565,6 +565,11 @@ impl InstalledCustody {
     }
 }
 
+// Ordered for fetch_max: uncertain cleanup always dominates an orderly stop.
+const OPEN: u8 = 0;
+const CLOSING: u8 = 1;
+const FAILED: u8 = 2;
+
 /// Child-side private capability. Only fixed original pipe stdio is accepted;
 /// no path, PID, arbitrary reader or decoded quota constructor exists.
 struct ChildAuthority {
@@ -572,8 +577,7 @@ struct ChildAuthority {
     holder: PreparedHostLifetimeLease,
     parent: ProcessExitObserver,
     projection: EndpointPartitionProjection,
-    fenced: AtomicBool,
-    cleanup_failed: AtomicBool,
+    lifecycle: AtomicU8,
     pool_claimed: AtomicBool,
     audit: Option<audit::ChildAudit>,
     guest: Mutex<GuestTransport>,
@@ -647,7 +651,7 @@ impl InstalledEndpointLease {
                 bail!("installed guest cancellation slot poisoned")
             }
         };
-        if self.authority.fenced.load(Ordering::Acquire) || guest.original.is_some() {
+        if self.authority.lifecycle.load(Ordering::Acquire) != OPEN || guest.original.is_some() {
             bail!("installed guest cancellation slot unavailable")
         }
         let original = Arc::new(InstalledGuestWake::new(stream.try_clone()?));
@@ -656,24 +660,31 @@ impl InstalledEndpointLease {
         self.check_current()?;
         Ok(original)
     }
-    /// Monotonic admission fence and original transport wake, with socket I/O
-    /// outside the publication mutex. It provides no exit or drain receipt.
-    pub fn fence(&self) {
-        self.authority.fenced.store(true, Ordering::Release);
-        let original = {
-            let guest = self
-                .authority
-                .guest
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guest.original.clone()
+    fn advance_and_wake(&self, state: u8) {
+        if self.authority.lifecycle.fetch_max(state, Ordering::AcqRel) >= state {
+            return;
+        }
+        let original = match self.authority.guest.lock() {
+            Ok(guest) => guest.original.clone(),
+            Err(poisoned) => {
+                self.authority.lifecycle.fetch_max(FAILED, Ordering::AcqRel);
+                poisoned.into_inner().original.clone()
+            }
         };
-        if let Some(original) = original {
-            let _ = original.shutdown();
+        if let Some(original) = original
+            && original.shutdown().is_err()
+        {
+            self.authority.lifecycle.fetch_max(FAILED, Ordering::AcqRel);
         }
     }
+    /// A failed original check permanently refuses admission and retirement proof.
+    pub fn fence(&self) {
+        self.advance_and_wake(FAILED);
+    }
+    fn close_admission_only(&self) {
+        self.advance_and_wake(CLOSING);
+    }
     fn fail_cleanup(&self) {
-        self.authority.cleanup_failed.store(true, Ordering::Release);
         self.fence();
     }
     pub(super) fn same_authority(&self, other: &Self) -> bool {
@@ -686,26 +697,37 @@ impl InstalledEndpointLease {
         }
         self.check_current()
     }
+    fn check_originals(&self) -> Result<()> {
+        self.authority.holder.verify_current()?;
+        if self.authority.parent.wait_event(Instant::now())? != ProcessExitWait::TimedOut {
+            bail!("installed endpoint parent exited")
+        }
+        if let Some(audit) = &self.authority.audit {
+            audit.check_current()?;
+        }
+        if parent_closed(&self.authority.input)? {
+            self.close_admission_only();
+        }
+        Ok(())
+    }
+    /// Destruction of an already held store still requires the original live
+    /// parent, holder and audit processes. This check never admits new work.
+    pub fn check_store_cleanup(&self) -> Result<()> {
+        if self.authority.lifecycle.load(Ordering::Acquire) == FAILED {
+            bail!("installed endpoint authority failed")
+        }
+        self.check_originals().inspect_err(|_| self.fence())?;
+        if self.authority.lifecycle.load(Ordering::Acquire) == FAILED {
+            bail!("installed endpoint authority failed")
+        }
+        Ok(())
+    }
     pub fn check_current(&self) -> Result<()> {
-        if self.authority.fenced.load(Ordering::Acquire) {
-            bail!("installed endpoint authority fenced")
+        self.check_store_cleanup()?;
+        if self.authority.lifecycle.load(Ordering::Acquire) != OPEN {
+            bail!("installed endpoint admission closed")
         }
-        let result = (|| {
-            self.authority.holder.verify_current()?;
-            if self.authority.parent.wait_event(Instant::now())? != ProcessExitWait::TimedOut
-                || parent_closed(&self.authority.input)?
-            {
-                bail!("installed endpoint parent admission closed")
-            }
-            if let Some(audit) = &self.authority.audit {
-                audit.check_current()?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            self.fence();
-        }
-        result
+        Ok(())
     }
 }
 
@@ -852,8 +874,7 @@ impl InstalledEndpointChild {
                 holder,
                 parent,
                 projection: prepared.projection,
-                fenced: AtomicBool::new(false),
-                cleanup_failed: AtomicBool::new(false),
+                lifecycle: AtomicU8::new(OPEN),
                 pool_claimed: AtomicBool::new(false),
                 audit,
                 guest: Mutex::new(GuestTransport::default()),
@@ -923,23 +944,18 @@ impl InstalledEndpointChild {
         &mut self,
         operation: impl FnOnce(&File) -> Result<T>,
     ) -> Result<T> {
-        let result = (|| {
-            self.check_parent()?;
-            let value = self
-                .lease
-                .authority
-                .holder
-                .with_verification_state(operation)?;
-            self.check_parent()?;
-            Ok(value)
-        })();
-        if result.is_err() {
-            self.lease.fence();
-        }
-        result
+        self.check_parent()?;
+        let value = self
+            .lease
+            .authority
+            .holder
+            .with_verification_state(operation)
+            .inspect_err(|_| self.lease.fence())?;
+        self.check_parent()?;
+        Ok(value)
     }
     pub fn parent_closed(&self) -> Result<bool> {
-        parent_closed(&self.lease.authority.input)
+        parent_closed(&self.lease.authority.input).inspect_err(|_| self.lease.fence())
     }
     pub fn send_ready(&mut self, handshake: EndpointHandshake, deadline: Instant) -> Result<()> {
         let deadline = deadline.min(self.startup_deadline);
@@ -970,10 +986,7 @@ impl InstalledEndpointChild {
         if self.phase != 1 || !self.parent_closed()? {
             bail!("installed endpoint drain phase differs")
         }
-        if self.lease.authority.cleanup_failed.load(Ordering::Acquire) {
-            bail!("installed endpoint cleanup is unverified")
-        }
-        self.lease.authority.fenced.store(true, Ordering::Release);
+        self.lease.check_store_cleanup()?;
         let session = self.projection().session;
         let serial = self.projection().partition_serial;
         write_frame(
@@ -1003,7 +1016,20 @@ fn parent_closed(input: &File) -> Result<bool> {
     if result < 0 {
         return Err(std::io::Error::last_os_error()).context("installed parent pipe observation");
     }
-    Ok(result > 0) // EOF, unexpected extra bytes or invalid/hung-up pipe all fence.
+    match (result, poll.revents) {
+        (0, 0) => Ok(false),
+        // Darwin reports POLLIN alongside HUP even on an empty pipe. Once
+        // all writers have closed, a nonconsuming byte count distinguishes
+        // EOF from an unexpected final frame on the original descriptor.
+        (1, flags)
+            if flags & libc::POLLHUP != 0
+                && flags & !(libc::POLLIN | libc::POLLHUP) == 0
+                && rustix::io::ioctl_fionread(input)? == 0 =>
+        {
+            Ok(true)
+        }
+        _ => bail!("unexpected installed parent control pipe event"),
+    }
 }
 fn duplicate_descriptor(raw: i32) -> Result<File> {
     // SAFETY: fcntl duplicates a descriptor and returns a new CLOEXEC owner.

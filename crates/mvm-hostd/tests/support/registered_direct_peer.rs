@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
 use mvm_contract::protocol::network_flow::Opcode;
 use mvm_core::net::session::{Session, read_sealed_frame, write_sealed_frame};
@@ -146,13 +146,16 @@ pub fn send(stream: &mut UnixStream, session: &mut Session, opcode: Opcode, id: 
     write_sealed_frame(stream, &session.seal(&frame).unwrap()).unwrap();
 }
 
-pub fn receive(stream: &mut UnixStream, session: &mut Session) -> (Opcode, u32, Vec<u8>) {
-    let sealed = read_sealed_frame(stream, 1 << 20).unwrap();
-    let plain = session.open(&sealed).unwrap();
-    let frame = mvm_contract::protocol::network_flow::decode(&plain).unwrap();
-    (
+pub fn receive(stream: &mut UnixStream, session: &mut Session) -> Result<(Opcode, u32, Vec<u8>)> {
+    let sealed = read_sealed_frame(stream, 1 << 20).context("read sealed FlowMux frame")?;
+    let plain = session
+        .open(&sealed)
+        .context("authenticate FlowMux frame")?;
+    let frame =
+        mvm_contract::protocol::network_flow::decode(&plain).context("decode FlowMux frame")?;
+    Ok((
         frame.header.opcode,
         frame.header.stream_id,
         frame.payload.to_vec(),
-    )
+    ))
 }

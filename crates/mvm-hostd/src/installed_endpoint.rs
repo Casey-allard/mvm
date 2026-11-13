@@ -581,6 +581,10 @@ impl ParentPayloadReservation for ChildPoolParent {
         self.lease.check_current().map_err(invalid)?;
         self.store.check_current()
     }
+    fn check_store_cleanup(&self) -> io::Result<()> {
+        self.lease.check_store_cleanup().map_err(invalid)?;
+        self.store.check_current()
+    }
 }
 fn invalid(error: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())

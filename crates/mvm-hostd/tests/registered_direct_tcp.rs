@@ -698,11 +698,20 @@ mod registered_prepare {
 
         let endpoint_diagnostic = || {
             let path = state.join("network-endpoint.stderr.log");
-            let mut diagnostic = String::new();
-            if let Ok(file) = File::open(path) {
-                let _ = file.take(2048).read_to_string(&mut diagnostic);
+            use std::io::{Seek, SeekFrom};
+            let tail = (|| -> std::io::Result<Vec<u8>> {
+                let mut file = File::open(path)?;
+                let length = file.metadata()?.len();
+                file.seek(SeekFrom::Start(length.saturating_sub(2048)))?;
+                let mut bytes = Vec::new();
+                file.take(2048).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })();
+            match tail {
+                Ok(bytes) if bytes.is_empty() => "endpoint stderr empty at observation".into(),
+                Ok(bytes) => format!("endpoint stderr tail: {}", String::from_utf8_lossy(&bytes)),
+                Err(error) => format!("endpoint stderr unavailable: {:?}", error.kind()),
             }
-            format!("signed controller stderr: {diagnostic}")
         };
         let mut substituted = plan.clone();
         substituted.plan_nonce = mvm_core::plan::Nonce::from_bytes([88; 16]);
@@ -759,7 +768,10 @@ mod registered_prepare {
             0,
             &Handshake::local("registered-direct-tcp").encode(),
         );
-        ensure!(receive(&mut guest, &mut session).0 == Opcode::HelloAck);
+        let at_receive = |stage: &str| format!("waiting for {stage}: {}", endpoint_diagnostic());
+        let hello = receive(&mut guest, &mut session)
+            .with_context(|| at_receive("HelloAck on stream 0"))?;
+        ensure!(hello.0 == Opcode::HelloAck);
         let setup_elapsed = setup_start.elapsed();
         send(
             &mut guest,
@@ -768,7 +780,9 @@ mod registered_prepare {
             1,
             b"unbound.mvm.peer:443",
         );
-        ensure!(receive(&mut guest, &mut session).0 == Opcode::Refused);
+        let denied = receive(&mut guest, &mut session)
+            .with_context(|| at_receive("unbound target refusal on stream 1"))?;
+        ensure!(denied.0 == Opcode::Refused);
         ensure!(
             listener
                 .accept()
@@ -813,7 +827,8 @@ mod registered_prepare {
             3,
             format!("{TARGET}:443").as_bytes(),
         );
-        let refusal = receive(&mut guest, &mut session);
+        let refusal = receive(&mut guest, &mut session)
+            .with_context(|| at_receive("wrong peer refusal on stream 3"))?;
         ensure!(
             refusal.1 == 3
                 && matches!(
@@ -830,7 +845,8 @@ mod registered_prepare {
             5,
             format!("{TARGET}:443").as_bytes(),
         );
-        let opened = receive(&mut guest, &mut session);
+        let opened = receive(&mut guest, &mut session)
+            .with_context(|| at_receive("authorized Opened on stream 5"))?;
         ensure!(
             (opened.0, opened.1) == (Opcode::Opened, 5),
             "correct original failed after refusal: {opened:?}"
@@ -840,7 +856,13 @@ mod registered_prepare {
         send(&mut guest, &mut session, Opcode::HalfClose, 5, &[]);
         let mut restored = Vec::new();
         loop {
-            let (op, id, bytes) = receive(&mut guest, &mut session);
+            let (op, id, bytes) = receive(&mut guest, &mut session).with_context(|| {
+                at_receive(&format!(
+                    "readback or HalfClose on stream 5 after {} of {} bytes",
+                    restored.len(),
+                    body.len()
+                ))
+            })?;
             ensure!(id == 5);
             match op {
                 Opcode::Data => {
@@ -859,7 +881,12 @@ mod registered_prepare {
             .map_err(|_| anyhow::anyhow!("original peer fixture failed"))??;
         ensure!(totals.received > 0 && totals.sent > 0);
         let retire_start = Instant::now();
-        endpoint.shutdown().with_context(endpoint_diagnostic)?;
+        endpoint.shutdown().with_context(|| {
+            format!(
+                "endpoint shutdown after stream 5 verified {}/{} bytes and HalfClose, peer joined, tls_received={} tls_sent={}: {}",
+                restored.len(), body.len(), totals.received, totals.sent, endpoint_diagnostic()
+            )
+        })?;
         ensure!(
             guest.read(&mut [0; 1])? == 0,
             "authenticated guest did not close"

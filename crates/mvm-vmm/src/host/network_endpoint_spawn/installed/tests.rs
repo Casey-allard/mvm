@@ -75,6 +75,16 @@ fn installed_endpoint_fixture_child() {
         )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
+    if mode == "ready-drain" {
+        assert!(!context.parent_closed().unwrap());
+        lease.close_admission_only();
+        assert!(alias.check_current().is_err());
+        alias.check_store_cleanup().unwrap();
+        let fd: i32 = std::env::var(COORD).unwrap().parse().unwrap();
+        // SAFETY: the fixture inherited this owned coordination socket once.
+        let mut coord = unsafe { UnixStream::from_raw_fd(fd) };
+        coord.write_all(&[1]).unwrap();
+    }
     if mode == "stale-holder" {
         let fd: i32 = std::env::var(COORD).unwrap().parse().unwrap();
         // SAFETY: only this fixture's pre_exec inherited its owned Unix socket.
@@ -91,13 +101,38 @@ fn installed_endpoint_fixture_child() {
             alias.check_current().is_err(),
             "restored bytes cannot reset fence"
         );
+        lease.close_admission_only();
+        assert!(
+            alias.check_store_cleanup().is_err(),
+            "Failed dominates Closing"
+        );
         coord.write_all(&[1]).unwrap();
+    }
+    if mode == "extra-input" {
+        loop {
+            match context.parent_closed() {
+                Err(_) => break,
+                Ok(true) => panic!("unexpected control bytes classified as clean EOF"),
+                Ok(false) => assert!(Instant::now() < deadline),
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        assert!(context.check_parent().is_err());
+        assert!(alias.check_store_cleanup().is_err());
+        assert!(context.send_drained(deadline).is_err());
+        std::process::exit(0);
     }
     while !context.parent_closed().unwrap() {
         assert!(Instant::now() < deadline);
         std::thread::park_timeout(Duration::from_millis(1));
     }
     assert!(context.check_parent().is_err());
+    if mode == "stale-holder" {
+        assert!(context.send_drained(deadline).is_err());
+        std::process::exit(0);
+    }
+    alias.check_store_cleanup().unwrap();
+    assert!(lease.check_current().is_err());
     context.send_drained(deadline).unwrap();
     assert!(context.send_drained(deadline).is_err());
     drop(context);
@@ -354,6 +389,9 @@ fn pipe_exchange(mode: &str) {
         let ready: Ready = read_frame(&mut output, CONFIG_LIMIT, deadline).unwrap();
         assert_eq!(ready.nonce, challenge.nonce);
         assert_eq!(ready.session, projection().session);
+        if mode == "ready-drain" {
+            coord.read_exact(&mut [0; 1]).unwrap();
+        }
         if mode == "stale-holder" {
             std::fs::write(&state, b"b").unwrap();
             coord.write_all(&[1]).unwrap();
@@ -396,7 +434,20 @@ fn pipe_exchange(mode: &str) {
             probe.try_lock().unwrap();
             return;
         }
+        if mode == "extra-input" {
+            input.write_all(&[1]).unwrap();
+        }
         drop(input);
+        if matches!(mode, "extra-input" | "stale-holder") {
+            assert_eq!(
+                observer.wait_event(deadline).unwrap(),
+                ProcessExitWait::Exited
+            );
+            assert!(child.0.as_mut().unwrap().wait().unwrap().success());
+            assert!(read_frame::<_, Drained>(&mut output, CONTROL_LIMIT, deadline).is_err());
+            probe.try_lock().unwrap();
+            return;
+        }
         let drained: Drained = read_frame(&mut output, CONTROL_LIMIT, deadline).unwrap();
         assert_eq!(drained.nonce, challenge.nonce);
         assert_eq!(drained.session, projection().session);
@@ -421,6 +472,10 @@ fn pipe_exchange(mode: &str) {
 #[test]
 fn private_endpoint_handshake_holds_original_sh_until_drained_and_child_exit() {
     mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("ready-drain"));
+}
+#[test]
+fn unexpected_control_byte_followed_by_eof_cannot_prove_drain() {
+    mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("extra-input"));
 }
 #[test]
 fn wrong_private_parent_nonce_refuses_before_readiness() {

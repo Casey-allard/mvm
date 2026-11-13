@@ -359,7 +359,7 @@ impl FlowMuxAccept {
 impl Drop for FlowMuxSession {
     fn drop(&mut self) {
         if let Some(audit) = &self.installed_audit {
-            audit.fence();
+            audit.close_admission_only();
         }
         if self.payload_mapping.is_some() {
             let mapped = {
