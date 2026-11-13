@@ -84,6 +84,16 @@ impl EndpointPartitionLimits {
 pub trait EndpointPartitionGuard: Send + Sync {
     fn check_current(&self, projection: &EndpointPartitionProjection) -> Result<()>;
 
+    /// Observe only the public key minted for the guest on this exact partition.
+    /// An observer may refuse. This notification never authorizes a peer or flow.
+    fn observe_flowmux_guest(
+        &self,
+        _projection: &EndpointPartitionProjection,
+        _guest: [u8; 32],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Bind retained telemetry to this original owner before writer effects.
     ///
     /// Implementations must compare the borrowed directory to the original
@@ -211,6 +221,16 @@ impl PreparedEndpointHandoff {
     }
     pub fn holder(&self) -> &PreparedHostLifetimeLease {
         &self.holder
+    }
+
+    /// Deliver the original public guest key to the held partition observer.
+    /// The observation confers no admission and is usable only while its owner is current.
+    pub fn observe_flowmux_guest(&self, guest: [u8; 32]) -> Result<()> {
+        self.check_current()?;
+        self.partition
+            .guard
+            .observe_flowmux_guest(self.partition.projection(), guest)?;
+        self.check_current()
     }
 
     /// Ask only the same original guard to bind retained telemetry storage.

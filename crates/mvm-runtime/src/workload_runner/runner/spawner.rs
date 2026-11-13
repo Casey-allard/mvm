@@ -267,8 +267,13 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
         handoff.check_direct_network(&facts, &req.network_limits, req.redaction)?;
         let session = hex::encode(handoff.partition().projection().session);
         let uds = vm_network_endpoint_socket(req.vm_name);
-        let (identity, drive) =
-            prepare_endpoint_identity(req, None, &BootEgressCa(None), &session, Some(original))?;
+        let (identity, drive) = prepare_endpoint_identity(
+            req,
+            None,
+            &BootEgressCa(None),
+            &session,
+            Some((original, &handoff)),
+        )?;
         mvm_vmm::host::telemetry_registration::register_telemetry_boot(
             req.state_dir,
             req.vm_name,
@@ -482,7 +487,10 @@ fn prepare_endpoint_identity(
     capture: Option<&Capture>,
     egress_ca: &BootEgressCa,
     session_id: &str,
-    registered: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
+    registered: Option<(
+        &mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>,
+        &mvm_core::host_lifetime::PreparedEndpointHandoff,
+    )>,
 ) -> Result<(
     mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig,
     Option<PathBuf>,
@@ -497,9 +505,10 @@ fn prepare_endpoint_identity(
         FlowMuxIdentitySource::Mint => {
             let material = FlowMuxIdentityMaterial::mint_from_host_signer(session_id)
                 .context("minting this boot's FlowMux identity")?;
-            if let Some(original) = registered {
+            if let Some((original, handoff)) = registered {
                 original
                     .check_flowmux_host_anchor(&material.host_signer_verifying_key()?.to_bytes())?;
+                handoff.observe_flowmux_guest(material.guest_verifying_key().to_bytes())?;
             }
             let reader_boot = mint_mailbox_reader_boot(req, material.guest_verifying_key())?;
             observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
