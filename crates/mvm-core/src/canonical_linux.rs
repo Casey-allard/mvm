@@ -75,6 +75,10 @@ impl PreparedCanonicalLinux {
     pub fn generation_dir(&self) -> &Path {
         self.inputs.generation_dir()
     }
+    #[cfg(unix)]
+    pub fn generation_directory_file(&self) -> &std::fs::File {
+        self.inputs.generation_directory_file()
+    }
     pub fn kernel_path(&self) -> std::path::PathBuf {
         self.view_path
             .join(self.declaration.artifacts[0].name.as_str())
@@ -578,6 +582,7 @@ mod tests {
         }
         let mut payload: Vec<(String, Vec<u8>)> = [
             ("kernel", kernel),
+            ("rootfs", b"fixture workload filesystem"),
             ("linux.json", linux),
             ("linux.bundle", root_signature),
             ("revocations.json", FEED),
@@ -619,6 +624,7 @@ mod tests {
                         path: path.clone(),
                         role: match name {
                             "kernel" => ArtifactRole::Kernel,
+                            "rootfs" => ArtifactRole::Rootfs,
                             "initrd" => ArtifactRole::Initrd,
                             _ => ArtifactRole::Other,
                         },
@@ -793,6 +799,9 @@ mod tests {
         let owner = Arc::new(
             prepare_with_clock(frame.capture().unwrap(), BackendKind::Hvf, inside_window).unwrap(),
         );
+        let root = owner.workload_root_declaration().unwrap();
+        assert_eq!(root.sha256, sha256_hex(b"fixture workload filesystem"));
+        assert_eq!(root.size_bytes, b"fixture workload filesystem".len() as u64);
         let mut config = crate::vm_backend::VmStartConfig {
             name: "canonical-owner-unit".into(),
             ..Default::default()

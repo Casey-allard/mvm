@@ -459,6 +459,8 @@ impl VerifiedBundleFile {
 #[derive(Debug)]
 pub struct CapturedCanonicalLinuxInputs {
     _archive: File,
+    #[cfg(unix)]
+    directory_file: File,
     directory_path: PathBuf,
     directory_guard: std::sync::Mutex<Option<tempfile::TempDir>>,
     manifest: BundleManifest,
@@ -472,6 +474,11 @@ impl CapturedCanonicalLinuxInputs {
     /// Resource location only, not execution or cleanup authority.
     pub fn generation_dir(&self) -> &Path {
         &self.directory_path
+    }
+
+    #[cfg(unix)]
+    pub fn generation_directory_file(&self) -> &File {
+        &self.directory_file
     }
 
     /// One-way retention before a native reader can exist.
@@ -506,7 +513,6 @@ impl CapturedCanonicalLinuxInputs {
     /// Reopen a retained regular file without following a link and verify the
     /// actual stream against its signed inventory. No ambient path is returned.
     pub fn open_artifact(&self, name: &str) -> Result<File> {
-        use std::io::{Seek, SeekFrom};
         let path = self
             .selected
             .get(name)
@@ -515,29 +521,45 @@ impl CapturedCanonicalLinuxInputs {
             .manifest
             .find_by_name(name)
             .context("artifact declaration missing")?;
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let mut file = options.open(path)?;
-        let metadata = file.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file() && metadata.len() == declaration.size_bytes,
-            "retained artifact is not regular or has changed size"
-        );
-        let mut digest = HashingWriter::new(io::sink());
-        io::copy(
-            &mut Read::by_ref(&mut file).take(declaration.size_bytes + 1),
-            &mut digest,
-        )?;
-        let (size, hash) = digest.finish();
-        check_artifact_digest(declaration, size, hash)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
+        open_verified_bundle_artifact(path, declaration)
     }
+}
+
+/// Verify the declared extent and digest through one open regular file and rewind it.
+pub fn open_verified_bundle_artifact(path: &Path, declaration: &BundleArtifact) -> Result<File> {
+    use std::io::{Seek, SeekFrom};
+    #[cfg(not(unix))]
+    anyhow::ensure!(
+        std::fs::symlink_metadata(path)?.is_file(),
+        "bundle artifact is not a regular file"
+    );
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() == declaration.size_bytes,
+        "retained artifact is not regular or has changed size"
+    );
+    let mut digest = HashingWriter::new(io::sink());
+    io::copy(
+        &mut Read::by_ref(&mut file).take(
+            declaration
+                .size_bytes
+                .checked_add(1)
+                .context("artifact extent overflow")?,
+        ),
+        &mut digest,
+    )?;
+    let (size, hash) = digest.finish();
+    check_artifact_digest(declaration, size, hash)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
 }
 
 /// Snapshot a pinned archive with bounded streaming I/O, then retain only the
@@ -604,6 +626,14 @@ pub fn capture_canonical_linux_inputs(
         .prefix("kernel-")
         .tempdir_in(&parent)?;
     crate::config::create_private_dir(directory.path())?;
+    #[cfg(unix)]
+    let directory_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(directory.path())?
+    };
     let snapshot_path = directory.path().join("archive.mvmpkg");
     let mut snapshot = std::fs::OpenOptions::new()
         .read(true)
@@ -697,6 +727,8 @@ pub fn capture_canonical_linux_inputs(
         }
     }
     Ok(CapturedCanonicalLinuxInputs {
+        #[cfg(unix)]
+        directory_file,
         _archive: snapshot,
         directory_path: directory.path().to_owned(),
         directory_guard: std::sync::Mutex::new(Some(directory)),
@@ -1509,6 +1541,35 @@ mod tests {
             sha256: sha256_hex(bytes),
             size_bytes: bytes.len() as u64,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_extent_uses_one_regular_file_and_preserves_trailing_zeroes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("root");
+        let body = b"original\0\0";
+        let decl = artifact("root", ArtifactRole::Rootfs, body);
+        std::fs::write(&path, body).unwrap();
+        let mut file = open_verified_bundle_artifact(&path, &decl).unwrap();
+        std::fs::rename(&path, directory.path().join("retained")).unwrap();
+        std::fs::write(&path, b"oversized replacement").unwrap();
+        assert!(open_verified_bundle_artifact(&path, &decl).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(directory.path().join("retained"), &path).unwrap();
+        assert!(open_verified_bundle_artifact(&path, &decl).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(open_verified_bundle_artifact(&path, &decl).is_err());
+        let mut readback = Vec::new();
+        file.read_to_end(&mut readback).unwrap();
+        assert_eq!(readback, body);
     }
 
     fn manifest(artifacts: Vec<BundleArtifact>) -> BundleManifest {

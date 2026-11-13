@@ -135,7 +135,9 @@ pub use stream::{
     BundlePayload, VerifiedBundleFile, capture_canonical_linux_inputs, open_archive,
     read_bundle_archive, verify_bundle_file, verify_exact_bundle_file, write_bundle_to,
 };
-pub use stream::{CapturedCanonicalLinuxInputs, MAX_IMAGE_SET_MANIFEST_BYTES};
+pub use stream::{
+    CapturedCanonicalLinuxInputs, MAX_IMAGE_SET_MANIFEST_BYTES, open_verified_bundle_artifact,
+};
 pub use verify_error::{BundleVerifyError, ensure_safe_path};
 
 /// Signed manifest label written by the local build front door.

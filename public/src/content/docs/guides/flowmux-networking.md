@@ -178,3 +178,22 @@ guest application
 Control and data share the authenticated FlowMux protocol but retain bounded,
 independent progress. Saturating one flow cannot create an unbounded queue or
 silently widen another flow's authority.
+
+
+### Canonical Linux input for an installed direct TCP endpoint
+
+The local SDK entry `try_launch_with_canonical_direct_policy` takes the externally
+signed request, the original prepared host lifetime, its direct TCP mapping, and the
+same `Arc<PreparedCanonicalLinux>` created for the installed signed bundle. The
+parent checks its reservation before MVM resolves installed artifacts. The kernel,
+CLI runtime release, workload root digest and length must agree with the original
+signed inputs.
+
+The parent also authorizes one full private copy of the workload root into the
+original kernel-generation directory. MVM caps writes at the signed length,
+checks the private file digest, unlinks it and passes its read-only descriptor to
+the backend. The storage reservation must cover this copy through final release.
+Preparing the archive, kernel, runtime and temporary files consumes additional
+resources. A deployment providing this profile must fund and enforce those
+resources separately. Canonical FlowMux still applies destination and tenant policy
+on each network operation.

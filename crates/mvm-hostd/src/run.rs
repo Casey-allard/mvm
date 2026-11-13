@@ -551,11 +551,14 @@ fn admit_signed_and_boot_local(
                 "canonical kernel and root must belong to the signed plan bundle"
             );
             kernel.bind_to_config(&mut config)?;
+        } else {
+            anyhow::ensure!(
+                mvm_core::crypto::image_verify::sha256_file(&req.rootfs_path)? == plan.image.sha256,
+                "selected root filesystem differs from the signed plan"
+            );
         }
-        anyhow::ensure!(
-            mvm_core::crypto::image_verify::sha256_file(&req.rootfs_path)? == plan.image.sha256,
-            "selected root filesystem differs from the signed plan"
-        );
+        // For canonical inputs, attachment checks the installed root through one
+        // bounded file handle against the same signed declaration before admission.
         mvm_runtime::bundle_runtime::attach_direct_runtime(
             &mut config,
             backend.name(),

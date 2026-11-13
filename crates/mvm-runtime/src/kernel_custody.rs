@@ -82,10 +82,10 @@ impl KernelBoundLaunch {
             }
         }
         #[cfg(unix)]
-        let root = if let Some(expected) = config
+        let root = if let Some((anchor, expected)) = config
             .host_lifetime
             .as_ref()
-            .and_then(|anchor| anchor.canonical_kernel())
+            .and_then(|anchor| anchor.canonical_kernel().map(|kernel| (anchor, kernel)))
         {
             anyhow::ensure!(
                 config
@@ -111,12 +111,15 @@ impl KernelBoundLaunch {
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&config.rootfs_path)?;
-            let sealed = mvm_vmm::host::restore_image::VerifiedRestoreFile::prepare_clone_only(
+            let (directory, bytes) = anchor.claim_original_root_copy(&config, backend)?;
+            let sealed = mvm_vmm::host::restore_image::VerifiedRestoreFile::prepare_funded_copy(
                 &source,
+                directory,
                 expected.generation_dir(),
                 &decl.sha256,
-                decl.size_bytes,
+                bytes,
             )?;
+            anchor.check_parent_current(&config, backend)?;
             Some(std::sync::Mutex::new(Some(sealed)))
         } else {
             None

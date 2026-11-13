@@ -510,27 +510,8 @@ fn verify_installed_artifact(
     artifact: &mvm_core::plan::bundle::BundleArtifact,
 ) -> Result<PathBuf> {
     let path = root.join(&artifact.path);
-    ensure!(
-        std::fs::symlink_metadata(&path)
-            .with_context(|| format!("reading installed bundle artifact {}", artifact.path))?
-            .file_type()
-            .is_file(),
-        "installed bundle artifact is not a regular file: {}",
-        artifact.path
-    );
-    let size = std::fs::metadata(&path)
-        .with_context(|| format!("reading installed bundle artifact {}", artifact.path))?
-        .len();
-    ensure!(
-        size == artifact.size_bytes,
-        "installed bundle artifact size changed: {}",
-        artifact.path
-    );
-    ensure!(
-        mvm_core::crypto::image_verify::sha256_file(&path)? == artifact.sha256,
-        "installed bundle artifact digest changed: {}",
-        artifact.path
-    );
+    mvm_core::plan::bundle::open_verified_bundle_artifact(&path, artifact)
+        .with_context(|| format!("verifying installed bundle artifact {}", artifact.path))?;
     Ok(path)
 }
 

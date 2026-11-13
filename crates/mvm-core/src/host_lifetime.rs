@@ -238,6 +238,18 @@ pub struct HostLifetimeInputs {
 pub trait CoreCurrentParentPermit: Send + Sync {
     fn check_current(&self, binding: &HostLaunchBinding) -> Result<()>;
 
+    /// Spend the original parent's explicit full-copy entitlement for this signed
+    /// filesystem extent in its original protected directory.
+    fn authorize_original_root_copy(
+        &self,
+        _binding: &HostLaunchBinding,
+        _kernel: &Arc<crate::canonical_linux::PreparedCanonicalLinux>,
+        _directory: &File,
+        _bytes: NonZeroU64,
+    ) -> Result<()> {
+        anyhow::bail!("original workload root copy is unfunded")
+    }
+
     /// Enter the already reserved portable verification and snapshot workspace.
     /// The callback only changes accounting state. The original parent retains
     /// responsibility for its reservation on refusal, panic, or abandoned startup.
@@ -343,6 +355,7 @@ impl PreparedHostLifetime {
             canonical: self.canonical,
             admitted: Mutex::new(None),
             current_parent: Mutex::new(None),
+            root_copy_claimed: AtomicBool::new(false),
             native_claimed: AtomicBool::new(false),
             endpoint_claimed: AtomicBool::new(false),
             startup_claimed: AtomicBool::new(false),
@@ -397,6 +410,7 @@ pub struct HostLifetimeAnchor {
     canonical: Option<Arc<crate::canonical_linux::PreparedCanonicalLinux>>,
     admitted: Mutex<Option<AdmissionBinding>>,
     current_parent: Mutex<Option<Arc<dyn CoreCurrentParentPermit>>>,
+    root_copy_claimed: AtomicBool,
     native_claimed: AtomicBool,
     endpoint_claimed: AtomicBool,
     startup_claimed: AtomicBool,
@@ -622,6 +636,7 @@ impl HostLifetimeAnchor {
                     .as_ref()
                     .is_some_and(|actual| Arc::ptr_eq(actual, kernel))
                     && plan.bundle.as_ref() == Some(kernel.pin())
+                    && plan.image.sha256 == kernel.workload_root_declaration()?.sha256
                     && config.legacy_portable_runtime.is_none()
                     && config.runtime_release_proof.is_some(),
                 "admitted canonical runtime owner changed"
@@ -731,6 +746,29 @@ impl HostLifetimeAnchor {
             .as_ref()
             .cloned()
             .context("original parent resource permit missing")
+    }
+
+    /// Accept a single full private copy only under original, current admission.
+    pub fn claim_original_root_copy(
+        self: &Arc<Self>,
+        config: &VmStartConfig,
+        backend: BackendKind,
+    ) -> Result<(&File, NonZeroU64)> {
+        let permit = self.current_parent_permit(config, backend)?;
+        permit.check_current(&self.binding)?;
+        let kernel = self
+            .canonical_kernel()
+            .context("missing original canonical owner")?;
+        let bytes = NonZeroU64::new(kernel.workload_root_declaration()?.size_bytes)
+            .context("empty original workload root")?;
+        ensure!(
+            !self.root_copy_claimed.swap(true, Ordering::AcqRel),
+            "original root copy already claimed"
+        );
+        let directory = kernel.generation_directory_file();
+        permit.authorize_original_root_copy(&self.binding, kernel, directory, bytes)?;
+        self.check_parent_current(config, backend)?;
+        Ok((directory, bytes))
     }
 
     /// Start the original parent's one-shot workspace after opaque admission.

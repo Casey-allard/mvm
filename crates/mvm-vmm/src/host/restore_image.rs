@@ -262,6 +262,61 @@ impl VerifiedRestoreFile {
         })
     }
 
+    /// Materialize at most the originally funded extent in the held private
+    /// directory. The issuer must independently authorize this full byte copy.
+    pub fn prepare_funded_copy(
+        source: &File,
+        directory: &File,
+        directory_path: &Path,
+        expected_sha256: &str,
+        bytes: std::num::NonZeroU64,
+    ) -> Result<Self, RestoreImageError> {
+        let checked = open_trusted_dir(directory_path)?;
+        let named = checked
+            .metadata()
+            .map_err(|e| io_err("inspect copy directory", directory_path, e))?;
+        let held = directory
+            .metadata()
+            .map_err(|e| io_err("inspect original directory", directory_path, e))?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(RestoreImageError::UntrustedDirectory(
+                directory_path.to_owned(),
+            ));
+        }
+        let source_metadata = source
+            .metadata()
+            .map_err(|e| io_err("stat copy source", directory_path, e))?;
+        // SAFETY: F_GETFL only inspects the still-borrowed descriptor.
+        let flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
+        if !source_metadata.is_file()
+            || source_metadata.len() != bytes.get()
+            || flags == -1
+            || flags & libc::O_ACCMODE != libc::O_RDONLY
+        {
+            return Err(io_err(
+                "check funded source extent",
+                directory_path,
+                io::Error::from(io::ErrorKind::InvalidInput),
+            ));
+        }
+        let name = private_name().map_err(|e| io_err("name funded copy", directory_path, e))?;
+        let mut reader = io::Read::take(source, bytes.get());
+        copy_into(
+            &mut reader,
+            directory_path,
+            directory,
+            &name,
+            directory_path,
+        )?;
+        let file = finish_private_copy(directory, &name, directory_path, &openat_readonly)?;
+        verify_private_file(&file, bytes.get(), expected_sha256)?;
+        Ok(Self {
+            file,
+            len: bytes.get(),
+            copy: PrivateCopy::Copied,
+        })
+    }
+
     /// The verified private copy.
     pub fn file(&self) -> &File {
         &self.file
@@ -828,7 +883,7 @@ fn clone_unsupported(e: &io::Error) -> bool {
 }
 
 fn copy_into(
-    src: &File,
+    mut reader: impl io::Read,
     source: &Path,
     dir: &File,
     name: &CString,
@@ -853,12 +908,11 @@ fn copy_into(
     }
     // SAFETY: `openat` just returned this descriptor and nothing else owns it.
     let mut dst = unsafe { File::from_raw_fd(fd) };
-    let mut reader = src;
     let copied = io::copy(&mut reader, &mut dst).map_err(|e| io_err("copy", source, e));
-    if copied.is_err() {
-        let _ = unlink_name(dir, name);
+    if let Err(error) = copied {
+        return Err(NamedCopy { dir, name }.remove_after(error, dir_path));
     }
-    copied.map(|_| ())
+    Ok(())
 }
 
 fn openat_readonly(dir: &File, name: &CString) -> io::Result<File> {
@@ -924,6 +978,37 @@ mod tests {
         let source = private.join("memory.bin");
         std::fs::write(&source, bytes).unwrap();
         (root, private, source)
+    }
+
+    #[test]
+    fn funded_root_copy_checks_original_directory_extent_and_exact_bytes() {
+        let payload = b"root with trailing zeros\0\0";
+        let (base, private, source) = fixture(payload);
+        let held = open_trusted_dir(&private).unwrap();
+        let other = base.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let extent = std::num::NonZeroU64::new(payload.len() as u64).unwrap();
+        let hash = sha256_hex(payload);
+        let copy = |path: &Path, len, hash: &str| {
+            VerifiedRestoreFile::prepare_funded_copy(
+                &File::open(&source).unwrap(),
+                &held,
+                path,
+                hash,
+                len,
+            )
+        };
+        assert!(copy(&other, extent, &hash).is_err());
+        assert!(copy(&private, std::num::NonZeroU64::new(1).unwrap(), &hash).is_err());
+        assert!(copy(&private, extent, &sha256_hex(b"other")).is_err());
+        let root = copy(&private, extent, &hash).unwrap();
+        assert_eq!(root.copy(), PrivateCopy::Copied);
+        let mut recovered = vec![0; payload.len()];
+        root.file().read_exact_at(&mut recovered, 0).unwrap();
+        assert_eq!(&recovered[..], payload);
+        assert_eq!(root.file().metadata().unwrap().nlink(), 0);
+        assert_eq!(std::fs::read_dir(&private).unwrap().count(), 1);
     }
 
     #[test]
