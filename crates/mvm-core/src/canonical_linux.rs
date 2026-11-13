@@ -300,6 +300,21 @@ pub fn prepare_canonical_linux(
     prepare_with_clock(inputs, backend, host_protocols, Utc::now)
 }
 
+/// Capture and authenticate at most the funded decoded archive extent.
+#[cfg(feature = "host-state")]
+pub fn prepare_funded_canonical_linux(
+    archive: &Path,
+    pin: &PlanArtifact,
+    backend: BackendKind,
+    host_protocols: HostProtocolSupport,
+    trust: &dyn TrustStore,
+    bytes: std::num::NonZeroU64,
+) -> Result<PreparedCanonicalLinux> {
+    let inputs =
+        crate::plan::bundle::capture_canonical_with_extent(archive, pin, trust, Some(bytes))?;
+    prepare_with_clock(inputs, backend, host_protocols, Utc::now)
+}
+
 #[cfg(feature = "host-state")]
 fn prepare_with_clock(
     inputs: CapturedCanonicalLinuxInputs,
@@ -646,6 +661,42 @@ mod tests {
             trust,
         }
     }
+    #[test]
+    fn funded_canonical_capture_bounds_actual_plain_and_decoded_gzip_extent() {
+        use std::io::Write;
+        let home = tempfile::tempdir().unwrap();
+        let mut env = TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        let original = frame(
+            b"unit kernel",
+            published_root::MANIFEST,
+            published_root::BUNDLE,
+            FEED_SIGNATURE,
+            true,
+        );
+        let archive = std::fs::read(&original.archive).unwrap();
+        let gz = original.archive.with_extension("gz");
+        let mut encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&gz).unwrap(),
+            flate2::Compression::fast(),
+        );
+        encoder.write_all(&archive).unwrap();
+        encoder.finish().unwrap();
+        for source in [&original.archive, &gz] {
+            let capture = |size| {
+                crate::plan::bundle::capture_canonical_with_extent(
+                    source,
+                    &original.pin,
+                    &original.trust,
+                    std::num::NonZeroU64::new(size),
+                )
+            };
+            assert!(capture(archive.len() as u64 - 1).is_err());
+            assert!(capture(archive.len() as u64 + 1).is_err());
+            assert_eq!(capture(archive.len() as u64).unwrap().pin(), &original.pin);
+        }
+    }
+
     fn coherent_application_replacement(kernel: &[u8]) -> Vec<u8> {
         let mut linux: ImageSetManifest = serde_json::from_slice(published_root::MANIFEST).unwrap();
         let member = linux

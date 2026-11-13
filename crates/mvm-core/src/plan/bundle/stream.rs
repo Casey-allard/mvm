@@ -574,6 +574,17 @@ pub fn capture_canonical_linux_inputs(
     pin: &super::PlanArtifact,
     trust: &dyn TrustStore,
 ) -> Result<CapturedCanonicalLinuxInputs> {
+    capture_canonical_with_extent(archive, pin, trust, None)
+}
+
+#[cfg(feature = "host-state")]
+pub(crate) fn capture_canonical_with_extent(
+    archive: &Path,
+    pin: &super::PlanArtifact,
+    trust: &dyn TrustStore,
+    quoted: Option<std::num::NonZeroU64>,
+) -> Result<CapturedCanonicalLinuxInputs> {
+    use std::io::Seek;
     anyhow::ensure!(
         cfg!(unix),
         "canonical Linux proof capture is unsupported on this platform"
@@ -587,16 +598,17 @@ pub fn capture_canonical_linux_inputs(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let source = options.open(archive)?;
-    let metadata = source.metadata()?;
+    let mut source = options.open(archive)?;
+    let limit = quoted.map_or(MAX_RAW_ARCHIVE, |extent| extent.get());
     anyhow::ensure!(
-        metadata.is_file() && metadata.len() <= MAX_RAW_ARCHIVE,
-        "bundle archive is not regular or exceeds the capture bound"
+        limit <= MAX_RAW_ARCHIVE,
+        "decoded archive quote exceeds capture bound"
     );
-    // An authenticated metadata preflight can refuse an oversized selected
-    // kernel before copying a multi-GiB workload archive. It is not authority
-    // for the later snapshot: that exact snapshot is independently verified.
-    let (head, signature) = read_manifest_entries(open_archive(archive)?)?;
+    // Keep the original open source for both passes, including gzip decoding.
+    let (head, signature) = read_manifest_entries(
+        decoded_archive_reader(archive, source.try_clone()?, quoted)?.take(limit),
+    )?;
+    source.rewind()?;
     let (head, key) = verify_signed_manifest(&head, &signature, trust)?;
     let pinned_signature = pin.signature_bytes().context("invalid pinned signature")?;
     anyhow::ensure!(
@@ -640,15 +652,15 @@ pub fn capture_canonical_linux_inputs(
         .write(true)
         .create_new(true)
         .open(&snapshot_path)?;
+    let mut reader = decoded_archive_reader(archive, source, quoted)?;
     let mut writer = HashingWriter::new(&mut snapshot);
-    io::copy(
-        &mut open_archive(archive)?.take(MAX_RAW_ARCHIVE + 1),
-        &mut writer,
-    )?;
+    io::copy(&mut Read::by_ref(&mut reader).take(limit), &mut writer)?;
     let (size, digest) = writer.finish();
     anyhow::ensure!(
-        size <= MAX_RAW_ARCHIVE && digest == pin.bundle_sha256,
-        "captured archive differs from its exact pin or exceeds the capture bound"
+        reader.read(&mut [0])? == 0
+            && quoted.is_none_or(|extent| extent.get() == size)
+            && digest == pin.bundle_sha256,
+        "captured archive differs from its exact pin or decoded extent"
     );
     snapshot.sync_all()?;
     #[cfg(unix)]
@@ -760,6 +772,15 @@ pub(super) fn open_quoted_archive(
     let file = options.open(path).map_err(|e| {
         BundleVerifyError::ManifestParse(format!("opening bundle archive {}: {e}", path.display()))
     })?;
+    decoded_archive_reader(path, file, quoted)
+}
+
+#[cfg(feature = "host-state")]
+fn decoded_archive_reader(
+    path: &Path,
+    file: File,
+    quoted: Option<std::num::NonZeroU64>,
+) -> Result<Box<dyn Read>, BundleVerifyError> {
     let metadata = file.metadata().map_err(|e| {
         BundleVerifyError::ManifestParse(format!("stat bundle archive {}: {e}", path.display()))
     })?;

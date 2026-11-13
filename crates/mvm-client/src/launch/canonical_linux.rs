@@ -27,3 +27,24 @@ pub fn prepare_canonical_linux(
         &trust,
     )
 }
+
+/// Authenticate the installed bundle using its reserved exact decoded extent.
+pub fn prepare_funded_canonical_linux(
+    archive: &Path,
+    pin: &PlanArtifact,
+    backend: BackendKind,
+    bytes: std::num::NonZeroU64,
+) -> Result<PreparedCanonicalLinux> {
+    let trust = mvm_core::registry_pack::application_bundle::trust_for_installed_bundle(
+        FsTrustStore::default_path()?,
+        &pin.bundle_sha256,
+    );
+    mvm_core::canonical_linux::prepare_funded_canonical_linux(
+        archive,
+        pin,
+        backend,
+        mvm_build::stage0_kernel::current_image_set_protocol_support(),
+        &trust,
+        bytes,
+    )
+}

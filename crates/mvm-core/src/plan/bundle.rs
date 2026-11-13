@@ -131,6 +131,8 @@ pub(crate) use stream::archive_sha256;
 #[cfg(feature = "host-state")]
 pub(crate) use stream::HashingWriter;
 #[cfg(feature = "host-state")]
+pub(crate) use stream::capture_canonical_with_extent;
+#[cfg(feature = "host-state")]
 pub use stream::{
     BundlePayload, VerifiedBundleFile, capture_canonical_linux_inputs, open_archive,
     read_bundle_archive, verify_bundle_file, verify_exact_bundle_file, write_bundle_to,
