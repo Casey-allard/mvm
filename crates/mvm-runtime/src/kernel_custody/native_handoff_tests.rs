@@ -150,7 +150,12 @@ fn exact_final_config_and_physical_recipe_are_checked_before_native_effects() {
     let home = tempfile::tempdir().unwrap();
     let mut env = TestEnv::new();
     env.isolate_mvm_home(home.path());
-    let owner = prepared_owner(BackendKind::Hvf);
+    let backend = if cfg!(target_os = "linux") {
+        BackendKind::Firecracker
+    } else {
+        BackendKind::Hvf
+    };
+    let owner = prepared_owner(backend);
     let mut config = VmStartConfig {
         name: "kernel-physical-unit".into(),
         ..Default::default()
@@ -159,7 +164,7 @@ fn exact_final_config_and_physical_recipe_are_checked_before_native_effects() {
     let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
     assert!(!has_retained_kernel(&lease).unwrap());
     assert!(KernelBoundLaunch::bind(config.clone(), BackendKind::Qemu, &lease).is_err());
-    let bound = KernelBoundLaunch::bind(config, BackendKind::Hvf, &lease).unwrap();
+    let bound = KernelBoundLaunch::bind(config, backend, &lease).unwrap();
     assert!(Arc::ptr_eq(
         bound.config().canonical_kernel.as_ref().unwrap(),
         &owner
