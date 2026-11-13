@@ -638,7 +638,11 @@ impl BoundCommand {
                 anyhow::Error::from(error).context("spawning original payload"),
             )
         })?;
-        let observation = match capture(&mut child) {
+        // An unwinding observer must leave the actual spawned child with its owner.
+        let observed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture(&mut child)))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("original child observer panicked")));
+        let observation = match observed {
             Ok(observation) => observation,
             Err(error) => {
                 return Err(RetainedSpawnFailure::Spawned {
