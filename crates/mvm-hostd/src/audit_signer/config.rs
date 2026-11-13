@@ -58,6 +58,7 @@ pub struct SignerHelperConfig {
 pub struct OwnedSignerSetup {
     pub config: SignerHelperConfig,
     pub audit_chain_bytes: Option<std::num::NonZeroU64>,
+    pub address_space_limit: Option<std::num::NonZeroU64>,
 }
 
 pub fn parse_signer_helper(bytes: &[u8]) -> Result<SignerHelperConfig, serde_json::Error> {

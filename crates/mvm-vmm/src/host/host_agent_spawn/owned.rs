@@ -531,7 +531,7 @@ impl OwnedHostAgent {
         )?;
         let nonce: [u8; 16] = rand::random();
         let bytes = Zeroizing::new(serde_json::to_vec(
-            &serde_json::json!({ "config": config(&inputs.tenant), "nonce":nonce, "audit_chain_bytes": audit_chain_bytes }),
+            &serde_json::json!({ "config": config(&inputs.tenant), "nonce":nonce, "audit_chain_bytes": audit_chain_bytes, "address_space_limit":address_space_limit }),
         )?);
         ensure!(
             bytes.len() <= CONTROL_MAX_FRAME_BYTES,
@@ -1295,6 +1295,7 @@ impl OwnedVmRegistration {
             );
             slot.phase = Phase::Closing;
         }
+        let mut callback_pending = false;
         let result = (|| -> Result<()> {
             if self.archive.as_ref().and_then(RegisteredAuditFile::terminal).is_none() {
                 self.shared.running()?;
@@ -1306,7 +1307,14 @@ impl OwnedVmRegistration {
                 }
             }
             if let (Some(owner),Some(file))=(&self.archive_owner,&self.archive) {
-                owner.retired_audit(self,file)?;
+                let limit=self.shared.audit_chain_bytes.context("original audit limit missing")?;
+                file.check_terminal(limit.get())?;
+                if let Err(error)=owner.retired_audit(self,file) {
+                    file.check_terminal(limit.get())?;
+                    callback_pending=true;
+                    return Err(error);
+                }
+                file.check_terminal(limit.get())?;
             }
             Ok(())
         })();
@@ -1323,6 +1331,8 @@ impl OwnedVmRegistration {
             "owned registration completion identity changed"
         );
         if let Err(error) = result {
+            // Closing retains this one slot until the consumer durably adopts the file.
+            if callback_pending {return Err(error);}
             if let Some(slot) = ledger.slots.get_mut(&self.vm) {
                 slot.phase = Phase::Uncertain;
             }

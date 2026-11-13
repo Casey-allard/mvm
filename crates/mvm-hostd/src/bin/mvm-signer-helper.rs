@@ -59,6 +59,7 @@ fn main() -> Result<()> {
     let (cfg, chain_bytes): (SignerHelperConfig, _) = if owned {
         let setup: mvm_hostd::audit_signer::config::OwnedSignerSetup = serde_json::from_slice(&raw)
             .context("decoding original signer setup")?;
+        mvm_hostd::owned_resources::check_process_address_space(setup.address_space_limit)?;
         (setup.config, setup.audit_chain_bytes)
     } else { (parse_config(&raw).context("mvm-signer-helper config parse failed")?, None) };
     if owned {

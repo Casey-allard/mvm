@@ -16,6 +16,19 @@ pub const CONTROL_WORKSPACES: usize = 1;
 const NODES: usize = 1024;
 const DEPTH: usize = 32;
 
+/// Recheck the kernel limit on each original process before establishing readiness.
+pub fn check_process_address_space(limit: Option<std::num::NonZeroU64>) -> anyhow::Result<()> {
+    let Some(limit) = limit else { return Ok(()); };
+    #[cfg(target_os = "linux")]
+    {
+        let actual=rustix::process::getrlimit(rustix::process::Resource::As);
+        anyhow::ensure!(actual.current.zip(actual.maximum).is_some_and(|(soft,hard)| soft<=hard && hard<=limit.get()),"original process address space exceeds its reservation");
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = limit; anyhow::bail!("original process address-space enforcement unavailable") }
+}
+
 #[derive(Clone)]
 pub struct WorkspacePool(Arc<Semaphore>);
 pub struct WorkspacePermit {

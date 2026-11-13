@@ -547,7 +547,7 @@ pub(crate) struct BootParams {
     #[cfg(unix)]
     pub(crate) host_lifetime: Option<Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
     #[cfg(unix)]
-    pub(crate) installed_payload_mapping: Option<CooperatingPayloadPolicy>,
+    pub(crate) installed_payload_mapping: Option<mvm_hostd::run::DirectTcpPolicy>,
     pub(crate) name: String,
     pub(crate) source: LaunchSource,
     pub(crate) profile: String,
@@ -953,9 +953,21 @@ impl LocalBackend {
     #[cfg(unix)]
     pub async fn try_launch_with_host_lifetime_and_mapping(
         &self,
-        mut request: LaunchRequest,
+        request: LaunchRequest,
         lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
         mapping: CooperatingPayloadPolicy,
+    ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
+        self.try_launch_with_host_lifetime_and_direct_policy(request, lifetime,
+            mvm_hostd::run::DirectTcpPolicy { mapping, peers: Vec::new() }).await
+    }
+
+    /// Launch with the exact operator-supplied peer routes covered by the canonical signed policy.
+    #[cfg(unix)]
+    pub async fn try_launch_with_host_lifetime_and_direct_policy(
+        &self,
+        mut request: LaunchRequest,
+        lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
+        mapping: mvm_hostd::run::DirectTcpPolicy,
     ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
         if request.signed_plan.is_none()
             || !matches!(
@@ -983,6 +995,11 @@ impl LocalBackend {
         mut request: LaunchRequest,
         lifetime: mvm_core::host_lifetime::PreparedHostLifetime,
     ) -> std::result::Result<LaunchOutcome, HostLifetimeLaunchFailure> {
+        if request.installed_payload_mapping.is_none() {
+            return Err(HostLifetimeLaunchFailure::unused(MvmError::InvalidSpec{
+                reason:"installed call requires an explicit signed direct TCP policy".into(),
+            },lifetime));
+        }
         if request.mode != LifecycleMode::Transient || request.name.is_none() {
             return Err(HostLifetimeLaunchFailure::unused(
                 MvmError::InvalidSpec {

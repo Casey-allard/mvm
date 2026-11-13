@@ -21,12 +21,10 @@ impl AdmittedNetworkPlan {
         policy: &crate::policy::network_policy::NetworkPolicy,
     ) -> Result<Self> {
         let digest = crate::policy::network_policy::content_sha256(policy);
-        if !plan
-            .asset_identities
-            .iter()
-            .any(|asset| asset.kind == crate::plan::AssetKind::Policy && asset.digest == digest)
-        {
-            bail!("network policy does not match the admitted plan asset");
+        let mut policies = plan.asset_identities.iter().filter(|asset|
+            asset.kind == crate::plan::AssetKind::Policy && asset.name == "network_policy");
+        if !policies.next().is_some_and(|asset| asset.digest == digest) || policies.next().is_some() {
+            bail!("network policy does not match the unique signed network_policy asset");
         }
         let bundle = plan
             .bundle

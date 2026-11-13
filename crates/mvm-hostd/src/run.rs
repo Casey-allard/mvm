@@ -378,9 +378,28 @@ pub fn admit_and_boot_local(
 }
 
 #[cfg(unix)]
+#[derive(Clone,Debug)]
+pub struct DirectTcpPolicy {
+    pub mapping: mvm_contract::policy::network_policy::CooperatingPayloadPolicy,
+    pub peers: Vec<mvm_contract::peer::PeerBinding>,
+}
+#[cfg(unix)]
+impl DirectTcpPolicy {
+    fn project(&self,base:mvm_core::network_policy::NetworkPolicy) -> Result<mvm_core::network_policy::NetworkPolicy> {
+        anyhow::ensure!(self.peers.len() <= self.mapping.peers().len(), "direct TCP peer routes exceed selected mappings");
+        for (index,peer) in self.peers.iter().enumerate() {
+            peer.validate()?;
+            anyhow::ensure!(self.mapping.select(peer.name.as_str(),peer.port).is_some() &&
+                !self.peers[..index].iter().any(|p| p.admits(&peer.name,peer.port)), "unselected or duplicate direct TCP peer route");
+        }
+        Ok(base.with_peers(self.peers.clone()).with_payload_mapping(Some(self.mapping.clone())))
+    }
+}
+
+#[cfg(unix)]
 pub struct SelectedLocalMapping<'a> {
     pub owner: std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
-    pub mapping: &'a mvm_contract::policy::network_policy::CooperatingPayloadPolicy,
+    pub mapping: &'a DirectTcpPolicy,
 }
 
 #[cfg(unix)]
@@ -464,7 +483,7 @@ fn admit_signed_and_boot_local(
     let admitted = if let Some(selected) = selected {
         anyhow::ensure!(cfg!(target_os = "linux") && backend.kind() == mvm_core::vm_backend::BackendKind::Firecracker && backend.supports_host_lifetime(), "installed direct runtime is unavailable");
         anyhow::ensure!(plan.post_run.destroy_on_exit && plan.network_mode == mvm_core::plan::NetworkMode::HostVsockProxy && plan.mailbox.is_none() && plan.ingress.is_empty() && plan.secrets.is_empty(), "selected direct scope requires transient vsock egress only");
-        config.network_policy = config.network_policy.with_payload_mapping(Some(selected.mapping.clone()));
+        config.network_policy = selected.mapping.project(config.network_policy)?;
         mvm_core::policy::direct_plan::AdmittedNetworkPlan::from_plan(plan, &config.name, &config.network_policy)?;
         selected.owner.bind_to_config(&mut config)?;
         let pin = plan.bundle.as_ref().context("signed portable bundle required")?;

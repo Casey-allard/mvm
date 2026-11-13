@@ -36,7 +36,7 @@ impl HostAgentParentPermit for Parent {
     }
     fn owned_process_address_space_limit(&self, tenant:&str) -> Result<Option<std::num::NonZeroU64>> {
         self.check_current(tenant)?;
-        Ok(std::num::NonZeroU64::new(256 << 20))
+        Ok(if OwnedHostAgent::supports_process_address_space_limit() { std::num::NonZeroU64::new(256 << 20) } else {None})
     }
     fn owned_audit_chain_bytes(&self, tenant:&str) -> Result<Option<std::num::NonZeroU64>> {
         self.check_current(tenant)?;
@@ -63,7 +63,7 @@ struct Fixture {
     _home: tempfile::TempDir,
     lease: tempfile::TempDir,
     parent: Arc<Parent>,
-    verifying: ed25519_dalek::VerifyingKey,
+    host_signer: ed25519_dalek::SigningKey,
 }
 impl Fixture {
     fn new() -> Self {
@@ -82,9 +82,9 @@ impl Fixture {
             env!("CARGO_BIN_EXE_mvm-signer-helper"),
         );
         env.set("MVM_HOST_AGENT_DAEMON", "1");
-        let verifying = mvm_hostd::audit::host_keypair::load_or_init_at(&config::mvm_keys_dir())
+        let host_signer = mvm_hostd::audit::host_keypair::load_or_init_at(&config::mvm_keys_dir())
             .unwrap()
-            .verifying;
+            .signing;
         let lease = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
@@ -109,7 +109,7 @@ impl Fixture {
             parent: Arc::new(Parent {
                 current: AtomicBool::new(true),
             }),
-            verifying,
+            host_signer,
         }
     }
     fn inputs(&self) -> OwnedHostAgentInputs {
@@ -153,6 +153,37 @@ fn register(
         service_proxies: &[],
     })
 }
+struct ArchiveRetry(AtomicBool);
+
+impl mvm_vmm::host::host_agent_spawn::RegisteredEndpointOwner for ArchiveRetry {
+    fn bind_registration(&self, _registrar:&OwnedHostAgentRegistrar, registration:&OwnedVmRegistration, _params:&HostAgentServicesParams<'_>) -> Result<()> {
+        ensure!(registration.registered_audit().is_some_and(|f| f.terminal().is_none()));
+        Ok(())
+    }
+    fn retired_audit(&self,_registration:&OwnedVmRegistration, file:&mvm_vmm::host::host_agent_spawn::RegisteredAuditFile) -> Result<()> {
+        let ended=file.terminal().ok_or_else(||anyhow::anyhow!("original signed terminal missing"))?;
+        ensure!(file.registered().same_registration(ended));
+        if self.0.swap(false, Ordering::SeqCst) { anyhow::bail!("fixture archive busy"); }
+        Ok(())
+    }
+}
+#[test]
+fn a_terminal_archive_retry_retains_only_its_original_registration() -> Result<()> {
+    let f=Fixture::new();
+    let mut agent=OwnedHostAgent::spawn(f.inputs())?;
+    let registrar=agent.registrar().with_registration_owner(Arc::new(ArchiveRetry(AtomicBool::new(true))))?;
+    let (state,socket)=f.vm("vm-1");
+    let mut first=register(&registrar,"vm-1",&state,&socket)?;
+    ensure!(first.shutdown().unwrap_err().to_string().contains("fixture archive busy"));
+    let (state2,socket2)=f.vm("vm-2");
+    let mut second=register(&registrar,"vm-2",&state2,&socket2)?;
+    ensure!(first.registered_audit().unwrap().terminal().is_some_and(|row|row.length==0));
+    first.shutdown()?;
+    second.shutdown()?;
+    agent.shutdown()?;
+    Ok(())
+}
+
 #[path = "support/registered_direct_peer.rs"]
 mod peer;
 mod registered_prepare {
@@ -411,7 +442,7 @@ mod registered_prepare {
         );
         let holder = fixture.inputs().holder;
         let mut agent = OwnedHostAgent::spawn(fixture.inputs())?;
-        let registrar = agent.registrar();
+        let registrar = agent.registrar().with_registration_owner(Arc::new(ArchiveRetry(AtomicBool::new(true))))?;
         let (state, socket) = fixture.vm("vm-1");
         let mut registration = register(&registrar, "vm-1", &state, &socket)?;
         let store = state.join("codec-functional-store");
@@ -462,7 +493,7 @@ mod registered_prepare {
             .ingress(&[])
             .flowmux_identity(FlowMuxIdentitySpawnConfig {
                 session_id: hex::encode([3; 32]),
-                host_signing_key_base64: STANDARD.encode([9; 32]),
+                host_signing_key_base64: STANDARD.encode(fixture.host_signer.to_bytes()),
                 guest_verifying_key_base64: STANDARD
                     .encode(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()),
             })
@@ -501,7 +532,7 @@ mod registered_prepare {
         let (mut session, _) = mvm_core::net::session::Session::guest(
             &mut guest,
             SigningKey::from_bytes(&[7; 32]),
-            &SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            &fixture.host_signer.verifying_key(),
         )?;
 
         // The canonical launcher waits for post-handshake session publication.
@@ -518,15 +549,15 @@ mod registered_prepare {
         send(&mut guest, &mut session, Opcode::OpenTcp, 1, b"unbound.mvm.peer:443");
         ensure!(receive(&mut guest, &mut session).0 == Opcode::Refused);
         ensure!(listener.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock));
+        let initiator_spki = fixture_identity(&fixture.host_signer).spki_sha256();
         let peer = std::thread::spawn(move || -> Result<()> {
             let wrong = fixture_identity(&SigningKey::from_bytes(&[12;32]));
             let first = accept(&listener)?;
-            let initiator = fixture_identity(&SigningKey::from_bytes(&[9;32]));
             // Accept may finish the TLS handshake before learning that the initiator rejected its SPKI.
-            if let Ok(mut wrong_session) = TlsCarrier::accept(first, &wrong, initiator.spki_sha256(), Instant::now()+Duration::from_secs(4)) {
+            if let Ok(mut wrong_session) = TlsCarrier::accept(first, &wrong, initiator_spki, Instant::now()+Duration::from_secs(4)) {
                 let mut byte = [0]; ensure!(wrong_session.read(&mut byte).unwrap_or(0) == 0, "failed peer received application bytes");
             }
-            serve_original(accept(&listener)?, address, peer_key, plan, 5)?;
+            serve_original(accept(&listener)?, address, peer_key, initiator_spki, plan, 5)?;
             ensure!(listener.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock));
             Ok(())
         });
@@ -584,7 +615,12 @@ mod registered_prepare {
                 ))?)?
         );
         drop(retained);
+        ensure!(registration.shutdown().unwrap_err().to_string().contains("fixture archive busy"));
+        let (second_state,second_socket)=fixture.vm("vm-2");
+        let mut second=register(&registrar,"vm-2",&second_state,&second_socket)?;
+        ensure!(registration.registered_audit().unwrap().terminal().is_some());
         registration.shutdown()?;
+        second.shutdown()?;
         agent.shutdown()?;
         Ok(())
     }

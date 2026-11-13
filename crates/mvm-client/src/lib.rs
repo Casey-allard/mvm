@@ -158,6 +158,8 @@ pub use local::{LocalBackend, auto_selected_backend_name, default_vcpus};
 #[cfg(unix)]
 pub use launch::{HostLifetimeLaunchFailure, UnusedHostLifetimePreparation};
 #[cfg(unix)]
+pub use mvm_hostd::run::DirectTcpPolicy;
+#[cfg(unix)]
 pub use mvm_runtime::workload_runner::OwnedRetirement;
 
 pub use mvm_hostd::parent_death::exit_when_orphaned;

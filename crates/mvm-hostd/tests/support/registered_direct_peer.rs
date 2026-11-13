@@ -14,10 +14,9 @@ pub fn accept(listener:&TcpListener)->Result<TcpStream> {
     rustix::event::poll(&mut [rustix::event::PollFd::new(listener, rustix::event::PollFlags::IN)], Some(&rustix::event::Timespec{tv_sec:8,tv_nsec:0}))?;
     Ok(listener.accept()?.0)
 }
-pub fn serve_original(socket:TcpStream,address:SocketAddr,server_identity:PinnedIdentity,plan:AdmittedNetworkPlan,stream_id:u32)->Result<()> {
+pub fn serve_original(socket:TcpStream,address:SocketAddr,server_identity:PinnedIdentity,initiator_spki:[u8;32],plan:AdmittedNetworkPlan,stream_id:u32)->Result<()> {
     let until=Instant::now()+Duration::from_secs(8);
-    let initiator=fixture_identity(&SigningKey::from_bytes(&[9;32]));
-    let tls=TlsCarrier::accept(socket, &server_identity,initiator.spki_sha256(),until)?;
+    let tls=TlsCarrier::accept(socket, &server_identity,initiator_spki,until)?;
     let facts = ScopeFacts {
         object_profile: 2,
         policy_sha256: hex::decode(&plan.policy_sha256)

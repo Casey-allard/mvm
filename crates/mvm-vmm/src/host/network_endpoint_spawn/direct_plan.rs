@@ -33,7 +33,7 @@ mod payload_plan_contract_tests {
         plan.asset_identities.push(
             mvm_core::plan::AssetIdentity::new(
                 mvm_core::plan::AssetKind::Policy,
-                "network",
+                "network_policy",
                 mvm_core::policy::network_policy::content_sha256(&policy),
             )
             .expect("identity"),

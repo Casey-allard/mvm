@@ -93,7 +93,7 @@ mod tests {
         plan.asset_identities.push(
             mvm_core::plan::AssetIdentity::new(
                 mvm_core::plan::AssetKind::Policy,
-                "direct-tcp",
+                "network_policy",
                 mvm_core::policy::network_policy::content_sha256(&policy([7; 32])),
             )
             .unwrap(),

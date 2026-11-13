@@ -145,7 +145,7 @@ async fn spawn_worker(raw_cfg: &[u8]) -> Result<Child> {
     Ok(child)
 }
 
-async fn spawn_signer_helper(cfg: &HostAgentConfig, audit_chain_bytes: Option<std::num::NonZeroU64>) -> Result<Child> {
+async fn spawn_signer_helper(cfg: &HostAgentConfig, audit_chain_bytes: Option<std::num::NonZeroU64>, address_space_limit:Option<std::num::NonZeroU64>) -> Result<Child> {
     let bin = signer_helper_bin_path()?;
     let helper_cfg = SignerHelperConfig {
         tenant_id: cfg.tenant_id.clone(),
@@ -175,7 +175,7 @@ async fn spawn_signer_helper(cfg: &HostAgentConfig, audit_chain_bytes: Option<st
         .context("mvm-signer-helper stdin was not piped")?;
     stdin
         .write_all(&if owned {
-            serde_json::to_vec(&mvm_hostd::audit_signer::config::OwnedSignerSetup { config: helper_cfg, audit_chain_bytes })?
+            serde_json::to_vec(&mvm_hostd::audit_signer::config::OwnedSignerSetup { config: helper_cfg, audit_chain_bytes, address_space_limit })?
         } else { serde_json::to_vec(&helper_cfg)? })
         .await
         .context("pipe SignerHelperConfig to mvm-signer-helper")?;
@@ -222,7 +222,7 @@ async fn supervise_signer_helper(
 ) {
     let mut first_ready = Some(first_ready);
     loop {
-        match spawn_signer_helper(&cfg, None).await {
+        match spawn_signer_helper(&cfg, None, None).await {
             Ok(mut child) => {
                 let rebound = {
                     let daemon = daemon.lock().await;
@@ -444,10 +444,12 @@ fn main() -> Result<()> {
             nonce: [u8; 16],
             #[serde(default)]
             audit_chain_bytes: Option<std::num::NonZeroU64>,
+            address_space_limit: Option<std::num::NonZeroU64>,
         }
         let startup: Startup =
             serde_json::from_slice(&bytes).context("owned host-agent config parse failed")?;
-        (Vec::new(), startup.config, Some((startup.nonce, startup.audit_chain_bytes)))
+        mvm_hostd::owned_resources::check_process_address_space(startup.address_space_limit)?;
+        (Vec::new(), startup.config, Some((startup.nonce, startup.audit_chain_bytes, startup.address_space_limit)))
     } else {
         let raw = mvm_hostd::read_launch_config("mvm-host-agent")?;
         let cfg: HostAgentConfig =
@@ -468,9 +470,9 @@ fn main() -> Result<()> {
     let runtime = builder
         .build()
         .context("mvm-host-agent supervisor tokio runtime build failed")?;
-    if let Some((nonce, audit_chain_bytes)) = owned_nonce {
+    if let Some((nonce, audit_chain_bytes,address_space_limit)) = owned_nonce {
         runtime.block_on(async move {
-            let signer = spawn_signer_helper(&cfg, audit_chain_bytes).await?;
+            let signer = spawn_signer_helper(&cfg, audit_chain_bytes,address_space_limit).await?;
             HostAgentDaemon::run_owned(cfg, nonce, signer).await
         })?;
     } else if is_worker_mode() {

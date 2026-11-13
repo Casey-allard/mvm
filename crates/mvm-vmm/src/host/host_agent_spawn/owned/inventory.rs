@@ -6,6 +6,7 @@ use std::ffi::{OsStr,OsString};
 
 pub struct RegisteredAuditFile {
     parent: File,
+    directory_path: PathBuf,
     file: File,
     name: OsString,
     key: [u8;32],
@@ -22,10 +23,11 @@ impl RegisteredAuditFile {
             && opened.vm == request.vm_id && Some(&opened.workload) == request.workload_id.as_ref()
             && opened.length <= limit, "signed original audit registration differs");
         let path=Path::new(&request.workload_chain_path);
-        let parent=crate::host::restore_image::open_trusted_dir(path.parent().context("missing audit parent")?)?;
+        let directory_path=path.parent().context("missing audit parent")?.to_path_buf();
+        let parent=crate::host::restore_image::open_trusted_dir(&directory_path)?;
         let name=path.file_name().context("missing audit filename")?.to_owned();
         let file=Self::open_reader(&parent,&name)?;
-        let result=Self{parent,file,name,key:signed.key,opened,terminal:None};
+        let result=Self{parent,directory_path,file,name,key:signed.key,opened,terminal:None};
         result.check_file(&result.opened,limit)?;
         Ok(result)
     }
@@ -36,6 +38,9 @@ impl RegisteredAuditFile {
     }
 
     fn check_file(&self,facts:&AuditInventory, limit:u64) -> Result<()> {
+        let current=crate::host::restore_image::open_trusted_dir(&self.directory_path)?.metadata()?;
+        let parent=self.parent.metadata()?;
+        ensure!((current.dev(),current.ino())==(parent.dev(),parent.ino()),"original audit directory changed");
         let held=self.file.metadata()?;
         let named = Self::open_reader(&self.parent,&self.name)?.metadata()?;
         ensure!((named.dev(),named.ino()) == (held.dev(),held.ino())
@@ -55,6 +60,10 @@ impl RegisteredAuditFile {
         self.check_file(&end,limit)?;
         self.terminal=Some(end);
         Ok(())
+    }
+
+    pub(super) fn check_terminal(&self,limit:u64) -> Result<()> {
+        self.check_file(self.terminal.as_ref().context("missing original terminal receipt")?,limit)
     }
 
     pub fn file(&self)->&File {&self.file}
