@@ -4658,6 +4658,7 @@ mod tests {
         let (_env, _home) = host_with_ceiling(Default::default());
         let keys = mvm_core::config::mvm_keys_dir();
         let mut input = fixture_input("vm-original");
+        input.stream_retention = mvm_core::plan::StreamRetention::Ephemeral;
         input.agent_verbs = Some(vec![
             mvm_core::plan::VerbId::new("activate-environment").unwrap(),
             mvm_core::plan::VerbId::new("run-entrypoint").unwrap(),
