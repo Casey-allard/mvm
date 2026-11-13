@@ -70,6 +70,10 @@ use anyhow::{Context as _, Result, bail};
 use mvm_contract::grants::CpuGrant;
 use mvm_contract::protocol::resource_controls::{EnforcedCeiling, EnforcedGrants, EnforcedTier};
 
+#[cfg(all(test, unix))]
+#[path = "spawn_scope_retained_tests.rs"]
+mod retained_tests;
+
 /// systemd expresses a CPU quota as a percentage of one core, so one percent is
 /// ten millicores.
 const MILLICORES_PER_PERCENT: u32 = 10;
@@ -529,6 +533,22 @@ pub struct BoundCommand {
     creation_timeout: Duration,
 }
 
+/// A failed launch retains any child and observation already acquired.
+/// Callers must collect or quarantine spawned custody before releasing credit.
+#[derive(Debug, thiserror::Error)]
+#[must_use]
+pub enum RetainedSpawnFailure<T: std::fmt::Debug> {
+    #[error("payload was not spawned: {0}")]
+    NotSpawned(#[source] anyhow::Error),
+    #[error("original payload custody retained after launch failure: {error}")]
+    Spawned {
+        child: Child,
+        observation: Option<T>,
+        #[source]
+        error: anyhow::Error,
+    },
+}
+
 impl BoundCommand {
     /// Configure the payload's stdin.
     pub fn stdin(&mut self, cfg: impl Into<Stdio>) -> &mut Self {
@@ -591,14 +611,8 @@ impl BoundCommand {
         let Some(unit) = self.unit.as_deref() else {
             return Ok(child);
         };
-        let pid = child.id();
-        let outcome = watch_launcher(self.creation_timeout, || {
-            if child.try_wait()?.is_some() {
-                return Ok(LauncherProbe::Exited);
-            }
-            probe_launcher_comm(proc_root, pid, &mut names)
-        })
-        .with_context(|| format!("watching the scope launcher for '{}'", self.machine_id))?;
+        let outcome = watch_original_launcher(&mut child, &mut names, self.creation_timeout)
+            .with_context(|| format!("watching the scope launcher for '{}'", self.machine_id))?;
         if outcome == LaunchWatch::TimedOut {
             let _ = child.kill();
             let _ = child.wait();
@@ -609,6 +623,55 @@ impl BoundCommand {
             ));
         }
         Ok(child)
+    }
+
+    /// Capture original-child evidence before any scope watch can reap it.
+    /// A failed capture or watch returns the same child, without killing it.
+    pub fn spawn_retained<T: std::fmt::Debug>(
+        &mut self,
+        capture: impl FnOnce(&mut Child) -> Result<T>,
+    ) -> std::result::Result<(Child, T), RetainedSpawnFailure<T>> {
+        let proc_root = Path::new(PROC_ROOT);
+        let mut names = LauncherComm::before_spawn(proc_root);
+        let mut child = self.command.spawn().map_err(|error| {
+            RetainedSpawnFailure::NotSpawned(
+                anyhow::Error::from(error).context("spawning original payload"),
+            )
+        })?;
+        let observation = match capture(&mut child) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return Err(RetainedSpawnFailure::Spawned {
+                    child,
+                    observation: None,
+                    error,
+                });
+            }
+        };
+        let Some(unit) = self.unit.as_deref() else {
+            return Ok((child, observation));
+        };
+        let outcome = watch_original_launcher(&mut child, &mut names, self.creation_timeout)
+            .with_context(|| {
+                format!(
+                    "watching the original scope launcher for '{}'",
+                    self.machine_id
+                )
+            });
+        let error = match outcome {
+            Ok(LaunchWatch::TimedOut) => {
+                scope_creation_timeout(&self.machine_id, unit, self.creation_timeout)
+            }
+            Ok(LaunchWatch::Execed | LaunchWatch::Exited | LaunchWatch::Unobservable) => {
+                return Ok((child, observation));
+            }
+            Err(error) => error,
+        };
+        Err(RetainedSpawnFailure::Spawned {
+            child,
+            observation: Some(observation),
+            error,
+        })
     }
 
     /// Run the launch to completion and return its status.
@@ -774,6 +837,20 @@ enum LaunchWatch {
     Exited,
     Unobservable,
     TimedOut,
+}
+
+fn watch_original_launcher(
+    child: &mut Child,
+    names: &mut LauncherComm,
+    timeout: Duration,
+) -> std::io::Result<LaunchWatch> {
+    let pid = child.id();
+    watch_launcher(timeout, || {
+        if child.try_wait()?.is_some() {
+            return Ok(LauncherProbe::Exited);
+        }
+        probe_launcher_comm(Path::new(PROC_ROOT), pid, names)
+    })
 }
 
 /// Poll `probe` until the launcher stops launching or `timeout` passes.
