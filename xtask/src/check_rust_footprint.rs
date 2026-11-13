@@ -34,16 +34,14 @@ use std::process::Command;
 
 use crate::rust_source::{CommentSyntax, blank_comments};
 
-// At the upstream cf585a544 join, the contributor tree measured 1,035,770
-// SLOC and 1,305,881 physical lines. The difference from upstream was 61,035
-// first-party SLOC (including inline tests) and 7,485 test/bench SLOC. Vendored
-// and generated totals were unchanged. Round each measured total up to 100.
-// CI witness, overclaim, snapshot-owner, Yocto importer, and CLI option-source
-// tests remain measured. Leave room for concurrent main changes.
+// The c0f15d82 upstream and f7536f65 mailbox integration measured 1,037,073
+// SLOC and 1,307,270 physical lines. Of the SLOC, 901,168 first-party lines
+// include inline tests, 87,200 belong to tests and benches, 48,329 are
+// vendored and 376 generated. Keep all coverage and round up to 100.
 /// Ceiling on total SLOC, all categories.
-const MAX_TOTAL_SLOC: usize = 1_035_800;
+const MAX_TOTAL_SLOC: usize = 1_037_100;
 /// Ceiling on total physical lines, all categories.
-const MAX_TOTAL_PHYSICAL: usize = 1_305_900;
+const MAX_TOTAL_PHYSICAL: usize = 1_307_300;
 /// How far under a ceiling the tree may sit before the ceiling must drop.
 const SLACK: usize = 10_000;
 
