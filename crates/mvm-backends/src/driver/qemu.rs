@@ -571,6 +571,7 @@ impl VmmDriver for QemuDriver {
         spec: &VmmSpec,
         files: mvm_vmm::driver::prepared_disks::PreparedBootFiles<'_>,
     ) -> Result<Box<dyn RunningVm>> {
+        files.require_no_workload_root()?;
         files.require_no_data()?;
         let mvm_vmm::driver::prepared_disks::PreparedBootFiles {
             kernel,

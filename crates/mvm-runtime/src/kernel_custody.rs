@@ -163,6 +163,7 @@ impl KernelBoundLaunch {
             spec,
             mvm_vmm::driver::prepared_disks::PreparedBootFiles {
                 kernel: self.kernel.as_ref(),
+                workload_root: None,
                 writable: disks,
                 data: None,
             },
