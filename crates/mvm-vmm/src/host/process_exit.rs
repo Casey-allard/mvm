@@ -362,7 +362,10 @@ fn wait_kqueue(fd: libc::c_int, deadline: Instant) -> Result<ProcessExitWait, Pr
 }
 
 #[cfg(target_os = "linux")]
-fn wait_pidfd(fd: libc::c_int, deadline: Instant) -> Result<ProcessExitWait, ProcessExitError> {
+pub(crate) fn wait_pidfd(
+    fd: libc::c_int,
+    deadline: Instant,
+) -> Result<ProcessExitWait, ProcessExitError> {
     loop {
         let timeout = deadline.saturating_duration_since(Instant::now());
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
@@ -375,6 +378,13 @@ fn wait_pidfd(fd: libc::c_int, deadline: Instant) -> Result<ProcessExitWait, Pro
         // timeout is bounded to the platform's integer range.
         let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
         if result > 0 {
+            if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+                || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0
+            {
+                return Err(ProcessExitError::Io(io::Error::other(
+                    "invalid original process-exit descriptor event",
+                )));
+            }
             return Ok(ProcessExitWait::Exited);
         }
         if result == 0 {
@@ -416,6 +426,12 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_invalid_descriptor_is_never_an_original_process_exit() {
+        assert!(wait_pidfd(i32::MAX, Instant::now()).is_err());
+    }
 
     #[test]
     fn a_status_that_lags_its_exit_event_is_still_collected() {

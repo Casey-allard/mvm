@@ -1436,6 +1436,8 @@ impl RunningVm for HvfRunningVm {
                     return Ok(mvm_vmm::driver::traits::KernelStopOutcome {
                         timing: None,
                         hvf_exit: None,
+                        #[cfg(target_os = "linux")]
+                        fc_exit: None,
                     });
                 }
                 Err(error) => return Err(error),
@@ -1451,6 +1453,8 @@ impl RunningVm for HvfRunningVm {
         Ok(mvm_vmm::driver::traits::KernelStopOutcome {
             timing,
             hvf_exit: Some(proof),
+            #[cfg(target_os = "linux")]
+            fc_exit: None,
         })
     }
 

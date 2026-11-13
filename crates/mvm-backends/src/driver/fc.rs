@@ -50,6 +50,11 @@ mod dial;
 mod kernel;
 #[cfg(target_os = "linux")]
 pub mod original;
+
+#[cfg(target_os = "linux")]
+mod owned;
+#[cfg(target_os = "linux")]
+pub use owned::{OriginalFcNotSpawned, OwnedFcBootFailure};
 mod stop;
 pub use config::FcApiPut;
 use config::fc_drive_puts;
