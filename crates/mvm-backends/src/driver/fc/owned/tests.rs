@@ -6,6 +6,7 @@ use mvm_vmm::driver::{
 };
 use std::{
     fs::File,
+    os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     process::Stdio,
     time::Duration,
@@ -219,10 +220,82 @@ fn original_custody_survives_a_kernel_recipe_refusal_before_spawn() {
 fn child(state: &mut OwnedFcState) {
     let mut command = mvm_core::env_hygiene::helper_command("/bin/cat");
     command.stdin(Stdio::piped()).stdout(Stdio::null());
+    mvm_vmm::host::restore_image::inherit_descriptors(
+        &mut command,
+        vec![state.lease.as_ref().unwrap().holder().as_raw_fd()],
+    );
     state.begin_spawn().unwrap();
     let mut child = command.spawn().unwrap();
     let original = OriginalProcess::observe(&mut child).unwrap();
     state.record_spawn(Ok((child, original))).unwrap();
+}
+
+fn kernel_anchor(
+    lease: &PreparedHostLifetimeLease,
+    binding: HostLaunchBinding,
+) -> Arc<mvm_core::host_lifetime::HostLifetimeAnchor> {
+    mvm_core::host_lifetime::PreparedHostLifetime::bind(
+        mvm_core::host_lifetime::HostLifetimeInputs {
+            directory: lease.directory().try_clone().unwrap(),
+            holder: lease.holder().try_clone().unwrap(),
+            expected: lease.expectation().clone(),
+            binding,
+        },
+        (),
+    )
+    .unwrap()
+    .into_anchor()
+}
+
+#[test]
+fn original_kernel_observation_requires_the_same_live_authenticated_owner() {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let mut original = state(root.path());
+    let anchor = kernel_anchor(original.lease.as_ref().unwrap(), binding());
+    let mut changed = binding();
+    changed.grant_serial += 1;
+    let different_binding = kernel_anchor(original.lease.as_ref().unwrap(), changed);
+    let elsewhere = tempfile::tempdir_in("/tmp").unwrap();
+    let different_holder = kernel_anchor(&lease(elsewhere.path()), binding());
+    child(&mut original);
+    let original = Arc::new(Mutex::new(original));
+    let vm = super::super::running::FcRunningVm {
+        owned: Some(original.clone()),
+        original_report: None,
+        id: mvm_core::vm_backend::VmId("w".into()),
+        state_dir: root.path().into(),
+        pid_file: root.path().join("never-read.pid"),
+        pid: None,
+        vsock_uds: "never-opened".into(),
+        flush_via_agent: false,
+    };
+    assert!(vm.check_original_firecracker_kernel(&anchor).is_err());
+    // This component fixture begins after config peer authentication. Separate
+    // connected-peer controls exercise that authentication against real peers.
+    original.lock().unwrap().authenticated = true;
+    assert!(vm.check_original_firecracker_kernel(&anchor).is_ok());
+    assert!(vm.process_identity().unwrap().is_none());
+    assert!(
+        vm.check_original_firecracker_kernel(&different_binding)
+            .is_err()
+    );
+    assert!(
+        vm.check_original_firecracker_kernel(&different_holder)
+            .is_err()
+    );
+    let held_child = original.lock().unwrap().child.take();
+    assert!(vm.check_original_firecracker_kernel(&anchor).is_err());
+    original.lock().unwrap().child = held_child;
+    original.lock().unwrap().retired = true;
+    assert!(vm.check_original_firecracker_kernel(&anchor).is_err());
+    original.lock().unwrap().retired = false;
+    {
+        let mut held = original.lock().unwrap();
+        held.stop_original(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+    }
+    assert!(vm.check_original_firecracker_kernel(&anchor).is_err());
+    original.lock().unwrap().retired = true;
 }
 
 #[test]

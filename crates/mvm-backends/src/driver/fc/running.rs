@@ -238,6 +238,46 @@ impl RunningVm for FcRunningVm {
         )
     }
 
+    #[cfg(target_os = "linux")]
+    fn check_original_firecracker_kernel(
+        &self,
+        anchor: &mvm_core::host_lifetime::HostLifetimeAnchor,
+    ) -> Result<()> {
+        let original = self
+            .owned
+            .as_ref()
+            .context("original Firecracker owner unavailable")?
+            .lock()
+            .map_err(|_| anyhow!("original Firecracker custody poisoned"))?;
+        anyhow::ensure!(
+            original.authenticated && original.spawn_attempted && !original.retired,
+            "original Firecracker is not an authenticated active launch"
+        );
+        anyhow::ensure!(
+            &original.binding == anchor.binding(),
+            "canonical kernel belongs to a different original launch"
+        );
+        anchor.verify_current()?;
+        original.check_current()?;
+        let lifetime = original
+            .lifetime
+            .as_ref()
+            .context("original lifetime absent")?;
+        let process = lifetime.process()?;
+        let lease = lifetime.lease()?;
+        anchor.check_original_lease(lease)?;
+        anyhow::ensure!(
+            original
+                .child
+                .as_ref()
+                .is_some_and(|child| child.id() == process.pid()),
+            "original Firecracker child differs from its held process"
+        );
+        process.verify_inherited_holder(lease)?;
+        original.check_current()?;
+        anchor.verify_current()
+    }
+
     fn pause(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(original) = &self.owned {

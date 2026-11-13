@@ -588,7 +588,7 @@ impl OwnedHostAgent {
         inputs.holder.verify_current()?;
         #[cfg(target_os = "linux")]
         if let Some(limit) = address_space_limit {
-            crate::host::network_endpoint_spawn::limit_original_address_space(
+            crate::host::process_limits::limit_original_address_space(
                 &mut command,
                 limit.get(),
             )?;
