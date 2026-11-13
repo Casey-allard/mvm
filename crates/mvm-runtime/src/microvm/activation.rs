@@ -36,7 +36,7 @@ pub use mvm_vmm::host::boot_config::booted_with_universal_initramfs;
 /// round-trip itself takes ~8ms. The 30s is headroom for a loaded host, not an
 /// expectation — which matters, because a schedule sized for "a few seconds"
 /// is a schedule that cannot see 50ms. See [`activation_retry_delay`].
-const ACTIVATION_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const ACTIVATION_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Activate a workload that booted with the universal initramfs.
 ///
@@ -173,6 +173,60 @@ pub(crate) fn activate_cold_hvf(
     let env = build_activation_environment(config)?;
     let response = owner.call_unary(&GuestRequest::ActivateEnvironment(env.clone()))?;
     require_activation_ack(response, &env)
+}
+
+/// Activate only the original checked Linux application session and retain it for its signed verb.
+#[cfg(target_os = "linux")]
+pub(crate) fn activate_installed_entrypoint(
+    vm: &dyn RunningVm,
+    config: &VmStartConfig,
+    plan: &ExecutionPlan,
+    host: &ed25519_dalek::VerifyingKey,
+    until: std::time::Instant,
+) -> Result<Box<dyn mvm_vmm::driver::OriginalEntrypointChannel>> {
+    let anchor = config
+        .host_lifetime
+        .as_ref()
+        .context("original entrypoint anchor missing")?;
+    let env = build_activation_environment(config)?;
+    verify_original_verb_grant(&env, &config.name, plan, host)?;
+    anchor.check_parent_current(config, mvm_core::vm_backend::BackendKind::Firecracker)?;
+    let mut channel = vm.open_owned_entrypoint(
+        anchor.clone(),
+        mvm_vmm::driver::OriginalEntrypointIdentity {
+            host: host.to_bytes(),
+        },
+        until,
+    )?;
+    let response = channel.activate(&GuestRequest::ActivateEnvironment(env.clone()), until)?;
+    require_activation_ack(response, &env)?;
+    anchor.check_parent_current(config, mvm_core::vm_backend::BackendKind::Firecracker)?;
+    Ok(channel)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_original_verb_grant(
+    env: &ActivateEnvironment,
+    vm_name: &str,
+    plan: &ExecutionPlan,
+    host: &ed25519_dalek::VerifyingKey,
+) -> Result<()> {
+    let envelope = env
+        .verb_grant_envelope
+        .as_ref()
+        .context("installed entrypoint requires a signed boot verb grant")?;
+    envelope
+        .grant
+        .verify(host, vm_name, &plan.nonce, chrono::Utc::now())?;
+    anyhow::ensure!(
+        envelope.plan_nonce_hex == plan.nonce.as_hex()
+            && envelope.grant.not_after == plan.valid_until
+            && Some(&envelope.grant.verbs) == plan.agent_verbs.as_ref()
+            && envelope.grant.drive.is_none()
+            && envelope.grant.application_terminal.is_none(),
+        "boot verb grant differs from original scoped entrypoint plan"
+    );
+    Ok(())
 }
 
 fn require_activation_ack(response: GuestResponse, env: &ActivateEnvironment) -> Result<()> {
@@ -457,6 +511,37 @@ mod tests {
                 sig: vec![0u8; 64],
             },
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_entrypoint_requires_the_original_signed_verb_projection() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let (_env, _directory) = test_env();
+        let mut env = build_activation_environment(&base_config()).unwrap();
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let verbs = vec!["activate-environment", "run-entrypoint"]
+            .into_iter()
+            .map(|verb| mvm_core::plan::VerbId::new(verb).unwrap())
+            .collect::<Vec<_>>();
+        plan.agent_verbs = Some(verbs.clone());
+        assert!(verify_original_verb_grant(&env, "vm-late", &plan, &key.verifying_key()).is_err());
+        let mut envelope = grant_until(plan.valid_until);
+        envelope.plan_nonce_hex = plan.nonce.as_hex();
+        envelope.grant.plan_nonce = plan.nonce.clone();
+        envelope.grant.verbs = verbs;
+        envelope.grant.sig = key
+            .sign(&envelope.grant.signing_bytes())
+            .to_bytes()
+            .to_vec();
+        env.verb_grant_envelope = Some(envelope);
+        verify_original_verb_grant(&env, "vm-late", &plan, &key.verifying_key()).unwrap();
+        assert!(verify_original_verb_grant(&env, "vm-other", &plan, &key.verifying_key()).is_err());
+        let other = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        assert!(verify_original_verb_grant(&env, "vm-late", &plan, &other).is_err());
+        plan.agent_verbs.as_mut().unwrap().pop();
+        assert!(verify_original_verb_grant(&env, "vm-late", &plan, &key.verifying_key()).is_err());
     }
 
     /// The reported failure: a grant that expired before the guest checked it

@@ -315,6 +315,33 @@ impl AdmittedPlan {
         &self.signer_id
     }
 
+    /// Check the exact original parent bound into this dispatched direct Linux admission.
+    #[cfg(target_os = "linux")]
+    pub fn check_original_entrypoint(
+        &self,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<()> {
+        let same_original = self
+            .direct_owner
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|bound| std::sync::Arc::ptr_eq(&bound, owner));
+        anyhow::ensure!(
+            same_original
+                && !self.plan.stream_retention.persists()
+                && self.plan.stream_edges.is_empty()
+                && self.dispatched
+                && self.backend == Some(BackendKind::Firecracker)
+                && self
+                    .plan
+                    .agent_verbs
+                    .as_ref()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == "run-entrypoint")),
+            "entrypoint differs from original signed direct launch"
+        );
+        Ok(())
+    }
+
     /// The canonical signed envelope, for a consumer that re-verifies rather
     /// than trusting this process.
     #[must_use]

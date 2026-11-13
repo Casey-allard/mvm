@@ -915,6 +915,21 @@ impl AnyBackend {
         }
     }
 
+    /// Invoke the single signed guest entrypoint through the retained direct launch owner.
+    #[cfg(target_os = "linux")]
+    pub fn run_owned_entrypoint(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: std::time::Instant,
+        event: &mut dyn FnMut(&mvm_agentd::vsock::EntrypointEvent),
+    ) -> anyhow::Result<mvm_agentd::vsock::EntrypointEvent> {
+        match self {
+            Self::Firecracker(runner) => runner.run_owned_entrypoint(id, owner, until, event),
+            _ => anyhow::bail!("original installed entrypoint unavailable"),
+        }
+    }
+
     /// Wait for the original workload's bounded report using the live launch owner.
     #[cfg(unix)]
     pub fn wait_owned_until(

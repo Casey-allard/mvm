@@ -904,8 +904,18 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 owner.check_parent_current(inputs.config, self.driver.kind())?;
             }
             trace.mark("admission_durable");
-            crate::microvm::activate_workload(&*vm, inputs.config)
-                .context("activate workload after boot")?;
+            #[cfg(target_os = "linux")]
+            let retained = if let Some(slot) = installed.as_ref() {
+                slot.activate_entrypoint(&*vm, inputs.config, &spec.cmdline)?
+            } else {
+                false
+            };
+            #[cfg(not(target_os = "linux"))]
+            let retained = false;
+            if !retained {
+                crate::microvm::activate_workload(&*vm, inputs.config)
+                    .context("activate workload after boot")?;
+            }
         }
         trace.mark("activate_workload");
 

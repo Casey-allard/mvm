@@ -188,6 +188,19 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
         Ok(slot)
     }
 
+    /// Invoke only the already-activated signed entrypoint on this original slot.
+    #[cfg(target_os = "linux")]
+    pub fn run_owned_entrypoint(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: Instant,
+        event: &mut dyn FnMut(&mvm_agentd::vsock::EntrypointEvent),
+    ) -> Result<mvm_agentd::vsock::EntrypointEvent> {
+        self.original_installed_slot(id, owner)?
+            .run_entrypoint(until, event)
+    }
+
     /// Observe only the originally retained native workload, until the supplied deadline.
     #[cfg(unix)]
     pub fn wait_owned_until(

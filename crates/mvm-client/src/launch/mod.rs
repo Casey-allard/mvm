@@ -1133,6 +1133,58 @@ impl LocalBackend {
             .map_err(crate::local::backend_err)
     }
 
+    /// Invoke the signed entrypoint once over the control session that activated this guest.
+    /// Requires an ephemeral plan with no stream edges. The observer receives
+    /// live guest frames and must return promptly. The absolute deadline bounds
+    /// original transport I/O; arbitrary caller callbacks run synchronously.
+    #[cfg(target_os = "linux")]
+    pub fn run_owned_entrypoint(
+        &self,
+        outcome: &LaunchOutcome,
+        until: std::time::Instant,
+        observer: &mut dyn crate::entrypoint::CallObserver,
+    ) -> Result<crate::entrypoint::CallOutcome> {
+        use crate::entrypoint::{
+            CallOutcome, CallTerminal, CaptureReport, RecordedDivergence, route_event,
+        };
+        let anchor = self.original_outcome_anchor(outcome)?;
+        outcome
+            .admitted
+            .check_original_entrypoint(anchor)
+            .map_err(crate::local::backend_err)?;
+        let name = &anchor.binding().vm_name;
+        let id = VmId(name.clone());
+        crate::guest::emit_vsock_rpc_audit(
+            name,
+            &mvm_agentd::vsock::GuestRequest::RunEntrypoint {
+                stdin: Vec::new(),
+                timeout_secs: 0,
+                env: Vec::new(),
+                stream_input: false,
+            },
+        );
+        let mut capture = mvm_hostd::stream::EntrypointSink::unrecorded();
+        let recorded = capture.is_recorded();
+        let mut divergence = RecordedDivergence::default();
+        observer.dispatching(name, false);
+        let terminal = self
+            .backend
+            .run_owned_entrypoint(&id, anchor, until, &mut |event| {
+                route_event(event, &mut capture, &mut divergence, observer);
+            });
+        drop(capture);
+        observer.dispatched();
+        let result = CallOutcome {
+            terminal: CallTerminal::from_event(&terminal.map_err(crate::local::backend_err)?),
+            capture: Some(CaptureReport {
+                recorded,
+                divergence,
+            }),
+        };
+        observer.call_finished(name, &result);
+        Ok(result)
+    }
+
     /// Wait until the absolute deadline for this original guest's workload exit report.
     /// The report is separate from stopping and collecting its VMM and endpoint.
     #[cfg(unix)]

@@ -50,7 +50,15 @@ impl std::fmt::Debug for OwnedRetirement {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[path = "installed/entrypoint.rs"]
+mod entrypoint;
+
 struct Custody {
+    #[cfg(target_os = "linux")]
+    entrypoint: Option<Box<dyn mvm_vmm::driver::OriginalEntrypointChannel>>,
+    #[cfg(target_os = "linux")]
+    entrypoint_busy: bool,
     vm: Option<Box<dyn RunningVm>>,
     failure: Option<anyhow::Error>,
     endpoint: Option<crate::workload_runner::claim::EndpointHandle>,
@@ -92,6 +100,10 @@ impl InstalledSlots {
             id: VmId(owner.binding().vm_name.clone()),
             owner: Arc::clone(owner),
             state: Mutex::new(Some(Custody {
+                #[cfg(target_os = "linux")]
+                entrypoint: None,
+                #[cfg(target_os = "linux")]
+                entrypoint_busy: false,
                 vm: None,
                 failure: None,
                 endpoint: None,
@@ -296,6 +308,11 @@ impl InstalledSlot {
     pub(super) fn stop(&self, streamer: &dyn ConsoleStreamer) -> Result<()> {
         let mut guard = self.access()?;
         let state = guard.as_ref().context("installed custody unavailable")?;
+        #[cfg(target_os = "linux")]
+        anyhow::ensure!(
+            !state.entrypoint_busy,
+            "original entrypoint is still in use"
+        );
         if state.retired {
             return Ok(());
         }
@@ -621,6 +638,16 @@ impl RunningVm for InstalledVmView {
         &self,
     ) -> Result<Option<mvm_core::protocol::hvf_control::HvfInstance>> {
         self.0.with_vm(|vm| vm.authenticated_hvf_instance())
+    }
+    #[cfg(target_os = "linux")]
+    fn open_owned_entrypoint(
+        &self,
+        anchor: Arc<HostLifetimeAnchor>,
+        identity: mvm_vmm::driver::OriginalEntrypointIdentity,
+        until: Instant,
+    ) -> Result<Box<dyn mvm_vmm::driver::OriginalEntrypointChannel>> {
+        self.0
+            .with_vm(|vm| vm.open_owned_entrypoint(anchor, identity, until))
     }
     #[cfg(target_os = "linux")]
     fn check_original_firecracker_kernel(&self, anchor: &HostLifetimeAnchor) -> Result<()> {
