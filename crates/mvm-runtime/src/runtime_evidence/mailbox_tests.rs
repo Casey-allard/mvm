@@ -9,7 +9,9 @@ fn plan() -> mvm_core::plan::ExecutionPlan {
     let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
     plan.mailbox = Some(MailboxGrant {
         mailbox: MailboxId::from_bytes([4; 32]),
-        authority_key: [5; 32],
+        authority_key: ed25519_dalek::SigningKey::from_bytes(&[5; 32])
+            .verifying_key()
+            .to_bytes(),
         epoch: ExecutionEpoch::new(1).unwrap(),
         report: None,
         retention: None,
