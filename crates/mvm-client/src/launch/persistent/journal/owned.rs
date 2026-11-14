@@ -5,6 +5,8 @@ use mvm_core::vm_backend::{BackendKind, VmId};
 use mvm_runtime::AnyBackend;
 use std::sync::Arc;
 mod agent_verbs;
+#[cfg(all(test, feature = "test-support"))]
+mod unused_tests;
 
 fn check_start_binding(
     backend: &AnyBackend,
@@ -574,7 +576,7 @@ impl crate::LocalBackend {
             no_helper: None,
         });
         let result = self
-            .start_owned_journal(name, grant, journal, &mut context)
+            .start_owned_journal(name, grant, Some(journal), &mut context)
             .await;
         match result {
             Ok(machine) => Ok(OwnedJournalStart {
@@ -593,7 +595,7 @@ impl crate::LocalBackend {
         &self,
         name: &str,
         grant: MailboxGrant,
-        journal: &mut InstalledJournal<'_>,
+        journal: Option<&mut InstalledJournal<'_>>,
         context: &mut JournalStartContext,
     ) -> Result<crate::launch::machine_start::MachineStart> {
         use crate::launch::machine_start;
@@ -620,7 +622,7 @@ impl crate::LocalBackend {
                 has_ad_hoc_argv: false,
                 mailbox: Some(grant),
             },
-            Some(journal),
+            journal,
             &reservation,
             Some(context),
         )?;
@@ -674,7 +676,18 @@ mod tests {
         assert!(output.stdout.is_empty() && output.stderr.is_empty());
     }
 
-    fn preparation(root: &std::path::Path, backend: BackendKind) -> PreparedHostLifetime {
+    pub(super) fn preparation(
+        root: &std::path::Path,
+        backend: BackendKind,
+    ) -> PreparedHostLifetime {
+        preparation_with_owner(root, backend, ())
+    }
+
+    pub(super) fn preparation_with_owner(
+        root: &std::path::Path,
+        backend: BackendKind,
+        owner: impl Send + Sync + 'static,
+    ) -> PreparedHostLifetime {
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(root.join("state"), b"live").unwrap();
         fs::set_permissions(root.join("state"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -706,7 +719,7 @@ mod tests {
                     memory_mib: 128,
                 },
             },
-            (),
+            owner,
         )
         .unwrap()
     }
