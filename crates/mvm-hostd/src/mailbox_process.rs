@@ -756,7 +756,9 @@ fn spawn_with_original_tracked<T>(
     let owner_dir = original_journal::owner_dir(&mvm_core::config::mvm_keys_dir(), vm_name)?;
     let guard = original_journal::claim_launch(&state_dir, &owner_dir, exclusive)?;
     if let Some(attempt) = attempt.as_deref_mut() {
-        attempt.arm(plan, &state_dir, guard.clone())?;
+        attempt
+            .arm(plan, &state_dir, guard.clone())
+            .map_err(std::io::Error::other)?;
     }
     let mut config = build_config(&mvm_core::config::mvm_keys_dir(), grant, &state_dir, route)?;
     let started = (|| {

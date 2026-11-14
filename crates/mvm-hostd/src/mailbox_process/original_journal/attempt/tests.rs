@@ -25,7 +25,9 @@ fn fixture() -> (
         incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,
         mailbox: MailboxId::from_bytes([1; 32]),
-        authority_key: [2; 32],
+        authority_key: ed25519_dalek::SigningKey::from_bytes(&[2; 32])
+            .verifying_key()
+            .to_bytes(),
         epoch: ExecutionEpoch::new(1).unwrap(),
         report: None,
         retention: Some(MailboxRetentionPolicy::new(1000).unwrap()),
