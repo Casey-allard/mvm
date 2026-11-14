@@ -29,7 +29,7 @@ fn check_start_binding(
 
 pub(crate) struct JournalStartContext {
     original: Arc<crate::LocalBackend>,
-    anchor: Arc<HostLifetimeAnchor>,
+    lifetime: Option<JournalLifetime>,
     boot: Option<Box<super::super::PreparedPersistentBoot>>,
     support: Option<Box<JournalSupport>>,
     retired: bool,
@@ -40,6 +40,11 @@ pub(crate) struct JournalStartContext {
     no_helper: Option<mvm_hostd::mailbox_process::original_journal::NoHelperStart>,
 }
 
+enum JournalLifetime {
+    Unused(Box<PreparedHostLifetime>),
+    Anchored(Arc<HostLifetimeAnchor>),
+}
+
 struct JournalSupport {
     _backend: AnyBackend,
     _config: mvm_core::vm_backend::VmStartConfig,
@@ -48,6 +53,77 @@ struct JournalSupport {
 }
 
 impl JournalStartContext {
+    fn new(original: Arc<crate::LocalBackend>, lifetime: PreparedHostLifetime) -> Self {
+        Self {
+            original,
+            lifetime: Some(JournalLifetime::Unused(Box::new(lifetime))),
+            boot: None,
+            support: None,
+            retired: false,
+            retirement: None,
+            parent_finished: false,
+            native_id: None,
+            helper_attempt: None,
+            no_helper: None,
+        }
+    }
+
+    fn anchor(&self) -> Result<&Arc<HostLifetimeAnchor>> {
+        match &self.lifetime {
+            Some(JournalLifetime::Anchored(anchor)) => Ok(anchor),
+            Some(JournalLifetime::Unused(_)) | None => {
+                anyhow::bail!("original journal preparation has not been entered")
+            }
+        }
+    }
+
+    fn enter_preparation(&mut self) -> Result<Arc<HostLifetimeAnchor>> {
+        ensure!(
+            self.has_no_start_effects(),
+            "original journal startup custody is not unused"
+        );
+        match self.lifetime.take() {
+            Some(JournalLifetime::Unused(prepared)) => {
+                let anchor = prepared.into_anchor();
+                self.lifetime = Some(JournalLifetime::Anchored(Arc::clone(&anchor)));
+                Ok(anchor)
+            }
+            Some(JournalLifetime::Anchored(anchor)) => {
+                self.lifetime = Some(JournalLifetime::Anchored(anchor));
+                anyhow::bail!("original journal preparation already entered")
+            }
+            None => anyhow::bail!("original journal lifetime custody missing"),
+        }
+    }
+
+    fn has_no_start_effects(&self) -> bool {
+        !self.retired
+            && !self.parent_finished
+            && self.boot.is_none()
+            && self.support.is_none()
+            && self.native_id.is_none()
+            && self.helper_attempt.is_none()
+            && self.no_helper.is_none()
+            && self.retirement.is_none()
+    }
+
+    fn take_unused(&mut self) -> Option<Box<PreparedHostLifetime>> {
+        if !self.has_no_start_effects() {
+            return None;
+        }
+        match self.lifetime.take() {
+            Some(JournalLifetime::Unused(prepared)) => {
+                self.retired = true;
+                Some(prepared)
+            }
+            Some(JournalLifetime::Anchored(anchor)) => {
+                self.lifetime = Some(JournalLifetime::Anchored(anchor));
+                None
+            }
+            None => None,
+        }
+    }
+
     pub(crate) fn agent_verbs(&self, requested: &[String]) -> Result<Vec<String>> {
         agent_verbs::select(requested)
     }
@@ -63,7 +139,7 @@ impl JournalStartContext {
             self.boot.is_none(),
             "original journal boot already prepared"
         );
-        let anchor = Arc::clone(&self.anchor);
+        let anchor = self.enter_preparation()?;
         self.boot = Some(Box::new(super::super::prepare_persistent_boot_with_owner(
             params,
             Some(journal),
@@ -121,17 +197,14 @@ impl JournalStartContext {
                     &boot.admission.admitted,
                     &self.original.backend,
                     &id,
-                    &self.anchor,
+                    &anchor,
                 ),
                 JournalStartDisposition::NoExec => {
                     self.no_helper = Some(attempt.take_no_exec()?);
                     (|| {
-                        self.original.backend.stop_owned(&id, &self.anchor)?;
-                        self.retirement = Some(
-                            self.original
-                                .backend
-                                .take_owned_retirement(&id, &self.anchor)?,
-                        );
+                        self.original.backend.stop_owned(&id, &anchor)?;
+                        self.retirement =
+                            Some(self.original.backend.take_owned_retirement(&id, &anchor)?);
                         Ok(())
                     })()
                 }
@@ -140,9 +213,9 @@ impl JournalStartContext {
                         &boot.admission.admitted,
                         &self.original.backend,
                         &id,
-                        &self.anchor,
+                        &anchor,
                     )
-                    .or_else(|_| self.original.backend.stop_owned(&id, &self.anchor)),
+                    .or_else(|_| self.original.backend.stop_owned(&id, &anchor)),
             };
             self.helper_attempt = Some(attempt);
             return match rollback {
@@ -158,7 +231,7 @@ impl JournalStartContext {
         #[cfg(target_os = "linux")]
         let ready = self.original.backend.check_owned_journal_ready(
             &id,
-            &self.anchor,
+            &anchor,
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         );
         #[cfg(not(target_os = "linux"))]
@@ -169,7 +242,7 @@ impl JournalStartContext {
                     &boot.admission.admitted,
                     &self.original.backend,
                     &id,
-                    &self.anchor,
+                    &anchor,
                 )
                 .context("owned journal readiness failed and original rollback was unresolved")?;
             return Err(error.context("original owned journal readiness failed"));
@@ -184,7 +257,7 @@ impl JournalStartContext {
                     &boot.admission.admitted,
                     &self.original.backend,
                     &id,
-                    &self.anchor,
+                    &anchor,
                 )
             },
             || boot.prepared_volumes.commit(),
@@ -215,7 +288,7 @@ impl Drop for JournalStartContext {
             // reservations and uncommitted volume custody for reconciliation.
             std::mem::forget((
                 Arc::clone(&self.original),
-                Arc::clone(&self.anchor),
+                self.lifetime.take(),
                 self.boot.take(),
                 self.support.take(),
                 self.retirement.take(),
@@ -262,10 +335,9 @@ impl OwnedJournalStart {
             .machine
             .as_ref()
             .context("original journal admission missing")?;
-        machine
-            .admitted
-            .check_original_entrypoint(&context.anchor)?;
-        let name = &context.anchor.binding().vm_name;
+        let anchor = context.anchor()?;
+        machine.admitted.check_original_entrypoint(anchor)?;
+        let name = &anchor.binding().vm_name;
         crate::guest::emit_vsock_rpc_audit(
             name,
             &mvm_agentd::vsock::GuestRequest::RunEntrypoint {
@@ -283,7 +355,7 @@ impl OwnedJournalStart {
         observer.dispatching(name, false);
         let terminal = context.original.backend.run_owned_journal_entrypoint(
             &VmId(name.clone()),
-            &context.anchor,
+            anchor,
             input,
             until,
             &mut |event| {
@@ -309,9 +381,11 @@ impl OwnedJournalStart {
             .expect("original machine admission retained")
     }
     pub fn retains_parent_owner<T: Send + Sync + 'static>(&self, owner: &Arc<T>) -> bool {
-        self.context
-            .as_ref()
-            .is_some_and(|context| context.anchor.retains_parent_owner(owner))
+        self.context.as_ref().is_some_and(|context| {
+            context
+                .anchor()
+                .is_ok_and(|anchor| anchor.retains_parent_owner(owner))
+        })
     }
 
     /// Publish retained telemetry through its original parent before releasing
@@ -360,7 +434,7 @@ fn finish_owned_journal(
     ) -> Result<()>,
 ) -> Result<mvm_hostd::mailbox_process::original_journal::JournalStopOutcome> {
     let original = Arc::clone(&context.original);
-    let anchor = Arc::clone(&context.anchor);
+    let anchor = Arc::clone(context.anchor()?);
     let id = VmId(anchor.binding().vm_name.clone());
     let outcome = journal.stop_and_collect_owned(
         &id.0,
@@ -465,17 +539,18 @@ impl OwnedJournalStartFailure {
             .native_id
             .as_ref()
             .context("original native dispatch missing")?;
+        let anchor = Arc::clone(context.anchor()?);
         ensure!(
-            id.0 == context.anchor.binding().vm_name,
+            id.0 == anchor.binding().vm_name,
             "original native identity differs"
         );
         if context.retirement.is_none() {
-            context.original.backend.stop_owned(id, &context.anchor)?;
+            context.original.backend.stop_owned(id, &anchor)?;
             context.retirement = Some(
                 context
                     .original
                     .backend
-                    .take_owned_retirement(id, &context.anchor)?,
+                    .take_owned_retirement(id, &anchor)?,
             );
         }
         proof.check_original(plan)?;
@@ -499,12 +574,36 @@ impl OwnedJournalStartFailure {
         context.retired = true;
         Ok(NoHelperRetirement { _private: () })
     }
-    pub fn into_unused(self) -> std::result::Result<PreparedHostLifetime, Self> {
-        if self.context.is_some() || self.unused.is_none() {
+    /// Return only the original preparation that never entered journal setup.
+    /// The original parent still owns any cancellation and credit release.
+    pub fn into_unused(mut self) -> std::result::Result<PreparedHostLifetime, Self> {
+        if self.context.is_none() {
+            return match self.unused.take() {
+                Some(unused) => Ok(*unused),
+                None => Err(self),
+            };
+        }
+        if self.unused.is_some() {
             return Err(self);
         }
-        let Self { unused, .. } = self;
-        Ok(*unused.expect("checked unused original preparation"))
+        match self
+            .context
+            .as_mut()
+            .and_then(|context| context.take_unused())
+        {
+            Some(unused) => Ok(*unused),
+            None => Err(self),
+        }
+    }
+
+    /// Return the SDK proof accepted by the original parent's cancellation path.
+    /// Wrapping preserves custody; it neither cancels nor releases credit.
+    pub fn into_unused_for_parent(
+        self,
+    ) -> std::result::Result<crate::UnusedHostLifetimePreparation, Self> {
+        self.into_unused().map(
+            crate::launch::host_lifetime_preflight::UnusedHostLifetimePreparation::from_uninvoked,
+        )
     }
 
     pub fn stop_and_collect(
@@ -563,18 +662,7 @@ impl crate::LocalBackend {
                 unused: Some(Box::new(lifetime)),
             });
         }
-        let mut context = Box::new(JournalStartContext {
-            original: Arc::clone(self),
-            anchor: lifetime.into_anchor(),
-            boot: None,
-            support: None,
-            retired: false,
-            retirement: None,
-            parent_finished: false,
-            native_id: None,
-            helper_attempt: None,
-            no_helper: None,
-        });
+        let mut context = Box::new(JournalStartContext::new(Arc::clone(self), lifetime));
         let result = self
             .start_owned_journal(name, grant, Some(journal), &mut context)
             .await;
@@ -645,6 +733,7 @@ mod tests {
     };
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn journal_call_refuses_oversized_input_before_consulting_native_custody() {
         let mut owner = OwnedJournalStart {
             machine: None,
@@ -663,6 +752,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn journal_call_refuses_expired_deadline_before_consulting_native_custody() {
         let mut owner = OwnedJournalStart {
             machine: None,

@@ -78,10 +78,23 @@ default. Workload transcript retention is separate from durable mailbox data:
 this selection changes neither the mailbox grant nor message durability,
 receipt, admission or retry semantics.
 
-Pure preflight refusals can return the unused preparation. Converted failures
-retain the actual backend, anchor and prepared custody; they do not establish
-that no effects occurred. Abandoning a successful or converted owner is not
-retirement and conservatively retains its original resources and admission.
+The SDK retains the original unconverted preparation while reserving the named
+lifecycle, loading and checking the stopped definition, validating sidecars and
+resolving the image. An early refusal can return that same preparation through
+`OwnedJournalStartFailure::into_unused`. `into_unused_for_parent` applies the
+same extraction guard and returns the existing opaque SDK proof accepted by
+the original parent's cancellation path. Neither operation releases credit,
+reconstructs an owner or attests that earlier filesystem/image-resolution
+effects were undone; their existing owners remain responsible for rollback.
+
+Before entering journal preparation or exposing its anchor to a callback or
+config, the SDK irreversibly converts the preparation to its original anchor.
+Every retained boot, native, helper, retirement or completion state refuses
+unused extraction. Converted failures retain the actual backend, anchor and
+prepared custody even when preparation failed before producing a boot or VM
+ID; they do not establish that no effects occurred. Abandoning either an unused
+context or a successful/converted owner is not retirement and conservatively
+retains its original lifetime, resources and admission.
 Recovery before an original journal helper exists still requires a separate
 positive disposition transaction; preservation alone is not successful cleanup.
 

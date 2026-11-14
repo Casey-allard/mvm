@@ -1,17 +1,30 @@
-//! Typed custody for the four pure installed-launch preflight refusals.
+//! Original unused-preparation custody returned by canonical SDK refusal paths.
 use mvm_core::{
     client::MvmError,
     host_lifetime::{HostLaunchBinding, PreparedHostLifetime},
 };
 use std::{fmt, sync::Arc};
 
-/// The exact preparation returned before conversion or canonical invocation.
+/// The exact preparation returned before anchor conversion or journal setup.
+/// This proves no workload dispatch through that path, not that earlier image
+/// resolution or filesystem preparation had no effects. Their owners still
+/// govern rollback, and only the original parent may cancel its reservation.
 /// There is no public constructor, owner getter, serialization or Clone.
+///
+/// ```compile_fail
+/// fn fabricate(prepared: mvm_core::host_lifetime::PreparedHostLifetime) {
+///     let _ = mvm_client::UnusedHostLifetimePreparation::from_uninvoked(prepared);
+/// }
+/// ```
 #[must_use = "retain for an explicit original-parent cancellation or retry"]
 pub struct UnusedHostLifetimePreparation {
     lifetime: PreparedHostLifetime,
 }
 impl UnusedHostLifetimePreparation {
+    pub(super) fn from_uninvoked(lifetime: PreparedHostLifetime) -> Self {
+        Self { lifetime }
+    }
+
     pub fn binding(&self) -> &HostLaunchBinding {
         self.lifetime.binding()
     }
@@ -42,7 +55,9 @@ impl HostLifetimeLaunchFailure {
     pub(super) fn unused(error: MvmError, lifetime: PreparedHostLifetime) -> Self {
         Self {
             error,
-            unused: Some(Box::new(UnusedHostLifetimePreparation { lifetime })),
+            unused: Some(Box::new(UnusedHostLifetimePreparation::from_uninvoked(
+                lifetime,
+            ))),
         }
     }
     pub(super) fn converted(error: MvmError) -> Self {
