@@ -338,6 +338,10 @@ pub(super) fn start_machine_spec_with_journal_context(
     };
     #[cfg(unix)]
     let admitted = if let Some(installed) = installed {
+        let boot_params = PersistentImageStartParams {
+            agent_verb: installed.agent_verbs(&spec.agent_verb)?,
+            ..boot_params
+        };
         installed.start(boot_params, journal, fresh_state)?
     } else {
         persistent::start_persistent(boot_params, journal, fresh_state)?

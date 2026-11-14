@@ -4,6 +4,7 @@ use mvm_core::host_lifetime::{HostLifetimeAnchor, PreparedHostLifetime};
 use mvm_core::vm_backend::{BackendKind, VmId};
 use mvm_runtime::AnyBackend;
 use std::sync::Arc;
+mod agent_verbs;
 
 fn check_start_binding(
     backend: &AnyBackend,
@@ -42,6 +43,10 @@ struct JournalSupport {
 }
 
 impl JournalStartContext {
+    pub(crate) fn agent_verbs(&self, requested: &[String]) -> Result<Vec<String>> {
+        agent_verbs::select(requested)
+    }
+
     pub(crate) fn start(
         &mut self,
         params: super::super::PersistentImageStartParams<'_>,
