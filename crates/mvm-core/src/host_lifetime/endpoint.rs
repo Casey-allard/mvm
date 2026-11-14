@@ -309,6 +309,31 @@ impl PreparedEndpointHandoff {
         self.check_current()
     }
 
+    /// Match a collector-only program to the original deny-all admission.
+    /// This grants no egress, new reservation or retained-file disposal authority.
+    pub fn check_telemetry_only(&self, redaction: &crate::policy::RedactionPolicy) -> Result<()> {
+        self.check_current()?;
+        let projection = self.partition.projection();
+        ensure!(
+            projection.profile == 1 && projection.store.is_none(),
+            "original collector partition differs"
+        );
+        let admission = self
+            .anchor
+            .admitted
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original admission poisoned"))?;
+        ensure!(
+            admission
+                .as_ref()
+                .and_then(|record| record.collector_redaction.as_ref())
+                == Some(redaction),
+            "collector inputs differ from original deny-all admission"
+        );
+        drop(admission);
+        self.check_current()
+    }
+
     /// Verify the network inputs against the opaque admission held by this handoff.
     pub fn check_direct_network(
         &self,

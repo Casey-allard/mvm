@@ -53,6 +53,7 @@ pub use installed::{
     InstalledEndpointChild, InstalledEndpointLease, InstalledGuestWake, InstalledHostServices,
     InstalledTelemetryRecords, installed_endpoint_bootstrap_requirement,
     spawn_network_endpoint_installed, spawn_network_endpoint_installed_registered,
+    spawn_telemetry_collector_installed_registered,
 };
 use owned::endpoint_command;
 pub use owned::{

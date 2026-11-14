@@ -950,4 +950,6 @@ mod registered_prepare {
         );
         Ok(())
     }
+
+    mod telemetry_tests;
 }

@@ -28,6 +28,8 @@ use std::{
 use zeroize::Zeroizing;
 
 mod audit;
+mod collector;
+pub use collector::spawn_telemetry_collector_installed_registered;
 mod bootstrap;
 mod producer;
 mod records;
@@ -259,9 +261,24 @@ fn validate_installed_proxy(proxy: Option<&EgressProxySpawnConfig>) -> Result<()
 /// Spawn only through the existing canonical endpoint binary/config path while
 /// retaining the original typed partition and holder through terminal cleanup.
 pub fn spawn_network_endpoint_installed_registered(
+    params: SubstitutionSpawnParams<'_>,
+    handoff: PreparedEndpointHandoff,
+    original: &InstalledHostServices<'_>,
+) -> Result<OwnedEndpoint> {
+    spawn_registered(params, handoff, original, RegisteredProgram::Network)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegisteredProgram {
+    Network,
+    Collector,
+}
+
+fn spawn_registered(
     mut params: SubstitutionSpawnParams<'_>,
     handoff: PreparedEndpointHandoff,
     original: &InstalledHostServices<'_>,
+    program: RegisteredProgram,
 ) -> Result<OwnedEndpoint> {
     let deadline = Instant::now() + STARTUP_LIMIT;
     if !params.telemetry {
@@ -279,7 +296,12 @@ pub fn spawn_network_endpoint_installed_registered(
     let projection = handoff.partition().projection();
     if params.lifetime != EndpointLifetime::Launcher
         || params.vm_name != projection.binding.vm_name
-        || projection.profile != 2
+        || projection.profile
+            != if program == RegisteredProgram::Network {
+                2
+            } else {
+                1
+            }
         || projection.limits.host_metadata_bytes < INSTALLED_BOOTSTRAP_MIN_BYTES
         || params.state_dir.as_os_str().len() > 4096
         || !params.ingress.is_empty()
@@ -287,61 +309,71 @@ pub fn spawn_network_endpoint_installed_registered(
     {
         bail!("installed endpoint shape or declared resource floor unsupported")
     }
-    let identity = params
-        .flowmux_identity
-        .as_ref()
-        .context("installed endpoint identity missing")?;
-    if identity.session_id != hex::encode(projection.session) {
-        bail!("installed endpoint canonical session differs")
+    if program == RegisteredProgram::Network {
+        let identity = params
+            .flowmux_identity
+            .as_ref()
+            .context("installed endpoint identity missing")?;
+        if identity.session_id != hex::encode(projection.session) {
+            bail!("installed endpoint canonical session differs")
+        }
+        let policy = params
+            .network_policy
+            .context("installed endpoint policy missing")?;
+        let plan = params
+            .admitted_network_plan
+            .as_ref()
+            .context("installed endpoint original admitted facts missing")?;
+        if plan.plan_id.0 != projection.admitted_plan_id || policy.payload_mapping().is_none() {
+            bail!("installed endpoint differs from original admitted mapping")
+        }
+        handoff.partition().check_owned_payload_store_resources()?;
+        let settings = original
+            .registration
+            .installed_endpoint_settings(original.registrar, &original.params)?;
+        let direct = EgressProxySpawnConfig::default();
+        let proxy = match settings {
+            InstalledEndpointSettings::ResolvedDirect => &direct,
+            InstalledEndpointSettings::ResolvedConfigured(proxy) => proxy,
+        };
+        validate_installed_proxy(Some(proxy))?;
+        if params
+            .egress_proxy
+            .as_ref()
+            .is_some_and(|supplied| supplied != proxy)
+        {
+            bail!("installed endpoint proxy differs from original settings");
+        }
+        params.egress_proxy = Some(proxy.clone());
+        params.session_marker = Some(params.state_dir.join(SUBST_SESSION_FILE));
+    } else {
+        collector::check_shape(&params, &handoff)?;
     }
-    let policy = params
-        .network_policy
-        .context("installed endpoint policy missing")?;
-    let plan = params
-        .admitted_network_plan
-        .as_ref()
-        .context("installed endpoint original admitted facts missing")?;
-    if plan.plan_id.0 != projection.admitted_plan_id || policy.payload_mapping().is_none() {
-        bail!("installed endpoint differs from original admitted mapping")
-    }
-    handoff.partition().check_owned_payload_store_resources()?;
     let env_path = mvm_core::config::vm_substitution_env_path(params.vm_name);
     owned::refuse_existing_evidence(&params, &env_path)?;
-    // Installed embeddings resolve the canonical operator table/environment
-    // under their original retained credit. Never allocate an unbounded
-    // ambient variable or operator TOML here, and never invent direct egress.
-    let settings = original
-        .registration
-        .installed_endpoint_settings(original.registrar, &original.params)?;
-    let direct = EgressProxySpawnConfig::default();
-    let proxy = match settings {
-        InstalledEndpointSettings::ResolvedDirect => &direct,
-        InstalledEndpointSettings::ResolvedConfigured(proxy) => proxy,
-    };
-    validate_installed_proxy(Some(proxy))?;
-    if params
-        .egress_proxy
-        .as_ref()
-        .is_some_and(|supplied| supplied != proxy)
-    {
-        bail!("installed endpoint proxy differs from original settings");
-    }
-    params.egress_proxy = Some(proxy.clone());
-    params.session_marker = Some(params.state_dir.join(SUBST_SESSION_FILE));
     let metadata = projection.limits.host_metadata_bytes;
     let telemetry_template = super::collector::TelemetrySection::owned(
         params.tenant,
         params.state_dir,
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     )?;
-    let config = encode_config_with_telemetry_credit(&params, &telemetry_template, metadata)?;
+    let config = program.encode(&params, &telemetry_template, metadata)?;
     original.check_endpoint(&params)?;
-    // The canonical digest and proxy parser run only after the original
-    // partition has passed the bounded config's full instance requirement.
-    plan.validate_for(policy, params.tenant, params.vm_name)?;
-    handoff.check_direct_network(plan, &params.network_limits, params.redaction)?;
-    if let Some(proxy) = &params.egress_proxy {
-        proxy.resolve()?;
+    // The full bounded instance quote precedes canonical policy hashing and
+    // proxy parsing; the bootstrap floor alone does not fund those operations.
+    if program == RegisteredProgram::Network {
+        let policy = params
+            .network_policy
+            .context("installed endpoint policy missing")?;
+        let plan = params
+            .admitted_network_plan
+            .as_ref()
+            .context("installed endpoint original admitted facts missing")?;
+        plan.validate_for(policy, params.tenant, params.vm_name)?;
+        handoff.check_direct_network(plan, &params.network_limits, params.redaction)?;
+        if let Some(proxy) = &params.egress_proxy {
+            proxy.resolve()?;
+        }
     }
     let audit = original
         .registration
@@ -364,8 +396,11 @@ pub fn spawn_network_endpoint_installed_registered(
         let key =
             Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(key.expose_bytes()));
         let telemetry = telemetry_template.with_key(&key)?;
-        let config = encode_config_with_telemetry_credit(&params, &telemetry, metadata)?;
+        let config = program.encode(&params, &telemetry, metadata)?;
         preparation.check_current(original, &params, deadline)?;
+        if program == RegisteredProgram::Collector {
+            collector::check_shape(&params, &preparation.custody().handoff)?;
+        }
         let bin = resolve_network_endpoint_path()?;
         preparation.check_current(original, &params, deadline)?;
         let log = owned::create_evidence(&endpoint_stderr_log_path(params.state_dir))?;
@@ -843,9 +878,17 @@ impl InstalledEndpointChild {
             struct Tenant<'a> {
                 tenant_id: &'a str,
             }
-            let tenant: Tenant<'_> = serde_json::from_str(prepared.config.get())?;
-            if tenant.tenant_id != audit.tenant() {
-                bail!("installed audit tenant differs from endpoint config");
+            if prepared.projection.profile == 1 {
+                collector::check_audit_config(
+                    prepared.config.get(),
+                    audit,
+                    &prepared.projection.binding.vm_name,
+                )?;
+            } else {
+                let tenant: Tenant<'_> = serde_json::from_str(prepared.config.get())?;
+                if tenant.tenant_id != audit.tenant() {
+                    bail!("installed audit tenant differs from endpoint config");
+                }
             }
             audit.preflight(&audit_excluded, &prepared.projection.binding.vm_name)?;
             #[cfg(target_os = "linux")]

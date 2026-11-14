@@ -370,6 +370,7 @@ struct AdmissionBinding {
     nonce: Nonce,
     body_sha256: [u8; 32],
     direct: Option<DirectNetworkBinding>,
+    collector_redaction: Option<crate::policy::RedactionPolicy>,
     legacy_portable: bool,
 }
 
@@ -399,6 +400,16 @@ impl DirectNetworkBinding {
             redaction: plan.redaction.clone(),
         }))
     }
+}
+
+fn collector_redaction(
+    config: &VmStartConfig,
+    plan: &ExecutionPlan,
+) -> Option<crate::policy::RedactionPolicy> {
+    (config.network_policy == crate::policy::network_policy::NetworkPolicy::deny_all()
+        && plan.secrets.is_empty()
+        && plan.ingress.is_empty())
+    .then(|| plan.redaction.clone())
 }
 
 /// Shared one-shot owner, never a serializable permission or exit receipt.
@@ -600,6 +611,7 @@ impl HostLifetimeAnchor {
             nonce: plan.nonce.clone(),
             body_sha256: Sha256::digest(serde_jcs::to_vec(plan)?).into(),
             direct: DirectNetworkBinding::from_plan(config, plan)?,
+            collector_redaction: collector_redaction(config, plan),
             legacy_portable: config.legacy_portable_runtime.is_some(),
         };
         ensure!(
@@ -659,6 +671,7 @@ impl HostLifetimeAnchor {
             nonce: plan.nonce.clone(),
             body_sha256: Sha256::digest(serde_jcs::to_vec(&plan)?).into(),
             direct: DirectNetworkBinding::from_plan(config, &plan)?,
+            collector_redaction: collector_redaction(config, &plan),
             legacy_portable: config.legacy_portable_runtime.is_some(),
         })
     }

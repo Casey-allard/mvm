@@ -4,6 +4,7 @@ use super::{InstalledEndpointProgram, InstalledEndpointResources};
 use anyhow::{Result, ensure};
 use mvm_vmm::host::network_endpoint_spawn::InstalledEndpointChild;
 
+mod collector;
 mod network;
 pub use network::{OwnedNetworkRuntimeRequirements, owned_network_runtime_requirements};
 
@@ -51,6 +52,12 @@ pub fn run_installed_endpoint() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("installed endpoint handshake failed"))?;
     let resources = InstalledEndpointResources::from_child(&mut child)
         .map_err(|_| anyhow::anyhow!("installed endpoint resource adoption failed"))?;
+    if matches!(
+        &resources.program,
+        InstalledEndpointProgram::TelemetryOnly(_)
+    ) {
+        return collector::run(child, resources);
+    }
     if let InstalledEndpointProgram::Network(config) = &resources.program
         && config.telemetry.is_some()
     {
