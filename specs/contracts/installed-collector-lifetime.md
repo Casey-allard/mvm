@@ -136,6 +136,18 @@ state-validation failure preserves the original proof, receipt and charges for
 retry. The result is `NoHelperRetirement`, with no invented mailbox-helper exit
 status. Runtime files remain retained; the generic state reaper is not used.
 
+Post-spawn configuration and socket-capture unwinds are caught while the
+actual child, marker and restart custody remain outside the callback. A fixed
+failed-readiness result returns that same child through the existing original
+journal owner; it cannot mint no-exec evidence or readiness. Existing VM stop,
+helper collection and parent publication still supply their own positive proof.
+The exceptional panic payload is deliberately retained without running its
+destructor, which could panic again and abandon the child. There is at most one
+such disposition per failed construction; it is not a general memory-reclamation
+guarantee. Existing process resource ceilings still apply. This path adds no
+panic-payload logging or returned diagnostics; it does not suppress the process's
+existing panic hook, catch process aborts or repair later constructor failures.
+
 Post-exec readiness failures retain their actual `JournalOwner` and use the
 existing owned helper collection path. Uncertain construction may be contained
 through the original native owner, but cannot use the no-helper publication

@@ -244,7 +244,15 @@ fn configure_held_helper(
     child: &mut Child,
     configure: impl FnOnce(&mut Child) -> Result<()>,
 ) -> Result<()> {
-    configure(child)
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| configure(child))) {
+        Ok(readiness) => readiness,
+        Err(payload) => {
+            // An arbitrary payload destructor can panic again. Keep the actual
+            // child in custody and let its existing owner collect it first.
+            std::mem::forget(payload);
+            anyhow::bail!("original helper configuration unwound")
+        }
+    }
 }
 
 #[cfg(test)]
