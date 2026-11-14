@@ -822,6 +822,19 @@ fn admit_with_stream_retention(
     let posture =
         crate::admission::run_grants::run_posture(variant, p.backend_kind, p.runtime_config);
     let posture = journal.map_or(posture, |endpoint| endpoint.authorize(posture));
+    #[cfg(unix)]
+    let posture = if retention == StreamRetention::Ephemeral && journal.is_some() {
+        let config = p
+            .runtime_config
+            .context("original journal runtime configuration missing")?;
+        let owner = config
+            .host_lifetime
+            .as_ref()
+            .context("original journal resource owner missing")?;
+        posture.with_installed_journal_owner(config, owner)?
+    } else {
+        posture
+    };
     let admitted = admit_for_run(
         &input,
         &SystemClock,

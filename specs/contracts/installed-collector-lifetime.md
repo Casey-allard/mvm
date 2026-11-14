@@ -126,6 +126,11 @@ unwind fences later calls while retaining original stop custody. Other
 installed entrypoints keep their one-shot behavior. This is a preview host-only
 endpoint mapping, with no guest wire or durable-mailbox semantic change.
 
+Canonical admission captures the actual journal anchor before admission completes,
+with the directed mailbox authorization and signed deny-all policy. Final gates
+revalidate that same binding; repeated entrypoint calls still require the exact
+original anchor Arc and dispatched admission. No owner is attached after admission.
+
 The reviewed design and qualification history are retained in SpiralCore's
 2026-11-14 owned-journal-control proposal. Component tests do not qualify native
 paired delivery, full failure recovery, platform/WAN operation or FIPS.

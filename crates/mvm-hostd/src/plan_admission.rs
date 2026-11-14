@@ -737,6 +737,8 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         }
         other => anyhow::anyhow!("plan validity error: {other}"),
     })?;
+    #[cfg(unix)]
+    installed_journal::capture_owner(posture, &verified)?;
 
     // Bundle re-verify at admit time. Only fires
     // when the plan pinned a bundle; missing context with a pinned

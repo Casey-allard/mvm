@@ -50,10 +50,28 @@ pub(super) fn run_post_admission_gates(
     }
     #[cfg(unix)]
     if admitted.direct_owner.is_some() && config.network_policy.payload_mapping().is_none() {
-        return Err((
-            "direct-network-policy",
-            anyhow::anyhow!("original direct mapping removed before launch"),
-        ));
+        let original = admitted
+            .direct_owner
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                (
+                    "direct-network-policy",
+                    anyhow::anyhow!("original launch owner expired"),
+                )
+            })?;
+        super::installed_journal::verify_original_owner(
+            &config,
+            &original,
+            backend,
+            admitted.plan(),
+        )
+        .map_err(|error| {
+            (
+                "direct-network-policy",
+                error.context("original direct mapping removed or journal binding differs"),
+            )
+        })?;
     }
     if let Err(error) = populate_audit_substrate(&mut config, admitted, policy_bundle) {
         return Err(("audit-substrate", error));
