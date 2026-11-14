@@ -2,7 +2,9 @@
 //! Only the canonical production launch can give a caller this handle. It
 //! retains the original Child until collection. A pidfile cannot recreate it.
 
+mod attempt;
 pub mod authorization;
+pub use attempt::{JournalStartAttempt, JournalStartDisposition, NoHelperStart};
 pub(crate) mod object_registration;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod object_workers;
@@ -16,7 +18,7 @@ pub use stop::{JournalOwner, JournalStopOutcome};
 mod runtime_state;
 pub use runtime_state::FreshState;
 
-use super::{MailboxLaunchPosture, MailboxProcessConfig, spawn_with_original};
+use super::{MailboxLaunchPosture, MailboxProcessConfig};
 use anyhow::{Context, Result, ensure};
 use mvm_agentd::vsock::connect_unix_before;
 use mvm_contract::protocol::mailbox::{MailboxAddress, PrincipalId};
@@ -79,18 +81,39 @@ impl OriginalJournalDestination {
         vm_name: &str,
         posture: &MailboxLaunchPosture,
     ) -> Result<Self> {
+        Self::start_custodied_inner(plan, backend, vm_name, posture, None)
+    }
+
+    pub fn start_custodied_tracked(
+        plan: &ExecutionPlan,
+        backend: &AnyBackend,
+        vm_name: &str,
+        posture: &MailboxLaunchPosture,
+        attempt: &mut JournalStartAttempt,
+    ) -> Result<Self> {
+        Self::start_custodied_inner(plan, backend, vm_name, posture, Some(attempt))
+    }
+
+    fn start_custodied_inner(
+        plan: &ExecutionPlan,
+        backend: &AnyBackend,
+        vm_name: &str,
+        posture: &MailboxLaunchPosture,
+        attempt: Option<&mut JournalStartAttempt>,
+    ) -> Result<Self> {
         ensure!(
             posture.variant() == Variant::Prod,
             "paired journal requires production admission"
         );
-        spawn_with_original(
+        super::spawn_with_original_tracked(
             plan,
             backend,
             vm_name,
             Some(posture),
             true,
-            |config, plan, guard| {
-                Self::spawn(config, plan, backend, guard).map_err(std::io::Error::other)
+            attempt,
+            |config, plan, guard, attempt| {
+                Self::spawn(config, plan, backend, guard, attempt).map_err(std::io::Error::other)
             },
         )?
         .context("destination VM has no admitted mailbox")
@@ -101,6 +124,7 @@ impl OriginalJournalDestination {
         plan: &ExecutionPlan,
         backend: &AnyBackend,
         guard: std::sync::Arc<LaunchClaim>,
+        attempt: Option<&mut JournalStartAttempt>,
     ) -> Result<Self> {
         let boot = config
             .reader_boot
@@ -155,7 +179,8 @@ impl OriginalJournalDestination {
             None
         };
         let current = &policy.context;
-        let (child, marker, readiness, restart) = stop.spawn_helper(config, &guard.owner_dir)?;
+        let (child, marker, readiness, restart) =
+            stop.spawn_helper_tracked(config, &guard.owner_dir, attempt)?;
         Ok(Self {
             child,
             restart,
@@ -276,12 +301,26 @@ impl<T> std::error::Error for IncompleteJournalStart<T> {}
 
 pub(super) fn spawn_claimed(
     dir: &std::path::Path,
+    command: std::process::Command,
+) -> std::io::Result<(Child, OriginalMarker)> {
+    spawn_claimed_tracked(dir, command, None)
+}
+
+pub(super) fn spawn_claimed_tracked(
+    dir: &std::path::Path,
     mut command: std::process::Command,
+    mut attempt: Option<&mut JournalStartAttempt>,
 ) -> std::io::Result<(Child, OriginalMarker)> {
     let mut marker = OriginalMarker::claim(dir)?;
+    if let Some(attempt) = attempt.as_deref_mut() {
+        attempt.fence_uncertain();
+    }
     match command.spawn() {
         Ok(child) => Ok((child, marker)),
         Err(exec) => {
+            if let Some(attempt) = attempt {
+                attempt.exec_failed();
+            }
             marker.clear_original()?;
             Err(exec)
         }

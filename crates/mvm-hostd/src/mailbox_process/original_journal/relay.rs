@@ -255,18 +255,41 @@ impl PairedJournalAdmission {
         name: &str,
         posture: &super::MailboxLaunchPosture,
     ) -> Result<OriginalJournalSourceHost> {
+        self.launch_custodied_source_inner(plan, backend, name, posture, None)
+    }
+
+    pub fn launch_custodied_source_tracked(
+        &self,
+        plan: &ExecutionPlan,
+        backend: &mvm_runtime::backend::AnyBackend,
+        name: &str,
+        posture: &super::MailboxLaunchPosture,
+        attempt: &mut super::JournalStartAttempt,
+    ) -> Result<OriginalJournalSourceHost> {
+        self.launch_custodied_source_inner(plan, backend, name, posture, Some(attempt))
+    }
+
+    fn launch_custodied_source_inner(
+        &self,
+        plan: &ExecutionPlan,
+        backend: &mvm_runtime::backend::AnyBackend,
+        name: &str,
+        posture: &super::MailboxLaunchPosture,
+        attempt: Option<&mut super::JournalStartAttempt>,
+    ) -> Result<OriginalJournalSourceHost> {
         ensure!(
             posture.variant() == mvm_core::plan::Variant::Prod,
             "paired source requires production posture"
         );
         self.verify(plan)?;
-        super::super::spawn_with_original(
+        super::super::spawn_with_original_tracked(
             plan,
             backend,
             name,
             Some(posture),
             true,
-            |config, plan, guard| {
+            attempt,
+            |config, plan, guard, attempt| {
                 let setup = (|| -> Result<_> {
                     let stop = super::stop::StopCustody::capture(config, backend, name)?;
                     let boot = config.reader_boot.as_ref().context("absent A boot")?;
@@ -308,7 +331,7 @@ impl PairedJournalAdmission {
                     config.keys.outbound_source = Some(delegated);
                     let listener = OwnedListener::bind(&config.vm_state_dir)?;
                     let (source, marker, readiness, restart) =
-                        stop.spawn_helper(config, &guard.owner_dir)?;
+                        stop.spawn_helper_tracked(config, &guard.owner_dir, attempt)?;
                     Ok(OriginalJournalSourceHost {
                         source,
                         restart,

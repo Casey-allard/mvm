@@ -16,7 +16,7 @@ use mvm_hostd::{
 #[cfg(unix)]
 pub(crate) use owned::JournalStartContext;
 #[cfg(unix)]
-pub use owned::{OwnedJournalStart, OwnedJournalStartFailure};
+pub use owned::{NoHelperRetirement, OwnedJournalStart, OwnedJournalStartFailure};
 
 /// The caller owns the helper slot across startup, including a later guest
 /// readiness or resource-accounting failure. Stop the VM and collect that
@@ -174,6 +174,27 @@ impl InstalledJournal<'_> {
         backend: &mvm_runtime::AnyBackend,
         id: &mvm_core::vm_backend::VmId,
     ) -> Result<()> {
+        self.serve_on_with_attempt(admitted, backend, id, None)
+    }
+
+    #[cfg(unix)]
+    fn serve_on_tracked(
+        &mut self,
+        admitted: &AdmittedPlan,
+        backend: &mvm_runtime::AnyBackend,
+        id: &mvm_core::vm_backend::VmId,
+        attempt: &mut mvm_hostd::mailbox_process::original_journal::JournalStartAttempt,
+    ) -> Result<()> {
+        self.serve_on_with_attempt(admitted, backend, id, Some(attempt))
+    }
+
+    fn serve_on_with_attempt(
+        &mut self,
+        admitted: &AdmittedPlan,
+        backend: &mvm_runtime::AnyBackend,
+        id: &mvm_core::vm_backend::VmId,
+        mut attempt: Option<&mut mvm_hostd::mailbox_process::original_journal::JournalStartAttempt>,
+    ) -> Result<()> {
         let posture = admitted
             .mailbox_posture()
             .context("missing admitted mailbox posture")?;
@@ -182,21 +203,45 @@ impl InstalledJournal<'_> {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Object { .. } => anyhow::bail!("object worker requires bilateral original join"),
             Self::Destination { owner, .. } => {
-                **owner = Some(OriginalJournalDestination::start_custodied(
-                    admitted.plan(),
-                    backend,
-                    name,
-                    &posture,
-                )?);
+                **owner = Some(match attempt.as_deref_mut() {
+                    Some(attempt) => OriginalJournalDestination::start_custodied_tracked(
+                        admitted.plan(),
+                        backend,
+                        name,
+                        &posture,
+                        attempt,
+                    )?,
+                    None => OriginalJournalDestination::start_custodied(
+                        admitted.plan(),
+                        backend,
+                        name,
+                        &posture,
+                    )?,
+                });
+                if let Some(attempt) = attempt {
+                    attempt.child_owned()?;
+                }
                 owner.as_ref().expect("retained original").require_ready()?;
             }
             Self::Source { admission, owner } => {
-                **owner = Some(admission.launch_custodied_source(
-                    admitted.plan(),
-                    backend,
-                    name,
-                    &posture,
-                )?);
+                **owner = Some(match attempt.as_deref_mut() {
+                    Some(attempt) => admission.launch_custodied_source_tracked(
+                        admitted.plan(),
+                        backend,
+                        name,
+                        &posture,
+                        attempt,
+                    )?,
+                    None => admission.launch_custodied_source(
+                        admitted.plan(),
+                        backend,
+                        name,
+                        &posture,
+                    )?,
+                });
+                if let Some(attempt) = attempt {
+                    attempt.child_owned()?;
+                }
                 owner.as_ref().expect("retained original").require_ready()?;
             }
         }

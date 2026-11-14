@@ -103,6 +103,31 @@ yet share a hard whole-operation deadline. These preview operations still need
 native clean, failed-start and retry witnesses with actual parent retention.
 They do not establish end-to-end WAN, sustained capacity or security validation.
 
+## Pre-helper refusal recovery
+
+The tracked original constructor distinguishes proven no-exec, an actual
+returned child, and uncertainty. Only the canonical creation boundary can arm
+the no-exec proof, retaining its original launch exclusion, state directory and
+boot binding. Entering process creation fences that proof; a returned exec
+failure can restore it. A construction panic remains uncertain. An empty owner
+slot, missing marker or absent process is never no-exec evidence.
+
+An installed SDK serving refusal immediately attempts stop through its retained
+backend and anchor. The no-exec branch retains the positive runtime retirement
+receipt and typed construction proof. `OwnedJournalStartFailure` exposes
+`helper_disposition()` for reporting and `finish_without_helper(until, finish)`
+for that branch. The callback receives the original admitted plan and mutable
+runtime retirement receipt; it must publish the retained endpoint telemetry and
+finish the original parent transaction before returning success. Callback or
+state-validation failure preserves the original proof, receipt and charges for
+retry. The result is `NoHelperRetirement`, with no invented mailbox-helper exit
+status. Runtime files remain retained; the generic state reaper is not used.
+
+Post-exec readiness failures retain their actual `JournalOwner` and use the
+existing owned helper collection path. Uncertain construction may be contained
+through the original native owner, but cannot use the no-helper publication
+path or claim that all helper resources have retired.
+
 ## Owned journal control
 
 The directed retained-journal mode closes its original activation-only

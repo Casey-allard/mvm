@@ -173,10 +173,11 @@ impl StopCustody {
     pub(super) fn socket_parent(&self) -> &File {
         self.split_socket.as_ref().map_or(&self.state, |(_, fd)| fd)
     }
-    pub(super) fn spawn_helper(
+    pub(super) fn spawn_helper_tracked(
         &self,
         config: &crate::mailbox_process::MailboxProcessConfig,
         owner_dir: &std::path::Path,
+        attempt: Option<&mut super::JournalStartAttempt>,
     ) -> Result<(
         Child,
         OriginalMarker,
@@ -195,7 +196,7 @@ impl StopCustody {
         if original.is_some() {
             command.arg(super::super::ORIGINAL_JOURNAL_V1);
         }
-        let (mut child, marker) = super::spawn_claimed(owner_dir, command)?;
+        let (mut child, marker) = super::spawn_claimed_tracked(owner_dir, command, attempt)?;
         let until = Instant::now() + super::super::READY_TIMEOUT;
         let readiness = match original {
             Some(original_vmm_v1) => super::super::configure_serving(

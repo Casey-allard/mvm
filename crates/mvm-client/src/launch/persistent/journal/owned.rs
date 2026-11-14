@@ -33,6 +33,9 @@ pub(crate) struct JournalStartContext {
     retired: bool,
     retirement: Option<mvm_runtime::workload_runner::OwnedRetirement>,
     parent_finished: bool,
+    native_id: Option<VmId>,
+    helper_attempt: Option<mvm_hostd::mailbox_process::original_journal::JournalStartAttempt>,
+    no_helper: Option<mvm_hostd::mailbox_process::original_journal::NoHelperStart>,
 }
 
 struct JournalSupport {
@@ -90,7 +93,66 @@ impl JournalStartContext {
             images,
             boot.admission.policy_bundle.as_ref(),
         )?;
-        journal.serve_on(&boot.admission.admitted, &self.original.backend, &id)?;
+        self.native_id = Some(id.clone());
+        let mut attempt = mvm_hostd::mailbox_process::original_journal::JournalStartAttempt::new();
+        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            journal.serve_on_tracked(
+                &boot.admission.admitted,
+                &self.original.backend,
+                &id,
+                &mut attempt,
+            )
+        }));
+        let served = match served {
+            Ok(result) => result,
+            Err(_) => {
+                attempt.fence_uncertain();
+                Err(anyhow::anyhow!(
+                    "original helper construction unwound; custody uncertain"
+                ))
+            }
+        };
+        if let Err(error) = served {
+            use mvm_hostd::mailbox_process::original_journal::JournalStartDisposition;
+            let rollback = match attempt.disposition() {
+                JournalStartDisposition::ChildOwned => journal.abort_original_owned(
+                    &boot.admission.admitted,
+                    &self.original.backend,
+                    &id,
+                    &self.anchor,
+                ),
+                JournalStartDisposition::NoExec => {
+                    self.no_helper = Some(attempt.take_no_exec()?);
+                    (|| {
+                        self.original.backend.stop_owned(&id, &self.anchor)?;
+                        self.retirement = Some(
+                            self.original
+                                .backend
+                                .take_owned_retirement(&id, &self.anchor)?,
+                        );
+                        Ok(())
+                    })()
+                }
+                JournalStartDisposition::Uncertain => journal
+                    .abort_original_owned(
+                        &boot.admission.admitted,
+                        &self.original.backend,
+                        &id,
+                        &self.anchor,
+                    )
+                    .or_else(|_| self.original.backend.stop_owned(&id, &self.anchor)),
+            };
+            self.helper_attempt = Some(attempt);
+            return match rollback {
+                Ok(()) => Err(error.context(
+                    "original journal serving refused; native stop confirmed, retirement pending",
+                )),
+                Err(rollback) => Err(error.context(format!(
+                    "original journal serving refused; native rollback unresolved: {rollback:#}"
+                ))),
+            };
+        }
+        self.helper_attempt = Some(attempt);
         #[cfg(target_os = "linux")]
         let ready = self.original.backend.check_owned_journal_ready(
             &id,
@@ -155,6 +217,8 @@ impl Drop for JournalStartContext {
                 self.boot.take(),
                 self.support.take(),
                 self.retirement.take(),
+                self.helper_attempt.take(),
+                self.no_helper.take(),
             ));
         }
     }
@@ -334,9 +398,104 @@ pub struct OwnedJournalStartFailure {
     context: Option<Box<JournalStartContext>>,
     unused: Option<Box<PreparedHostLifetime>>,
 }
+
+/// Positive native/collector retirement after a proven unexecuted helper.
+/// Runtime files remain retained; there is no invented mailbox-helper exit.
+#[must_use]
+#[derive(Debug)]
+pub struct NoHelperRetirement {
+    _private: (),
+}
 impl OwnedJournalStartFailure {
     pub fn error(&self) -> &anyhow::Error {
         &self.error
+    }
+
+    pub fn helper_disposition(
+        &self,
+    ) -> mvm_hostd::mailbox_process::original_journal::JournalStartDisposition {
+        use mvm_hostd::mailbox_process::original_journal::JournalStartDisposition;
+        self.context
+            .as_ref()
+            .map_or(JournalStartDisposition::Uncertain, |context| {
+                if context.no_helper.is_some() {
+                    JournalStartDisposition::NoExec
+                } else {
+                    context
+                        .helper_attempt
+                        .as_ref()
+                        .map_or(JournalStartDisposition::Uncertain, |attempt| {
+                            attempt.disposition()
+                        })
+                }
+            })
+    }
+
+    /// Complete only a creation-boundary-proven no-exec helper refusal.
+    /// This returns no helper status and does not remove retained runtime data.
+    pub fn finish_without_helper(
+        &mut self,
+        until: std::time::Instant,
+        mut finish: impl FnMut(
+            &mvm_core::plan::ExecutionPlan,
+            &mut mvm_runtime::workload_runner::OwnedRetirement,
+        ) -> Result<()>,
+    ) -> Result<NoHelperRetirement> {
+        let context = self
+            .context
+            .as_mut()
+            .context("original failed startup custody missing")?;
+        ensure!(
+            !context.retired && std::time::Instant::now() < until,
+            "original no-helper retirement unavailable"
+        );
+        let proof = context
+            .no_helper
+            .as_ref()
+            .context("creation-boundary no-exec proof missing")?;
+        let boot = context
+            .boot
+            .as_ref()
+            .context("original failed admission missing")?;
+        let plan = boot.admission.admitted.plan();
+        proof.check_original(plan)?;
+        let id = context
+            .native_id
+            .as_ref()
+            .context("original native dispatch missing")?;
+        ensure!(
+            id.0 == context.anchor.binding().vm_name,
+            "original native identity differs"
+        );
+        if context.retirement.is_none() {
+            context.original.backend.stop_owned(id, &context.anchor)?;
+            context.retirement = Some(
+                context
+                    .original
+                    .backend
+                    .take_owned_retirement(id, &context.anchor)?,
+            );
+        }
+        proof.check_original(plan)?;
+        ensure!(
+            std::time::Instant::now() < until,
+            "original no-helper publication deadline elapsed"
+        );
+        if !context.parent_finished {
+            finish(
+                plan,
+                context
+                    .retirement
+                    .as_mut()
+                    .expect("positive original runtime retirement"),
+            )?;
+            context.parent_finished = true;
+        }
+        proof.check_original(plan)?;
+        context.original.release_stopped_leases(&id.0)?;
+        crate::local::deregister_from_name_registry(&id.0);
+        context.retired = true;
+        Ok(NoHelperRetirement { _private: () })
     }
     pub fn into_unused(self) -> std::result::Result<PreparedHostLifetime, Self> {
         if self.context.is_some() || self.unused.is_none() {
@@ -410,6 +569,9 @@ impl crate::LocalBackend {
             retired: false,
             retirement: None,
             parent_finished: false,
+            native_id: None,
+            helper_attempt: None,
+            no_helper: None,
         });
         let result = self
             .start_owned_journal(name, grant, journal, &mut context)

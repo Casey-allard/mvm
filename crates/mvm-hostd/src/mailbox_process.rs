@@ -693,6 +693,31 @@ fn spawn_with_original<T>(
         std::sync::Arc<original_journal::LaunchClaim>,
     ) -> Result<T>,
 ) -> Result<Option<T>> {
+    spawn_with_original_tracked(
+        plan,
+        backend,
+        vm_name,
+        posture,
+        exclusive,
+        None,
+        |config, plan, guard, _| start(config, plan, guard),
+    )
+}
+
+fn spawn_with_original_tracked<T>(
+    plan: &ExecutionPlan,
+    backend: &AnyBackend,
+    vm_name: &str,
+    posture: Option<&MailboxLaunchPosture>,
+    exclusive: bool,
+    mut attempt: Option<&mut original_journal::JournalStartAttempt>,
+    start: impl FnOnce(
+        &mut MailboxProcessConfig,
+        &ExecutionPlan,
+        std::sync::Arc<original_journal::LaunchClaim>,
+        Option<&mut original_journal::JournalStartAttempt>,
+    ) -> Result<T>,
+) -> Result<Option<T>> {
     let Some(grant) = &plan.mailbox else {
         return Ok(None);
     };
@@ -730,6 +755,9 @@ fn spawn_with_original<T>(
         })?;
     let owner_dir = original_journal::owner_dir(&mvm_core::config::mvm_keys_dir(), vm_name)?;
     let guard = original_journal::claim_launch(&state_dir, &owner_dir, exclusive)?;
+    if let Some(attempt) = attempt.as_deref_mut() {
+        attempt.arm(plan, &state_dir, guard.clone())?;
+    }
     let mut config = build_config(&mvm_core::config::mvm_keys_dir(), grant, &state_dir, route)?;
     let started = (|| {
         config.reader_boot = load_reader_boot_for_plan(&state_dir, plan)?;
@@ -759,7 +787,7 @@ fn spawn_with_original<T>(
         }
         config.posture =
             Some(posture.handoff(config.reader_boot.as_ref().map(|binding| binding.boot)));
-        start(&mut config, plan, guard.clone()).map(Some)
+        start(&mut config, plan, guard.clone(), attempt).map(Some)
     })();
     if started.is_err()
         && matches!(std::fs::symlink_metadata(owner_dir.join(original_journal::MARKER)), Err(ref e) if e.kind() == ErrorKind::NotFound)
