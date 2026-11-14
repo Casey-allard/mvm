@@ -15,7 +15,9 @@ pub mod spec;
 pub mod traits;
 
 #[cfg(target_os = "linux")]
-pub use original_entrypoint::{OriginalEntrypointChannel, OriginalEntrypointIdentity};
+pub use original_entrypoint::{
+    OriginalEntrypointChannel, OriginalEntrypointIdentity, OriginalJournalControl,
+};
 pub use traits::{
     ChildForkRequest, DuplexStream, LateVolumeAttach, OriginalWorkloadReport, RunningVm,
     RunningVmStopTiming, StandbyParentSpawn, VmmDriver,

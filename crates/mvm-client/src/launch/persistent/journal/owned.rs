@@ -91,19 +91,25 @@ impl JournalStartContext {
             boot.admission.policy_bundle.as_ref(),
         )?;
         journal.serve_on(&boot.admission.admitted, &self.original.backend, &id)?;
-        crate::launch::detached::require_serving_guest_on(
-            &name,
-            &self.original.backend,
-            std::time::Duration::from_secs(30),
-            || {
-                journal.abort_original_owned(
+        #[cfg(target_os = "linux")]
+        let ready = self.original.backend.check_owned_journal_ready(
+            &id,
+            &self.anchor,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let ready: Result<()> = Err(anyhow::anyhow!("owned journal control requires Linux"));
+        if let Err(error) = ready {
+            journal
+                .abort_original_owned(
                     &boot.admission.admitted,
                     &self.original.backend,
                     &id,
                     &self.anchor,
                 )
-            },
-        )?;
+                .context("owned journal readiness failed and original rollback was unresolved")?;
+            return Err(error.context("original owned journal readiness failed"));
+        }
         account_started_on(
             &boot.admission,
             &self.original.backend,
@@ -160,6 +166,77 @@ pub struct OwnedJournalStart {
     context: Option<Box<JournalStartContext>>,
 }
 impl OwnedJournalStart {
+    /// Run one bounded input through this original journal's native control owner.
+    /// Calls serialize in the installed slot; uncertain dispatch fences future
+    /// calls while preserving the separate original stop/retirement authority.
+    #[cfg(target_os = "linux")]
+    pub fn run_entrypoint(
+        &mut self,
+        input: &[u8],
+        until: std::time::Instant,
+        observer: &mut dyn crate::entrypoint::CallObserver,
+    ) -> Result<crate::entrypoint::CallOutcome> {
+        use crate::entrypoint::{
+            CallOutcome, CallTerminal, CaptureReport, RecordedDivergence, route_event,
+        };
+        ensure!(
+            input.len() <= 64 << 10,
+            "owned journal input exceeds 64 KiB"
+        );
+        ensure!(
+            std::time::Instant::now() < until,
+            "owned journal call deadline elapsed"
+        );
+        let context = self
+            .context
+            .as_ref()
+            .context("original journal control custody missing")?;
+        ensure!(!context.retired, "original journal already retired");
+        let machine = self
+            .machine
+            .as_ref()
+            .context("original journal admission missing")?;
+        machine
+            .admitted
+            .check_original_entrypoint(&context.anchor)?;
+        let name = &context.anchor.binding().vm_name;
+        crate::guest::emit_vsock_rpc_audit(
+            name,
+            &mvm_agentd::vsock::GuestRequest::RunEntrypoint {
+                stdin: input.to_vec(),
+                timeout_secs: until
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs(),
+                env: Vec::new(),
+                stream_input: false,
+            },
+        );
+        let mut capture = mvm_hostd::stream::EntrypointSink::unrecorded();
+        let recorded = capture.is_recorded();
+        let mut divergence = RecordedDivergence::default();
+        observer.dispatching(name, false);
+        let terminal = context.original.backend.run_owned_journal_entrypoint(
+            &VmId(name.clone()),
+            &context.anchor,
+            input,
+            until,
+            &mut |event| {
+                route_event(event, &mut capture, &mut divergence, observer);
+            },
+        );
+        drop(capture);
+        observer.dispatched();
+        let result = CallOutcome {
+            terminal: CallTerminal::from_event(&terminal?),
+            capture: Some(CaptureReport {
+                recorded,
+                divergence,
+            }),
+        };
+        observer.call_finished(name, &result);
+        Ok(result)
+    }
+
     pub fn machine(&self) -> &crate::launch::machine_start::MachineStart {
         self.machine
             .as_ref()
@@ -402,6 +479,38 @@ mod tests {
         fs::{self, File, OpenOptions},
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
     };
+
+    #[test]
+    fn journal_call_refuses_oversized_input_before_consulting_native_custody() {
+        let mut owner = OwnedJournalStart {
+            machine: None,
+            context: None,
+        };
+        let mut output = crate::entrypoint::dispatch::CapturedOutput::default();
+        let error = owner
+            .run_entrypoint(
+                &vec![0; (64 << 10) + 1],
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                &mut output,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 64 KiB"));
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    }
+
+    #[test]
+    fn journal_call_refuses_expired_deadline_before_consulting_native_custody() {
+        let mut owner = OwnedJournalStart {
+            machine: None,
+            context: None,
+        };
+        let mut output = crate::entrypoint::dispatch::CapturedOutput::default();
+        let error = owner
+            .run_entrypoint(b"{}", std::time::Instant::now(), &mut output)
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline elapsed"));
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    }
 
     fn preparation(root: &std::path::Path, backend: BackendKind) -> PreparedHostLifetime {
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();

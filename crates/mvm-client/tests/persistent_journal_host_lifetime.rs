@@ -32,3 +32,14 @@ fn ordinary_persistent_journal_start_keeps_its_existing_contract() {
             .await
     };
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_journal_call_requires_the_retained_start_owner() {
+    let _call = |owner: &mut mvm_client::launch::persistent::journal::OwnedJournalStart,
+                 input: &[u8],
+                 until: std::time::Instant,
+                 observer: &mut dyn mvm_client::entrypoint::CallObserver| {
+        owner.run_entrypoint(input, until, observer)
+    };
+}

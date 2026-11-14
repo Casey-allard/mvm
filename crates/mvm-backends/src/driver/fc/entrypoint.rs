@@ -12,7 +12,7 @@ use mvm_vmm::driver::{OriginalEntrypointChannel, OriginalEntrypointIdentity};
 use std::{
     io::{self, Read, Write},
     os::unix::net::UnixStream,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -31,7 +31,9 @@ struct Channel {
     anchor: Arc<HostLifetimeAnchor>,
     stream: Option<UnixStream>,
     session: AuthenticatedSession,
-    _first_guest: VerifyingKey,
+    first_guest: VerifyingKey,
+    path: PathBuf,
+    host: [u8; 32],
     phase: Phase,
 }
 
@@ -69,18 +71,44 @@ pub(super) fn open(
         held.entrypoint_opened = true;
         current(&held, &anchor, None, until)?;
     }
+    let (stream, session, peer) = connect(&original, &anchor, &identity.host, path, until)?;
+    Ok(Box::new(Channel {
+        original,
+        anchor,
+        stream: Some(stream),
+        session,
+        first_guest: peer,
+        path: path.to_owned(),
+        host: identity.host,
+        phase: Phase::Authenticated,
+    }))
+}
+
+fn connect(
+    original: &Mutex<OwnedFcState>,
+    anchor: &HostLifetimeAnchor,
+    host: &[u8; 32],
+    path: &Path,
+    until: Instant,
+) -> Result<(UnixStream, AuthenticatedSession, VerifyingKey)> {
+    {
+        let held = original
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("original custody busy or poisoned"))?;
+        current(&held, anchor, None, until)?;
+    }
     let keys = mvm_core::config::mvm_keys_dir_at(mvm_core::config::mvm_home_strict()?);
     let (signer, public) = mvm_core::crypto::ed25519_keypair::load_existing(
         &keys.join("host-signer.ed25519"),
         &keys.join("host-signer.pub"),
     )?;
     ensure!(
-        public.to_bytes() == identity.host,
+        &public.to_bytes() == host,
         "original registered host identity changed"
     );
     before(until)?;
     let mut stream = connect_unix_before(path, until)?;
-    check(&original, &anchor, &stream, until)?;
+    check(original, anchor, &stream, until)?;
     complete_connect_handshake(
         &mut DeadlineIo {
             stream: &mut stream,
@@ -88,7 +116,7 @@ pub(super) fn open(
         },
         GUEST_AGENT_PORT,
     )?;
-    check(&original, &anchor, &stream, until)?;
+    check(original, anchor, &stream, until)?;
     let session_id = mvm_core::domain::session::SessionId::new();
     let (session, peer) = AuthenticatedSession::host_retaining_peer(
         &mut DeadlineIo {
@@ -98,15 +126,8 @@ pub(super) fn open(
         session_id.as_str(),
         signer,
     )?;
-    check(&original, &anchor, &stream, until)?;
-    Ok(Box::new(Channel {
-        original,
-        anchor,
-        stream: Some(stream),
-        session,
-        _first_guest: peer,
-        phase: Phase::Authenticated,
-    }))
+    check(original, anchor, &stream, until)?;
+    Ok((stream, session, peer))
 }
 
 fn check(
@@ -155,6 +176,12 @@ impl Channel {
 }
 
 impl OriginalEntrypointChannel for Channel {
+    fn finish_journal_activation(
+        self: Box<Self>,
+        until: Instant,
+    ) -> Result<Box<dyn mvm_vmm::driver::OriginalJournalControl>> {
+        journal::finish_activation(*self, until)
+    }
     fn activate(&mut self, request: &GuestRequest, until: Instant) -> Result<GuestResponse> {
         let mut stream = self.take(Phase::Authenticated, until)?;
         ensure!(
@@ -204,6 +231,8 @@ impl OriginalEntrypointChannel for Channel {
         self.finish(stream, Phase::Flushed, until)
     }
 }
+
+mod journal;
 
 fn before(until: Instant) -> Result<()> {
     ensure!(Instant::now() < until, "original control deadline elapsed");

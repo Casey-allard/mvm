@@ -102,3 +102,26 @@ have their own stage bounds; synchronous storage and parent publication do not
 yet share a hard whole-operation deadline. These preview operations still need
 native clean, failed-start and retry witnesses with actual parent retention.
 They do not establish end-to-end WAN, sustained capacity or security validation.
+
+## Owned journal control
+
+The directed retained-journal mode closes its original activation-only
+continuation after authenticated ACK and current-owner checks, allowing the
+unchanged signed guest to initialize its mailbox and concurrent control loop.
+It retains the original Firecracker owner, anchor, host identity and first
+learned guest key. Readiness and bounded one-shot entrypoint calls use existing
+protected guest messages on original-instance-authenticated sessions; a fresh
+peer key or VM-name lookup cannot replace that identity.
+
+Selection requires the actual retained signed mailbox grant with exactly one
+journal direction, no object-pair mapping, matching boot binding, exact two
+entrypoint verbs and ephemeral workload streams. Input is bounded at 64 KiB and
+cumulative output at 128 KiB, in addition to canonical serialized-frame limits.
+Calls serialize; ambiguous I/O, changed authority/key, timeout or callback
+unwind fences later calls while retaining original stop custody. Other
+installed entrypoints keep their one-shot behavior. This is a preview host-only
+endpoint mapping, with no guest wire or durable-mailbox semantic change.
+
+The reviewed design and qualification history are retained in SpiralCore's
+2026-11-14 owned-journal-control proposal. Component tests do not qualify native
+paired delivery, full failure recovery, platform/WAN operation or FIPS.

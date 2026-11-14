@@ -115,6 +115,15 @@ fn original_guest_protocol_child() {
                 .write(&mut stream, &GuestResponse::ActivateEnvironmentAck)
                 .unwrap();
         }
+        if mode.starts_with("journal-") {
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            serve_journal(
+                &listener,
+                SigningKey::from_bytes(&seed),
+                &VerifyingKey::from_bytes(&public).unwrap(),
+                &mode,
+            );
+        }
         if matches!(mode.as_str(), "complete" | "panic" | "partial") {
             assert!(matches!(
                 session.read(&mut stream).unwrap(),
@@ -168,6 +177,193 @@ fn original_guest_protocol_child() {
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+fn serve_journal(listener: &UnixListener, guest: SigningKey, host: &VerifyingKey, mode: &str) {
+    let count = if mode == "journal-complete" {
+        3
+    } else if mode == "journal-key" {
+        1
+    } else {
+        2
+    };
+    for index in 0..count {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(BUDGET)).unwrap();
+        stream.set_write_timeout(Some(BUDGET)).unwrap();
+        let mut connect = [0; 13];
+        stream.read_exact(&mut connect).unwrap();
+        assert_eq!(&connect, b"CONNECT 5252\n");
+        stream.write_all(b"OK 8123\n").unwrap();
+        let signer = if mode == "journal-key" {
+            SigningKey::from_bytes(&[71; 32])
+        } else {
+            guest.clone()
+        };
+        let mut session = AuthenticatedSession::guest(&mut stream, signer, host).unwrap();
+        if mode == "journal-key" || (index > 0 && mode == "journal-input") {
+            assert!(session.read::<GuestRequest>(&mut stream).is_err());
+            continue;
+        }
+        if index == 0 {
+            assert!(matches!(
+                session.read(&mut stream).unwrap(),
+                GuestRequest::Ping
+            ));
+            session.write(&mut stream, &GuestResponse::Pong).unwrap();
+        } else {
+            assert!(
+                matches!(session.read(&mut stream).unwrap(), GuestRequest::RunEntrypoint { stdin, timeout_secs: 2, env, stream_input: false }
+                if stdin == b"in\0" && env.is_empty())
+            );
+            if mode == "journal-partial" {
+                let mut frame = vec![];
+                session
+                    .write(
+                        &mut frame,
+                        &GuestResponse::EntrypointEvent(EntrypointEvent::Exit { code: 42 }),
+                    )
+                    .unwrap();
+                stream.write_all(&frame[..frame.len() - 1]).unwrap();
+                stream.shutdown(Shutdown::Write).unwrap();
+            } else {
+                let chunk = if mode == "journal-output" {
+                    vec![0; 64 << 10]
+                } else {
+                    OUTPUT.to_vec()
+                };
+                for _ in 0..if mode == "journal-output" { 3 } else { 1 } {
+                    session
+                        .write(
+                            &mut stream,
+                            &GuestResponse::EntrypointEvent(EntrypointEvent::Stdout {
+                                chunk: chunk.clone(),
+                            }),
+                        )
+                        .unwrap();
+                }
+                if mode != "journal-panic" {
+                    session
+                        .write(
+                            &mut stream,
+                            &GuestResponse::EntrypointEvent(EntrypointEvent::Exit { code: 42 }),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+    }
+}
+
+#[test]
+fn journal_activation_closes_before_ready_and_reuses_only_terminal_calls() {
+    let fixture = Fixture::new("journal-complete");
+    let mut journal = fixture
+        .activated()
+        .finish_journal_activation(until())
+        .unwrap();
+    journal.ready(until()).unwrap();
+    for _ in 0..2 {
+        let mut output = vec![];
+        let terminal = journal
+            .entrypoint(&run(false), until(), &mut |event| {
+                output.push(event.clone())
+            })
+            .unwrap();
+        assert_eq!(terminal, EntrypointEvent::Exit { code: 42 });
+        assert_eq!(
+            output,
+            [EntrypointEvent::Stdout {
+                chunk: OUTPUT.to_vec()
+            }]
+        );
+    }
+    assert!(fixture.open().is_err());
+    drop(journal);
+    fixture.finish();
+}
+
+#[test]
+fn journal_changed_guest_key_fences_without_replacing_original() {
+    let fixture = Fixture::new("journal-key");
+    let mut journal = fixture
+        .activated()
+        .finish_journal_activation(until())
+        .unwrap();
+    assert!(journal.ready(until()).is_err());
+    assert!(journal.ready(until()).is_err());
+    drop(journal);
+    fixture.finish();
+}
+
+#[test]
+fn journal_partial_reply_and_output_overflow_fence_reuse() {
+    for mode in ["journal-partial", "journal-output"] {
+        let fixture = Fixture::new(mode);
+        let mut journal = fixture
+            .activated()
+            .finish_journal_activation(until())
+            .unwrap();
+        journal.ready(until()).unwrap();
+        let mut bytes = 0;
+        assert!(
+            journal
+                .entrypoint(&run(false), until(), &mut |event| {
+                    if let EntrypointEvent::Stdout { chunk } = event {
+                        bytes += chunk.len();
+                    }
+                })
+                .is_err()
+        );
+        assert!(bytes <= 128 << 10);
+        assert!(journal.ready(until()).is_err());
+        drop(journal);
+        fixture.finish();
+    }
+}
+
+#[test]
+fn journal_callback_unwind_fences_and_preserves_original_stop() {
+    let fixture = Fixture::new("journal-panic");
+    let mut journal = fixture
+        .activated()
+        .finish_journal_activation(until())
+        .unwrap();
+    journal.ready(until()).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        journal.entrypoint(&run(false), until(), &mut |_| {
+            panic!("fixture observer unwind")
+        })
+    }));
+    assert!(result.is_err());
+    assert!(journal.ready(until()).is_err());
+    drop(journal);
+    fixture.finish();
+}
+
+#[test]
+fn journal_input_overflow_never_sends_application_input() {
+    let fixture = Fixture::new("journal-input");
+    let mut journal = fixture
+        .activated()
+        .finish_journal_activation(until())
+        .unwrap();
+    journal.ready(until()).unwrap();
+    let request = GuestRequest::RunEntrypoint {
+        stdin: vec![0; (64 << 10) + 1],
+        timeout_secs: 2,
+        env: vec![],
+        stream_input: false,
+    };
+    assert!(
+        journal
+            .entrypoint(&request, until(), &mut |_| panic!("unexpected event"))
+            .is_err()
+    );
+    assert!(journal.ready(until()).is_err());
+    drop(journal);
+    fixture.finish();
 }
 
 struct Fixture {

@@ -10,6 +10,15 @@ fn has_verb(plan: &ExecutionPlan, verb: &str) -> bool {
         .is_some_and(|verbs| verbs.iter().any(|item| item.as_str() == verb))
 }
 
+fn selects_journal(plan: &ExecutionPlan) -> bool {
+    plan.mailbox.is_some_and(|grant| {
+        grant.retention.is_some()
+            && grant.durable_object_pair_sha256_v1.is_none()
+            && (grant.incoming_journal_policy_sha256_v1.is_some()
+                ^ grant.outbound_journal_v1.is_some())
+    })
+}
+
 fn deadline(plan: &ExecutionPlan, until: Instant, seconds: u32) -> Result<Instant> {
     let start = Instant::now();
     let now = chrono::Utc::now();
@@ -72,15 +81,45 @@ impl InstalledSlot {
             boot_cmdline,
             until,
         )?;
+        let journal = if selects_journal(&plan) {
+            anyhow::ensure!(
+                plan.agent_verbs
+                    .as_ref()
+                    .is_some_and(|verbs| verbs.len() == 2),
+                "original journal requires only activation and entrypoint verbs"
+            );
+            let boot = mvm_core::mailbox::reader::MailboxReaderBootBinding::load(&vm_state_dir(
+                &config.name,
+            ))?;
+            boot.check_plan(&plan)?;
+            let journal = channel.finish_journal_activation(until)?;
+            self.owner
+                .check_parent_current(config, BackendKind::Firecracker)?;
+            Some((journal, boot))
+        } else {
+            let mut state = self.access()?;
+            let custody = state
+                .as_mut()
+                .context("original entrypoint custody absent")?;
+            anyhow::ensure!(
+                custody.entrypoint.is_none() && custody.journal.is_none() && !custody.retired,
+                "original activation already claimed"
+            );
+            custody.entrypoint = Some(channel);
+            return Ok(true);
+        };
         let mut state = self.access()?;
         let custody = state
             .as_mut()
             .context("original entrypoint custody absent")?;
         anyhow::ensure!(
-            custody.entrypoint.is_none() && !custody.retired,
+            custody.entrypoint.is_none() && custody.journal.is_none() && !custody.retired,
             "original activation already claimed"
         );
-        custody.entrypoint = Some(channel);
+        if let Some((journal, boot)) = journal {
+            custody.journal = Some(journal);
+            custody.journal_boot = Some(boot);
+        }
         Ok(true)
     }
 
@@ -169,6 +208,9 @@ impl InstalledSlot {
     }
 }
 
+#[path = "journal.rs"]
+mod journal;
+
 /// A rejected original event is never exposed to the capture sink or observer.
 /// Latch the first refusal even if a later read would find current authority.
 fn observe_current(
@@ -196,6 +238,37 @@ fn observe_current(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_control_selection_requires_retained_directed_mailbox_not_just_verbs() {
+        use mvm_contract::protocol::mailbox::{
+            ExecutionEpoch, MailboxGrant, MailboxId, MailboxRetentionPolicy,
+        };
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        assert!(!selects_journal(&plan));
+        let mut grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
+            mailbox: MailboxId::from_bytes([1; 32]),
+            authority_key: [2; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: Some(MailboxRetentionPolicy::new(1000).unwrap()),
+        };
+        plan.mailbox = Some(grant);
+        assert!(!selects_journal(&plan));
+        grant.incoming_journal_policy_sha256_v1 = Some([3; 32]);
+        plan.mailbox = Some(grant);
+        assert!(selects_journal(&plan));
+        grant.durable_object_pair_sha256_v1 = Some([4; 32]);
+        plan.mailbox = Some(grant);
+        assert!(!selects_journal(&plan));
+        grant.durable_object_pair_sha256_v1 = None;
+        grant.retention = None;
+        plan.mailbox = Some(grant);
+        assert!(!selects_journal(&plan));
+    }
 
     #[test]
     fn lost_parent_authority_withholds_originating_event_and_terminal() {

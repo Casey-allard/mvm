@@ -22,4 +22,24 @@ pub trait OriginalEntrypointChannel: Send {
         observer: &mut dyn FnMut(&EntrypointEvent),
     ) -> Result<EntrypointEvent>;
     fn sync_filesystems(&mut self, until: Instant) -> Result<()>;
+    /// Close the acknowledged activation continuation for a separately
+    /// admitted persistent journal. Unsupported owners refuse this conversion.
+    fn finish_journal_activation(
+        self: Box<Self>,
+        _until: Instant,
+    ) -> Result<Box<dyn OriginalJournalControl>> {
+        anyhow::bail!("original journal control unavailable")
+    }
+}
+
+/// Repeated one-request sessions bound to the original activated guest.
+/// Ambiguous operations fence this owner without releasing native custody.
+pub trait OriginalJournalControl: Send {
+    fn ready(&mut self, until: Instant) -> Result<()>;
+    fn entrypoint(
+        &mut self,
+        request: &GuestRequest,
+        until: Instant,
+        observer: &mut dyn FnMut(&EntrypointEvent),
+    ) -> Result<EntrypointEvent>;
 }

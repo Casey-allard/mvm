@@ -61,6 +61,12 @@ struct Custody {
     #[cfg(target_os = "linux")]
     entrypoint: Option<Box<dyn mvm_vmm::driver::OriginalEntrypointChannel>>,
     #[cfg(target_os = "linux")]
+    journal: Option<Box<dyn mvm_vmm::driver::OriginalJournalControl>>,
+    #[cfg(target_os = "linux")]
+    journal_boot: Option<mvm_core::mailbox::reader::MailboxReaderBootBinding>,
+    #[cfg(target_os = "linux")]
+    journal_fenced: bool,
+    #[cfg(target_os = "linux")]
     entrypoint_busy: bool,
     vm: Option<Box<dyn RunningVm>>,
     failure: Option<anyhow::Error>,
@@ -105,6 +111,12 @@ impl InstalledSlots {
             state: Mutex::new(Some(Custody {
                 #[cfg(target_os = "linux")]
                 entrypoint: None,
+                #[cfg(target_os = "linux")]
+                journal: None,
+                #[cfg(target_os = "linux")]
+                journal_boot: None,
+                #[cfg(target_os = "linux")]
+                journal_fenced: false,
                 #[cfg(target_os = "linux")]
                 entrypoint_busy: false,
                 vm: None,
@@ -354,6 +366,8 @@ impl InstalledSlot {
         // Close it before any disposal receipt can release this launch's debit.
         #[cfg(target_os = "linux")]
         drop(state.entrypoint.take());
+        #[cfg(target_os = "linux")]
+        drop(state.journal.take());
         if !state.native_dispatch_entered {
             anyhow::ensure!(
                 state.failure.is_some() && state.vm.is_none() && state.exit.is_none(),

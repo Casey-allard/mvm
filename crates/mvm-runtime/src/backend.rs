@@ -930,6 +930,38 @@ impl AnyBackend {
         }
     }
 
+    /// Check readiness on a fresh session authenticated to the original guest.
+    #[cfg(target_os = "linux")]
+    pub fn check_owned_journal_ready(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: std::time::Instant,
+    ) -> Result<()> {
+        match self {
+            Self::Firecracker(runner) => runner.check_owned_journal_ready(id, owner, until),
+            _ => anyhow::bail!("original journal control unavailable"),
+        }
+    }
+
+    /// Invoke one admitted journal call without replaying an uncertain result.
+    #[cfg(target_os = "linux")]
+    pub fn run_owned_journal_entrypoint(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        input: &[u8],
+        until: std::time::Instant,
+        event: &mut dyn FnMut(&mvm_agentd::vsock::EntrypointEvent),
+    ) -> Result<mvm_agentd::vsock::EntrypointEvent> {
+        match self {
+            Self::Firecracker(runner) => {
+                runner.run_owned_journal_entrypoint(id, owner, input, until, event)
+            }
+            _ => anyhow::bail!("original journal control unavailable"),
+        }
+    }
+
     /// Wait for the original workload's bounded report using the live launch owner.
     #[cfg(unix)]
     pub fn wait_owned_until(
