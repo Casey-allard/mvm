@@ -210,7 +210,8 @@ impl StopCustody {
                 ),
                 None => super::super::configure_serving(config, child),
             }?;
-            restart.capture_socket(child, self.socket_parent(), until)
+            restart.capture_socket(child, self.socket_parent(), until)?;
+            Ok(())
         });
         Ok((
             child,
