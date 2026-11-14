@@ -117,6 +117,10 @@ Selection requires the actual retained signed mailbox grant with exactly one
 journal direction, no object-pair mapping, matching boot binding, exact two
 entrypoint verbs and ephemeral workload streams. Input is bounded at 64 KiB and
 cumulative output at 128 KiB, in addition to canonical serialized-frame limits.
+Journal execution honors canonical zero-as-unbounded `exec_secs`; each operation
+still expires at the earlier of its caller deadline and signed plan validity.
+A nonzero execution duration further caps that bound. Ordinary one-shot timeout
+behavior remains unchanged.
 Calls serialize; ambiguous I/O, changed authority/key, timeout or callback
 unwind fences later calls while retaining original stop custody. Other
 installed entrypoints keep their one-shot behavior. This is a preview host-only

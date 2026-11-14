@@ -1,6 +1,15 @@
 //! Serialized calls under the original signed persistent journal admission.
 use super::*;
 
+fn journal_deadline(plan: &ExecutionPlan, until: Instant) -> Result<Instant> {
+    let seconds = plan.resources.timeouts.exec_secs;
+    deadline_with_cap(
+        plan,
+        until,
+        (seconds != 0).then(|| Duration::from_secs(seconds.into())),
+    )
+}
+
 impl InstalledSlot {
     pub(in crate::workload_runner::runner) fn journal_ready(&self, until: Instant) -> Result<()> {
         self.with_journal(until, |channel, _, until, _| channel.ready(until))
@@ -98,7 +107,8 @@ impl InstalledSlot {
                 ))? == boot,
                 "original journal boot changed"
             );
-            let until = deadline(&plan, until, plan.resources.timeouts.exec_secs)?;
+            let until = journal_deadline(&plan, until)
+                .context("original journal pre-operation admission deadline")?;
             let seconds = until.saturating_duration_since(Instant::now()).as_secs();
             anyhow::ensure!(seconds > 0, "original journal timeout below one second");
             let channel = state
@@ -128,5 +138,59 @@ impl InstalledSlot {
             state.journal_fenced = false;
         }
         result.map_err(|_| anyhow::anyhow!("original journal callback unwound; control fenced"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(seconds: u32) -> ExecutionPlan {
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.valid_from = chrono::Utc::now() - chrono::Duration::seconds(1);
+        plan.valid_until = chrono::Utc::now() + chrono::Duration::seconds(60);
+        plan.resources.timeouts.exec_secs = seconds;
+        plan
+    }
+
+    #[test]
+    fn unbounded_journal_execution_still_obeys_the_callers_absolute_deadline() {
+        let until = Instant::now() + Duration::from_secs(2);
+        assert_eq!(journal_deadline(&plan(0), until).unwrap(), until);
+    }
+
+    #[test]
+    fn unbounded_journal_execution_never_extends_signed_validity() {
+        let mut plan = plan(0);
+        plan.valid_until = chrono::Utc::now() + chrono::Duration::seconds(2);
+        let before = Instant::now();
+        let until = before + Duration::from_secs(10);
+        let actual = journal_deadline(&plan, until).unwrap();
+        assert!(actual < until);
+        assert!(actual > before + Duration::from_secs(1));
+        assert!(actual <= before + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bounded_journal_execution_keeps_the_existing_cap() {
+        let before = Instant::now();
+        let actual = journal_deadline(&plan(1), before + Duration::from_secs(10)).unwrap();
+        let after = Instant::now();
+        assert!(actual >= before + Duration::from_secs(1));
+        assert!(actual <= after + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn expired_journal_plan_or_caller_deadline_refuses() {
+        let valid = plan(0);
+        assert!(journal_deadline(&valid, Instant::now() - Duration::from_secs(1)).is_err());
+        let mut expired = valid;
+        expired.valid_until = chrono::Utc::now() - chrono::Duration::seconds(1);
+        assert!(journal_deadline(&expired, Instant::now() + Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn one_shot_zero_cap_behavior_is_unchanged() {
+        assert!(deadline(&plan(0), Instant::now() + Duration::from_secs(2), 0).is_err());
     }
 }

@@ -285,6 +285,15 @@ fn journal_activation_closes_before_ready_and_reuses_only_terminal_calls() {
 }
 
 #[test]
+fn journal_conversion_requires_activation_ack_and_keeps_original_stop_custody() {
+    let fixture = Fixture::new("expired");
+    let channel = fixture.open().unwrap();
+    assert!(channel.finish_journal_activation(until()).is_err());
+    assert!(fixture.open().is_err());
+    fixture.finish();
+}
+
+#[test]
 fn journal_changed_guest_key_fences_without_replacing_original() {
     let fixture = Fixture::new("journal-key");
     let mut journal = fixture

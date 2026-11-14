@@ -31,16 +31,22 @@ pub(super) fn finish_activation(
     mut channel: Channel,
     until: Instant,
 ) -> Result<Box<dyn OriginalJournalControl>> {
-    let stream = channel.take(Phase::Activated, until)?;
+    let stream = channel
+        .take(Phase::Activated, until)
+        .context("original journal activation ACK boundary")?;
     // Closing this acknowledged continuation lets PID 1 initialize the mailbox
     // and enter its normal control accept loop. Never spend a workload call.
+    stream
+        .shutdown(std::net::Shutdown::Both)
+        .context("original journal activation continuation shutdown")?;
     drop(stream);
     {
         let held = channel
             .original
             .try_lock()
             .map_err(|_| anyhow::anyhow!("original custody busy or poisoned"))?;
-        current(&held, &channel.anchor, None, until)?;
+        current(&held, &channel.anchor, None, until)
+            .context("original journal post-activation-close custody")?;
     }
     Ok(Box::new(Journal {
         original: channel.original,
@@ -58,10 +64,11 @@ impl Journal {
         ensure!(!self.fenced, "original journal control fenced");
         self.fenced = true;
         let (stream, session, guest) =
-            connect(&self.original, &self.anchor, &self.host, &self.path, until)?;
+            connect(&self.original, &self.anchor, &self.host, &self.path, until)
+                .context("original journal session establishment")?;
         ensure!(
             guest == self.guest,
-            "original journal guest identity changed"
+            "original journal guest key pin differs"
         );
         Ok((stream, session))
     }
@@ -80,15 +87,22 @@ impl OriginalJournalControl for Journal {
             stream: &mut stream,
             until,
         };
-        session.write(&mut io, &GuestRequest::Ping)?;
+        session
+            .write(&mut io, &GuestRequest::Ping)
+            .context("original journal protected Ping write")?;
+        let response = session
+            .read(&mut io)
+            .context("original journal protected Pong read")?;
         ensure!(
             matches!(
-                check_response(&GuestRequest::Ping, session.read(&mut io)?)?,
+                check_response(&GuestRequest::Ping, response)
+                    .context("original journal Pong response validation")?,
                 GuestResponse::Pong
             ),
             "original journal readiness was not acknowledged"
         );
-        self.complete(&stream, until)?;
+        self.complete(&stream, until)
+            .context("original journal readiness final custody check")?;
         self.ready = true;
         Ok(())
     }

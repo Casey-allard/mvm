@@ -20,15 +20,22 @@ fn selects_journal(plan: &ExecutionPlan) -> bool {
 }
 
 fn deadline(plan: &ExecutionPlan, until: Instant, seconds: u32) -> Result<Instant> {
+    deadline_with_cap(plan, until, Some(Duration::from_secs(seconds.into())))
+}
+
+fn deadline_with_cap(
+    plan: &ExecutionPlan,
+    until: Instant,
+    cap: Option<Duration>,
+) -> Result<Instant> {
     let start = Instant::now();
     let now = chrono::Utc::now();
     anyhow::ensure!(
         plan.valid_from <= now && now < plan.valid_until,
         "original entrypoint plan is outside its validity window"
     );
-    let budget = (plan.valid_until - now)
-        .to_std()?
-        .min(Duration::from_secs(seconds.into()));
+    let validity = (plan.valid_until - now).to_std()?;
+    let budget = cap.map_or(validity, |cap| validity.min(cap));
     let end = until.min(
         start
             .checked_add(budget)

@@ -95,7 +95,7 @@ fn connect(
         let held = original
             .try_lock()
             .map_err(|_| anyhow::anyhow!("original custody busy or poisoned"))?;
-        current(&held, anchor, None, until)?;
+        current(&held, anchor, None, until).context("original control pre-dial custody")?;
     }
     let keys = mvm_core::config::mvm_keys_dir_at(mvm_core::config::mvm_home_strict()?);
     let (signer, public) = mvm_core::crypto::ed25519_keypair::load_existing(
@@ -107,16 +107,17 @@ fn connect(
         "original registered host identity changed"
     );
     before(until)?;
-    let mut stream = connect_unix_before(path, until)?;
-    check(original, anchor, &stream, until)?;
+    let mut stream = connect_unix_before(path, until).context("original control Unix dial")?;
+    check(original, anchor, &stream, until).context("original control dial peer authentication")?;
     complete_connect_handshake(
         &mut DeadlineIo {
             stream: &mut stream,
             until,
         },
         GUEST_AGENT_PORT,
-    )?;
-    check(original, anchor, &stream, until)?;
+    )
+    .context("original control CONNECT handshake")?;
+    check(original, anchor, &stream, until).context("original control post-CONNECT custody")?;
     let session_id = mvm_core::domain::session::SessionId::new();
     let (session, peer) = AuthenticatedSession::host_retaining_peer(
         &mut DeadlineIo {
@@ -125,8 +126,9 @@ fn connect(
         },
         session_id.as_str(),
         signer,
-    )?;
-    check(original, anchor, &stream, until)?;
+    )
+    .context("original control protected guest handshake")?;
+    check(original, anchor, &stream, until).context("original control post-handshake custody")?;
     Ok((stream, session, peer))
 }
 
