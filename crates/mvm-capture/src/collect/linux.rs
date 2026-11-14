@@ -88,16 +88,18 @@ pub(super) fn collect_packages(report: &mut CaptureReportV1) -> Result<(), Captu
 pub(super) fn trace_explicit_commands(
     report: &mut CaptureReportV1,
     commands: &[String],
+    project_path: &std::path::Path,
 ) -> Result<(), CaptureError> {
     let tracer =
         crate::collect::trace::StraceTracer::new(crate::collect::trace::StraceLimits::default());
     for cmd in commands {
         let argv: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
-        match tracer.trace_command(&argv) {
+        match tracer.trace_command(&argv, project_path) {
             Ok(events) => {
                 record_trace_events(report, &argv, events);
             }
             Err(e) => {
+                let executed = matches!(&e, crate::collect::trace::TraceFailure::Started(_));
                 report.observations.push(Observation {
                     id: obs_id("trace", cmd),
                     kind: ObservationKind::Executable,
@@ -105,7 +107,7 @@ pub(super) fn trace_explicit_commands(
                     source: "linux-trace-request".to_owned(),
                     evidence: Evidence {
                         observed_path: Some(cmd.clone()),
-                        executed: true,
+                        executed,
                         ..Default::default()
                     },
                     confidence: Confidence::Observed,

@@ -2925,7 +2925,7 @@ Inspect a project directory and emit a versioned capture report.
 | ----------------- | --------------------------------------------------------------------- |
 | `<path>`          | Project directory to inspect                                          |
 | `--output <path>` | Output file for the capture report (required)                         |
-| `--run "<cmd>"`   | Explicit command to record for later tracing/verification; repeatable |
+| `--run "<cmd>"`   | Explicit command to trace on Linux in the selected project directory; repeatable |
 
 ### `mvmctl capture resolve`
 

@@ -13,6 +13,62 @@ fn fixture_root() -> PathBuf {
         .expect("fixture exists")
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn explicit_command_runs_in_captured_project() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempfile::tempdir().expect("project directory");
+    let script = project.path().join("observe-cwd");
+    std::fs::write(&script, "#!/bin/sh\npwd > \"$0.cwd\"\n").expect("write explicit command");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("make explicit command executable");
+    let options = mvm_capture::collect::CollectOptions {
+        project_path: project.path().to_path_buf(),
+        explicit_commands: vec![script.to_string_lossy().into_owned()],
+        ..Default::default()
+    };
+
+    mvm_capture::collect::collect_project(&options).expect("capture project");
+
+    let observed = std::fs::read_to_string(project.path().join("observe-cwd.cwd"))
+        .expect("explicit command writes inside captured project");
+    assert_eq!(
+        PathBuf::from(observed.trim()),
+        project.path().canonicalize().expect("canonical project")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_project_does_not_execute_explicit_command() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("command directory");
+    let script = temporary.path().join("observe-execution");
+    std::fs::write(&script, "#!/bin/sh\nprintf executed > \"$0.marker\"\n")
+        .expect("write explicit command");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("make explicit command executable");
+    let options = mvm_capture::collect::CollectOptions {
+        project_path: temporary.path().join("absent-project"),
+        explicit_commands: vec![script.to_string_lossy().into_owned()],
+        ..Default::default()
+    };
+
+    let report = mvm_capture::collect::collect_project(&options).expect("capture reports refusal");
+
+    assert!(!temporary.path().join("observe-execution.marker").exists());
+    assert!(report.observations.iter().any(|observation| {
+        observation.source == "linux-trace-request"
+            && !observation.evidence.executed
+            && observation
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("dynamic tracing failed:"))
+    }));
+}
+
 #[test]
 fn capture_report_is_versioned_and_contains_manifests() {
     let opts = mvm_capture::collect::CollectOptions {

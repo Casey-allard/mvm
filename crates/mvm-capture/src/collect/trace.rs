@@ -35,6 +35,14 @@ pub(super) struct StraceTracer {
     limits: StraceLimits,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum TraceFailure {
+    #[error("{0}")]
+    NotStarted(CaptureError),
+    #[error("{0}")]
+    Started(CaptureError),
+}
+
 impl StraceTracer {
     pub(super) fn new(limits: StraceLimits) -> Self {
         Self { limits }
@@ -46,29 +54,33 @@ impl StraceTracer {
     pub(super) fn trace_command(
         &self,
         command: &[String],
-    ) -> Result<Vec<TraceEvent>, CaptureError> {
+        project_path: &Path,
+    ) -> Result<Vec<TraceEvent>, TraceFailure> {
         if command.is_empty() {
-            return Err(CaptureError::InvalidObservation(
+            return Err(TraceFailure::NotStarted(CaptureError::InvalidObservation(
                 "empty command cannot be traced".to_owned(),
-            ));
+            )));
         }
 
-        let output_file = tempfile::NamedTempFile::new()
-            .map_err(|e| CaptureError::Io(PathBuf::from("<strace-output>"), e))?;
+        let output_file = tempfile::NamedTempFile::new().map_err(|e| {
+            TraceFailure::NotStarted(CaptureError::Io(PathBuf::from("<strace-output>"), e))
+        })?;
         let output_path = output_file.path().to_path_buf();
 
-        let mut cmd = build_trace_command(command, &output_path, self.limits.max_seconds);
-        cmd.stdin(Stdio::null())
+        let mut cmd = build_trace_command(command, &output_path, self.limits.max_seconds)
+            .map_err(TraceFailure::NotStarted)?;
+        cmd.current_dir(project_path)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| CaptureError::Io(PathBuf::from("strace"), e))?;
+            .map_err(|e| TraceFailure::NotStarted(CaptureError::Io(PathBuf::from("strace"), e)))?;
 
         let status = child
             .wait()
-            .map_err(|e| CaptureError::Io(PathBuf::from("strace"), e))?;
+            .map_err(|e| TraceFailure::Started(CaptureError::Io(PathBuf::from("strace"), e)))?;
 
         let stderr = child
             .stderr
@@ -82,21 +94,23 @@ impl StraceTracer {
 
         // strace exits with the traced process's status; 124 means timeout killed it.
         if !status.success() && status.code() == Some(124) {
-            return Err(CaptureError::LimitExceeded(format!(
+            return Err(TraceFailure::Started(CaptureError::LimitExceeded(format!(
                 "strace timed out after {} seconds",
                 self.limits.max_seconds
-            )));
+            ))));
         }
 
         let output = read_limited(&output_path, self.limits.max_output_bytes)
-            .map_err(|e| CaptureError::Io(output_path.clone(), e))?;
+            .map_err(|e| TraceFailure::Started(CaptureError::Io(output_path.clone(), e)))?;
         let text = String::from_utf8_lossy(&output);
         let events = parse_strace_output(&text, self.limits.max_events);
 
         if events.is_empty() && !stderr.is_empty() {
-            return Err(CaptureError::PackageQueryFailed(format!(
-                "strace produced no parseable events; stderr: {}",
-                stderr.lines().next().unwrap_or("unknown")
+            return Err(TraceFailure::Started(CaptureError::PackageQueryFailed(
+                format!(
+                    "strace produced no parseable events; stderr: {}",
+                    stderr.lines().next().unwrap_or("unknown")
+                ),
             )));
         }
 
@@ -113,14 +127,23 @@ fn read_limited(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn build_trace_command(command: &[String], output_path: &Path, max_seconds: u64) -> Command {
-    let has_timeout = which::which("timeout").is_ok();
-    if has_timeout {
-        let mut cmd = mvm_core::env_hygiene::helper_command("timeout");
+fn build_trace_command(
+    command: &[String],
+    output_path: &Path,
+    max_seconds: u64,
+) -> Result<Command, CaptureError> {
+    let tracer = which::which("strace").map_err(|error| {
+        CaptureError::PackageQueryFailed(format!("strace unavailable: {error}"))
+    })?;
+    let tracer = std::path::absolute(&tracer).map_err(|error| CaptureError::Io(tracer, error))?;
+    if let Ok(timeout) = which::which("timeout") {
+        let timeout =
+            std::path::absolute(&timeout).map_err(|error| CaptureError::Io(timeout, error))?;
+        let mut cmd = mvm_core::env_hygiene::helper_command(timeout);
         cmd.arg("--signal=KILL")
             .arg("--kill-after=1s")
             .arg(format!("{}", max_seconds))
-            .arg("strace")
+            .arg(tracer)
             .arg("-f")
             .arg("-e")
             .arg("trace=openat,open,connect,execve,execveat")
@@ -130,9 +153,9 @@ fn build_trace_command(command: &[String], output_path: &Path, max_seconds: u64)
             .arg(output_path)
             .arg("--")
             .args(command);
-        cmd
+        Ok(cmd)
     } else {
-        let mut cmd = mvm_core::env_hygiene::helper_command("strace");
+        let mut cmd = mvm_core::env_hygiene::helper_command(tracer);
         cmd.arg("-f")
             .arg("-e")
             .arg("trace=openat,open,connect,execve,execveat")
@@ -142,7 +165,7 @@ fn build_trace_command(command: &[String], output_path: &Path, max_seconds: u64)
             .arg(output_path)
             .arg("--")
             .args(command);
-        cmd
+        Ok(cmd)
     }
 }
 
@@ -240,6 +263,17 @@ fn extract_quoted_string(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracing_helpers_are_pinned_before_child_directory_changes() {
+        let command = build_trace_command(&["true".to_owned()], Path::new("trace.txt"), 10)
+            .expect("tracing helpers available");
+        assert!(Path::new(command.get_program()).is_absolute());
+        if which::which("timeout").is_ok() {
+            let arguments: Vec<_> = command.get_args().collect();
+            assert!(Path::new(arguments[3]).is_absolute());
+        }
+    }
 
     #[test]
     fn parse_openat_extracts_path() {
