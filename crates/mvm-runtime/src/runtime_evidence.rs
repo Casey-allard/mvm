@@ -12,12 +12,73 @@ use mvm_build::guest_runtime::evidence::{
 };
 use mvm_build::guest_runtime::source::{CheckedSourceRuntime, check_source_runtime};
 use mvm_core::arch::GuestArch;
+use mvm_core::mailbox::reader::{
+    MailboxReaderBootBinding, MailboxReaderCompatibilityV1, require_mailbox_reader_compatibility,
+    require_mailbox_reader_grant,
+};
 use mvm_core::protocol::runtime_release::{
     CliRuntimeLaunchBinding, RuntimeBindingProvenance, RuntimeLaunchBinding,
 };
 use mvm_core::util::atomic_io::{sync_dir, sync_file, write_private_new};
 use mvm_core::vm_backend::VmStartConfig;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+#[path = "runtime_evidence/mailbox_tests.rs"]
+mod mailbox_tests;
+
+/// Compatibility selected from an already checked runtime. Private fields and
+/// no deserializer prevent a launch request from supplying its own capability.
+#[derive(Debug)]
+pub struct VerifiedMailboxReader {
+    profile: Option<MailboxReaderCompatibilityV1>,
+}
+
+fn checked_mailbox_reader(
+    declaration: &RuntimeAssembly,
+    arch: GuestArch,
+) -> Result<VerifiedMailboxReader> {
+    declaration.validate(arch)?;
+    let profile = declaration.mailbox_reader_v1.clone();
+    if let Some(profile) = &profile {
+        profile.validate()?;
+    }
+    Ok(VerifiedMailboxReader { profile })
+}
+
+impl VerifiedMailboxReader {
+    pub(crate) fn require(
+        &self,
+        plan: &mvm_core::plan::ExecutionPlan,
+        binding: Option<&MailboxReaderBootBinding>,
+    ) -> Result<()> {
+        require_mailbox_profile(self.profile.as_ref(), plan, binding)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(profile: Option<MailboxReaderCompatibilityV1>) -> Self {
+        Self { profile }
+    }
+}
+
+pub(crate) fn require_mailbox_profile(
+    profile: Option<&MailboxReaderCompatibilityV1>,
+    plan: &mvm_core::plan::ExecutionPlan,
+    binding: Option<&MailboxReaderBootBinding>,
+) -> Result<()> {
+    if let Some(grant) = &plan.mailbox {
+        require_mailbox_reader_grant(profile, grant)?;
+        if let Some(binding) = binding {
+            require_mailbox_reader_compatibility(profile, plan, binding)?;
+        }
+    } else {
+        anyhow::ensure!(
+            binding.is_none(),
+            "mailbox boot binding has no admitted grant"
+        );
+    }
+    Ok(())
+}
 
 mod namespace;
 use namespace::{check_owner, private_directory};
@@ -38,6 +99,24 @@ pub enum VerifiedLaunchRuntime {
 }
 
 impl VerifiedLaunchRuntime {
+    pub fn require_mailbox_reader(
+        &self,
+        plan: &mvm_core::plan::ExecutionPlan,
+        binding: Option<&MailboxReaderBootBinding>,
+    ) -> Result<()> {
+        self.mailbox_reader()?.require(plan, binding)
+    }
+
+    fn mailbox_reader(&self) -> Result<VerifiedMailboxReader> {
+        match self {
+            Self::Release(_) | Self::Source(_) => {
+                checked_mailbox_reader(self.declaration(GuestArch::host())?, GuestArch::host())
+            }
+            Self::LegacyBundle(_) | Self::LegacyPortable(_) => {
+                Ok(VerifiedMailboxReader { profile: None })
+            }
+        }
+    }
     pub fn is_release(&self) -> bool {
         matches!(self, Self::Release(_))
     }
@@ -499,7 +578,15 @@ pub fn verify_runtime_for_launch(
     config: &VmStartConfig,
     minimum_protocol: u32,
 ) -> Result<Option<VerifiedLaunchRuntime>> {
-    verify_runtime_for_launch_at(config, minimum_protocol, None)
+    let verified = verify_runtime_for_launch_at(config, minimum_protocol, None)?;
+    if let Some(json) = config.plan_json.as_deref() {
+        let plan = mvm_core::plan::plan_from_admitted_json(json)?;
+        match &verified {
+            Some(runtime) => runtime.require_mailbox_reader(&plan, None)?,
+            None => require_mailbox_profile(None, &plan, None)?,
+        }
+    }
+    Ok(verified)
 }
 
 /// Release-only preflight over the actual selected launch bytes. The returned
@@ -671,9 +758,13 @@ fn runtime_selection(
 pub(crate) struct RuntimeLifecycleLease {
     directory: PathBuf,
     _lock: std::fs::File,
+    mailbox_reader: std::sync::OnceLock<VerifiedMailboxReader>,
 }
 
 impl RuntimeLifecycleLease {
+    pub(crate) fn mailbox_reader(&self) -> Option<&VerifiedMailboxReader> {
+        self.mailbox_reader.get()
+    }
     pub(crate) fn canonical_kernel_record(&self) -> PathBuf {
         self.directory.join("canonical-kernel.json")
     }
@@ -754,6 +845,7 @@ impl RuntimeLifecycleLease {
         Ok(Self {
             directory,
             _lock: lock,
+            mailbox_reader: std::sync::OnceLock::new(),
         })
     }
 
@@ -770,8 +862,22 @@ impl RuntimeLifecycleLease {
             .context("runtime lifecycle namespace has no home")?;
         let Some(verified) = verify_runtime_for_launch_at(config, minimum_protocol, Some(home))?
         else {
+            if let Some(json) = config.plan_json.as_deref() {
+                let plan = mvm_core::plan::plan_from_admitted_json(json)?;
+                require_mailbox_profile(None, &plan, None)?;
+            }
             return Ok(config.clone());
         };
+        // Reuse this verification for both semantic admission and the actual
+        // identity projection below; no second archive/signature read is owed.
+        let mailbox_reader = verified.mailbox_reader()?;
+        if let Some(json) = config.plan_json.as_deref() {
+            let plan = mvm_core::plan::plan_from_admitted_json(json)?;
+            mailbox_reader.require(&plan, None)?;
+        }
+        self.mailbox_reader
+            .set(mailbox_reader)
+            .map_err(|_| anyhow::anyhow!("runtime lifecycle compatibility already bound"))?;
         if let VerifiedLaunchRuntime::LegacyBundle(legacy) = &verified {
             let mut bound = legacy.snapshot_in(config, &self.directory)?;
             bound.source_runtime_archive_sha256 = None;

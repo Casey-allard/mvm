@@ -144,6 +144,7 @@ mod tests {
 
     fn declaration() -> RuntimeAssembly {
         RuntimeAssembly {
+            mailbox_reader_v1: None,
             assembly_format: crate::guest_bins::assembly::RUNTIME_ASSEMBLY_FORMAT,
             arch: GuestArch::Aarch64,
             protocol_version: 2,

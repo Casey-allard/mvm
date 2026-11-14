@@ -4,6 +4,28 @@
 //! Callers must obtain the scope from an authenticated current guest boot and
 //! persist one-time challenge use before publishing a lease.
 
+mod compatibility;
+pub use compatibility::{
+    LEGACY_MAILBOX_READER_BOOT_BYTES, MailboxReaderCompatibilityV1, MailboxReaderFeatureV1,
+    require_mailbox_reader_compatibility, require_mailbox_reader_grant,
+};
+
+/// Compiled reader definitions and parser used for runtime declarations.
+pub const COMPILED_MAILBOX_READER_INPUTS: &[(&str, &[u8])] = &[
+    (
+        "crates/mvm-core/src/mailbox/reader.rs",
+        include_bytes!("reader.rs"),
+    ),
+    (
+        "crates/mvm-core/src/mailbox/reader/compatibility.rs",
+        include_bytes!("reader/compatibility.rs"),
+    ),
+    (
+        "crates/mvm-core/src/mailbox/reader/platforms/unix.rs",
+        include_bytes!("reader/platforms/unix.rs"),
+    ),
+];
+
 use std::path::Path;
 
 #[cfg(unix)]

@@ -180,6 +180,7 @@ mod tests {
         // Exercises the comparison used after verification, not a successful
         // signature verification. No trusted runtime handle is fabricated.
         let declaration = mvm_build::guest_bins::assembly::RuntimeAssembly {
+            mailbox_reader_v1: None,
             assembly_format: mvm_build::guest_bins::assembly::RUNTIME_ASSEMBLY_FORMAT,
             arch: mvm_core::arch::GuestArch::host(),
             protocol_version: mvm_runtime::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION,

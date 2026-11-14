@@ -589,6 +589,7 @@ mod tests {
         }
         let digest = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
         let declaration = RuntimeAssembly {
+            mailbox_reader_v1: None,
             assembly_format: crate::guest_bins::assembly::RUNTIME_ASSEMBLY_FORMAT,
             arch: GuestArch::X86_64,
             protocol_version: 2,

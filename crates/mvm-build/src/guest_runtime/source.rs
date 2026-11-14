@@ -100,25 +100,51 @@ pub fn check_source_runtime(
         // Schema 1 has no declaration: derive it, never bless supplied hashes.
         // A declaration this host already derived and signed for this archive
         // and this build is read back instead; any doubt about it derives again.
-        let declaration = match super::declaration_cache::load(cache_root, &runtime.digest, arch) {
-            Some(declaration) => declaration,
-            None => {
-                let cache = tempfile::tempdir()?;
-                let derived = crate::guest_bins::assembly::derive_runtime_assembly(
-                    &runtime,
-                    arch,
-                    cache.path(),
-                )?;
-                super::declaration_cache::store(cache_root, &runtime.digest, arch, &derived);
-                derived
-            }
-        };
-        if let Some(claimed) = runtime.manifest.assemblies.get(&arch)
-            && claimed != &declaration
+        let mut declaration =
+            match super::declaration_cache::load(cache_root, &runtime.digest, arch) {
+                Some(declaration) => declaration,
+                None => {
+                    let cache = tempfile::tempdir()?;
+                    let derived = crate::guest_bins::assembly::derive_runtime_assembly(
+                        &runtime,
+                        arch,
+                        cache.path(),
+                    )?;
+                    super::declaration_cache::store(cache_root, &runtime.digest, arch, &derived);
+                    derived
+                }
+            };
+        // The signed host cache accelerates byte assembly, not feature discovery.
+        declaration.mailbox_reader_v1 = None;
+        let mut claimed = runtime.manifest.assemblies.get(&arch).cloned();
+        if let Some(claimed) = &mut claimed {
+            // Byte assembly does not prove reader features of arbitrary archived executables.
+            claimed.mailbox_reader_v1 = None;
+        }
+        if claimed
+            .as_ref()
+            .is_some_and(|claimed| claimed != &declaration)
         {
             return Err(GuestRuntimeError::Cache(
                 "unsigned source assembly declaration differs from archive members".into(),
             ));
+        }
+        if let Some(profile) = runtime
+            .manifest
+            .assemblies
+            .get(&arch)
+            .and_then(|assembly| assembly.mailbox_reader_v1.as_ref())
+        {
+            let fingerprints = crate::guest_bins::GuestBinsFingerprints::of_tree(&workspace)?;
+            if *profile != crate::guest_bins::assembly::current_mailbox_reader_compatibility()
+                || runtime.manifest.guest_source_fingerprint != fingerprints.guest_source
+                || runtime.manifest.sdk_cdylib_source_fingerprint != fingerprints.sdk_cdylib
+            {
+                return Err(GuestRuntimeError::Cache(
+                    "source mailbox reader declaration differs from current build inputs".into(),
+                ));
+            }
+            declaration.mailbox_reader_v1 = Some(profile.clone());
         }
         declarations.insert(key, declaration.clone());
         declaration

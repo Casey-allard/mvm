@@ -206,6 +206,7 @@ pub struct EndpointSpawnInputs<'a> {
     pub ingress: &'a [mvm_core::plan::IngressMapping],
     /// The admitted plan for a cold boot that grants a guest mailbox.
     pub reader_plan: Option<&'a mvm_core::plan::ExecutionPlan>,
+    pub mailbox_runtime: Option<&'a crate::runtime_evidence::VerifiedMailboxReader>,
     /// Where this boot's FlowMux identity comes from. A cold boot mints one; a
     /// warm claim inherits its parent's, because the restored child already
     /// holds the parent's signing key in memory.
@@ -352,8 +353,10 @@ impl<'a> ClaimGuards<'a> {
             network_limits: inputs.network_limits,
             ingress: inputs.ingress,
             reader_plan: inputs.reader_plan,
+            mailbox_runtime: inputs.mailbox_runtime,
             identity: inputs.identity,
         };
+        request.require_mailbox_reader(None)?;
         if inputs.secrets.is_empty()
             && !inputs.network_policy.admits_outbound()
             && inputs.ingress.is_empty()
@@ -414,11 +417,13 @@ impl<'a> ClaimGuards<'a> {
             secrets: inputs.secrets,
             redaction: inputs.redaction,
             reader_plan: inputs.reader_plan,
+            mailbox_runtime: inputs.mailbox_runtime,
             network_policy: inputs.network_policy,
             network_limits: inputs.network_limits,
             ingress: inputs.ingress,
             identity: inputs.identity,
         };
+        request.require_mailbox_reader(None)?;
         let spawned = self.spawner.spawn_installed(&request, config, original)?;
         anyhow::ensure!(
             spawned.owner.is_some() || (spawned.egress_uds.is_none() && !spawned.telemetry),
@@ -632,6 +637,7 @@ mod tests {
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
             reader_plan: None,
+            mailbox_runtime: None,
         }
     }
 
@@ -669,6 +675,38 @@ mod tests {
 
         // Disarm the reaper so drop doesn't chase a nonexistent endpoint.
         child.defuse();
+    }
+
+    #[test]
+    fn unsupported_mailbox_profile_refuses_before_any_spawner_call() {
+        use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.mailbox = Some(MailboxGrant {
+            mailbox: MailboxId::from_bytes([4; 32]),
+            authority_key: [5; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: None,
+            durable_object_pair_sha256_v1: Some([6; 32]),
+            outbound_journal_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+        });
+        plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+        let spawner = FakeSpawner::default();
+        let guards = ClaimGuards::new(&spawner);
+        let state = tempfile::tempdir().unwrap();
+        let redaction = RedactionPolicy::default();
+        let policy = NetworkPolicy::deny_all();
+        let mut inputs = endpoint_inputs(state.path(), &redaction, &policy);
+        inputs.reader_plan = Some(&plan);
+        assert!(
+            guards
+                .spawn_endpoint(&VmId("unsupported-mailbox".into()), &inputs)
+                .is_err()
+        );
+        assert!(spawner.seen_vm.lock().unwrap().is_none());
+        assert!(spawner.identity_vm.lock().unwrap().is_none());
+        assert!(spawner.telemetry_vm.lock().unwrap().is_none());
     }
 
     #[test]

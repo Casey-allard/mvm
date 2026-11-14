@@ -4,6 +4,12 @@
 //! Cryptography, clocks, replay storage, routing, and transport live in
 //! `mvm_core::mailbox` and its runtime consumers.
 
+/// Compiled grant and wire definitions used for runtime declarations.
+pub const COMPILED_MAILBOX_READER_INPUTS: &[(&str, &[u8])] = &[(
+    "crates/mvm-contract/src/protocol/mailbox.rs",
+    include_bytes!("mailbox.rs"),
+)];
+
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 

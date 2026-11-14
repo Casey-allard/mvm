@@ -41,8 +41,32 @@ pub struct NetworkEndpointSpawnRequest<'a> {
     pub ingress: &'a [mvm_core::plan::IngressMapping],
     /// Verified cold plan for optional per-boot mailbox reader key delivery.
     pub reader_plan: Option<&'a mvm_core::plan::ExecutionPlan>,
+    /// Opaque compatibility from the same checked runtime lifecycle, not a DTO.
+    pub mailbox_runtime: Option<&'a crate::runtime_evidence::VerifiedMailboxReader>,
     /// Where the guest's half of the authenticated session comes from.
     pub identity: FlowMuxIdentitySource<'a>,
+}
+
+impl NetworkEndpointSpawnRequest<'_> {
+    pub(crate) fn require_mailbox_reader(
+        &self,
+        binding: Option<&mvm_core::mailbox::reader::MailboxReaderBootBinding>,
+    ) -> Result<()> {
+        let Some(plan) = self.reader_plan else {
+            anyhow::ensure!(binding.is_none(), "reader projection has no admitted plan");
+            return Ok(());
+        };
+        if matches!(self.identity, FlowMuxIdentitySource::InheritFrom(_)) {
+            if let Some(grant) = &plan.mailbox {
+                mvm_core::mailbox::reader::require_mailbox_reader_grant(None, grant)
+                    .context("restored mailbox extensions require independent reader rekey")?;
+            }
+        }
+        match self.mailbox_runtime {
+            Some(runtime) => runtime.require(plan, binding),
+            None => crate::runtime_evidence::require_mailbox_profile(None, plan, binding),
+        }
+    }
 }
 
 /// A stood-up endpoint: the channel, and the drive the guest reads its identity
@@ -215,6 +239,7 @@ pub(super) fn prepare_standby_identity(
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
             reader_plan: None,
+            mailbox_runtime: None,
             identity: FlowMuxIdentitySource::Mint,
         })
         .map_err(|error| {
@@ -583,6 +608,7 @@ fn mint_mailbox_reader_boot(
                 guest_identity,
                 key.verifying_key().to_bytes(),
             )?;
+            req.require_mailbox_reader(Some(&binding))?;
             Ok((key, binding))
         })
         .transpose()
@@ -890,6 +916,7 @@ mod tests {
                 network_limits: mvm_core::plan::NetworkLimits::default(),
                 ingress: &[],
                 reader_plan: None,
+                mailbox_runtime: None,
                 identity,
             },
             anchor,
@@ -990,6 +1017,7 @@ mod tests {
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
             reader_plan: Some(&plan),
+            mailbox_runtime: None,
             identity: FlowMuxIdentitySource::Mint,
         };
         let drive = prepare_observation_identity(&request, &anchor)
@@ -1018,6 +1046,7 @@ mod tests {
                     state_dir: &child,
                     identity: FlowMuxIdentitySource::InheritFrom(&parent),
                     reader_plan: None,
+                    mailbox_runtime: None,
                     ..request
                 },
                 &anchor,
@@ -1050,7 +1079,7 @@ mod tests {
         });
         plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
         let state = root.path().join("selected");
-        let request = NetworkEndpointSpawnRequest {
+        let mut request = NetworkEndpointSpawnRequest {
             vm_name: &plan.image.name,
             state_dir: &state,
             tenant: "tenant",
@@ -1060,8 +1089,24 @@ mod tests {
             network_limits: Default::default(),
             ingress: &[],
             reader_plan: Some(&plan),
+            mailbox_runtime: None,
             identity: FlowMuxIdentitySource::Mint,
         };
+        // Legacy runtime metadata cannot publish even a small object selector.
+        assert!(prepare_observation_identity_inner(&request, &anchor, None).is_err());
+        assert!(
+            !state.exists(),
+            "compatibility refusal must precede drive/boot publication"
+        );
+        // This fixture selects policy only; it is not release-verification evidence.
+        let compatibility = crate::runtime_evidence::VerifiedMailboxReader::fixture(Some(
+            mvm_core::mailbox::reader::MailboxReaderCompatibilityV1 {
+                format: 1,
+                max_boot_bytes: 8192,
+                features: vec![mvm_core::mailbox::reader::MailboxReaderFeatureV1::ObjectPairV1],
+            },
+        ));
+        request.mailbox_runtime = Some(&compatibility);
         let slot = Capture::new();
         let drive = prepare_observation_identity_inner(&request, &anchor, Some(&slot))
             .unwrap()
@@ -1091,6 +1136,50 @@ mod tests {
         assert_ne!(std::fs::read(sibling_drive).unwrap(), image);
         assert_eq!(slot.get().unwrap(), expected);
         assert_eq!(std::fs::read(drive).unwrap(), image);
+    }
+
+    #[test]
+    fn inherited_baseline_reader_is_preserved_but_new_extensions_require_rekey() {
+        use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.mailbox = Some(MailboxGrant {
+            mailbox: MailboxId::from_bytes([5; 32]),
+            authority_key: [6; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: None,
+            durable_object_pair_sha256_v1: None,
+            outbound_journal_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+        });
+        let check = |plan: &mvm_core::plan::ExecutionPlan| {
+            NetworkEndpointSpawnRequest {
+                vm_name: "inherited",
+                state_dir: Path::new("/unused-child"),
+                tenant: "tenant",
+                secrets: &[],
+                redaction: &RedactionPolicy::default(),
+                network_policy: &NetworkPolicy::deny_all(),
+                network_limits: Default::default(),
+                ingress: &[],
+                reader_plan: Some(plan),
+                mailbox_runtime: None,
+                identity: FlowMuxIdentitySource::InheritFrom(Path::new("/unused-parent")),
+            }
+            .require_mailbox_reader(None)
+        };
+        check(&plan).unwrap();
+        plan.mailbox
+            .as_mut()
+            .unwrap()
+            .incoming_journal_policy_sha256_v1 = Some([7; 32]);
+        assert!(check(&plan).is_err());
+        plan.mailbox
+            .as_mut()
+            .unwrap()
+            .incoming_journal_policy_sha256_v1 = None;
+        plan.mailbox.as_mut().unwrap().durable_object_pair_sha256_v1 = Some([8; 32]);
+        assert!(check(&plan).is_err());
     }
 
     #[test]

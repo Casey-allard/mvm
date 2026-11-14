@@ -472,6 +472,26 @@ pub fn build_guest_bins(build: &GuestBinsBuild) -> Result<WrittenGuestBins, Gues
         artifact.add(&member, &path)?;
     }
     artifact.declare_runtime_assemblies()?;
+    assembly::verify_protocol_source(&build.workspace_root)?;
+    let final_fingerprints = GuestBinsFingerprints {
+        guest_source: guest_agent_build::guest_source_fingerprint_with(
+            &build.workspace_root,
+            guest_agent_build::Freshness::Rewalk,
+        )?,
+        sdk_cdylib: guest_agent_build::sdk_cdylib_source_fingerprint_with(
+            &build.workspace_root,
+            guest_agent_build::Freshness::Rewalk,
+        )?,
+    };
+    if artifact.fingerprints != final_fingerprints {
+        return Err(GuestBinsError::Assembly(
+            "guest source changed while capturing runtime artifacts".into(),
+        ));
+    }
+    for declaration in artifact.assemblies.values_mut() {
+        declaration.mailbox_reader_v1 = Some(assembly::current_mailbox_reader_compatibility());
+        declaration.validate(declaration.arch)?;
+    }
     artifact.write(&build.out_dir)
 }
 

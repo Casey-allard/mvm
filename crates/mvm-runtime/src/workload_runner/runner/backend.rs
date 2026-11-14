@@ -112,7 +112,7 @@ impl<S: NetworkEndpointSpawner + 'static, B: BrokerRegistrar + 'static>
                 self.driver.workload_base_bootargs(has_disk)
             }),
         };
-        let prepared = self.prepare_workload_boot(&inputs)?;
+        let prepared = self.prepare_workload_boot(&inputs, lifecycle.mailbox_reader())?;
         let (broker, _) = self.register_workload_broker(config, &prepared.socks)?;
         Ok(ColdHvfChannel::new(cold_hvf_channel::ColdHvfPreparation {
             launch,

@@ -551,7 +551,12 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             if let Some(workspace) = workspace {
                 workspace.complete()?;
             }
-            self.boot_bound_workload_guarded(inputs, Some(&kernel_binding), writable_images)
+            self.boot_bound_workload_guarded(
+                inputs,
+                Some(&kernel_binding),
+                writable_images,
+                lifecycle.mailbox_reader(),
+            )
         })();
         #[cfg(unix)]
         if let Some(slot) = installed {
@@ -566,7 +571,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
     /// callers must hold the lifecycle lease and pass the verifier's paths.
     #[cfg(test)]
     fn boot_bound_workload(&self, inputs: &WorkloadLaunchInputs<'_>) -> Result<Box<dyn RunningVm>> {
-        self.boot_bound_workload_guarded(inputs, None, Vec::new())
+        self.boot_bound_workload_guarded(inputs, None, Vec::new(), None)
     }
 
     fn require_caller_registration_shape(&self, config: &VmStartConfig) -> Result<()> {
@@ -623,6 +628,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
     fn prepare_workload_boot(
         &self,
         inputs: &WorkloadLaunchInputs<'_>,
+        mailbox_runtime: Option<&crate::runtime_evidence::VerifiedMailboxReader>,
     ) -> Result<PreparedWorkloadBoot> {
         self.check_installed_endpoint_inputs(inputs)?;
         // A caller times this call from outside and cannot see past it, yet the
@@ -664,6 +670,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             network_limits,
             ingress: &ingress,
             reader_plan: reader_plan.as_ref().filter(|plan| plan.mailbox.is_some()),
+            mailbox_runtime,
             // A cold boot mints this guest's identity and hands it a drive.
             identity: FlowMuxIdentitySource::Mint,
         };
@@ -806,6 +813,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         inputs: &WorkloadLaunchInputs<'_>,
         kernel: Option<&crate::kernel_custody::KernelBoundLaunch>,
         writable_images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        mailbox_runtime: Option<&crate::runtime_evidence::VerifiedMailboxReader>,
     ) -> Result<Box<dyn RunningVm>> {
         anyhow::ensure!(
             (inputs.config.canonical_kernel.is_none()
@@ -826,7 +834,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             #[cfg(unix)]
             installed,
             trace,
-        } = self.prepare_workload_boot(inputs)?;
+        } = self.prepare_workload_boot(inputs, mailbox_runtime)?;
         let mut trace = trace.context("prepared workload launch trace missing")?;
         let state_dir = vm_state_dir(&inputs.config.name);
         // Unconditional and best-effort. The follower can wait for a console
@@ -1135,6 +1143,15 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         )
         .map_err(refuse)?;
 
+        // Preserve the established baseline warm path. New reader extensions
+        // require a fresh plan/boot/ACK binding, which this restore path cannot
+        // install in the guest's already-restored memory and identity drive.
+        if let Some(grant) = &plan.mailbox {
+            mvm_core::mailbox::reader::require_mailbox_reader_grant(None, grant)
+                .map_err(|error| StandbyError::ClaimFailed(format!(
+                    "restored mailbox extension requires original independent reader rekey: {error:#}"
+                )))?;
+        }
         // (6a) Fresh, registry-unique identity for the child.
         let child = match preloaded_child_name.clone() {
             Some(name) => {
@@ -1269,6 +1286,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                     // A warm child must rekey and enroll independently; it
                     // cannot inherit a parent's mailbox ACK authority.
                     reader_plan: None,
+                    mailbox_runtime: None,
                     // A restored child already holds its parent's signing key
                     // in the memory image it woke from, and there is no way to
                     // put a different one there. Its endpoint pins what the
