@@ -56,11 +56,11 @@ impl NetworkEndpointSpawnRequest<'_> {
             anyhow::ensure!(binding.is_none(), "reader projection has no admitted plan");
             return Ok(());
         };
-        if matches!(self.identity, FlowMuxIdentitySource::InheritFrom(_)) {
-            if let Some(grant) = &plan.mailbox {
-                mvm_core::mailbox::reader::require_mailbox_reader_grant(None, grant)
-                    .context("restored mailbox extensions require independent reader rekey")?;
-            }
+        if matches!(self.identity, FlowMuxIdentitySource::InheritFrom(_))
+            && let Some(grant) = &plan.mailbox
+        {
+            mvm_core::mailbox::reader::require_mailbox_reader_grant(None, grant)
+                .context("restored mailbox extensions require independent reader rekey")?;
         }
         match self.mailbox_runtime {
             Some(runtime) => runtime.require(plan, binding),
