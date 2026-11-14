@@ -198,19 +198,20 @@ impl StopCustody {
         }
         let (mut child, marker) = super::spawn_claimed_tracked(owner_dir, command, attempt)?;
         let until = Instant::now() + super::super::READY_TIMEOUT;
-        let readiness = match original {
-            Some(original_vmm_v1) => super::super::configure_serving(
-                &super::super::OriginalJournalStartup {
-                    config,
-                    original_vmm_v1,
-                    required_reader_sha256: None,
-                },
-                &mut child,
-            ),
-            None => super::super::configure_serving(config, &mut child),
-        };
-        let readiness = readiness
-            .and_then(|()| restart.capture_socket(&mut child, self.socket_parent(), until));
+        let readiness = configure_held_helper(&mut child, |child| {
+            match original {
+                Some(original_vmm_v1) => super::super::configure_serving(
+                    &super::super::OriginalJournalStartup {
+                        config,
+                        original_vmm_v1,
+                        required_reader_sha256: None,
+                    },
+                    child,
+                ),
+                None => super::super::configure_serving(config, child),
+            }?;
+            restart.capture_socket(child, self.socket_parent(), until)
+        });
         Ok((
             child,
             marker,
@@ -237,6 +238,16 @@ impl StopCustody {
         }
     }
 }
+
+fn configure_held_helper(
+    child: &mut Child,
+    configure: impl FnOnce(&mut Child) -> Result<()>,
+) -> Result<()> {
+    configure(child)
+}
+
+#[cfg(test)]
+mod configuration_tests;
 
 pub enum JournalOwner<'a> {
     Source(&'a mut OriginalJournalSourceHost),
