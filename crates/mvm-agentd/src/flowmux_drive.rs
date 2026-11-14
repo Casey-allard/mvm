@@ -405,7 +405,7 @@ mod linux {
         run_dir: &Path,
     ) -> Result<(), IdentityDriveError> {
         use std::io::{Read as _, Write as _};
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let from = drive_dir.join(MAILBOX_READER_BOOT_FILE);
         let file = match std::fs::OpenOptions::new()
             .read(true)
@@ -437,13 +437,16 @@ mod linux {
         let mut output = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o444)
+            .mode(0o400)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&to)
             .map_err(io_err("create mailbox reader boot"))?;
         output
             .write_all(&bytes)
-            .map_err(io_err("copy mailbox reader boot"))
+            .map_err(io_err("copy mailbox reader boot"))?;
+        output
+            .set_permissions(std::fs::Permissions::from_mode(0o444))
+            .map_err(io_err("set public mailbox reader boot permissions"))
     }
 
     pub(super) fn install_mailbox_ack_key(
