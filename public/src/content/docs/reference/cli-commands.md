@@ -1314,8 +1314,15 @@ Interrupting (Ctrl-C, SIGTERM) a foreground transient run stops and removes its
 VM before `mvmctl` exits with status 130 (143 for SIGTERM); a second interrupt
 during that cleanup exits at once.
 `--volume` host shares work on every run mode. The syntax is
-`HOST:/GUEST[:MODE]` (`MODE` defaults to `ro`; `rw` needs `--profile dev` or
-`permissive`). Persistent machine specs canonicalize host paths to absolute
+`HOST:/GUEST[:MODE][:include=a,b][:exclude=c]` (`MODE` defaults to `ro`;
+`rw` needs `--profile dev` or `permissive`). Directory shares materialize
+into an ext4 snapshot at boot under a **default deny-by-default protected-path
+set** (`.env`, `.ssh`, `.aws`, `.gnupg`, `id_rsa*`, `*.pem`, `*.key`,
+`.npmrc`, `.netrc`, `.kube`, `.config/gcloud`, …): credential-carrying paths
+never enter the image. `:include=` re-exposes built-in-denied paths for that
+share; `:exclude=` denies additional relative paths. Both ride the signed
+ExecutionPlan and are bound at claim time, so a re-bind cannot weaken them.
+Persistent machine specs canonicalize host paths to absolute
 paths so later reconnects re-mount the same share regardless of your working
 directory; the host directory must exist at boot.
 
@@ -1343,7 +1350,7 @@ guest, on any tier.
 | `mvmctl machine run -it --image <ref> -- <cmd>`                                                | Run `<cmd>` attached to a PTY, return its exit code, tear down                                                                                                                                                                                                                                                                       |
 | `mvmctl machine run -it --name <name> --image <ref> -- <cmd>`                                  | Same, with a stable transient VM name while it runs                                                                                                                                                                                                                                                                                  |
 | `mvmctl machine create <name> --image <ref>`                                                   | Persist a named OCI-backed machine spec without booting it                                                                                                                                                                                                                                                                           |
-| `mvmctl machine create <name> --manifest <path>`                                               | Persist a named machine spec from an image-backed `mvm.toml` / `Mvmfile.toml`                                                                                                                                                                                                                                                        |
+| `mvmctl machine create <name> --manifest <path>`                                               | Persist a named machine spec from an image-backed `mvm.toml` / `Mvmfile.toml`; the root may include ordered local CPU/memory defaults, but included files cannot supply a source or permissions                                                                                                                                             |
 | `mvmctl machine create <name> --manifest <path> --policy NAME\|PATH`                          | Persist a spec under an authored policy profile, resolved with the manifest's `[policy]` and `[network] allow_hosts` exactly as `run` resolves them; network and resource bounds are re-admitted on each start. Existing specs with tool-specific rules refuse to start. Also on `machine start --image/--manifest` |
 | `mvmctl machine create <name> --image <ref> --net --allow-host <host[:port]>`                  | Persist a named spec with opt-in egress settings for future lifecycle starts                                                                                                                                                                                                                                                         |
 | `mvmctl machine create <name> --manifest <path>`                                               | Persist an image-backed `mvm.toml` / `Mvmfile.toml` as a named machine spec                                                                                                                                                                                                                                                          |

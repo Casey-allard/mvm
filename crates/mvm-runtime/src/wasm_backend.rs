@@ -1754,6 +1754,8 @@ mod tests {
             read_only: false,
             kind: mvm_core::vm_backend::VmVolumeKind::Disk,
             encrypted: false,
+            share_include: Vec::new(),
+            share_exclude: Vec::new(),
         }];
         assert_eq!(
             reject_unsupported_start_config(&config),
@@ -1787,6 +1789,8 @@ mod tests {
                 read_only: true,
                 kind: mvm_core::vm_backend::VmVolumeKind::Disk,
                 encrypted: false,
+                share_include: Vec::new(),
+                share_exclude: Vec::new(),
             }];
             assert!(
                 matches!(

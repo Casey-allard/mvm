@@ -141,6 +141,8 @@ pub fn shares_from_vm_volumes(volumes: &[VmVolume]) -> Vec<mvm_core::plan::HostS
             read_only: v.read_only,
             encrypted: v.encrypted,
             content_sha256: None,
+            include: v.share_include.clone(),
+            exclude: v.share_exclude.clone(),
         })
         .collect()
 }
@@ -762,6 +764,8 @@ mod tests {
                 read_only: true,
                 kind: VmVolumeKind::Disk,
                 encrypted: false,
+                share_include: Vec::new(),
+                share_exclude: Vec::new(),
             },
             VmVolume {
                 materialized_image: Some("/state/src.ext4".to_string()),
@@ -772,6 +776,8 @@ mod tests {
                 read_only: false,
                 kind: VmVolumeKind::Disk,
                 encrypted: false,
+                share_include: Vec::new(),
+                share_exclude: Vec::new(),
             },
         ];
         let shares = shares_from_vm_volumes(&volumes);
@@ -827,6 +833,8 @@ mod tests {
                 read_only: true,
                 kind: VmVolumeKind::Disk,
                 encrypted: false,
+                share_include: Vec::new(),
+                share_exclude: Vec::new(),
             }],
             destroy_on_exit: true,
             grants: None,
@@ -900,6 +908,8 @@ mod tests {
                 read_only: true,
                 kind: VmVolumeKind::Disk,
                 encrypted: false,
+                share_include: Vec::new(),
+                share_exclude: Vec::new(),
             }],
             destroy_on_exit: true,
             grants: None,

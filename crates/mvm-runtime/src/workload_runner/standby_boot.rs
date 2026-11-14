@@ -845,6 +845,8 @@ mod tests {
             read_only: false,
             kind: VmVolumeKind::Disk,
             encrypted: false,
+            share_include: Vec::new(),
+            share_exclude: Vec::new(),
         }];
         let spec = standby_spec_for(&launch, tmp.path());
 
