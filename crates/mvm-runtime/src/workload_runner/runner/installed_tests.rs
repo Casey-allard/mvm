@@ -177,6 +177,19 @@ fn fixture(
     VmStartConfig,
     Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
 ) {
+    fixture_with_collector(portable, false)
+}
+
+fn fixture_with_collector(
+    portable: bool,
+    collector: bool,
+) -> (
+    mvm_core::util::test_env::TestEnv,
+    tempfile::TempDir,
+    NativeDriver,
+    VmStartConfig,
+    Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+) {
     let mut env = mvm_core::util::test_env::TestEnv::new();
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -257,6 +270,17 @@ fn fixture(
     };
     anchor.bind_to_config(&mut config).unwrap();
     let mut plan = PlanFixture::new().runtime_profile("mock").build();
+    if collector {
+        config.network_policy = NetworkPolicy::deny_all();
+        plan.asset_identities.push(
+            mvm_core::plan::AssetIdentity::new(
+                mvm_core::plan::AssetKind::Policy,
+                "network_policy",
+                mvm_core::policy::network_policy::content_sha256(&config.network_policy),
+            )
+            .unwrap(),
+        );
+    }
     if let Some(pin) = portable_pin {
         config.legacy_portable_runtime = Some(mvm_core::vm_backend::LegacyPortableRuntimeProof {
             archive: root.path().join("missing.mvmpkg"),
@@ -284,6 +308,60 @@ fn fixture(
         )
         .unwrap();
     (env, root, driver, config, anchor)
+}
+
+#[test]
+fn deny_all_installed_collector_uses_the_original_registered_host_anchor() {
+    let (_env, _root, _driver, mut config, _anchor) = fixture_with_collector(false, true);
+    assert!(config.network_policy.payload_mapping().is_none());
+    assert!(mvm_vmm::host::cmdline::uses_installed_payload_anchor(
+        &config
+    ));
+    config.host_lifetime = None;
+    assert!(!mvm_vmm::host::cmdline::uses_installed_payload_anchor(
+        &config
+    ));
+}
+
+#[test]
+fn unselected_installed_deny_all_does_not_select_a_registered_collector() {
+    let (_env, _root, _driver, config, _anchor) = fixture(false);
+    assert_eq!(config.network_policy, NetworkPolicy::deny_all());
+    assert!(!mvm_vmm::host::cmdline::uses_installed_payload_anchor(
+        &config
+    ));
+}
+
+#[test]
+fn selected_installed_collector_refuses_an_unsupported_spawner_before_dispatch() {
+    let (_env, _root, driver, config, _anchor) = fixture_with_collector(false, true);
+    let dispatched = Arc::clone(&driver.dispatched);
+    let runner = WorkloadRunner::new(driver, NoEndpoint, NoBroker);
+    let redaction = RedactionPolicy::default();
+    let inputs = WorkloadLaunchInputs {
+        config: &config,
+        tenant: "local",
+        secrets: &[],
+        redaction: &redaction,
+        network_policy: &config.network_policy,
+        cmdline: "console=ttyS0".into(),
+    };
+    let refused = runner
+        .start_workload(&inputs)
+        .err()
+        .expect("unsupported collector");
+    assert!(
+        refused
+            .to_string()
+            .contains("registered installed endpoint startup unavailable"),
+        "{refused:#}"
+    );
+    assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    assert!(
+        !vm_state_dir(&config.name)
+            .join(mvm_core::host_lifetime::INSTALLED_NATIVE_CUSTODY_MARKER)
+            .exists()
+    );
 }
 
 #[test]

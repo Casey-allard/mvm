@@ -208,6 +208,19 @@ fn selected_store_fixture() -> Fixture {
 }
 
 #[test]
+fn collector_selection_poison_keeps_original_registration_required() {
+    let fixture = Fixture::new();
+    let handoff = fixture.handoff(Arc::new(DefaultGuard));
+    assert!(!handoff.anchor.requires_registered_collector());
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = handoff.anchor.admitted.lock().unwrap();
+        panic!("poison original collector selection");
+    }));
+    assert!(poisoned.is_err());
+    assert!(handoff.anchor.requires_registered_collector());
+}
+
+#[test]
 fn owned_store_resource_guard_default_refuses_before_effects() {
     let f = selected_store_fixture();
     let partition = PreparedEndpointPartition::new(f.projection, Arc::new(DefaultGuard)).unwrap();

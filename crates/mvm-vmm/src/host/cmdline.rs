@@ -245,12 +245,16 @@ pub fn runner_cmdline(
     runner_cmdline_for_hostname(config, state_dir, base_bootargs, Some(&config.name))
 }
 
-/// The installed mapped payload path supplies its checked public anchor at the
-/// original endpoint ownership boundary, after the initial cmdline assembly.
+/// Installed mapped-payload and collector-only paths supply their checked public
+/// anchor at the original registered ownership boundary, after cmdline assembly.
 pub fn uses_installed_payload_anchor(config: &VmStartConfig) -> bool {
     #[cfg(unix)]
     {
-        config.host_lifetime.is_some() && config.network_policy.payload_mapping().is_some()
+        config.host_lifetime.as_ref().is_some_and(|owner| {
+            config.network_policy.payload_mapping().is_some()
+                || (config.network_policy == mvm_core::network_policy::NetworkPolicy::deny_all()
+                    && owner.requires_registered_collector())
+        })
     }
     #[cfg(not(unix))]
     {

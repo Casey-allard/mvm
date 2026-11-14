@@ -7,12 +7,15 @@ enum Case {
     MissingRetainedCredit,
     ForeignRegistration,
     WrongRedaction,
+    WrongSignedPolicy,
+    DuplicateSignedPolicy,
 }
 
 fn telemetry_handoff(
     holder: &PreparedHostLifetimeLease,
     state: &Path,
     credit: bool,
+    case: Case,
 ) -> Result<(PreparedEndpointHandoff, Arc<Guard>)> {
     let policy = NetworkPolicy::deny_all();
     let mut plan = PlanFixture::new().workload("vm-1").build();
@@ -23,6 +26,22 @@ fn telemetry_handoff(
             "network_policy",
             mvm_core::policy::network_policy::content_sha256(&policy),
         )?);
+    if matches!(case, Case::WrongSignedPolicy) {
+        plan.asset_identities
+            .iter_mut()
+            .find(|asset| asset.name == "network_policy")
+            .context("fixture policy missing")?
+            .digest = "ff".repeat(32);
+    }
+    if matches!(case, Case::DuplicateSignedPolicy) {
+        let policy = plan
+            .asset_identities
+            .iter()
+            .find(|asset| asset.name == "network_policy")
+            .context("fixture policy missing")?
+            .clone();
+        plan.asset_identities.push(policy);
+    }
     plan.plan_id = compute_plan_id(&plan);
     let issuer = SigningKey::from_bytes(&[8; 32]);
     let signed = sign_plan(&plan, &issuer, "fixture");
@@ -92,9 +111,11 @@ fn run_case(case: Case) -> Result<()> {
             let (path, sock) = fixture.vm("vm-2");
             ("vm-2", path, sock)
         }
-        Case::Collect | Case::MissingRetainedCredit | Case::WrongRedaction => {
-            ("vm-1", state.clone(), socket.clone())
-        }
+        Case::Collect
+        | Case::MissingRetainedCredit
+        | Case::WrongRedaction
+        | Case::WrongSignedPolicy
+        | Case::DuplicateSignedPolicy => ("vm-1", state.clone(), socket.clone()),
     };
     let mut registration = register(
         &registrar,
@@ -121,6 +142,7 @@ fn run_case(case: Case) -> Result<()> {
         &holder,
         &state,
         !matches!(case, Case::MissingRetainedCredit),
+        case,
     )?;
     let mut redaction = mvm_core::policy::RedactionPolicy::default();
     if matches!(case, Case::WrongRedaction) {
@@ -255,4 +277,14 @@ fn registered_telemetry_refuses_foreign_registration_before_effects() -> Result<
 #[test]
 fn registered_telemetry_refuses_changed_redaction_before_effects() -> Result<()> {
     run_case(Case::WrongRedaction)
+}
+
+#[test]
+fn registered_telemetry_refuses_a_different_signed_network_policy_before_effects() -> Result<()> {
+    run_case(Case::WrongSignedPolicy)
+}
+
+#[test]
+fn registered_telemetry_refuses_duplicate_signed_network_policies_before_effects() -> Result<()> {
+    run_case(Case::DuplicateSignedPolicy)
 }

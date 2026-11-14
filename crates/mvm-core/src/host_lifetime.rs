@@ -406,10 +406,22 @@ fn collector_redaction(
     config: &VmStartConfig,
     plan: &ExecutionPlan,
 ) -> Option<crate::policy::RedactionPolicy> {
-    (config.network_policy == crate::policy::network_policy::NetworkPolicy::deny_all()
-        && plan.secrets.is_empty()
-        && plan.ingress.is_empty())
-    .then(|| plan.redaction.clone())
+    if config.network_policy != crate::policy::network_policy::NetworkPolicy::deny_all()
+        || !plan.secrets.is_empty()
+        || !plan.ingress.is_empty()
+    {
+        return None;
+    }
+    let mut policies = plan.asset_identities.iter().filter(|asset| {
+        asset.kind == crate::plan::AssetKind::Policy && asset.name == "network_policy"
+    });
+    let original = policies.next()?;
+    if policies.next().is_some()
+        || original.digest != crate::policy::network_policy::content_sha256(&config.network_policy)
+    {
+        return None;
+    }
+    Some(plan.redaction.clone())
 }
 
 /// Shared one-shot owner, never a serializable permission or exit receipt.
@@ -460,6 +472,17 @@ impl fmt::Debug for HostLifetimeAnchor {
 }
 
 impl HostLifetimeAnchor {
+    /// Select original collector registration without granting launch authority.
+    /// Uncertain admission state keeps registration required; later checks refuse.
+    pub fn requires_registered_collector(&self) -> bool {
+        match self.admitted.lock() {
+            Ok(admission) => admission
+                .as_ref()
+                .is_some_and(|binding| binding.collector_redaction.is_some()),
+            Err(_) => true,
+        }
+    }
+
     pub fn canonical_kernel(&self) -> Option<&Arc<crate::canonical_linux::PreparedCanonicalLinux>> {
         self.canonical.as_ref()
     }

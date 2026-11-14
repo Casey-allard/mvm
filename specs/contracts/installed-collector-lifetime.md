@@ -11,8 +11,9 @@ with enforced process address-space and confinement support.
 
 The canonical mailbox and receipt formats do not change. Collector-only mode
 starts no FlowMux session, network listener, proxy, guest NIC, or SSH service.
-The caller must supply a deny-all admission with no ingress or secrets. The
-handoff matches the supplied redaction policy to the original admitted policy.
+The caller must supply a deny-all admission with no ingress or secrets and
+exactly one signed `Policy/network_policy` asset matching that policy digest.
+The handoff matches the supplied redaction policy to the original admitted policy.
 Unsupported shapes refuse before protected telemetry preparation.
 
 The parent retains an actual partition funding the controller, collector

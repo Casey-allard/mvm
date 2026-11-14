@@ -236,24 +236,26 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
     ) -> Result<InstalledSpawnedEndpoint> {
         use mvm_vmm::host::network_endpoint_spawn::{
             AdmittedNetworkPlan, EndpointLifetime, spawn_network_endpoint_installed_registered,
+            spawn_telemetry_collector_installed_registered,
         };
 
-        let original = original
-            .context("installed direct endpoint requires signed host-service registration")?;
+        let original =
+            original.context("installed endpoint requires signed host-service registration")?;
         original.check_endpoint_binding(req.vm_name, req.tenant, req.state_dir)?;
         let anchor = config
             .host_lifetime
             .as_ref()
             .context("installed direct endpoint original lifetime missing")?;
+        let collector_only = req.network_policy == &NetworkPolicy::deny_all();
         anyhow::ensure!(
             self.supports_registered_installed_endpoint()
                 && anchor.binding().backend == BackendKind::Firecracker
                 && req.network_policy == &config.network_policy
-                && req.network_policy.payload_mapping().is_some()
+                && (collector_only || req.network_policy.payload_mapping().is_some())
                 && req.secrets.is_empty()
                 && req.ingress.is_empty()
                 && matches!(req.identity, FlowMuxIdentitySource::Mint),
-            "unsupported original direct TCP endpoint launch"
+            "unsupported original installed endpoint launch"
         );
         anchor.check_parent_current(config, BackendKind::Firecracker)?;
         let plan = mvm_core::plan::plan_from_admitted_json(
@@ -262,9 +264,21 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
                 .as_deref()
                 .context("original admitted plan missing")?,
         )?;
-        let facts = AdmittedNetworkPlan::from_plan(&plan, req.vm_name, req.network_policy)?;
         let handoff = anchor.prepare_endpoint_handoff(config, BackendKind::Firecracker)?;
-        handoff.check_direct_network(&facts, &req.network_limits, req.redaction)?;
+        let facts = if collector_only {
+            handoff.check_telemetry_only(req.redaction)?;
+            anyhow::ensure!(
+                handoff.partition().projection().limits.cache_disk_bytes
+                    >= mvm_vmm::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP
+                        + mvm_core::runtime_state_protection::INSTALLED_TELEMETRY_SIDECAR_BYTES,
+                "original installed collector retained credit missing"
+            );
+            None
+        } else {
+            let facts = AdmittedNetworkPlan::from_plan(&plan, req.vm_name, req.network_policy)?;
+            handoff.check_direct_network(&facts, &req.network_limits, req.redaction)?;
+            Some(facts)
+        };
         let session = hex::encode(handoff.partition().projection().session);
         let uds = vm_network_endpoint_socket(req.vm_name);
         let (identity, drive) = prepare_endpoint_identity(
@@ -280,32 +294,33 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
             &identity.guest_verifying_key_base64,
         )?;
         mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(req.state_dir, true)?;
-        let endpoint = spawn_network_endpoint_installed_registered(
-            SubstitutionSpawnParams {
-                vm_name: req.vm_name,
-                state_dir: req.state_dir,
-                lifetime: EndpointLifetime::Launcher,
-                telemetry: true,
-                tenant: req.tenant,
-                secrets: req.secrets,
-                redaction: req.redaction,
-                transport: EndpointTransport::Uds { path: uds.clone() },
-                egress_proxy: None,
-                session_marker: None,
-                tls_intermediate: None,
-                admitted_network_plan: Some(facts),
-                network_policy: Some(req.network_policy),
-                network_limits: req.network_limits,
-                ingress: req.ingress,
-                resolver_remote: None,
-                binding_store_dir: None,
-                flowmux_identity: Some(identity),
-            },
-            handoff,
-            original,
-        )?;
+        let params = SubstitutionSpawnParams {
+            vm_name: req.vm_name,
+            state_dir: req.state_dir,
+            lifetime: EndpointLifetime::Launcher,
+            telemetry: true,
+            tenant: req.tenant,
+            secrets: req.secrets,
+            redaction: req.redaction,
+            transport: EndpointTransport::Uds { path: uds.clone() },
+            egress_proxy: None,
+            session_marker: None,
+            tls_intermediate: None,
+            admitted_network_plan: facts,
+            network_policy: (!collector_only).then_some(req.network_policy),
+            network_limits: req.network_limits,
+            ingress: req.ingress,
+            resolver_remote: None,
+            binding_store_dir: None,
+            flowmux_identity: (!collector_only).then_some(identity),
+        };
+        let endpoint = if collector_only {
+            spawn_telemetry_collector_installed_registered(params, handoff, original)?
+        } else {
+            spawn_network_endpoint_installed_registered(params, handoff, original)?
+        };
         Ok(InstalledSpawnedEndpoint {
-            egress_uds: Some(uds),
+            egress_uds: (!collector_only).then_some(uds),
             identity_drive: drive,
             owner: Some(endpoint),
             telemetry: true,
