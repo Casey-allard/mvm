@@ -9,7 +9,7 @@ use std::{
 fn configured_original(configure: impl FnOnce(&mut Child) -> Result<()>) -> Result<()> {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut command = std::process::Command::new("/bin/sh");
+    let mut command = mvm_core::env_hygiene::helper_command("/bin/sh");
     command.args(["-c", "exit 17"]);
     let (mut child, mut marker) = super::super::spawn_claimed(root.path(), command).unwrap();
     let original_pid = child.id();
