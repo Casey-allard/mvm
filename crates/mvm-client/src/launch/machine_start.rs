@@ -250,6 +250,25 @@ pub(super) fn start_machine_spec_with_journal(
     journal: Option<&mut InstalledJournal<'_>>,
     reservation: &super::PairedBootReservation,
 ) -> Result<MachineStart> {
+    start_machine_spec_with_journal_context(
+        spec,
+        host,
+        params,
+        journal,
+        reservation,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+pub(super) fn start_machine_spec_with_journal_context(
+    spec: &mp::MachineSpec,
+    host: &dyn StartHost,
+    params: MachineStartParams<'_>,
+    journal: Option<&mut InstalledJournal<'_>>,
+    reservation: &super::PairedBootReservation,
+    #[cfg(unix)] installed: Option<&mut persistent::journal::JournalStartContext>,
+) -> Result<MachineStart> {
     reservation.require_name(&spec.name)?;
     persistent::journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     AnyBackend::require_hypervisor_selectable(params.hypervisor)?;
@@ -291,36 +310,40 @@ pub(super) fn start_machine_spec_with_journal(
         .prepare_volumes(&spec.name, &spec.volumes)
         .context("resolving registered local volumes before admission")?;
     let workload_dir = persistent_workload_dir(spec);
-    let admitted = persistent::start_persistent(
-        PersistentImageStartParams {
-            name: &spec.name,
-            image_label: &boot.label,
-            resolved_digest: &boot.digest,
-            rootfs_path: &boot.rootfs,
-            profile: &spec.profile,
-            cpus: spec.cpus,
-            memory_mib,
-            mem_initial_mib,
-            prepared_volumes,
-            network_policy,
-            ports: &spec.ports,
-            backend_name: params.hypervisor,
-            kernel_path,
-            agent_verb: spec.agent_verb.clone(),
-            caller_commitment: spec.caller_commitment.clone(),
-            registry_pack_image: spec.registry_pack_image.clone(),
-            has_ad_hoc_argv: params.has_ad_hoc_argv,
-            grants: spec.grants.clone(),
-            mailbox: params.mailbox,
-            gpu: spec.gpu,
-            gpu_device: spec.gpu_device,
-            workload_dir: workload_dir.as_deref(),
-            secrets,
-            backend: host.backend(params.hypervisor),
-        },
-        journal,
-        fresh_state,
-    )?;
+    let boot_params = PersistentImageStartParams {
+        name: &spec.name,
+        image_label: &boot.label,
+        resolved_digest: &boot.digest,
+        rootfs_path: &boot.rootfs,
+        profile: &spec.profile,
+        cpus: spec.cpus,
+        memory_mib,
+        mem_initial_mib,
+        prepared_volumes,
+        network_policy,
+        ports: &spec.ports,
+        backend_name: params.hypervisor,
+        kernel_path,
+        agent_verb: spec.agent_verb.clone(),
+        caller_commitment: spec.caller_commitment.clone(),
+        registry_pack_image: spec.registry_pack_image.clone(),
+        has_ad_hoc_argv: params.has_ad_hoc_argv,
+        grants: spec.grants.clone(),
+        mailbox: params.mailbox,
+        gpu: spec.gpu,
+        gpu_device: spec.gpu_device,
+        workload_dir: workload_dir.as_deref(),
+        secrets,
+        backend: host.backend(params.hypervisor),
+    };
+    #[cfg(unix)]
+    let admitted = if let Some(installed) = installed {
+        installed.start(boot_params, journal, fresh_state)?
+    } else {
+        persistent::start_persistent(boot_params, journal, fresh_state)?
+    };
+    #[cfg(not(unix))]
+    let admitted = persistent::start_persistent(boot_params, journal, fresh_state)?;
     Ok(MachineStart {
         resolved_digest: boot.digest,
         admitted,

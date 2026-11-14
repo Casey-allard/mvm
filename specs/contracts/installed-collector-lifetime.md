@@ -56,3 +56,40 @@ stronger guarantee. Retained ciphertext and its wrapped key remain together;
 publication, expiry, archival and disposal require their separate original-owner
 transactions. No native, WAN, platform, fleet-capacity or FIPS qualification
 follows from the registered-process fixture.
+
+## Preview SDK integration
+
+`Arc<LocalBackend>::start_persistent_with_journal_and_host_lifetime` is an
+explicit installed start operation. It consumes the original
+`PreparedHostLifetime`, requires a prepared canonical Linux kernel and the
+original parent's funded workspace, and returns an `OwnedJournalStart`.
+The ordinary `start_persistent_with_journal` operation retains its existing
+contract. The installed operation uses canonical admission and final gates,
+the same backend instance for activation and rollback, and the existing
+original source or destination journal helper. It creates no second mailbox
+authority or ordinary mailbox helper.
+
+Pure preflight refusals can return the unused preparation. Converted failures
+retain the actual backend, anchor and prepared custody; they do not establish
+that no effects occurred. Abandoning a successful or converted owner is not
+retirement and conservatively retains its original resources and admission.
+Recovery before an original journal helper exists still requires a separate
+positive disposition transaction; preservation alone is not successful cleanup.
+
+The owned `stop_and_collect` operation validates the original journal boot,
+state, marker and kernel identity and stops through the retained backend and
+anchor. A successful rollback records that positive stop on the original
+journal owner so subsequent collection does not require a stopped process to
+appear live. The SDK holds the positive runtime retirement receipt while the
+caller publishes retained telemetry through its original parent. The callback
+must preserve and reconcile any receipt it moves before returning an error;
+the SDK cannot recreate a moved receipt. Only successful parent publication
+and SDK finalization permit journal marker clearance. Neither path calls the
+generic protected-state reaper or waives retained telemetry protection.
+
+The collection deadline bounds the journal's kernel observer and mailbox-helper
+collection. Existing native stop, endpoint drain and broker control operations
+have their own stage bounds; synchronous storage and parent publication do not
+yet share a hard whole-operation deadline. These preview operations still need
+native clean, failed-start and retry witnesses with actual parent retention.
+They do not establish end-to-end WAN, sustained capacity or security validation.

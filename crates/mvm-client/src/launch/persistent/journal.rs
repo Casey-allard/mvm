@@ -1,5 +1,7 @@
 //! Original mailbox authorities supplied by the persistent-machine orchestrator.
 use anyhow::{Context, Result, ensure};
+#[cfg(unix)]
+mod owned;
 use mvm_contract::protocol::mailbox::MailboxGrant;
 use mvm_hostd::{
     mailbox_process::{
@@ -11,6 +13,10 @@ use mvm_hostd::{
     },
     plan_admission::{AdmittedPlan, RunPosture},
 };
+#[cfg(unix)]
+pub(crate) use owned::JournalStartContext;
+#[cfg(unix)]
+pub use owned::{OwnedJournalStart, OwnedJournalStartFailure};
 
 /// The caller owns the helper slot across startup, including a later guest
 /// readiness or resource-accounting failure. Stop the VM and collect that
@@ -138,11 +144,40 @@ impl InstalledJournal<'_> {
         admitted: &AdmittedPlan,
         started: &crate::StartedVm,
     ) -> Result<()> {
+        self.serve_on(admitted, started.backend(), started.vm_id())
+    }
+
+    #[cfg(unix)]
+    fn abort_original_owned(
+        &mut self,
+        admitted: &AdmittedPlan,
+        backend: &mvm_runtime::AnyBackend,
+        id: &mvm_core::vm_backend::VmId,
+        anchor: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<()> {
+        use mvm_hostd::mailbox_process::original_journal::JournalOwner;
+        let held = match self {
+            Self::Destination { owner, .. } => owner.as_mut().map(JournalOwner::Destination),
+            Self::Source { owner, .. } => owner.as_mut().map(JournalOwner::Source),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Object { .. } => {
+                anyhow::bail!("original collector rollback does not serve object workers")
+            }
+        };
+        held.context("original journal helper missing during installed rollback")?
+            .abort_original_launch_owned(admitted.plan(), backend, id, anchor)
+    }
+
+    fn serve_on(
+        &mut self,
+        admitted: &AdmittedPlan,
+        backend: &mvm_runtime::AnyBackend,
+        id: &mvm_core::vm_backend::VmId,
+    ) -> Result<()> {
         let posture = admitted
             .mailbox_posture()
             .context("missing admitted mailbox posture")?;
-        let name = &started.vm_id().0;
-        let backend = started.backend();
+        let name = &id.0;
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Object { .. } => anyhow::bail!("object worker requires bilateral original join"),
@@ -175,6 +210,17 @@ pub(super) fn account_started(
     ctx: &crate::admission::AdmissionContext,
     started: &crate::StartedVm,
     name: &str,
+    abort: impl FnMut() -> Result<()>,
+    retain: impl FnMut(),
+) -> Result<()> {
+    account_started_on(ctx, started.backend(), started.vm_id(), name, abort, retain)
+}
+
+fn account_started_on(
+    ctx: &crate::admission::AdmissionContext,
+    backend: &mvm_runtime::AnyBackend,
+    id: &mvm_core::vm_backend::VmId,
+    name: &str,
     mut abort: impl FnMut() -> Result<()>,
     mut retain: impl FnMut(),
 ) -> Result<()> {
@@ -191,16 +237,16 @@ pub(super) fn account_started(
         result
     };
     let enforced = mvm_hostd::plan_admission::apply_grants_with_owned_rollback(
-        started.backend(),
-        started.vm_id(),
+        backend,
+        id,
         &ctx.admitted,
         Some(&ctx.emitter),
         &mut rollback,
     )?;
-    crate::launch::grants_report::publish_grants(ctx, started, &enforced);
+    crate::launch::grants_report::publish_grants_for(ctx, id, &enforced);
     mvm_hostd::plan_admission::record_charge_with_owned_rollback(
-        started.backend(),
-        started.vm_id(),
+        backend,
+        id,
         name,
         &ctx.admitted,
         Some(&ctx.emitter),

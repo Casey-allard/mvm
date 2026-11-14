@@ -211,6 +211,14 @@ fn prepare_persistent_boot(
     params: PersistentImageStartParams<'_>,
     journal: Option<&journal::InstalledJournal<'_>>,
 ) -> Result<PreparedPersistentBoot> {
+    prepare_persistent_boot_with_owner(params, journal, |_| Ok(()))
+}
+
+fn prepare_persistent_boot_with_owner(
+    params: PersistentImageStartParams<'_>,
+    journal: Option<&journal::InstalledJournal<'_>>,
+    bind_owner: impl FnOnce(&mut mvm_core::vm_backend::VmStartConfig) -> Result<()>,
+) -> Result<PreparedPersistentBoot> {
     let PersistentImageStartParams {
         name,
         image_label,
@@ -302,6 +310,7 @@ fn prepare_persistent_boot(
     // sealed production boots; the guest profile and verb grant remain the
     // authoritative RPC gates as well.
     start_config.dev_console = preopen_console_for_profile(profile);
+    bind_owner(&mut start_config)?;
     // Everything the boot waits on is prepared before admission, because
     // admission starts the plan's validity window and the verb grant minted
     // from it lives exactly as long. See `crate::launch::boot_order`.

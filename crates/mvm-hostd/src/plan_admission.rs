@@ -96,6 +96,10 @@ mod canonical_kernel;
 mod composition;
 mod display_grants;
 mod final_gates;
+#[cfg(unix)]
+mod installed_journal;
+#[cfg(unix)]
+pub use installed_journal::prepare_runtime as prepare_installed_journal_runtime;
 mod grant_validation;
 mod host_gates;
 mod mailbox_posture;

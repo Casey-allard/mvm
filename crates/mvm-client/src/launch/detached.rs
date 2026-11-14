@@ -82,7 +82,16 @@ pub(super) fn require_serving_guest_with_rollback(
     timeout: std::time::Duration,
     rollback: impl FnOnce() -> Result<()>,
 ) -> std::result::Result<(), DetachedReadinessError> {
-    let ready = started.backend().kind() == mvm_core::vm_backend::BackendKind::Mock
+    require_serving_guest_on(name, started.backend(), timeout, rollback)
+}
+
+pub(super) fn require_serving_guest_on(
+    name: &str,
+    backend: &mvm_runtime::AnyBackend,
+    timeout: std::time::Duration,
+    rollback: impl FnOnce() -> Result<()>,
+) -> std::result::Result<(), DetachedReadinessError> {
+    let ready = backend.kind() == mvm_core::vm_backend::BackendKind::Mock
         || crate::readiness::wait_for_guest_agent_for(name, timeout);
     require_serving_guest_result(name, timeout, ready, rollback)
 }

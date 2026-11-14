@@ -59,9 +59,17 @@ pub(super) fn publish_grants(
     started: &StartedVm,
     enforced: &EnforcedGrants,
 ) {
+    publish_grants_for(ctx, started.vm_id(), enforced);
+}
+
+pub(super) fn publish_grants_for(
+    ctx: &AdmissionContext,
+    id: &mvm_core::vm_backend::VmId,
+    enforced: &EnforcedGrants,
+) {
     let undeclared = Grants::default();
     let requested = ctx.admitted.plan().grants.as_ref().unwrap_or(&undeclared);
-    crate::record_enforced_grants(&started.vm_id().0, enforced);
+    crate::record_enforced_grants(&id.0, enforced);
 
     if let Err(e) = ctx
         .emitter

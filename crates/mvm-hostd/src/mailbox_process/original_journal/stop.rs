@@ -12,8 +12,32 @@ use std::{
     fs::File,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     process::{Child, ExitStatus},
+    sync::Arc,
     time::{Duration, Instant},
 };
+
+struct InstalledStopOwner<'a> {
+    backend: &'a AnyBackend,
+    anchor: &'a Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+}
+
+impl InstalledStopOwner<'_> {
+    fn check_name(&self, name: &str) -> Result<()> {
+        ensure!(
+            self.anchor.binding().vm_name == name
+                && self.anchor.binding().backend == self.backend.kind(),
+            "original installed journal stop binding differs"
+        );
+        ensure!(
+            cfg!(target_os = "linux") && self.backend.kind() == BackendKind::Firecracker,
+            "original installed journal stop backend unavailable"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod owned_stop_tests;
 
 pub(super) struct StopCustody {
     state: File,
@@ -309,12 +333,75 @@ impl JournalOwner<'_> {
         Ok(())
     }
 
+    /// Record rollback only after the actual installed backend confirms stop.
+    pub fn abort_original_launch_owned(
+        &mut self,
+        plan: &ExecutionPlan,
+        backend: &AnyBackend,
+        id: &VmId,
+        anchor: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<()> {
+        InstalledStopOwner { backend, anchor }.check_name(&id.0)?;
+        let (name, boot, guard, state, marker, _) = self.parts();
+        ensure!(
+            name == plan.image.name && name == id.0,
+            "abort belongs to another VM"
+        );
+        boot.check_plan(plan)?;
+        let dir = mvm_core::config::vm_state_dir(name);
+        let owner =
+            mvm_core::config::vm_mailbox_original_owner_at(&mvm_core::config::mvm_keys_dir(), name);
+        ensure!(owner == guard.owner_dir, "different original installation");
+        require_directory(&state.state, &dir)?;
+        ensure!(
+            &MailboxReaderBootBinding::load(&dir)? == boot && backend.kind() == state.kind,
+            "original installed boot changed before abort"
+        );
+        marker.require_original()?;
+        if state.sdk_abort_confirmed || state.vm_stopped {
+            return Ok(());
+        }
+        let (original, _) = state.vmm.as_ref().context("original VMM observer absent")?;
+        ensure!(
+            original.is_live_and_ours()
+                && backend.host_process_id(id)? == Some(original.pid as u32),
+            "original installed VMM changed before abort"
+        );
+        backend.stop_owned(id, anchor)?;
+        state.sdk_abort_confirmed = true;
+        Ok(())
+    }
+
     /// Stop only the original VM, collect its mailbox, then perform the caller's
     /// SDK accounting while the original name exclusion and launcher still hold.
     pub fn stop_and_collect(
         &mut self,
         name: &str,
         until: Instant,
+        finish: impl FnOnce(&ExecutionPlan, bool) -> Result<()>,
+    ) -> Result<JournalStopOutcome> {
+        self.stop_and_collect_with_owner(name, until, None, finish)
+    }
+
+    /// Collect the same original mailbox after its installed native owner stops.
+    pub fn stop_and_collect_owned(
+        &mut self,
+        name: &str,
+        until: Instant,
+        backend: &AnyBackend,
+        anchor: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        finish: impl FnOnce(&ExecutionPlan, bool) -> Result<()>,
+    ) -> Result<JournalStopOutcome> {
+        let installed = InstalledStopOwner { backend, anchor };
+        installed.check_name(name)?;
+        self.stop_and_collect_with_owner(name, until, Some(installed), finish)
+    }
+
+    fn stop_and_collect_with_owner(
+        &mut self,
+        name: &str,
+        until: Instant,
+        installed: Option<InstalledStopOwner<'_>>,
         finish: impl FnOnce(&ExecutionPlan, bool) -> Result<()>,
     ) -> Result<JournalStopOutcome> {
         #[cfg(target_os = "macos")]
@@ -369,6 +456,16 @@ impl JournalOwner<'_> {
             .context("no original kernel process identity")?;
         if !state.vm_stopped && !state.sdk_abort_confirmed {
             let stop_registered = || -> Result<()> {
+                if let Some(InstalledStopOwner { backend, anchor }) = &installed {
+                    let vm = VmId(name.to_owned());
+                    ensure!(
+                        backend.kind() == state.kind
+                            && original.is_live_and_ours()
+                            && backend.host_process_id(&vm)? == Some(original.pid as u32),
+                        "original installed VMM identity changed"
+                    );
+                    return backend.stop_owned(&vm, anchor);
+                }
                 let backend = AnyBackend::for_started_vm(name)
                     .context("original VMM backend is unavailable")?;
                 let vm = VmId(name.to_owned());
