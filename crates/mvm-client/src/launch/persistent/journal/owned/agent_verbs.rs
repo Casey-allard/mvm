@@ -4,6 +4,16 @@ use anyhow::{Result, ensure};
 const ACTIVATE: &str = "activate-environment";
 const RUN: &str = "run-entrypoint";
 
+pub(super) fn require_ephemeral(
+    retention: mvm_core::plan::StreamRetention,
+) -> Result<mvm_core::plan::StreamRetention> {
+    ensure!(
+        !retention.persists(),
+        "installed journal workload streams must be ephemeral"
+    );
+    Ok(retention)
+}
+
 pub(super) fn select(requested: &[String]) -> Result<Vec<String>> {
     if requested.is_empty() {
         return Ok(vec![ACTIVATE.into(), RUN.into()]);
@@ -20,6 +30,16 @@ pub(super) fn select(requested: &[String]) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_entrypoint_refuses_persistent_workload_streams() {
+        use mvm_core::plan::StreamRetention;
+        assert_eq!(
+            require_ephemeral(StreamRetention::Ephemeral).unwrap(),
+            StreamRetention::Ephemeral
+        );
+        assert!(require_ephemeral(StreamRetention::Persist).is_err());
+    }
 
     #[test]
     fn empty_request_selects_the_two_ephemeral_entrypoint_verbs() {

@@ -69,6 +69,15 @@ the same backend instance for activation and rollback, and the existing
 original source or destination journal helper. It creates no second mailbox
 authority or ordinary mailbox helper.
 
+The installed entrypoint admits exactly `activate-environment` and
+`run-entrypoint`, with ephemeral workload I/O streams and no stream edges.
+An empty verb request selects that pair; an explicit request must contain both
+names exactly once. Broader requests and persistent workload streams are
+unsupported. The ordinary persistent API retains its existing recorded-stream
+default. Workload transcript retention is separate from durable mailbox data:
+this selection changes neither the mailbox grant nor message durability,
+receipt, admission or retry semantics.
+
 Pure preflight refusals can return the unused preparation. Converted failures
 retain the actual backend, anchor and prepared custody; they do not establish
 that no effects occurred. Abandoning a successful or converted owner is not

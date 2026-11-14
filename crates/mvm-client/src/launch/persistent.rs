@@ -22,8 +22,8 @@ use super::runtime_source::{
 };
 use crate::admission::policy::shares_from_volume_cfg;
 use crate::admission::{
-    AdmitPlanForBootParams, admit_persistent_ingress, attach_guest_boot_config, emit_failed,
-    emit_launched, enforce_kernel, enforce_shares, guest_profile_for_boot,
+    AdmitPlanForBootParams, admit_persistent_ingress_with_retention, attach_guest_boot_config,
+    emit_failed, emit_launched, enforce_kernel, enforce_shares, guest_profile_for_boot,
 };
 
 fn preopen_console_for_profile(profile: &str) -> bool {
@@ -211,13 +211,19 @@ fn prepare_persistent_boot(
     params: PersistentImageStartParams<'_>,
     journal: Option<&journal::InstalledJournal<'_>>,
 ) -> Result<PreparedPersistentBoot> {
-    prepare_persistent_boot_with_owner(params, journal, |_| Ok(()))
+    prepare_persistent_boot_with_owner(
+        params,
+        journal,
+        |_| Ok(()),
+        mvm_core::plan::StreamRetention::Persist,
+    )
 }
 
 fn prepare_persistent_boot_with_owner(
     params: PersistentImageStartParams<'_>,
     journal: Option<&journal::InstalledJournal<'_>>,
     bind_owner: impl FnOnce(&mut mvm_core::vm_backend::VmStartConfig) -> Result<()>,
+    retention: mvm_core::plan::StreamRetention,
 ) -> Result<PreparedPersistentBoot> {
     let PersistentImageStartParams {
         name,
@@ -334,7 +340,7 @@ fn prepare_persistent_boot_with_owner(
                     })
                 })
                 .collect::<Vec<_>>();
-            admit_persistent_ingress(
+            admit_persistent_ingress_with_retention(
                 AdmitPlanForBootParams {
                     mailbox,
                     // What the backend will arm, so the admitted tier opens
@@ -400,6 +406,7 @@ fn prepare_persistent_boot_with_owner(
                 },
                 ingress,
                 journal,
+                retention,
             )
         },
     )?;

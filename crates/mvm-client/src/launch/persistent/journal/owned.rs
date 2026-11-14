@@ -73,6 +73,7 @@ impl JournalStartContext {
                     &self.original.backend,
                 )
             },
+            agent_verbs::require_ephemeral(mvm_core::plan::StreamRetention::Ephemeral)?,
         )?));
         let boot = self.boot.as_mut().expect("original prepared journal");
         let name = boot.start_config.name.clone();
