@@ -37,6 +37,16 @@ seven descriptors and a 1 MiB store workspace in addition to the codec operation
 charge. Providers that do not implement this check refuse activation. A
 projection or cache digest does not grant resource or mailbox authority.
 
+The selected serial service also requires seven concurrent workers: its
+foreground controller, one session worker, three collector workers, one TCP
+relay and one codec reader. The existing runtime requirement query supplies
+this complete quote. Both provider preflight and the selected child check it
+before starting service effects; wider stream declarations remain unsupported.
+The original aggregate allowance also pays for shared tenant helpers and
+backend exit-capture workers. Two guest slots do not guarantee that two fully
+selected endpoints fit, and an exhausted aggregate allowance refuses another
+endpoint rather than increasing capacity.
+
 Cancellation closes the original guest transport through one shared wake
 handle. Setup, relay and lease fencing reuse a successful shutdown; a failed
 kernel shutdown remains an error. Shutdown alone does not release storage:
