@@ -414,7 +414,9 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
     assert!(mvm_agentd::vsock::host_signer_pub_token(&render(&injected_config)).is_none());
     let stale = state_dir.join("verb-grant.json");
     std::fs::write(&stale, b"predecessor").unwrap();
-    assert!(render(&config).contains("mvm.require_grant=1"));
+    assert!(mvm_agentd::vsock::parse_require_grant_cmdline(&render(
+        &config
+    )));
     assert_eq!(
         render(&injected_config).contains("mvm.require_grant="),
         cfg!(not(target_os = "linux")),

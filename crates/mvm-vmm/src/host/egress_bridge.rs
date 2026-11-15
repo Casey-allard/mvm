@@ -98,10 +98,14 @@ pub fn profile_cmdline_token(config: &mvm_core::vm_backend::VmStartConfig) -> Op
     Some(format!("{PROFILE_CMDLINE_KEY}={}", policy.profile.as_str()))
 }
 
-/// The `mvm.require_grant=1` token when a verb-grant sidecar exists.
+/// Exact guest token requiring a verified verb grant for this boot.
+pub const REQUIRE_GRANT_CMDLINE_TOKEN: &str = "mvm.require_grant=1";
+
+/// The required-grant token when a verb-grant sidecar exists.
 pub fn require_grant_cmdline_token(vm_name: &str) -> Option<String> {
     let path = mvm_core::config::vm_state_dir(vm_name).join("verb-grant.json");
-    path.exists().then(|| "mvm.require_grant=1".to_string())
+    path.exists()
+        .then(|| REQUIRE_GRANT_CMDLINE_TOKEN.to_string())
 }
 
 /// The `mvm.telemetry=1` token when this boot is provisioned for telemetry

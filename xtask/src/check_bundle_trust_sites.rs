@@ -31,7 +31,9 @@ const COMPOSING_CALLS: &[&str] = &[
 const MUST_COMPOSE: &[&str] = &[
     "crates/mvm-hostd/src/supervisor/admission/caller_registration.rs",
     "crates/mvm-client/src/admission/pinned_bundle.rs",
-    "crates/mvm-client/src/launch/bundle_runtime.rs",
+    // The SDK wrapper delegates installed attachment to this shared owner.
+    "crates/mvm-runtime/src/bundle_runtime.rs",
+    "crates/mvm-hostd/src/run.rs",
     "crates/mvm-client/src/launch/canonical_linux.rs",
     "crates/mvm-runtime/src/vm/template/lifecycle/snapshot.rs",
     "crates/mvm-cli/src/pack_registry.rs",

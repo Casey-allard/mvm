@@ -591,7 +591,10 @@ fn admit_signed_and_boot_local(
         )?;
         let resolver = mvm_core::plan::bundle::FsBundleResolver::default_path()?
             .with_exact_archive(&pin.bundle_sha256, bytes)?;
-        let trust = mvm_core::plan::bundle::FsTrustStore::default_path()?;
+        let trust = mvm_core::registry_pack::application_bundle::trust_for_installed_bundle(
+            mvm_core::plan::bundle::FsTrustStore::default_path()?,
+            &pin.bundle_sha256,
+        );
         let support = mvm_core::image_set::BackendImageSupport::for_backend(backend.kind())
             .context("selected backend lacks image support")?;
         let protocols = mvm_build::stage0_kernel::current_image_set_protocol_support();

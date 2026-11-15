@@ -81,14 +81,20 @@ fn attach_installed_bundle(
         return Ok(false);
     };
     let registry = BundleRegistry::default_path()?;
-    let release = mvm_core::registry_pack::application_bundle::trust_for_installed_archive(
-        FsTrustStore::default_path()?,
-        &archive,
-    );
+    let release = match quote {
+        Some((pin, _)) => mvm_core::registry_pack::application_bundle::trust_for_installed_bundle(
+            FsTrustStore::default_path()?,
+            &pin.bundle_sha256,
+        ),
+        None => mvm_core::registry_pack::application_bundle::trust_for_installed_archive(
+            FsTrustStore::default_path()?,
+            &archive,
+        ),
+    };
     let (verified, trust): (VerifiedBundleFile, Box<dyn TrustStore>) = if let Some((pin, bytes)) =
         quote
     {
-        let trust = FsTrustStore::default_path()?;
+        let trust = release;
         let verified =
             mvm_core::plan::bundle::verify_exact_bundle_file(&archive, &trust, pin, bytes)?;
         let boot = verified

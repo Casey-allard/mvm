@@ -247,7 +247,8 @@ pub(crate) fn append_registered_boot_grant(
     owner.check_parent_current(config, mvm_core::vm_backend::BackendKind::Firecracker)?;
     cmdline.push(' ');
     cmdline.push_str(&token);
-    cmdline.push_str(" mvm.require_grant=1");
+    cmdline.push(' ');
+    cmdline.push_str(mvm_vmm::host::egress_bridge::REQUIRE_GRANT_CMDLINE_TOKEN);
     Ok(())
 }
 
