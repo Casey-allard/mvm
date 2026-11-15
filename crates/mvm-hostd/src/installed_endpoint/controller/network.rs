@@ -38,18 +38,56 @@ pub struct OwnedNetworkRuntimeRequirements {
     pub controller: OwnedEndpointRuntimeRequirements,
     pub session_stack_bytes: u64,
     pub additional_threads: u8,
+    /// Complete concurrent thread requirement for the selected serial service.
+    pub required_workers: u32,
     /// One selected controller/session per original child. The kernel limits the entire address space.
     pub process_address_space_enforced: bool,
 }
 pub fn owned_network_runtime_requirements() -> Result<OwnedNetworkRuntimeRequirements> {
+    let controller = owned_endpoint_runtime_requirements()?;
+    let collector = crate::telemetry_collector::owned_collector_requirements()?;
+    // Foreground controller, session, collector, and the serial flow's
+    // original relay and duplex reader coexist. None is spare tenant capacity.
+    let additional_threads = 1;
+    let required_workers = [
+        1,
+        u32::from(controller.additional_threads),
+        u32::from(additional_threads),
+        u32::from(collector.threads),
+        1,
+        1,
+    ]
+    .into_iter()
+    .try_fold(0u32, u32::checked_add)
+    .context("installed Object-TCP worker requirement overflow")?;
     Ok(OwnedNetworkRuntimeRequirements {
-        controller: owned_endpoint_runtime_requirements()?,
+        controller,
         session_stack_bytes: mvm_core::host_lifetime::native_thread_stack_terms(SESSION_STACK)?
             .known_rust_bytes,
-        additional_threads: 1,
+        additional_threads,
+        required_workers,
         process_address_space_enforced: cfg!(target_os = "linux"),
     })
 }
+
+impl OwnedNetworkRuntimeRequirements {
+    /// Validate the declaration before subdivision of the original partition.
+    /// These limits cannot create a reservation or enlarge its worker allowance.
+    pub fn check_worker_limits(
+        &self,
+        limits: &mvm_core::host_lifetime::EndpointPartitionLimits,
+    ) -> Result<()> {
+        ensure!(
+            limits.max_streams == 1 && limits.workers >= self.required_workers,
+            "installed Object-TCP worker allowance is insufficient or unsupported"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "network/worker_tests.rs"]
+mod worker_tests;
 
 /// Reject required services outside this first versioned implementation before
 /// listener/collector effects. The complete HTTP/connector profile remains open.
@@ -151,6 +189,7 @@ pub(super) fn run(
         .context("original network config missing")?;
     let path = selected_config(config)?;
     let quote = owned_network_runtime_requirements()?;
+    quote.check_worker_limits(&child.projection().limits)?;
     let stack = quote
         .controller
         .main_stack_envelope_bytes

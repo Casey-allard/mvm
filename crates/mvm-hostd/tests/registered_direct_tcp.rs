@@ -467,7 +467,8 @@ mod registered_prepare {
                     + mvm_vmm::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP
                     + mvm_core::runtime_state_protection::INSTALLED_TELEMETRY_SIDECAR_BYTES,
                 staging_disk_bytes: 16 << 20,
-                workers: 1,
+                workers: mvm_hostd::installed_endpoint::owned_network_runtime_requirements()?
+                    .required_workers,
                 max_streams: 1,
             },
         })
