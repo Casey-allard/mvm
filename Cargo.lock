@@ -6166,7 +6166,7 @@ checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 [[package]]
 name = "spiralcore-directory-macos"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=86497e8868146f2a21ba581dd09fcfabfca6486d#86497e8868146f2a21ba581dd09fcfabfca6486d"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=8994951b7c13fe5acf6f5ea3060ad4e51dc473c2#8994951b7c13fe5acf6f5ea3060ad4e51dc473c2"
 dependencies = [
  "libc",
 ]
@@ -6174,7 +6174,7 @@ dependencies = [
 [[package]]
 name = "spiralcore-mvm-flowmux"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=86497e8868146f2a21ba581dd09fcfabfca6486d#86497e8868146f2a21ba581dd09fcfabfca6486d"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=8994951b7c13fe5acf6f5ea3060ad4e51dc473c2#8994951b7c13fe5acf6f5ea3060ad4e51dc473c2"
 dependencies = [
  "mio",
  "rustls",
@@ -6185,7 +6185,7 @@ dependencies = [
 [[package]]
 name = "spiralcore-storage-windows"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=86497e8868146f2a21ba581dd09fcfabfca6486d#86497e8868146f2a21ba581dd09fcfabfca6486d"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=8994951b7c13fe5acf6f5ea3060ad4e51dc473c2#8994951b7c13fe5acf6f5ea3060ad4e51dc473c2"
 dependencies = [
  "windows-sys 0.61.2",
 ]
@@ -6193,7 +6193,7 @@ dependencies = [
 [[package]]
 name = "spiralcore-transfer"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=86497e8868146f2a21ba581dd09fcfabfca6486d#86497e8868146f2a21ba581dd09fcfabfca6486d"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=8994951b7c13fe5acf6f5ea3060ad4e51dc473c2#8994951b7c13fe5acf6f5ea3060ad4e51dc473c2"
 dependencies = [
  "cpu-time",
  "httparse",
@@ -6984,7 +6984,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "uor-r4-object-store"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=86497e8868146f2a21ba581dd09fcfabfca6486d#86497e8868146f2a21ba581dd09fcfabfca6486d"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=8994951b7c13fe5acf6f5ea3060ad4e51dc473c2#8994951b7c13fe5acf6f5ea3060ad4e51dc473c2"
 dependencies = [
  "sha2 0.10.9",
 ]
