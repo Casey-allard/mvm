@@ -1371,6 +1371,10 @@ impl FlowMuxSession {
 }
 
 #[cfg(test)]
+#[path = "flowmux/credit_tests.rs"]
+mod credit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::udp_relay::encode_udp_addr;
     use mvm_contract::protocol::network_flow::hello::BEHAVIOR_REVISION;
