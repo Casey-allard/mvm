@@ -181,11 +181,21 @@ impl SpiralCorePayloadFactory {
             .checked_add(limits.max_states)
             .and_then(|n| n.checked_add(6))
             .ok_or_else(|| invalid("owned store visit count overflow"))?;
+        let workspace_bytes = 1 << 20;
+        let directory_bytes =
+            u64::try_from(spiralcore_transfer::v1::OwnedStorePolicy::directory_buffer_bytes())
+                .map_err(invalid)?;
+        if directory_bytes > workspace_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "core directory buffers exceed qualified store workspace",
+            ));
+        }
         Ok(OwnedStoreWork {
             funded_entry_visits: u16::try_from(visits).map_err(invalid)?,
             shared_parent_fds: 1,
             fds_per_store: 6,
-            workspace_bytes: 1 << 20,
+            workspace_bytes,
         })
     }
 }
@@ -759,7 +769,46 @@ struct InstalledPayloadStore {
     created_inode: Option<u64>,
     directory: Option<Arc<std::fs::File>>,
     lease: Option<spiralcore_transfer::v1::OwnedStoreLease>,
+    #[cfg(test)]
+    drop_probe: Option<InstalledStoreDropProbe>,
 }
+#[cfg(test)]
+#[derive(Default)]
+struct StoreDropObservation {
+    called: std::sync::atomic::AtomicBool,
+    ledger_held: std::sync::atomic::AtomicBool,
+    credit_visible: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+struct InstalledStoreDropProbe {
+    pool: std::sync::Weak<PoolInner>,
+    observation: Arc<StoreDropObservation>,
+}
+#[cfg(test)]
+impl Drop for InstalledPayloadStore {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let Some(probe) = &self.drop_probe else {
+            return;
+        };
+        let (held, credit) =
+            probe
+                .pool
+                .upgrade()
+                .map_or((false, false), |pool| match pool.ledger.try_lock() {
+                    Ok(ledger) => (false, ledger.used.active == 0),
+                    Err(std::sync::TryLockError::WouldBlock) => (true, false),
+                    Err(std::sync::TryLockError::Poisoned(_)) => (false, false),
+                });
+        probe.observation.ledger_held.store(held, Ordering::Relaxed);
+        probe
+            .observation
+            .credit_visible
+            .store(credit, Ordering::Relaxed);
+        probe.observation.called.store(true, Ordering::Release);
+    }
+}
+
 impl InstalledPayloadStore {
     fn named(&self) -> io::Result<rustix::fs::Stat> {
         Ok(rustix::fs::statat(
@@ -950,6 +999,8 @@ impl PayloadResourcePermit {
             created_inode: None,
             directory: None,
             lease: None,
+            #[cfg(test)]
+            drop_probe: None,
         };
         // EEXIST has no effect and confers no ownership. Retain the original
         // parent and name for every other outcome before further fallible I/O.
@@ -1041,6 +1092,9 @@ impl Drop for PayloadResourcePermit {
             self.inner.retain_uncertain();
             return;
         };
+        // Final buffers and handles must be gone before another admission can
+        // observe returned credit. Cleanup and authority checks already passed.
+        drop(self.store.take());
         ledger.used.active = active;
         ledger.used.resident_charge = resident;
         ledger.used.disk_charge = disk;
@@ -1051,8 +1105,7 @@ impl Drop for PayloadResourcePermit {
 #[cfg(test)]
 mod resource_pool_tests {
     use super::*;
-    #[test]
-    fn replaced_installed_store_quarantines_original_locked_owner_after_endpoint_drop() {
+    fn claimed_installed_store() -> ClaimedInstalledStore {
         use spiralcore_transfer::{
             resource_profile::ResourceProfile,
             v1::{OwnedLaneNamespaces, OwnedStorePolicy},
@@ -1114,6 +1167,119 @@ mod resource_pool_tests {
             contender.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)
         ));
+        let observation = Arc::new(StoreDropObservation::default());
+        let Some(OwnedPayloadStore::Installed(store)) = permit.store.as_mut() else {
+            panic!("missing captured installed store");
+        };
+        store.drop_probe = Some(InstalledStoreDropProbe {
+            pool: Arc::downgrade(&pool.inner),
+            observation: Arc::clone(&observation),
+        });
+        ClaimedInstalledStore {
+            root,
+            path,
+            pool,
+            permit,
+            contender,
+            charge,
+            observation,
+        }
+    }
+
+    struct ClaimedInstalledStore {
+        root: tempfile::TempDir,
+        path: std::path::PathBuf,
+        pool: PayloadResourcePool,
+        permit: PayloadResourcePermit,
+        contender: std::fs::File,
+        charge: u64,
+        observation: Arc<StoreDropObservation>,
+    }
+
+    #[test]
+    fn installed_store_destruction_precedes_returned_credit() {
+        use std::sync::atomic::Ordering;
+        let fixture = claimed_installed_store();
+        assert_eq!(
+            fixture
+                .pool
+                .snapshot()
+                .expect("original charge")
+                .resident_charge,
+            fixture.charge
+        );
+        let clock = Instant::now();
+        drop(fixture.permit);
+        let snapshot = fixture.pool.snapshot().expect("released ledger");
+        let called = fixture.observation.called.load(Ordering::Acquire);
+        let held = fixture.observation.ledger_held.load(Ordering::Relaxed);
+        let credit = fixture.observation.credit_visible.load(Ordering::Relaxed);
+        let owner_released = fixture.contender.try_lock().is_ok();
+        eprintln!(
+            "STORE_DROP_ORDER called={called} ledger_held={held} returned_credit_visible={credit} original_owner_released={owner_released} retirement_wall_ns={}",
+            clock.elapsed().as_nanos()
+        );
+        assert!(called && held && !credit);
+        assert!(owner_released);
+        assert!(!fixture.path.exists());
+        assert_eq!(snapshot, PayloadPoolSnapshot::default());
+    }
+
+    #[test]
+    fn poisoned_store_ledger_retains_original_buffers_lock_and_debit() {
+        use std::sync::atomic::Ordering;
+        let fixture = claimed_installed_store();
+        std::thread::scope(|scope| {
+            let pool = &fixture.pool;
+            assert!(
+                scope
+                    .spawn(move || {
+                        let _ledger = pool.inner.ledger.lock().expect("original ledger");
+                        panic!("injected ledger poison");
+                    })
+                    .join()
+                    .is_err()
+            );
+        });
+        drop(fixture.permit);
+        assert!(!fixture.observation.called.load(Ordering::Acquire));
+        let ledger = match fixture.pool.inner.ledger.lock() {
+            Ok(_) => panic!("ledger poison lost"),
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(
+            (
+                ledger.used.active,
+                ledger.used.quarantined,
+                ledger.used.resident_charge
+            ),
+            (1, 1, fixture.charge)
+        );
+        assert_eq!(ledger.stores.len(), 1);
+        // Cleanup finishes before ledger poison is reconciled. Confirmed
+        // absence does not return the retained original handles or their debit.
+        assert!(!fixture.path.exists());
+        assert!(
+            matches!(ledger.stores.as_slice(), [OwnedPayloadStore::Installed(store)] if store.lease.is_some() && store.directory.is_some())
+        );
+        assert!(matches!(
+            fixture.contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+    }
+
+    #[test]
+    fn replaced_installed_store_quarantines_original_locked_owner_after_endpoint_drop() {
+        use std::sync::atomic::Ordering;
+        let ClaimedInstalledStore {
+            root,
+            path,
+            pool,
+            permit,
+            contender,
+            charge,
+            observation,
+        } = claimed_installed_store();
         let moved = root.path().join("moved");
         std::fs::rename(&path, &moved).expect("move original after claim");
         mvm_core::private_fs::create_owned_private_dir(&path).expect("replacement directory");
@@ -1137,6 +1303,7 @@ mod resource_pool_tests {
             std::fs::read(path.join("sentinel")).expect("unchanged replacement"),
             b"foreign"
         );
+        assert!(!observation.called.load(Ordering::Acquire));
     }
     #[test]
     fn installed_store_workspace_is_charged_before_visits_are_available() {
@@ -1145,6 +1312,14 @@ mod resource_pool_tests {
         let operation = small.operation_charge().expect("small operation charge");
         let terms = SpiralCorePayloadFactory::owned_store_requirements().expect("store work");
         assert_eq!(terms.funded_entry_visits, 102);
+        assert!(terms.workspace_bytes >= 1 << 20);
+        assert!(
+            terms.workspace_bytes
+                >= u64::try_from(
+                    spiralcore_transfer::v1::OwnedStorePolicy::directory_buffer_bytes()
+                )
+                .expect("core directory payload")
+        );
         assert_eq!((terms.shared_parent_fds, terms.fds_per_store), (1, 6));
         let charge = operation + terms.workspace_bytes;
         for (resident_bytes, funded) in [(charge - 1, false), (charge, true)] {

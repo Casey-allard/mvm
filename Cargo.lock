@@ -6164,9 +6164,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
+name = "spiralcore-directory-macos"
+version = "0.1.0"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=29393e9b476daeef41f51485d2fb8829c4bbefde#29393e9b476daeef41f51485d2fb8829c4bbefde"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "spiralcore-mvm-flowmux"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=adcc7197aa277277be5d074383c6267476163206#adcc7197aa277277be5d074383c6267476163206"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=29393e9b476daeef41f51485d2fb8829c4bbefde#29393e9b476daeef41f51485d2fb8829c4bbefde"
 dependencies = [
  "mio",
  "rustls",
@@ -6177,7 +6185,7 @@ dependencies = [
 [[package]]
 name = "spiralcore-storage-windows"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=adcc7197aa277277be5d074383c6267476163206#adcc7197aa277277be5d074383c6267476163206"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=29393e9b476daeef41f51485d2fb8829c4bbefde#29393e9b476daeef41f51485d2fb8829c4bbefde"
 dependencies = [
  "windows-sys 0.61.2",
 ]
@@ -6185,7 +6193,7 @@ dependencies = [
 [[package]]
 name = "spiralcore-transfer"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=adcc7197aa277277be5d074383c6267476163206#adcc7197aa277277be5d074383c6267476163206"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=29393e9b476daeef41f51485d2fb8829c4bbefde#29393e9b476daeef41f51485d2fb8829c4bbefde"
 dependencies = [
  "cpu-time",
  "httparse",
@@ -6196,6 +6204,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "spiralcore-directory-macos",
  "spiralcore-storage-windows",
  "subtle",
  "uor-r4-object-store",
@@ -6975,7 +6984,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "uor-r4-object-store"
 version = "0.1.0"
-source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=adcc7197aa277277be5d074383c6267476163206#adcc7197aa277277be5d074383c6267476163206"
+source = "git+https://github.com/R4-Laboratories/SpiralCore?rev=29393e9b476daeef41f51485d2fb8829c4bbefde#29393e9b476daeef41f51485d2fb8829c4bbefde"
 dependencies = [
  "sha2 0.10.9",
 ]
