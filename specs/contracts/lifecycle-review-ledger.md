@@ -65,8 +65,8 @@ a source-count result; the fresh current-root measurement above includes all
 tracked generated, vendored and test code.
 
 Adopting canonical main `dd2af083` and composing its typed admission stages with
-the selected-runtime contribution yields 2,997 Rust files, 1,050,570 source
-lines and 1,322,779 physical lines: 195 source / 199 physical lines above the
+the selected-runtime contribution yields 2,997 Rust files, 1,050,561 source
+lines and 1,322,770 physical lines: 186 source / 190 physical lines above the
 upload-credit checkpoint. Exact ceilings match these measured totals with no
 headroom. This preliminary measurement invokes the unchanged canonical counter
 and comment lexer with an explicit merged source root, binding all 4,717 source
@@ -74,6 +74,10 @@ inputs and the counter executable before/after. The old compiled xtask resolves
 its own source root, so invoking it from another cwd measured the old tree and
 is not evidence for this merge. Fresh merged-root xtask and execution gates
 remain required. These counters do not increase runtime resource allowances.
+The first merged candidate stopped in strict Clippy on an oversized private
+authority enum. Its replacement uses the existing two-way optional verified
+plan carrier without an extra heap allocation or lint suppression; that failure
+remains recorded separately from qualification of the corrected source.
 
 ## Files NOT read
 

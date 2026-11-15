@@ -271,15 +271,11 @@ pub fn admit_and_boot_local(
 
 struct ResolvedLocal<'a> {
     req: &'a LocalRunRequest,
-    authority: LocalAuthority<'a>,
+    // None synthesizes locally; Some retains the authenticated external plan.
+    authority: Option<VerifiedExternalPlan<'a>>,
     rootfs_sha: String,
     kernel_sha: Option<String>,
     config: VmStartConfig,
-}
-
-enum LocalAuthority<'a> {
-    Synthesized,
-    Signed(VerifiedExternalPlan<'a>),
 }
 
 struct VerifiedLocal<'a> {
@@ -306,17 +302,16 @@ impl<'a> ResolvedLocal<'a> {
         );
         let sha = mvm_core::crypto::image_verify::sha256_file_cached(&req.rootfs_path)
             .with_context(|| format!("hashing rootfs at {}", req.rootfs_path.display()))?;
-        let authority = match req.signed_plan.as_ref() {
-            Some(signed) => {
-                LocalAuthority::Signed(crate::plan_admission::verify_external_plan(signed)?)
-            }
-            None => LocalAuthority::Synthesized,
-        };
+        let authority = req
+            .signed_plan
+            .as_ref()
+            .map(crate::plan_admission::verify_external_plan)
+            .transpose()?;
 
         // Pin the kernel into the signed plan. Deliberately the uncached digest: a
         // path+mtime-keyed cache can hand back a stale hash, which for an integrity
         // pin would defeat the point of having one.
-        let kernel_sha = if matches!(authority, LocalAuthority::Synthesized) {
+        let kernel_sha = if authority.is_none() {
             req.kernel_path
                 .as_ref()
                 .map(|k| {
@@ -331,11 +326,7 @@ impl<'a> ResolvedLocal<'a> {
         // With no egress grant the deny-all default stands; a granted allow-list
         // is projected onto it, so the policy the gate enforces, and the seccomp
         // tier the guest installs, derive from the grants the plan is signed for.
-        let network_policy = match req
-            .grants
-            .as_ref()
-            .filter(|_| matches!(authority, LocalAuthority::Synthesized))
-        {
+        let network_policy = match req.grants.as_ref().filter(|_| authority.is_none()) {
             Some(grants) if grants.egress.is_some() => {
                 mvm_contract::grants::projection::network_policy_from_grants(grants)
             }
@@ -351,13 +342,13 @@ impl<'a> ResolvedLocal<'a> {
             roothash: req.roothash.clone(),
             ..Default::default()
         };
-        if matches!(authority, LocalAuthority::Synthesized) {
+        if authority.is_none() {
             config.cpus = req.cpus;
             config.memory_mib = req.mem_mib;
             config.volumes = req.volumes.clone();
             config.tenant_id = Some(LOCAL_TENANT.to_string());
             config.network_policy = network_policy;
-        } else if let LocalAuthority::Signed(verified) = &authority {
+        } else if let Some(verified) = &authority {
             config = resolve_signed_config(req, verified.plan(), Some(&sha))?;
         }
         Ok(Self {
@@ -392,7 +383,7 @@ impl VerifiedLocal<'_> {
             config,
         } = self.resolved;
         let verified_runtime = self.runtime;
-        if let LocalAuthority::Signed(signed) = authority {
+        if let Some(signed) = authority {
             return admit_signed_local(backend, signed, config, verified_runtime, ctx);
         }
 
