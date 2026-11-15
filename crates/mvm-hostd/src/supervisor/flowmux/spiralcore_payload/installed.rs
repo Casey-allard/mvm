@@ -278,12 +278,21 @@ impl InstalledScopeController {
         )
         .map_err(invalid)?;
         let limits = resources.receiver_limits();
+        self.reader_resources.check_current()?;
+        // The serial controller and retained reader have separately funded this
+        // execution stack class. Native/alternate-stack terms keep their payer.
+        let existing_stack_bytes =
+            u64::try_from(spiralcore_mvm_flowmux::READER_STACK_BYTES).map_err(invalid)?;
         let policy = spiralcore_transfer::v1::OwnedStorePolicy::small_v1(
             &limits,
             permit.owned_store_visits()?,
             spiralcore_transfer::v1::OwnedLaneNamespaces::One(
                 context.namespace().map_err(invalid)?,
             ),
+            spiralcore_transfer::v1::OwnedWorkspaceFunding {
+                heap_bytes: permit.owned_store_heap_bytes()?,
+                existing_stack_bytes,
+            },
         )
         .map_err(invalid)?;
         let name = format!("flow-{}", hex::encode(facts.commitment().map_err(invalid)?));

@@ -1,5 +1,6 @@
 //! Canonical post-admission mapping onto the single shared object core.
 mod installed;
+mod workspace;
 
 use super::{AdmittedTcpPayload, AuthenticatedTcpPayloadFactory, AuthenticatedTcpPayloadIo};
 use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
@@ -1143,6 +1144,10 @@ mod resource_pool_tests {
             &limits,
             permit.owned_store_visits().expect("booked visits"),
             OwnedLaneNamespaces::One(context.namespace().expect("fixture scope")),
+            spiralcore_transfer::v1::OwnedWorkspaceFunding {
+                heap_bytes: permit.owned_store_heap_bytes().expect("booked heap"),
+                existing_stack_bytes: 2 << 20,
+            },
         )
         .expect("policy");
         let lease = permit
@@ -1341,6 +1346,13 @@ mod resource_pool_tests {
                     .kind(),
                 io::ErrorKind::Unsupported
             );
+            assert_eq!(
+                plain
+                    .owned_store_heap_bytes()
+                    .expect_err("no installed heap reservation")
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
             drop(plain);
             let permit = pool.reserve_installed_profile(small);
             if funded {
@@ -1349,6 +1361,17 @@ mod resource_pool_tests {
                     permit.owned_store_visits().expect("booked visits"),
                     terms.funded_entry_visits
                 );
+                assert_eq!(
+                    permit.owned_store_heap_bytes().expect("booked heap"),
+                    terms.workspace_bytes
+                );
+                let required = spiralcore_transfer::v1::OwnedStorePolicy::workspace_requirements(
+                    &small.receiver_limits(),
+                    spiralcore_transfer::v1::OwnedLaneNamespaces::One([9; 32]),
+                )
+                .expect("derived core workspace");
+                assert!(required.required_heap_bytes <= terms.workspace_bytes);
+                assert_eq!(required.required_existing_stack_bytes, 2 << 20);
                 assert_eq!(pool.snapshot().expect("booked").resident_charge, charge);
             } else {
                 assert!(matches!(permit, Err(e) if e.kind() == io::ErrorKind::WouldBlock));
