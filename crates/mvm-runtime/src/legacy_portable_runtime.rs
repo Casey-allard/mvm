@@ -374,19 +374,10 @@ pub(crate) mod fixtures {
 
     /// Signed original portable inputs, not a verified capability.
     pub fn signed_legacy_portable_runtime_fixture(home: &Path) -> VmStartConfig {
-        fixture(home, Some(2), false, 4).unwrap()
+        fixture(home, Some(2), false, 4, false).unwrap()
     }
 
     pub(super) fn fixture(
-        home: &Path,
-        protocol: Option<u32>,
-        wrong_role: bool,
-        schema: u32,
-    ) -> std::result::Result<VmStartConfig, mvm_core::plan::BundleVerifyError> {
-        fixture_with_verity(home, protocol, wrong_role, schema, false)
-    }
-
-    pub(super) fn fixture_with_verity(
         home: &Path,
         protocol: Option<u32>,
         wrong_role: bool,
@@ -597,7 +588,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut env = mvm_core::util::test_env::TestEnv::new();
         env.isolate_mvm_home(home.path());
-        let config = fixture(home.path(), Some(2), false, 4).unwrap();
+        let config = fixture(home.path(), Some(2), false, 4, false).unwrap();
         let proof = config.legacy_portable_runtime.unwrap();
         let trust = FsTrustStore::default_path().unwrap();
         let mut archive = std::fs::read(&proof.archive).unwrap();
@@ -628,7 +619,7 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let mut env = mvm_core::util::test_env::TestEnv::new();
             env.isolate_mvm_home(home.path());
-            let prepared = fixture(home.path(), Some(2), false, schema);
+            let prepared = fixture(home.path(), Some(2), false, schema, false);
             if schema == 6 {
                 match prepared {
                     Err(mvm_core::plan::BundleVerifyError::UnsupportedSchema {
@@ -662,7 +653,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut env = mvm_core::util::test_env::TestEnv::new();
         env.isolate_mvm_home(home.path());
-        let config = fixture(home.path(), Some(2), false, 4).unwrap();
+        let config = fixture(home.path(), Some(2), false, 4, false).unwrap();
         assert!(matches!(
             verify_runtime_for_launch(&config, 2).unwrap(),
             Some(crate::runtime_evidence::VerifiedLaunchRuntime::LegacyPortable(_))
@@ -798,7 +789,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut env = mvm_core::util::test_env::TestEnv::new();
         env.isolate_mvm_home(home.path());
-        let config = fixtures::fixture_with_verity(home.path(), Some(2), false, 4, true).unwrap();
+        let config = fixtures::fixture(home.path(), Some(2), false, 4, true).unwrap();
         let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
         let bound = lease.bind(&config).unwrap();
         let sidecar = Path::new(bound.verity_path.as_deref().unwrap());
@@ -860,7 +851,7 @@ mod tests {
             (Some(2), true),
         ] {
             let source = tempfile::tempdir().unwrap();
-            let config = fixture(source.path(), protocol, wrong_role, 4).unwrap();
+            let config = fixture(source.path(), protocol, wrong_role, 4, false).unwrap();
             assert!(
                 verify_runtime_for_launch(&config, 2).is_err(),
                 "{protocol:?} {wrong_role}"
@@ -894,7 +885,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut env = mvm_core::util::test_env::TestEnv::new();
         env.isolate_mvm_home(home.path());
-        let config = fixture(home.path(), Some(2), false, 4).unwrap();
+        let config = fixture(home.path(), Some(2), false, 4, false).unwrap();
         let bound = RuntimeLifecycleLease::acquire(&config.name)
             .unwrap()
             .bind(&config)

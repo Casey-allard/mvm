@@ -448,7 +448,7 @@ pub(crate) fn admit_persistent_ingress(
     admit_persistent_ingress_with_retention(p, ingress, journal, StreamRetention::Persist)
 }
 
-pub(crate) fn admit_persistent_ingress_with_retention(
+fn admit_persistent_ingress_with_retention(
     p: AdmitPlanForBootParams<'_>,
     ingress: Vec<mvm_core::plan::IngressMapping>,
     journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,

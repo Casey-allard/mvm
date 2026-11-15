@@ -38,8 +38,7 @@ async fn stopped_definition_refusal_returns_original_unused_preparation_and_hold
     env.isolate_mvm_home(home.path());
     let owner_dir = tempfile::tempdir().unwrap();
     let parent = Arc::new(());
-    let lifetime =
-        super::tests::preparation_with_owner(owner_dir.path(), BackendKind::Mock, parent.clone());
+    let lifetime = super::tests::preparation(owner_dir.path(), BackendKind::Mock, parent.clone());
     let binding = lifetime.binding().clone();
     let holder = std::fs::OpenOptions::new()
         .read(true)
@@ -87,7 +86,7 @@ async fn stopped_definition_refusal_returns_original_unused_preparation_and_hold
 #[test]
 fn entered_preparation_refuses_unused_extraction_without_losing_original_anchor() {
     let home = tempfile::tempdir().unwrap();
-    let lifetime = super::tests::preparation(home.path(), BackendKind::Mock);
+    let lifetime = super::tests::preparation(home.path(), BackendKind::Mock, ());
     let original = Arc::new(crate::LocalBackend::with_hypervisor("mock"));
     let mut context = context(original, lifetime);
     assert!(context.anchor().is_err());
@@ -122,7 +121,7 @@ fn retained_startup_state_refuses_extraction_and_preserves_failure_for_retry() {
         Retained::HelperAttempt,
     ] {
         let home = tempfile::tempdir().unwrap();
-        let lifetime = super::tests::preparation(home.path(), BackendKind::Mock);
+        let lifetime = super::tests::preparation(home.path(), BackendKind::Mock, ());
         let original = Arc::new(crate::LocalBackend::with_hypervisor("mock"));
         let mut context = context(original, lifetime);
         match retained {
@@ -172,7 +171,7 @@ fn retained_startup_state_refuses_extraction_and_preserves_failure_for_retry() {
 #[test]
 fn missing_transition_state_refuses_without_reconstructing_preparation() {
     let home = tempfile::tempdir().unwrap();
-    let lifetime = super::tests::preparation(home.path(), BackendKind::Mock);
+    let lifetime = super::tests::preparation(home.path(), BackendKind::Mock, ());
     let original = Arc::new(crate::LocalBackend::with_hypervisor("mock"));
     let mut context = context(original, lifetime);
     let original_state = context.lifetime.take();
@@ -195,8 +194,7 @@ fn missing_transition_state_refuses_without_reconstructing_preparation() {
 fn abandoning_unused_context_keeps_the_original_holder_and_parent() {
     let home = tempfile::tempdir().unwrap();
     let parent = Arc::new(());
-    let lifetime =
-        super::tests::preparation_with_owner(home.path(), BackendKind::Mock, parent.clone());
+    let lifetime = super::tests::preparation(home.path(), BackendKind::Mock, parent.clone());
     let holder = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

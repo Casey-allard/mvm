@@ -151,10 +151,6 @@ impl OriginalJournalSourceHost {
 
     /// Nonblocking on an idle listener. One shared action deadline for all
     /// socket traffic and revocation sampling once A has connected.
-    pub fn forward_once(&mut self, until: Instant) -> Result<bool> {
-        Ok(self.forward_once_with_counts(until)?.is_some())
-    }
-
     pub fn forward_once_with_counts(&mut self, until: Instant) -> Result<Option<CompletedRelayIo>> {
         self.forward_once_observed(until, |_, _| {})
     }

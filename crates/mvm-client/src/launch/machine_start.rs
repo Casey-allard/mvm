@@ -240,22 +240,12 @@ pub fn start_machine_spec(
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
     let reservation = super::PairedBootReservation::for_lifecycle_mutation(&spec.name)?;
-    start_machine_spec_with_journal(spec, host, params, None, &reservation)
-}
-
-pub(super) fn start_machine_spec_with_journal(
-    spec: &mp::MachineSpec,
-    host: &dyn StartHost,
-    params: MachineStartParams<'_>,
-    journal: Option<&mut InstalledJournal<'_>>,
-    reservation: &super::PairedBootReservation,
-) -> Result<MachineStart> {
     start_machine_spec_with_journal_context(
         spec,
         host,
         params,
-        journal,
-        reservation,
+        None,
+        &reservation,
         #[cfg(unix)]
         None,
     )

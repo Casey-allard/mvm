@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use mvm_runtime::machine::persist::{self as mp, MachineSpec, SpecReconcile};
 
 use super::machine_start::{
-    MachineStart, MachineStartParams, StartHost, start_machine_spec_with_journal,
+    MachineStart, MachineStartParams, StartHost, start_machine_spec_with_journal_context,
 };
 use crate::secret::MachineSecretRef;
 
@@ -254,7 +254,15 @@ pub(super) fn boot_recorded_with_journal(
     journal: Option<&mut super::persistent::journal::InstalledJournal<'_>>,
     reservation: &super::PairedBootReservation,
 ) -> Result<MachineStart> {
-    let started = start_machine_spec_with_journal(spec, host, params, journal, reservation)?;
+    let started = start_machine_spec_with_journal_context(
+        spec,
+        host,
+        params,
+        journal,
+        reservation,
+        #[cfg(unix)]
+        None,
+    )?;
     super::machine_start::record_machine_started(spec, started.resolved_digest.clone());
     if let Err(err) = mp::overwrite_machine_spec(spec) {
         tracing::warn!(error = %err, machine = %spec.name, "updating machine start metadata failed (non-fatal)");

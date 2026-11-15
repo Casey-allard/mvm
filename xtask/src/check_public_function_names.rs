@@ -23,6 +23,125 @@ struct SiblingPair {
 // that was actually verified, and conflating the names would hide that
 // verification boundary at call sites.
 const EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
+    // The verified kernel handoff retains the original prepared workload-root descriptor.
+    (
+        "crates/mvm-backends/src/driver/fc/kernel.rs",
+        "module",
+        "boot_descriptor",
+        "boot_descriptor_with_root",
+    ),
+    // Journal startup retains the existing reservation and journal owner through recording.
+    (
+        "crates/mvm-client/src/launch/detached.rs",
+        "module",
+        "boot_recorded",
+        "boot_recorded_with_journal",
+    ),
+    // Journal rollback invokes the admitted original owner and retains uncertain aborts.
+    (
+        "crates/mvm-client/src/launch/detached.rs",
+        "module",
+        "require_serving_guest",
+        "require_serving_guest_with_rollback",
+    ),
+    // The internal start retains the existing reservation, journal and optional original context.
+    (
+        "crates/mvm-client/src/launch/machine_start.rs",
+        "module",
+        "start_machine_spec",
+        "start_machine_spec_with_journal_context",
+    ),
+    // Installed launch consumes the original prepared lifetime and preserves failure custody.
+    (
+        "crates/mvm-client/src/launch/mod.rs",
+        "impl LocalBackend",
+        "launch",
+        "launch_with_host_lifetime",
+    ),
+    // A journal start requires its stopped definition and original one-start grant/helper.
+    (
+        "crates/mvm-client/src/launch/mod.rs",
+        "impl LocalBackend",
+        "start_persistent",
+        "start_persistent_with_journal",
+    ),
+    // Runtime-state confinement retains its directory while rechecking the original store lease.
+    (
+        "crates/mvm-hostd/src/installed_endpoint.rs",
+        "impl InstalledEndpointResources",
+        "confine",
+        "confine_with_runtime_state",
+    ),
+    // Bootstrap funding enforces its model floor and debits metadata before publication.
+    (
+        "crates/mvm-hostd/src/installed_endpoint/auxiliary.rs",
+        "impl AuxiliaryLedger",
+        "new",
+        "new_with_bootstrap",
+    ),
+    // Held directory/file identities select the confinement inputs without ambient path substitution.
+    (
+        "crates/mvm-hostd/src/jailer/landlock.rs",
+        "module",
+        "apply",
+        "apply_with_owned_files",
+    ),
+    // Owned confinement keeps selected descriptor identities and their filter shapes together.
+    (
+        "crates/mvm-hostd/src/jailer/mod.rs",
+        "module",
+        "confine_self",
+        "confine_self_with_owned_files",
+    ),
+    // Held store, record and runtime-state capabilities select the required syscall filter shape.
+    (
+        "crates/mvm-hostd/src/jailer/seccomp.rs",
+        "module",
+        "apply",
+        "apply_with_owned_files",
+    ),
+    // Required orphan protection validates its reserved stack class and refuses unavailable support.
+    (
+        "crates/mvm-hostd/src/parent_death.rs",
+        "module",
+        "exit_when_orphaned",
+        "exit_when_orphaned_with_stack",
+    ),
+    // Installed mapping carries the original selected owner and externally signed plan.
+    (
+        "crates/mvm-hostd/src/run.rs",
+        "module",
+        "admit_and_boot_local",
+        "admit_and_boot_local_with_installed_mapping",
+    ),
+    // Bounded original-handle wait refuses unsupported deadlines instead of waiting unbounded.
+    (
+        "crates/mvm-vmm/src/driver/traits.rs",
+        "trait RunningVm",
+        "wait",
+        "wait_with_deadline",
+    ),
+    // Native boot transfers the original lifetime; unsupported drivers refuse before effects.
+    (
+        "crates/mvm-vmm/src/driver/traits.rs",
+        "trait VmmDriver",
+        "boot_custodied",
+        "boot_custodied_with_host_lifetime",
+    ),
+    // The caller-reserved frame cap refuses oversize before body allocation under the same deadline.
+    (
+        "crates/mvm-vmm/src/host/hvf_control_transport.rs",
+        "module",
+        "read_frame",
+        "read_frame_with_limit",
+    ),
+    // The caller-reserved frame cap bounds encoding before any prefix or body is written.
+    (
+        "crates/mvm-vmm/src/host/hvf_control_transport.rs",
+        "module",
+        "write_frame",
+        "write_frame_with_limit",
+    ),
     (
         "crates/mvm-client/src/admission/mod.rs",
         "module",

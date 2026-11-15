@@ -773,13 +773,6 @@ mod tests {
     pub(super) fn preparation(
         root: &std::path::Path,
         backend: BackendKind,
-    ) -> PreparedHostLifetime {
-        preparation_with_owner(root, backend, ())
-    }
-
-    pub(super) fn preparation_with_owner(
-        root: &std::path::Path,
-        backend: BackendKind,
         owner: impl Send + Sync + 'static,
     ) -> PreparedHostLifetime {
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -821,7 +814,7 @@ mod tests {
     #[test]
     fn journal_preflight_refuses_foreign_binding_without_consuming_preparation() {
         let home = tempfile::tempdir().unwrap();
-        let lifetime = preparation(home.path(), BackendKind::Firecracker);
+        let lifetime = preparation(home.path(), BackendKind::Firecracker, ());
         let backend = AnyBackend::Mock(mvm_runtime::MockBackend::new());
         let error = check_start_binding(&backend, "foreign-journal", &lifetime).unwrap_err();
         assert!(error.to_string().contains("lifetime binding differs"));
@@ -832,7 +825,7 @@ mod tests {
     #[test]
     fn journal_preflight_refuses_mock_isolation_without_consuming_preparation() {
         let home = tempfile::tempdir().unwrap();
-        let lifetime = preparation(home.path(), BackendKind::Mock);
+        let lifetime = preparation(home.path(), BackendKind::Mock, ());
         let backend = AnyBackend::Mock(mvm_runtime::MockBackend::new());
         let error = check_start_binding(&backend, "owned-journal", &lifetime).unwrap_err();
         assert!(error.to_string().contains("backend unavailable"));
