@@ -3,6 +3,7 @@ use super::tests::{
     gate_allowing_addr, read_flowmux_frame, run_session, tcp_echo_server, write_frame,
 };
 use mvm_contract::protocol::network_flow::{INITIAL_STREAM_CREDIT, Opcode};
+use std::time::Duration;
 
 #[test]
 fn returned_upload_credit_keeps_the_session_validator_current() {
@@ -11,6 +12,12 @@ fn returned_upload_credit_keeps_the_session_validator_current() {
     let address = tcp_echo_server();
     let (mut guest, mut session, host) =
         run_session(gate_allowing_addr(address.ip(), address.port(), None));
+    guest
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    guest
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     write_frame(
         &mut guest,
         &mut session,

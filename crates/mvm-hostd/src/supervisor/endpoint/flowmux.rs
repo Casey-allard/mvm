@@ -1256,6 +1256,19 @@ impl FlowMuxSession {
     }
 
     fn send_window_update(&self, stream_id: u32, delta: u32) -> Result<(), FlowMuxError> {
+        // The peer may spend returned credit only after this side's validator
+        // records the same grant. Release the guard before session/writer locks.
+        lock_validator(&self.validator)
+            .admit(
+                &mvm_contract::protocol::network_flow::FrameFacts::new(
+                    Direction::HostToGuest,
+                    Opcode::WindowUpdate,
+                    stream_id,
+                )
+                .with_payload(4)
+                .with_credit(delta),
+            )
+            .map_err(|error| FlowMuxError::FrameRefused(error.to_string()))?;
         self.write_frame(Opcode::WindowUpdate, stream_id, &delta.to_be_bytes())
     }
 
