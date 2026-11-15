@@ -110,3 +110,86 @@ fn checked_declaration_refuses_wrong_architecture_and_malformed_profile() {
     });
     assert!(checked_mailbox_reader(&declaration, GuestArch::X86_64).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn checked_custody_keeps_original_reader_profile_for_legacy_mailbox() {
+    let _guard = crate::base::runtime_meta::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let mut env = mvm_core::util::test_env::TestEnv::new();
+    env.isolate_mvm_home(home.path());
+    let rootfs = home.path().join("rootfs");
+    std::fs::write(&rootfs, b"checked mailbox fixture").unwrap();
+    let (mut config, _) = checked_source_runtime_fixture("checked-reader", &rootfs).unwrap();
+    let checked = verify_runtime_for_launch(&config, MIN_GUEST_RPC_PROTOCOL_VERSION)
+        .unwrap()
+        .unwrap();
+    let plan = plan();
+    config.plan_json = Some(serde_json::to_string(&plan).unwrap());
+    let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
+    lease.bind_checked(&config, Some(&checked)).unwrap();
+    lease
+        .mailbox_reader()
+        .expect("checked custody must retain the original compatibility projection")
+        .require(&plan, None)
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_custody_refuses_old_runtime_object_grant_before_snapshot() {
+    let _guard = crate::base::runtime_meta::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let mut env = mvm_core::util::test_env::TestEnv::new();
+    env.isolate_mvm_home(home.path());
+    let rootfs = home.path().join("rootfs");
+    std::fs::write(&rootfs, b"checked mailbox fixture").unwrap();
+    let (mut config, _) = checked_source_runtime_fixture("checked-refusal", &rootfs).unwrap();
+    let checked = verify_runtime_for_launch(&config, MIN_GUEST_RPC_PROTOCOL_VERSION)
+        .unwrap()
+        .unwrap();
+    let mut plan = plan();
+    plan.mailbox.as_mut().unwrap().durable_object_pair_sha256_v1 = Some([6; 32]);
+    plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+    config.plan_json = Some(serde_json::to_string(&plan).unwrap());
+    let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
+    let entries = || {
+        std::fs::read_dir(&lease.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = entries();
+    let error = lease.bind_checked(&config, Some(&checked)).unwrap_err();
+    assert!(error.to_string().contains("mailbox"), "{error:#}");
+    assert_eq!(
+        entries(),
+        before,
+        "refusal must precede runtime custody effects"
+    );
+    assert!(lease.mailbox_reader().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_custody_without_runtime_refuses_object_grant() {
+    let home = tempfile::tempdir().unwrap();
+    let mut env = mvm_core::util::test_env::TestEnv::new();
+    env.isolate_mvm_home(home.path());
+    let mut plan = plan();
+    plan.mailbox.as_mut().unwrap().durable_object_pair_sha256_v1 = Some([6; 32]);
+    plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+    let config = VmStartConfig {
+        name: "missing-checked-reader".into(),
+        plan_json: Some(serde_json::to_string(&plan).unwrap()),
+        ..Default::default()
+    };
+    let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
+    let error = lease.bind_checked(&config, None).unwrap_err();
+    assert!(error.to_string().contains("mailbox"), "{error:#}");
+    assert!(lease.mailbox_reader().is_none());
+}

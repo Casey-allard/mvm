@@ -131,6 +131,21 @@ impl AdmittedPlan {
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
         bundle: Option<&PolicyBundle>,
     ) -> Result<VmId> {
+        self.start_persistent_journal_original_with_verified_runtime(
+            backend, config, images, bundle, None,
+        )
+    }
+
+    /// Retain this launch's authenticated runtime through original journal dispatch.
+    #[cfg(unix)]
+    pub fn start_persistent_journal_original_with_verified_runtime(
+        &mut self,
+        backend: &AnyBackend,
+        config: VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        bundle: Option<&PolicyBundle>,
+        verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+    ) -> Result<VmId> {
         anyhow::ensure!(
             !self.dispatched
                 && cfg!(target_os = "linux")
@@ -162,9 +177,12 @@ impl AdmittedPlan {
                 ))? == self.plan.image.sha256,
             "different persistent boot image or original signed plan"
         );
-        verify_selected_runtime(&config)?;
+        RunPosture::on_backend(self.variant, backend.kind())
+            .with_runtime(Some(&config))
+            .with_verified_runtime(verified_runtime)
+            .verify_launch_runtime(self.plan())?;
         if self.assurance_runtime.is_some() {
-            self.verify_assurance_launch(&config)?;
+            self.verify_assurance_launch(&config, verified_runtime)?;
         }
         let (config, runtime) =
             final_gates::run_post_admission_gates(config, self, backend.kind(), bundle)
@@ -183,6 +201,10 @@ impl AdmittedPlan {
             self.mailbox_posture().as_ref(),
         )?;
         self.dispatched = true;
-        backend.start_custodied(&config, images)
+        backend.start_custodied_verified_release(
+            &config,
+            images,
+            verified_runtime.map(|set| set.release()),
+        )
     }
 }

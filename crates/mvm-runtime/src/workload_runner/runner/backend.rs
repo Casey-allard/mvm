@@ -22,6 +22,7 @@ impl
         &self,
         config: &VmStartConfig,
         images: mvm_vmm::host::boot_images::FrozenBootImageBytes,
+        release: Option<&mvm_build::guest_runtime::evidence::VerifiedReleaseRuntime>,
     ) -> Result<ColdHvfChannel> {
         let plan = config
             .plan_json
@@ -32,7 +33,7 @@ impl
             p.mailbox
                 .is_some_and(|g| g.durable_object_pair_sha256_v1.is_some())
         }) else {
-            return self.prepare_cold_hvf_channel(config, images);
+            return self.prepare_cold_hvf_channel_verified(config, images, release);
         };
         let slot = Arc::new(std::sync::OnceLock::new());
         let runner = WorkloadRunner {
@@ -43,7 +44,7 @@ impl
             broker: RealBrokerRegistrar,
             console_streamer: Arc::clone(&self.console_streamer),
         };
-        let mut owner = runner.prepare_cold_hvf_channel(config, images)?;
+        let mut owner = runner.prepare_cold_hvf_channel_verified(config, images, release)?;
         // prepare_cold_hvf_channel has completed writing the original identity
         // drive, before any HVF child or control handshake exists.
         let reader = slot
@@ -76,6 +77,16 @@ impl<S: NetworkEndpointSpawner + 'static, B: BrokerRegistrar + 'static>
         config: &VmStartConfig,
         images: mvm_vmm::host::boot_images::FrozenBootImageBytes,
     ) -> Result<ColdHvfChannel> {
+        self.prepare_cold_hvf_channel_verified(config, images, None)
+    }
+
+    /// Bind launch-owned release bytes before handing control to native HVF.
+    pub fn prepare_cold_hvf_channel_verified(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::host::boot_images::FrozenBootImageBytes,
+        release: Option<&mvm_build::guest_runtime::evidence::VerifiedReleaseRuntime>,
+    ) -> Result<ColdHvfChannel> {
         cold_hvf_channel::require_cold_start_config(config)?;
         anyhow::ensure!(
             config.roothash.as_deref() == Some(images.root_hash()),
@@ -83,7 +94,10 @@ impl<S: NetworkEndpointSpawner + 'static, B: BrokerRegistrar + 'static>
         );
         self.require_caller_registration_shape(config)?;
         let lifecycle = crate::runtime_evidence::RuntimeLifecycleLease::acquire(&config.name)?;
-        let config = lifecycle.bind(config)?;
+        let config = match release {
+            Some(release) => lifecycle.bind_verified_release(config, release)?,
+            None => lifecycle.bind(config)?,
+        };
         let launch =
             crate::kernel_custody::KernelBoundLaunch::bind(config, self.driver.kind(), &lifecycle)?;
         let config = launch.config();
@@ -425,14 +439,22 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
 /// `VmmDriver` seam rather than being copied into each backend. State is
 /// disk-backed under the per-VM `vm_state_dir`, so a stateless CLI invocation
 /// reconstructs a handle by id.
-impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegistrar + 'static>
-    WorkloadRunner<D, S, B>
-{
+impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner<D, S, B> {
     /// Start through this concrete runner with original writable-image custody.
     pub fn start_custodied(
         &self,
         config: &VmStartConfig,
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+    ) -> Result<VmId> {
+        self.start_custodied_verified_release(config, images, None)
+    }
+
+    /// Transfer a launch's verified release bytes to the lifecycle binder.
+    pub fn start_custodied_verified_release(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        release: Option<&mvm_build::guest_runtime::evidence::VerifiedReleaseRuntime>,
     ) -> Result<VmId> {
         #[cfg(unix)]
         if let Some(owner) = &config.host_lifetime {
@@ -480,10 +502,103 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
             network_policy: &config.network_policy,
             cmdline,
         };
-        match self.start_workload_custodied(&inputs, images) {
+        match self.start_workload_custodied_with_release(&inputs, images, release) {
             Ok(_vm) => Ok(VmId(config.name.clone())),
             Err(e) => Err(e),
         }
+    }
+
+    pub(super) fn start_workload_custodied_with_release(
+        &self,
+        inputs: &WorkloadLaunchInputs<'_>,
+        writable_images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        release: Option<&mvm_build::guest_runtime::evidence::VerifiedReleaseRuntime>,
+    ) -> Result<Box<dyn RunningVm>> {
+        self.require_caller_registration_shape(inputs.config)?;
+        self.check_installed_endpoint_inputs(inputs)?;
+        #[cfg(unix)]
+        let workspace = match &inputs.config.host_lifetime {
+            Some(owner)
+                if owner.canonical_kernel().is_some()
+                    || inputs.config.legacy_portable_runtime.is_some() =>
+            {
+                Some(owner.begin_startup_workspace(inputs.config, self.driver.kind())?)
+            }
+            Some(owner) => {
+                // A clone cannot omit the admitted portable selection to skip
+                // workspace admission and begin lifecycle effects.
+                owner.check_parent_current(inputs.config, self.driver.kind())?;
+                None
+            }
+            None => None,
+        };
+        #[cfg(unix)]
+        let installed = match &inputs.config.host_lifetime {
+            Some(owner) => Some(self.installed.reserve(owner)?),
+            None => None,
+        };
+        let lifecycle =
+            crate::runtime_evidence::RuntimeLifecycleLease::acquire(&inputs.config.name)?;
+        #[cfg(unix)]
+        if let Some(owner) = &inputs.config.host_lifetime {
+            installed::refuse_unowned(&VmId(inputs.config.name.clone()))?;
+            mvm_core::util::atomic_io::write_private_new(
+                &installed::marker(&VmId(inputs.config.name.clone())),
+                &serde_json::to_vec(owner.binding())?,
+            )?;
+        }
+        anyhow::ensure!(
+            !crate::kernel_custody::has_retained_kernel(&lifecycle)?,
+            "canonical kernel lifetime for this VM is still unresolved"
+        );
+        let bound_config = match release {
+            Some(release) => lifecycle.bind_verified_release(inputs.config, release)?,
+            None => lifecycle.bind(inputs.config)?,
+        };
+        let kernel_binding = crate::kernel_custody::KernelBoundLaunch::bind(
+            bound_config,
+            self.driver.kind(),
+            &lifecycle,
+        )?;
+        let bound_config = kernel_binding.config();
+        let bound_cmdline = if bound_config.runtime_release_proof.is_some()
+            || bound_config.unsigned_runtime_development
+        {
+            cmdline::runner_cmdline(
+                bound_config,
+                &vm_state_dir(&bound_config.name),
+                |has_disk| self.driver.workload_base_bootargs(has_disk),
+            )
+        } else {
+            inputs.cmdline.clone()
+        };
+        let inputs = &WorkloadLaunchInputs {
+            config: bound_config,
+            tenant: inputs.tenant,
+            secrets: inputs.secrets,
+            redaction: inputs.redaction,
+            network_policy: inputs.network_policy,
+            cmdline: bound_cmdline,
+        };
+        let result = (|| {
+            #[cfg(unix)]
+            if let Some(workspace) = workspace {
+                workspace.complete()?;
+            }
+            self.boot_bound_workload_guarded(
+                inputs,
+                Some(&kernel_binding),
+                writable_images,
+                lifecycle.mailbox_reader(),
+            )
+        })();
+        #[cfg(unix)]
+        if let Some(slot) = installed {
+            return slot.retain_start(lifecycle, kernel_binding, result);
+        }
+        result.map_err(|error| {
+            cold_hvf_channel::retain_boot_error(error, (lifecycle, kernel_binding))
+        })
     }
 }
 

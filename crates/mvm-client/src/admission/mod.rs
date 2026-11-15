@@ -64,7 +64,10 @@ pub use boot_config::{
     guest_profile_for_boot,
 };
 pub use bundle_binding::{BundlePin, InheritedBundle};
-pub use durability::admit_plan_for_boot_syncing_beside_boot;
+pub use durability::{
+    admit_plan_for_boot_syncing_beside_boot,
+    admit_plan_for_boot_with_verified_runtime_syncing_beside_boot,
+};
 pub use enforce::{enforce_kernel, enforce_shares, enforce_shares_for_claim};
 pub use instructions::InstructionSources;
 pub(crate) use outcome::record_boot;
@@ -395,6 +398,41 @@ pub fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<AdmissionCon
     Ok(admitted)
 }
 
+/// Admit a release launch using its checked whole-runtime selection.
+pub fn admit_plan_for_boot_with_verified_runtime(
+    p: AdmitPlanForBootParams<'_>,
+    runtime: &mvm_runtime::runtime_evidence::VerifiedRuntimeSet,
+) -> Result<AdmissionContext> {
+    let phase = mvm_runtime::ui::activity::start("Signing and admitting the execution plan");
+    let admitted =
+        admit_plan_for_boot_configured_ingress_with_verified_runtime(p, Vec::new(), runtime)?;
+    phase.finish();
+    Ok(admitted)
+}
+
+/// Sign the verified retained release identity for a checkpoint fork.
+pub fn admit_plan_for_boot_with_verified_retained(
+    p: AdmitPlanForBootParams<'_>,
+    retained: &mvm_runtime::checkpoint::VerifiedRetainedRuntime,
+) -> Result<AdmissionContext> {
+    let phase = mvm_runtime::ui::activity::start("Signing and admitting the execution plan");
+    let (context, durability) = admit_with_runtime_evidence(
+        p,
+        Vec::new(),
+        durability::AdmissionSync::Inline,
+        None,
+        StreamRetention::Persist,
+        None,
+        Some(retained),
+    )?;
+    debug_assert!(
+        durability.is_settled(),
+        "a retained-runtime admission is durable before it returns"
+    );
+    phase.finish();
+    Ok(context)
+}
+
 pub fn admit_plan_for_boot_configured_ingress(
     p: AdmitPlanForBootParams<'_>,
     ingress: Vec<mvm_core::plan::IngressMapping>,
@@ -416,12 +454,46 @@ pub(crate) fn admit_persistent_ingress_with_retention(
     journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
     retention: StreamRetention,
 ) -> Result<AdmissionContext> {
-    let (context, durability) = admit_with_stream_retention(
+    admit_persistent_ingress_with_runtime(p, ingress, journal, retention, None)
+}
+
+pub(crate) fn admit_persistent_ingress_with_runtime(
+    p: AdmitPlanForBootParams<'_>,
+    ingress: Vec<mvm_core::plan::IngressMapping>,
+    journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
+    retention: StreamRetention,
+    runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+) -> Result<AdmissionContext> {
+    let (context, durability) = admit_with_runtime_evidence(
         p,
         ingress,
         durability::AdmissionSync::Inline,
         journal,
         retention,
+        runtime,
+        None,
+    )?;
+    debug_assert!(
+        durability.is_settled(),
+        "an inline admission is already durable"
+    );
+    Ok(context)
+}
+
+/// Keep a verified runtime beside the config through signed plan admission.
+pub fn admit_plan_for_boot_configured_ingress_with_verified_runtime(
+    p: AdmitPlanForBootParams<'_>,
+    ingress: Vec<mvm_core::plan::IngressMapping>,
+    runtime: &mvm_runtime::runtime_evidence::VerifiedRuntimeSet,
+) -> Result<AdmissionContext> {
+    let (context, durability) = admit_with_runtime_evidence(
+        p,
+        ingress,
+        durability::AdmissionSync::Inline,
+        None,
+        StreamRetention::Persist,
+        Some(runtime),
+        None,
     )?;
     debug_assert!(
         durability.is_settled(),
@@ -448,6 +520,21 @@ fn admit_with_stream_retention(
     sync: durability::AdmissionSync,
     journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
     retention: StreamRetention,
+) -> Result<(
+    AdmissionContext,
+    mvm_core::admission_durability::AdmissionDurability,
+)> {
+    admit_with_runtime_evidence(p, ingress, sync, journal, retention, None, None)
+}
+
+fn admit_with_runtime_evidence(
+    p: AdmitPlanForBootParams<'_>,
+    ingress: Vec<mvm_core::plan::IngressMapping>,
+    sync: durability::AdmissionSync,
+    journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
+    retention: StreamRetention,
+    runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+    retained: Option<&mvm_runtime::checkpoint::VerifiedRetainedRuntime>,
 ) -> Result<(
     AdmissionContext,
     mvm_core::admission_durability::AdmissionDurability,
@@ -848,7 +935,9 @@ fn admit_with_stream_retention(
         p.ledger,
         p.keys_dir,
         admission_ctx.as_ref(),
-        posture,
+        posture
+            .with_verified_runtime(runtime)
+            .with_verified_retained(retained),
     )
     .or_else(|err| -> Result<_> {
         if let Some(refused) =

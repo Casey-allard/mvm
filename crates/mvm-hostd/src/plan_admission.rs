@@ -62,10 +62,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use ed25519_dalek::VerifyingKey;
 use mvm_build::guest_libc::GuestLibc;
+use mvm_contract::grants::Grants;
 use mvm_contract::grants::ceiling::GrantCeiling;
-use mvm_contract::grants::{CpuGrant, Grants};
-use mvm_contract::protocol::capability_negotiation::negotiate_grants;
-use mvm_contract::protocol::resource_controls::{EnforcedGrants, ResourceControls};
+use mvm_contract::protocol::resource_controls::EnforcedGrants;
 use mvm_contract::provenance::{
     ActorRef, AttestationBinding, DecisionActorRole, DecisionCategory, DecisionOutcome,
     DecisionRecord, DecisionRecordBuilder,
@@ -79,9 +78,7 @@ use mvm_core::plan::{
     verify_plan_id,
 };
 use mvm_core::policy::PolicyBundle;
-use mvm_core::spawn_scope;
 use mvm_core::vm_backend::BackendKind;
-use mvm_vmm::quota::QuotaConfig;
 
 use crate::audit::host_keypair::host_signer_id;
 use mvm_contract::builder::BuilderError;
@@ -110,8 +107,10 @@ mod registry_pack;
 mod shares;
 mod verb_grant_sidecar;
 
-use assurance_runtime::{AssuranceRuntimeBinding, verify_selected_runtime};
-use grant_validation::{enforce_mailbox_retention, enforce_wall_clock_projection};
+use assurance_runtime::AssuranceRuntimeBinding;
+use grant_validation::{admit_grants, enforce_mailbox_retention};
+#[cfg(test)]
+use grant_validation::{enforceability_gate, host_cpu_mechanism_gap};
 use host_gates::{admit_host_interface, admit_within_host_budget};
 pub use mailbox_posture::{MailboxLaunchPosture, MailboxPostureHandoff};
 pub use nonce_ledger::InMemoryNonceLedger;
@@ -228,6 +227,22 @@ impl AdmittedPlan {
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
         bundle: Option<&PolicyBundle>,
     ) -> Result<VmId> {
+        self.start_persistent_object_original_with_verified_runtime(
+            launch, backend, config, images, bundle, None,
+        )
+    }
+
+    /// Keep authenticated runtime evidence beside the original selected admission.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn start_persistent_object_original_with_verified_runtime(
+        &mut self,
+        launch: &crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<'_>,
+        backend: &AnyBackend,
+        config: VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        bundle: Option<&PolicyBundle>,
+        verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+    ) -> Result<VmId> {
         anyhow::ensure!(
             !self.dispatched
                 && self.variant == Variant::Prod
@@ -255,9 +270,12 @@ impl AdmittedPlan {
                 ))? == self.plan.image.sha256,
             "different persistent boot image or original signed plan"
         );
-        verify_selected_runtime(&config)?;
+        RunPosture::on_backend(self.variant, backend.kind())
+            .with_runtime(Some(&config))
+            .with_verified_runtime(verified_runtime)
+            .verify_launch_runtime(self.plan())?;
         if self.assurance_runtime.is_some() {
-            self.verify_assurance_launch(&config)?;
+            self.verify_assurance_launch(&config, verified_runtime)?;
         }
         let (config, runtime) =
             final_gates::run_post_admission_gates(config, self, backend.kind(), bundle)
@@ -271,13 +289,22 @@ impl AdmittedPlan {
         self.dispatched = true;
         #[cfg(target_os = "linux")]
         {
-            let (id, original) =
-                backend.start_original_object_firecracker_custodied(&config, images)?;
+            let (id, original) = backend.start_original_object_firecracker_with_verified_runtime(
+                &config,
+                images,
+                verified_runtime,
+            )?;
             self.object_firecracker = Some(original);
             Ok(id)
         }
         #[cfg(target_os = "macos")]
-        self.activate_object_hvf(launch.hvf_original(), backend, config, images)
+        self.activate_object_hvf(
+            launch.hvf_original(),
+            backend,
+            config,
+            images,
+            verified_runtime,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -397,7 +424,8 @@ impl AdmittedPlan {
     #[cfg(test)]
     pub(crate) fn with_assurance_runtime_for_test(mut self, config: &VmStartConfig) -> Self {
         self.assurance_runtime = Some(
-            AssuranceRuntimeBinding::verify(config, &self.plan).expect("verified test runtime"),
+            AssuranceRuntimeBinding::verify(config, &self.plan, None)
+                .expect("verified test runtime"),
         );
         self
     }
@@ -518,7 +546,7 @@ pub fn admit_plan_for_run(
     extension_ctx: Option<&ExtensionAdmissionContext<'_>>,
     posture: RunPosture,
 ) -> Result<AdmittedPlan> {
-    posture.verify_runtime()?;
+    posture.verify_launch_runtime(plan)?;
     let assurance_runtime = posture.assurance_runtime(plan)?;
     validate_extension_bindings(plan)?;
     let extensions = verify_extension_packs(plan, extension_ctx)?;
@@ -639,7 +667,7 @@ impl VerifiedExternalPlan<'_> {
         let verified = self.body;
         let signed = self.signed;
         let signer_id = signed.0.signer_id.clone();
-        posture.verify_runtime()?;
+        posture.verify_launch_runtime(&verified)?;
         let assurance_runtime = posture.assurance_runtime(&verified)?;
         validate_extension_bindings(&verified)?;
         // No extension verification context on this path: a plan that binds
@@ -1000,6 +1028,9 @@ pub fn admit_for_run(
     if let Some(original) = posture.object_plan {
         original.apply_unsigned(&mut plan, clock.now().timestamp_millis())?;
     }
+    if let Some(identity) = posture.release_identity()? {
+        plan.runtime_identity = Some(identity);
+    }
     admit_plan_for_run(
         &plan,
         clock,
@@ -1036,6 +1067,8 @@ pub struct RunPosture<'a> {
     incoming_journal: Option<&'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission>,
     paired_journal:
         Option<&'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission>,
+    verified_runtime: Option<&'a mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+    verified_retained: Option<&'a mvm_runtime::checkpoint::VerifiedRetainedRuntime>,
 }
 
 impl<'a> RunPosture<'a> {
@@ -1054,6 +1087,8 @@ impl<'a> RunPosture<'a> {
             object_plan: None,
             incoming_journal: None,
             paired_journal: None,
+            verified_runtime: None,
+            verified_retained: None,
         }
     }
 
@@ -1077,6 +1112,8 @@ impl<'a> RunPosture<'a> {
             object_plan: None,
             incoming_journal: None,
             paired_journal: None,
+            verified_runtime: None,
+            verified_retained: None,
         }
     }
 
@@ -1195,185 +1232,82 @@ impl<'a> RunPosture<'a> {
         pair.verify(plan)
     }
 
+    /// Carry authenticated release bytes beside the cloneable launch config.
+    #[must_use]
+    pub fn with_verified_runtime(
+        mut self,
+        runtime: Option<&'a mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+    ) -> Self {
+        self.verified_runtime = runtime;
+        self
+    }
+
+    /// Carry authenticated checkpoint runtime evidence beside a fork's config.
+    #[must_use]
+    pub fn with_verified_retained(
+        mut self,
+        retained: Option<&'a mvm_runtime::checkpoint::VerifiedRetainedRuntime>,
+    ) -> Self {
+        self.verified_retained = retained;
+        self
+    }
+
+    fn release_identity(&self) -> Result<Option<mvm_core::plan::RuntimeIdentity>> {
+        anyhow::ensure!(
+            self.verified_runtime.is_none() || self.verified_retained.is_none(),
+            "launch cannot mix fresh and retained runtime verification"
+        );
+        if let Some(retained) = self.verified_retained {
+            if let Some(identity) = retained.identity() {
+                mvm_runtime::runtime_evidence::verify_runtime_for_claim(
+                    retained,
+                    self.runtime_config,
+                )?;
+                return Ok(Some(identity.clone()));
+            }
+            // Source and legacy forks have no signed release identity. Keep
+            // their existing admission verifier; the warm-claim comparator
+            // deliberately refuses legacy bindings and is not a fork gate.
+            return Ok(None);
+        }
+        self.verified_runtime
+            .map(|runtime| {
+                runtime.verify_config(
+                    self.runtime_config
+                        .context("verified runtime has no selected launch config")?,
+                )?;
+                Ok(runtime.identity().clone())
+            })
+            .transpose()
+    }
+
+    fn verify_launch_runtime(&self, plan: &ExecutionPlan) -> Result<()> {
+        if let Some(identity) = self.release_identity()? {
+            plan.require_runtime_identity(&identity)?;
+            if let Some(runtime) = self.verified_runtime {
+                runtime.require_mailbox_reader(plan, None)?;
+            }
+        } else {
+            anyhow::ensure!(
+                plan.runtime_identity.is_none(),
+                "signed runtime identity has no verified launch evidence"
+            );
+            anyhow::ensure!(
+                !self
+                    .runtime_config
+                    .is_some_and(|config| config.runtime_release_proof.is_some()),
+                "release runtime requires verified launch evidence"
+            );
+            self.verify_runtime()?;
+        }
+        Ok(())
+    }
+
     /// The sealed-production / developer posture this run carries.
     #[must_use]
     pub fn variant(&self) -> Variant {
         self.variant
     }
-}
-
-/// Refuse a run whose grants this host will not admit.
-///
-/// Two independent questions, in this order:
-///
-/// 1. *May it ask for this?* — the ceiling, which bounds the request.
-/// 2. *Can anything here deliver it?* — the mechanisms of the backend that will
-///    boot it, which decide whether an admitted grant would be enforced or
-///    merely recorded.
-///
-/// The second is posture-dependent: a sealed production run must not boot with
-/// a bound nothing implements, while a developer's laptop legitimately runs on
-/// tiers that cannot bound CPU at all. Warning rather than refusing in dev is
-/// what keeps the refusal credible in prod instead of training everyone to
-/// route around it.
-fn admit_grants(plan: &ExecutionPlan, ceiling: &GrantCeiling, posture: RunPosture) -> Result<()> {
-    let undeclared = Grants::default();
-    let grants = plan.grants.as_ref().unwrap_or(&undeclared);
-
-    enforce_wall_clock_projection(plan, grants)?;
-
-    // Memory is checked even when nothing was granted: it is fixed at VM
-    // creation rather than requested, and an unbounded one reserves the host.
-    ceiling
-        .admits(grants, plan.resources.mem_mib)
-        .map_err(|violation| {
-            anyhow::anyhow!(
-                "grant exceeds this host's ceiling: {dimension} requested {requested}, \
-                 host allows at most {ceiling}",
-                dimension = violation.dimension,
-                requested = violation.requested,
-                ceiling = violation.ceiling,
-            )
-        })?;
-
-    display_grants::admit_display_input(grants, posture.variant)?;
-    enforceability_gate(grants, plan, posture)
-}
-
-/// Refuse (prod) or warn (dev) when the backend this run boots on has no
-/// mechanism behind a declared grant.
-fn enforceability_gate(grants: &Grants, plan: &ExecutionPlan, posture: RunPosture) -> Result<()> {
-    // A run that granted CPU or wall clock is the only one with anything to
-    // enforce here; asking otherwise would warn on every unbounded boot.
-    //
-    // `grants.egress` is deliberately outside both this gate and the ceiling,
-    // and is enforced elsewhere rather than left unenforced. It is not bounded
-    // by a numeric ceiling, and "can this tier deliver it" is not a per-backend
-    // question for egress: every workload's traffic already leaves through the
-    // one per-VM substitution endpoint, so a granted allow-list is projected
-    // onto the policy that endpoint installs, and its gate is what admits or
-    // drops each flow.
-    //
-    // What this early return does not do is check that the projection happened.
-    // It cannot: the policy the endpoint installs rides on the launch config,
-    // not in the plan body this function reads, so keeping the two derived from
-    // one authored value is the obligation of the seam that builds both. What
-    // holds here unconditionally is the floor — an absent egress grant and an
-    // empty allow-list both project to deny-all, so a workload that granted
-    // nothing reaches nothing.
-    if grants.cpu.is_none() && grants.wall_clock.is_none() {
-        return Ok(());
-    }
-
-    // No backend object, no answer. The plan's own `runtime_profile` is not a
-    // substitute: it is a label the plan's author chose, so believing it would
-    // let a mislabelled plan pick which resource controls it is measured
-    // against.
-    let Some(kind) = posture.backend else {
-        return refuse_or_warn(
-            posture.variant,
-            "this run was admitted without the backend that will boot it, so no mechanism \
-             can be named for the grants it declares"
-                .to_string(),
-        );
-    };
-
-    // The gate measures against `kind`. But if the plan *does* name a tier and
-    // it is not this one, the plan and the launch disagree about what is about
-    // to run, and a grant checked against either answer is checked against the
-    // wrong one. Refused in both postures: this is a contradiction, not a
-    // missing mechanism, so there is nothing for a dev warning to soften.
-    //
-    // A profile that names no tier at all (`transient-run`) is not a
-    // disagreement — it makes no claim to contradict.
-    if let Some(declared) = BackendKind::from_label(&plan.runtime_profile.0)
-        && declared != kind
-    {
-        anyhow::bail!(
-            "plan declares runtime profile {declared} but this run boots on {actual}; \
-             refusing to measure its grants against either",
-            declared = declared.as_str(),
-            actual = kind.as_str(),
-        );
-    }
-
-    if let Err(gaps) = negotiate_grants(grants, kind) {
-        let detail = gaps
-            .iter()
-            .map(|gap| format!("{} — {}", gap.capability, gap.alternative.describe()))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return refuse_or_warn(
-            posture.variant,
-            format!(
-                "the {tier} tier cannot enforce every declared grant: {detail}",
-                tier = kind.as_str()
-            ),
-        );
-    }
-
-    // The tier says the mechanism exists; this host has to actually have it.
-    // `ResourceControls::for_backend` answers per backend kind and, for CPU,
-    // per target OS — neither of which knows whether *this* host has a systemd
-    // user session to delegate from. Without this second question a sealed run
-    // on a Linux host with no session bus is admitted, boots unbounded, and
-    // reports `declared`: refused in prose and permitted in code.
-    if let Some(detail) = host_cpu_mechanism_gap(grants, kind, spawn_scope::mechanism_gap()) {
-        return refuse_or_warn(posture.variant, detail);
-    }
-    Ok(())
-}
-
-/// Refusal detail when the backend's tier claims a CPU share it can serve but
-/// this host cannot serve it.
-///
-/// Pure, with the host probe passed in, so both answers are testable on any
-/// host — including the combination that cannot be produced locally (a tier
-/// that bounds CPU on a machine whose mechanism is missing).
-fn host_cpu_mechanism_gap(
-    grants: &Grants,
-    kind: BackendKind,
-    gap: Option<spawn_scope::MechanismGap>,
-) -> Option<String> {
-    // Only a share rides on this mechanism. A fuel budget is wasmtime's, and an
-    // absent CPU grant has nothing to enforce.
-    let millicores = match grants.cpu {
-        Some(CpuGrant::Share { millicores }) => millicores,
-        _ => return None,
-    };
-    if !ResourceControls::for_backend(kind).cpu.serves_share() {
-        // The tier itself cannot serve a share; `negotiate_grants` already
-        // spoke to that, and saying it twice would name one problem as two.
-        return None;
-    }
-
-    // HVF enforces shares with its own in-process scheduler; the cgroup probe
-    // is irrelevant there. A share that the scheduler cannot parameterize is
-    // the only missing-mechanism case on this tier.
-    if kind == BackendKind::Hvf {
-        if let Err(e) = QuotaConfig::for_share(millicores) {
-            return Some(format!("the hvf tier cannot enforce cpu.share: {e}"));
-        }
-        return None;
-    }
-
-    let gap = gap?;
-    Some(format!(
-        "the {tier} tier bounds CPU with a cgroup quota, but this host cannot attach one: {reason}",
-        tier = kind.as_str(),
-        reason = gap.describe()
-    ))
-}
-
-fn refuse_or_warn(variant: Variant, detail: String) -> Result<()> {
-    if variant.is_prod() {
-        anyhow::bail!("refusing an unenforceable grant: {detail}");
-    }
-    tracing::warn!(
-        "{detail} — admitting anyway because this is a dev run; the grant is recorded, \
-         not enforced"
-    );
-    Ok(())
 }
 
 /// Soft caps on the JSON envelope sizes flowing through
@@ -2392,11 +2326,25 @@ pub struct StartAdmittedParams<'a> {
 /// including the in-memory mock in tests).
 #[tracing::instrument(skip_all)]
 pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine> {
+    let verified =
+        mvm_runtime::runtime_evidence::verify_selected_release_runtime_set(&params.config)?;
+    start_admitted_with_verified_release(params, verified.as_ref())
+}
+
+/// Start a locally admitted release using this launch's authenticated archive.
+pub(crate) fn start_admitted_with_verified_release(
+    params: StartAdmittedParams<'_>,
+    verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+) -> Result<StartedMachine> {
     let backend = params.backend;
     let mut admitted = params.admitted;
     anyhow::ensure!(
         !admitted.dispatched,
         "original admitted plan was already dispatched"
+    );
+    anyhow::ensure!(
+        admitted.plan().runtime_identity.is_none() || params.emitter.is_some(),
+        "signed release runtime cannot dispatch without an admission audit emitter"
     );
 
     anyhow::ensure!(
@@ -2410,12 +2358,21 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
     // `plan.admitted` already fired, so a gate refusal emits `plan.failed`
     // carrying the refusing stage rather than leaving a dangling admission.
     let gated = (|| {
-        if params.assurance.is_some() || admitted.assurance_runtime.is_some() {
+        if params.assurance.is_some() {
             admitted
-                .verify_assurance_launch(&params.config)
+                .bind_assurance_runtime(&params.config, verified_runtime)
                 .map_err(|error| ("assurance-runtime", error))?;
         }
-        verify_selected_runtime(&params.config).map_err(|error| ("guest-runtime", error))?;
+        if params.assurance.is_some() || admitted.assurance_runtime.is_some() {
+            admitted
+                .verify_assurance_launch(&params.config, verified_runtime)
+                .map_err(|error| ("assurance-runtime", error))?;
+        }
+        RunPosture::on_backend(admitted.variant, backend.kind())
+            .with_runtime(Some(&params.config))
+            .with_verified_runtime(verified_runtime)
+            .verify_launch_runtime(admitted.plan())
+            .map_err(|error| ("guest-runtime", error))?;
         final_gates::run_post_admission_gates(
             params.config,
             &admitted,
@@ -2463,16 +2420,20 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
             .is_some_and(|g| g.durable_object_pair_sha256_v1.is_some())
     {
         backend
-            .start_original_object_firecracker(&config)
+            .start_original_object_firecracker_with_verified_runtime(
+                &config,
+                Vec::new(),
+                verified_runtime,
+            )
             .map(|(id, original)| {
                 admitted.object_firecracker = Some(original);
                 id
             })
     } else {
-        backend.start(&config)
+        backend.start_with_verified_runtime(&config, verified_runtime)
     };
     #[cfg(not(target_os = "linux"))]
-    let started = backend.start(&config);
+    let started = backend.start_with_verified_runtime(&config, verified_runtime);
     match started.context("backend start after signed-plan admission") {
         Ok(vm_id) => {
             // A VM whose grants could not be applied is running without the
@@ -2574,21 +2535,33 @@ pub fn admit_and_start(
     backend: &AnyBackend,
     params: AdmitAndStartParams<'_>,
 ) -> Result<StartedMachine> {
+    let verified =
+        mvm_runtime::runtime_evidence::verify_selected_release_runtime_set(&params.config)?;
+    admit_and_start_with_verified_release(backend, params, verified.as_ref())
+}
+
+/// Admit and boot a local launch with one release verification for all gates.
+pub(crate) fn admit_and_start_with_verified_release(
+    backend: &AnyBackend,
+    params: AdmitAndStartParams<'_>,
+    verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+) -> Result<StartedMachine> {
     // The tier comes from the backend that is about to boot this plan — the
     // object itself, via its typed discriminant. Nothing here reads a backend
     // name: the grant gate decides which resource controls a run is measured
     // against, and deciding that from a string is how a plan ends up measured
     // against a tier it is not running on.
-    let posture =
-        RunPosture::on_backend(params.variant, backend.kind()).with_runtime(Some(&params.config));
-    if params.assurance.is_some() {
-        crate::operator_admitted_trial_booter::verify_assurance_guest_protocol(&params.config)?;
-    }
+    let posture = RunPosture::on_backend(params.variant, backend.kind())
+        .with_runtime(Some(&params.config))
+        .with_verified_runtime(verified_runtime);
 
     // Synthesize the plan up-front so a refusal can be recorded with the
     // plan context if admission fails. Synthesis failures have no plan to
     // anchor to; they propagate without a chain entry.
-    let plan = synthesize_plan(params.synthesis).context("synthesizing plan")?;
+    let mut plan = synthesize_plan(params.synthesis).context("synthesizing plan")?;
+    if let Some(runtime) = verified_runtime {
+        plan.runtime_identity = Some(runtime.identity().clone());
+    }
 
     let admitted_result = admit_plan_for_run(
         &plan,
@@ -2619,14 +2592,17 @@ pub fn admit_and_start(
         params.audit_durability,
     )?;
 
-    start_admitted(StartAdmittedParams {
-        backend,
-        admitted,
-        config: params.config,
-        policy_bundle: params.policy_bundle,
-        emitter: params.emitter,
-        assurance: params.assurance,
-    })
+    start_admitted_with_verified_release(
+        StartAdmittedParams {
+            backend,
+            admitted,
+            config: params.config,
+            policy_bundle: params.policy_bundle,
+            emitter: params.emitter,
+            assurance: params.assurance,
+        },
+        verified_runtime,
+    )
 }
 
 #[cfg(test)]
@@ -2708,6 +2684,133 @@ mod tests {
     use rand::Rng;
 
     const FIXTURE_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn runtime_identity_fixture() -> mvm_core::plan::RuntimeIdentity {
+        let digests = mvm_core::plan::RuntimeArtifactDigests {
+            overlay_sha256: "a".repeat(64),
+            overlay_verity_sha256: "b".repeat(64),
+            overlay_roothash: "c".repeat(64),
+            initramfs_sha256: "d".repeat(64),
+        };
+        mvm_core::plan::RuntimeIdentity {
+            archive_sha256: "f".repeat(64),
+            version: "0.28.0".into(),
+            arch: mvm_core::arch::GuestArch::host().to_string(),
+            declaration: digests.clone(),
+            selected: digests,
+            signer_identity: "release@example.org".into(),
+            signer_issuer: "https://issuer.example.org".into(),
+        }
+    }
+
+    #[test]
+    fn signed_runtime_identity_without_launch_evidence_is_not_admitted() {
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.runtime_identity = Some(runtime_identity_fixture());
+        let error = RunPosture::without_backend(Variant::Dev)
+            .verify_launch_runtime(&plan)
+            .expect_err("plan data cannot substitute for a verified launch-owned set");
+        assert!(error.to_string().contains("no verified launch evidence"));
+    }
+
+    #[test]
+    fn release_proof_without_a_launch_owned_set_cannot_be_admitted() {
+        let plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        let config = VmStartConfig {
+            runtime_release_proof: Some(mvm_core::protocol::runtime_release::RuntimeReleaseProof {
+                archive: "/untrusted/runtime.tar.gz".into(),
+                checksum: "/untrusted/runtime.tar.gz.sha256".into(),
+                signature_bundle: "/untrusted/runtime.tar.gz.bundle".into(),
+                archive_sha256: "a".repeat(64),
+                version: "0.28.0".into(),
+                arch: mvm_core::arch::GuestArch::host(),
+            }),
+            ..Default::default()
+        };
+        let error = RunPosture::without_backend(Variant::Dev)
+            .with_runtime(Some(&config))
+            .verify_launch_runtime(&plan)
+            .expect_err("a path-based proof cannot replace a verified runtime set");
+        assert!(
+            error
+                .to_string()
+                .contains("requires verified launch evidence")
+        );
+    }
+
+    #[test]
+    fn a_verified_legacy_fork_keeps_its_existing_admission_path() {
+        use mvm_core::checkpoint::{
+            CheckpointClass, CheckpointId, CheckpointMeta, ContentBlob, HVF_FRAME_BLOB,
+        };
+        use mvm_vmm::runtime_artifacts::{RuntimeArtifact, RuntimeArtifacts};
+
+        let (_env, home) = host_with_ceiling(Default::default());
+        let fixture = tempfile::tempdir().expect("signed legacy fixture");
+        let selected =
+            mvm_runtime::signed_legacy_runtime_fixture(fixture.path(), home.path(), false);
+        let (config, binding) =
+            mvm_runtime::runtime_evidence::retained_legacy_runtime_fixture(&selected)
+                .expect("retain legacy fixture before checkpoint capture");
+        let observe = |path: &str| RuntimeArtifact {
+            path: path.into(),
+            sha256: mvm_core::crypto::image_verify::sha256_file(std::path::Path::new(path))
+                .expect("fixture digest"),
+        };
+        let actual = RuntimeArtifacts {
+            kernel: None,
+            initramfs: config.initrd_path.as_deref().map(observe),
+            disks: vec![observe(&config.rootfs_path)],
+            kernel_cmdline: "console=hvc0".into(),
+            firecracker_drives: None,
+        };
+        let store = mvm_runtime::checkpoint::CheckpointStore::at(home.path().join("checkpoints"));
+        let id = CheckpointId::new("legacy-fork");
+        let content = store.content_dir(&id);
+        std::fs::create_dir_all(&content).expect("checkpoint content directory");
+        let bytes = serde_json::to_vec(&actual).expect("runtime observation");
+        std::fs::write(content.join("runtime-artifacts.json"), &bytes)
+            .expect("checkpoint runtime evidence");
+        let meta = CheckpointMeta::builder(id, CheckpointClass::VmFull, &config.name)
+            .runtime_launch_binding(Some(binding))
+            .content(vec![
+                ContentBlob {
+                    name: "runtime-artifacts.json".into(),
+                    sha256: mvm_core::crypto::image_verify::sha256_reader(bytes.as_slice())
+                        .expect("evidence digest"),
+                },
+                ContentBlob {
+                    name: HVF_FRAME_BLOB.into(),
+                    sha256: "ab".repeat(32),
+                },
+            ])
+            .build();
+        let retained = mvm_runtime::checkpoint::verify_checkpoint_runtime(&store, &meta)
+            .expect("authenticated retained legacy generation");
+        assert!(retained.identity().is_none());
+        let plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        RunPosture::without_backend(Variant::Dev)
+            .with_runtime(Some(&config))
+            .with_verified_retained(Some(&retained))
+            .verify_launch_runtime(&plan)
+            .expect("legacy fork uses its prior verifier, not the warm-claim-only comparator");
+
+        let mut invalid = config.clone();
+        invalid
+            .legacy_bundle_runtime
+            .as_mut()
+            .expect("legacy proof")
+            .pin
+            .bundle_sha256 = "0".repeat(64);
+        assert!(
+            RunPosture::without_backend(Variant::Dev)
+                .with_runtime(Some(&invalid))
+                .with_verified_retained(Some(&retained))
+                .verify_launch_runtime(&plan)
+                .is_err(),
+            "a changed legacy proof still refuses"
+        );
+    }
 
     #[test]
     fn local_retention_requires_a_configured_host_ceiling() {
@@ -6052,7 +6155,90 @@ mod tests {
             initrd_path: Some(directory.path().join("initramfs").display().to_string()),
             ..Default::default()
         };
-        assert!(AssuranceRuntimeBinding::verify(&config, &plan_binding(&[])).is_err());
+        assert!(AssuranceRuntimeBinding::verify(&config, &plan_binding(&[]), None).is_err());
+    }
+
+    #[test]
+    fn dispatch_without_verified_owner_refuses_signed_runtime_identity_before_effects() {
+        let (_env, _home) = host_with_ceiling(Default::default());
+        for has_release_identity in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let audit = tempfile::tempdir().unwrap();
+            let backend = mvm_runtime::AnyBackend::from_hypervisor("mock");
+            let config = VmStartConfig {
+                name: format!("dispatch-runtime-{has_release_identity}"),
+                rootfs_path: directory.path().join("rootfs").display().to_string(),
+                ..Default::default()
+            };
+            std::fs::write(&config.rootfs_path, b"dispatch fixture").unwrap();
+            let digest = mvm_core::crypto::image_verify::sha256_file(std::path::Path::new(
+                &config.rootfs_path,
+            ))
+            .unwrap();
+            let mut input = fixture_input(&config.name);
+            input.image_sha256 = &digest;
+            let mut plan = synthesize_plan(&input).unwrap();
+            if has_release_identity {
+                plan.runtime_identity = Some(runtime_identity_fixture());
+            }
+            plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let signed = sign_plan(&plan, &key, "host:test");
+            // Isolate dispatch with a signed admitted snapshot. This fixture
+            // supplies no verified runtime and claims no release authentication.
+            let admitted = AdmittedPlan::for_test(plan, "host:test".into(), signed);
+            let emitter = crate::audit::emitter::AuditEmitter::with_dir(
+                ed25519_dalek::SigningKey::from_bytes(&[41; 32]),
+                audit.path(),
+            )
+            .unwrap();
+            crate::audit::durability::record_admission(
+                Some(&emitter),
+                admitted.plan(),
+                admitted.signer_id(),
+                crate::audit::durability::AuditDurability::BestEffort,
+            )
+            .unwrap();
+            let vm_id = mvm_core::vm_backend::VmId(config.name.clone());
+            let state_dir = mvm_core::config::vm_state_dir(&config.name);
+            let result = start_admitted(StartAdmittedParams {
+                backend: &backend,
+                admitted,
+                config,
+                policy_bundle: None,
+                emitter: Some(&emitter),
+                assurance: None,
+            });
+            if !has_release_identity {
+                result.expect("ordinary no-release dispatch remains admitted");
+                assert!(matches!(
+                    backend.status(&vm_id),
+                    Ok(mvm_core::vm_backend::VmStatus::Running)
+                ));
+                continue;
+            }
+            let error = result.expect_err(
+                "a signed runtime identity needs its original verified owner at dispatch",
+            );
+            assert!(
+                format!("{error:#}").contains("no verified launch evidence"),
+                "{error:#}"
+            );
+            assert!(!matches!(
+                backend.status(&vm_id),
+                Ok(mvm_core::vm_backend::VmStatus::Running)
+            ));
+            assert!(
+                !state_dir.exists(),
+                "refusal precedes backend state effects"
+            );
+            let chain = std::fs::read_to_string(audit.path().join("local.jsonl")).unwrap();
+            assert!(
+                chain.contains("plan.failed") && chain.contains("guest-runtime"),
+                "{chain}"
+            );
+            assert!(!chain.contains("plan.launched"), "{chain}");
+        }
     }
 
     #[test]
@@ -6128,7 +6314,7 @@ mod tests {
             ..baked_assurance_config(directory.path())
         };
         let mut plan = plan_binding(&[]);
-        assert!(AssuranceRuntimeBinding::verify(&config, &plan).is_err());
+        assert!(AssuranceRuntimeBinding::verify(&config, &plan, None).is_err());
         plan.image.sha256 =
             mvm_core::crypto::image_verify::sha256_file(std::path::Path::new(&config.rootfs_path))
                 .unwrap();
@@ -6147,17 +6333,17 @@ mod tests {
                 .require_assurance_runtime("different-machine")
                 .is_err()
         );
-        admitted.verify_assurance_launch(&config).unwrap();
+        admitted.verify_assurance_launch(&config, None).unwrap();
 
         let renamed = VmStartConfig {
             name: "different-machine".into(),
             ..config.clone()
         };
-        assert!(admitted.verify_assurance_launch(&renamed).is_err());
+        assert!(admitted.verify_assurance_launch(&renamed, None).is_err());
         std::fs::write(&kernel, b"replacement kernel").unwrap();
-        assert!(admitted.verify_assurance_launch(&config).is_err());
+        assert!(admitted.verify_assurance_launch(&config, None).is_err());
         std::fs::write(&config.rootfs_path, b"replacement rootfs").unwrap();
-        assert!(AssuranceRuntimeBinding::verify(&config, admitted.plan()).is_err());
+        assert!(AssuranceRuntimeBinding::verify(&config, admitted.plan(), None).is_err());
     }
 
     #[test]
@@ -6177,7 +6363,7 @@ mod tests {
         );
         let admitted = AdmittedPlan::for_test(plan, signer_id, signed)
             .with_assurance_runtime_for_test(&config);
-        admitted.verify_assurance_launch(&config).unwrap();
+        admitted.verify_assurance_launch(&config, None).unwrap();
         for mutation in 0..3 {
             let mut changed = config.clone();
             let proof = changed.legacy_portable_runtime.as_mut().unwrap();
@@ -6190,12 +6376,12 @@ mod tests {
                     proof.archive = copy;
                     // An independently valid proof at another location still
                     // changes the selection this capability admitted.
-                    AssuranceRuntimeBinding::verify(&changed, admitted.plan()).unwrap();
+                    AssuranceRuntimeBinding::verify(&changed, admitted.plan(), None).unwrap();
                 }
                 _ => unreachable!(),
             }
             assert!(
-                admitted.verify_assurance_launch(&changed).is_err(),
+                admitted.verify_assurance_launch(&changed, None).is_err(),
                 "mutation {mutation}"
             );
         }

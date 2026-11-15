@@ -7,6 +7,8 @@ description: How egress, ports, files, volumes, and snapshots fit the mvm model.
 
 Local runtime networking is policy-shaped. Examples should start from deny-by-default and add only the destinations or ports the workload needs.
 
+For a release-backed launch, the authenticated runtime selection stays with that launch through admission and artifact custody. The signed runtime identity does not replace the owned verification result. Mailbox compatibility is checked against the authenticated declaration before dispatch and again before taking artifact custody; unsupported object or journal semantics refuse. Another launch verifies its own selection. These source checks do not establish compatible signed publication or successful installed mailbox delivery on a backend.
+
 ## Ports
 
 Port forwarding is an explicit operation. Treat service exposure as part of the workload contract: name the guest port, host binding, protocol, and expected readiness behavior.

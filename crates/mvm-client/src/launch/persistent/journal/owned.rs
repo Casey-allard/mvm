@@ -165,12 +165,16 @@ impl JournalStartContext {
         }
         // The entire prepared group is held before canonical dispatch can
         // create a process or register an installed endpoint.
-        let id = boot.admission.admitted.start_persistent_journal_original(
-            &self.original.backend,
-            boot.start_config.clone(),
-            images,
-            boot.admission.policy_bundle.as_ref(),
-        )?;
+        let id = boot
+            .admission
+            .admitted
+            .start_persistent_journal_original_with_verified_runtime(
+                &self.original.backend,
+                boot.start_config.clone(),
+                images,
+                boot.admission.policy_bundle.as_ref(),
+                boot.verified_runtime.as_ref(),
+            )?;
         self.native_id = Some(id.clone());
         let mut attempt = mvm_hostd::mailbox_process::original_journal::JournalStartAttempt::new();
         let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

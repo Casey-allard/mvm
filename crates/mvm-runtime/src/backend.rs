@@ -870,6 +870,20 @@ impl AnyBackend {
         config: &VmStartConfig,
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
     ) -> Result<(VmId, OriginalObjectFirecracker)> {
+        self.start_original_object_firecracker_with_verified_runtime(config, images, None)
+    }
+
+    /// Preserve the original reader while carrying this launch's verified runtime.
+    #[cfg(target_os = "linux")]
+    pub fn start_original_object_firecracker_with_verified_runtime(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        runtime: Option<&crate::runtime_evidence::VerifiedRuntimeSet>,
+    ) -> Result<(VmId, OriginalObjectFirecracker)> {
+        if let Some(runtime) = runtime {
+            runtime.verify_config(config)?;
+        }
         let Self::Firecracker(runner) = self else {
             anyhow::bail!("requires Linux Firecracker")
         };
@@ -889,7 +903,7 @@ impl AnyBackend {
         let observation = mvm_backends::driver::fc::original::LaunchObservation::default();
         let id = runner
             .with_original_object_observation(observation.clone())
-            .start_custodied(config, images)?;
+            .start_custodied_verified_release(config, images, runtime.map(|set| set.release()))?;
         Ok((id, OriginalObjectFirecracker { observation }))
     }
 
@@ -1027,6 +1041,26 @@ impl AnyBackend {
         }
     }
 
+    /// Start with one launch-owned release verification when one was selected.
+    pub fn start_with_verified_runtime(
+        &self,
+        config: &VmStartConfig,
+        runtime: Option<&crate::runtime_evidence::VerifiedRuntimeSet>,
+    ) -> Result<VmId> {
+        let Some(runtime) = runtime else {
+            return self.start(config);
+        };
+        runtime.verify_config(config)?;
+        #[cfg(unix)]
+        {
+            self.start_custodied_verified_release(config, Vec::new(), Some(runtime.release()))
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("verified release runtime has no supported custody backend")
+        }
+    }
+
     /// Start with original writable-image custody transferred to the final writer.
     #[cfg(unix)]
     pub fn start_custodied(
@@ -1034,21 +1068,40 @@ impl AnyBackend {
         config: &VmStartConfig,
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
     ) -> Result<VmId> {
-        if images.is_empty() {
+        self.start_custodied_verified_release(config, images, None)
+    }
+
+    /// Hand one authenticated release selection to the backend's custody point.
+    #[cfg(unix)]
+    pub fn start_custodied_verified_release(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        release: Option<&mvm_build::guest_runtime::evidence::VerifiedReleaseRuntime>,
+    ) -> Result<VmId> {
+        if images.is_empty() && release.is_none() {
             return self.start(config);
         }
         if !self.activation_waits_for_admission() {
             config.wait_for_admission_durability()?;
         }
         match self {
-            Self::Firecracker(runner) => runner.start_custodied(config, images),
-            Self::Libkrun(runner) => runner.start_custodied(config, images),
-            Self::Qemu(runner) => runner.start_custodied(config, images),
-            Self::Hvf(runner) => runner.start_custodied(config, images),
+            Self::Firecracker(runner) => {
+                runner.start_custodied_verified_release(config, images, release)
+            }
+            Self::Libkrun(runner) => {
+                runner.start_custodied_verified_release(config, images, release)
+            }
+            Self::Qemu(runner) => runner.start_custodied_verified_release(config, images, release),
+            Self::Hvf(runner) => runner.start_custodied_verified_release(config, images, release),
             #[cfg(feature = "test-support")]
             Self::Mock(backend) => {
                 // The hermetic writer has no real descriptors to inherit, but
                 // it still exercises the same ownership and admission path.
+                anyhow::ensure!(
+                    release.is_none(),
+                    "mock backend cannot consume a verified release runtime"
+                );
                 let images = images;
                 let id = backend.start(config)?;
                 drop(images);
@@ -1065,8 +1118,20 @@ impl AnyBackend {
         config: &VmStartConfig,
         images: mvm_vmm::host::boot_images::FrozenBootImageBytes,
     ) -> Result<crate::workload_runner::runner::OwnedRuntimeLaunch> {
+        self.prepare_owned_launch_with_verified_runtime(config, images, None)
+    }
+
+    /// Keep the verified release archive alive through the native custody handoff.
+    pub fn prepare_owned_launch_with_verified_runtime(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::host::boot_images::FrozenBootImageBytes,
+        runtime: Option<&crate::runtime_evidence::VerifiedRuntimeSet>,
+    ) -> Result<crate::workload_runner::runner::OwnedRuntimeLaunch> {
         match self {
-            AnyBackend::Hvf(runner) => runner.prepare_owned_hvf_original(config, images),
+            AnyBackend::Hvf(runner) => {
+                runner.prepare_owned_hvf_original(config, images, runtime.map(|set| set.release()))
+            }
             _ => anyhow::bail!("owned native launch requires concrete macOS HVF"),
         }
     }

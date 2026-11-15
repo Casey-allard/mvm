@@ -17,12 +17,12 @@ use crate::launch::start_params::VmStartParams;
 use crate::record_readiness as record_vm_readiness;
 
 use super::runtime_source::{
-    attach_runtime_overlay_if_cached, attach_universal_initramfs_if_cached,
-    emit_runtime_source_status,
+    attach_runtime_overlay_if_cached_version_verified, attach_universal_initramfs_if_cached,
+    attach_universal_initramfs_with_verified_release, emit_runtime_source_status,
 };
 use crate::admission::policy::shares_from_volume_cfg;
 use crate::admission::{
-    AdmitPlanForBootParams, admit_persistent_ingress_with_retention, attach_guest_boot_config,
+    AdmitPlanForBootParams, admit_persistent_ingress_with_runtime, attach_guest_boot_config,
     emit_failed, emit_launched, enforce_kernel, enforce_shares, guest_profile_for_boot,
 };
 
@@ -205,6 +205,7 @@ struct PreparedPersistentBoot {
     admission: crate::admission::AdmissionContext,
     prepared_volumes: crate::volume::LaunchPreparation,
     built_runtime: Option<mvm_hostd::plan_admission::PreparedBuiltPackRuntime>,
+    verified_runtime: Option<mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
 }
 
 fn prepare_persistent_boot(
@@ -320,13 +321,32 @@ fn prepare_persistent_boot_with_owner(
     // Everything the boot waits on is prepared before admission, because
     // admission starts the plan's validity window and the verb grant minted
     // from it lives exactly as long. See `crate::launch::boot_order`.
+    let mut prepared = (start_config, None);
     let admission = crate::launch::boot_order::admit_after_preparation(
-        &mut start_config,
-        |config| {
-            attach_runtime_overlay_if_cached(config, backend_name)?;
-            attach_universal_initramfs_if_cached(config, backend_name)
+        &mut prepared,
+        |(config, verified_runtime)| {
+            let release = attach_runtime_overlay_if_cached_version_verified(
+                config,
+                backend_name,
+                None,
+                None,
+            )?;
+            match release {
+                Some(release) => {
+                    attach_universal_initramfs_with_verified_release(
+                        config,
+                        backend_name,
+                        &release,
+                    )?;
+                    *verified_runtime = Some(
+                        mvm_runtime::runtime_evidence::verify_release_runtime_set(config, release)?,
+                    );
+                    Ok(())
+                }
+                None => attach_universal_initramfs_if_cached(config, backend_name),
+            }
         },
-        |config| {
+        |(config, verified_runtime)| {
             let admission_ledger = InMemoryNonceLedger::new();
             let ingress = machine_port_ingress(ports)?;
             let instruction_mounts = volumes
@@ -340,7 +360,7 @@ fn prepare_persistent_boot_with_owner(
                     })
                 })
                 .collect::<Vec<_>>();
-            admit_persistent_ingress_with_retention(
+            admit_persistent_ingress_with_runtime(
                 AdmitPlanForBootParams {
                     mailbox,
                     // What the backend will arm, so the admitted tier opens
@@ -407,9 +427,11 @@ fn prepare_persistent_boot_with_owner(
                 ingress,
                 journal,
                 retention,
+                verified_runtime.as_ref(),
             )
         },
     )?;
+    let (mut start_config, verified_runtime) = prepared;
     for volume in &mut start_config.volumes {
         if admission
             .admitted
@@ -457,12 +479,18 @@ fn prepare_persistent_boot_with_owner(
             emit_failed(&admission, "registry-pack-runtime", error);
         })?;
     }
+    if let Some(runtime) = &verified_runtime {
+        runtime.verify_config(&start_config).inspect_err(|error| {
+            emit_failed(&admission, "release-runtime", error);
+        })?;
+    }
     Ok(PreparedPersistentBoot {
         backend,
         start_config,
         admission,
         prepared_volumes,
         built_runtime: _built_runtime,
+        verified_runtime,
     })
 }
 
@@ -504,6 +532,7 @@ fn finish_legacy_persistent(
         start_config,
         mut admission,
         mut prepared_volumes,
+        verified_runtime,
         ..
     } = boot;
     let name_label = start_config.name.clone();
@@ -527,19 +556,23 @@ fn finish_legacy_persistent(
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(journal::InstalledJournal::Object { launch, .. }) = journal.as_deref() {
-            let id = admission.admitted.start_persistent_object_original(
-                launch,
-                &backend,
-                start_config.clone(),
-                images,
-                admission.policy_bundle.as_ref(),
-            )?;
+            let id = admission
+                .admitted
+                .start_persistent_object_original_with_verified_runtime(
+                    launch,
+                    &backend,
+                    start_config.clone(),
+                    images,
+                    admission.policy_bundle.as_ref(),
+                    verified_runtime.as_ref(),
+                )?;
             return Ok(crate::StartedVm::from_started(backend, id));
         }
-        Ok(crate::boot::start_prepared_custodied(
+        Ok(crate::boot::start_prepared_custodied_with_verified_runtime(
             backend,
             &start_config,
             images,
+            verified_runtime.as_ref(),
         )?)
     })() {
         Ok(started) => started,

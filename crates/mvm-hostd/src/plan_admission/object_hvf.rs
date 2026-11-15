@@ -102,6 +102,7 @@ impl AdmittedPlan {
         backend: &AnyBackend,
         mut config: VmStartConfig,
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
     ) -> Result<VmId> {
         ensure!(
             images.is_empty() && config.volumes.is_empty(),
@@ -113,7 +114,11 @@ impl AdmittedPlan {
             .freeze_native_boot(&mut config, backend.kind())?
             .context("missing original HVF image preparation")?;
         frozen.verify_config(&config)?;
-        let runtime = backend.prepare_owned_launch(&config, frozen.take_boot_images()?)?;
+        let runtime = backend.prepare_owned_launch_with_verified_runtime(
+            &config,
+            frozen.take_boot_images()?,
+            verified_runtime,
+        )?;
         frozen.verify_config(runtime.config()?)?;
         self.object_hvf = Some(held.clone());
         held.activate(runtime)
