@@ -22,7 +22,7 @@ use super::{decode_envelope, encode_envelope, verify_receipt};
 
 // A verdict contains no payload. Bound the response even when a peer never
 // closes or sends arbitrarily large error text.
-const MAX_VERDICT_BYTES: u64 = 4 * 1024;
+pub const MAX_VERDICT_BYTES: u64 = 4 * 1024;
 
 /// Why a frame was not queued. Sent back to the peer verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -33,6 +33,10 @@ pub enum Refusal {
     QueueFull(usize),
     #[error("durable mailbox storage quota is full")]
     StorageFull,
+    #[error("sender ordinal already retired")]
+    SenderOrdinalRetired,
+    #[error("sender ordinal is outside the contiguous issued window")]
+    SenderOrdinalGap,
     #[error("mailbox message expired before acceptance")]
     Expired,
     #[error("mailbox retry budget exhausted; reconcile the stable message ID")]
@@ -195,7 +199,25 @@ fn send_expected_receipt<S: Read + Write>(
     allowed: &[DeliveryOutcome],
 ) -> Result<SignedDestinationReceipt, Refusal> {
     let receipt: SignedDestinationReceipt = exchange(stream, &encode_frame(capability, envelope)?)?;
-    verify_receipt(&receipt, destination_key).map_err(|_| Refusal::Malformed)?;
+    verify_expected_receipt(
+        &receipt,
+        envelope,
+        expected_header,
+        destination_key,
+        allowed,
+    )?;
+    Ok(receipt)
+}
+
+/// Reauthenticate a held response against the original envelope on a local retry.
+pub fn verify_expected_receipt(
+    receipt: &SignedDestinationReceipt,
+    envelope: &MailboxEnvelope,
+    expected_header: &MailboxEnvelopeHeader,
+    destination_key: &VerifyingKey,
+    allowed: &[DeliveryOutcome],
+) -> Result<(), Refusal> {
+    verify_receipt(receipt, destination_key).map_err(|_| Refusal::Malformed)?;
     let address = MailboxAddress {
         tenant: expected_header.tenant,
         authorization_domain: expected_header.authorization_domain,
@@ -211,7 +233,7 @@ fn send_expected_receipt<S: Read + Write>(
     {
         return Err(Refusal::Malformed);
     }
-    Ok(receipt)
+    Ok(())
 }
 
 /// Guest side: write one plaintext message and read the host's verdict.

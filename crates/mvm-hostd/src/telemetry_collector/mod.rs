@@ -28,7 +28,13 @@ use mvm_vmm::host::telemetry_registration::{
     assert_peer_is_current, resolve_expected_telemetry_peer,
 };
 
+mod owned;
 mod sink;
+pub use owned::{
+    OWNED_COLLECTOR_STATUS_BYTES, OwnedCollectorRequirements, OwnedEmbeddedCollector,
+    owned_collector_requirements, owned_scanner_requested_bytes,
+};
+pub(crate) use owned::{OwnedCollectorStart, start_owned};
 
 pub use sink::{
     CappedJsonlSink, IngestOutcome, LossClass, LossCounters, QueuedSink, RecordFile, RecordSink,

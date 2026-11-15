@@ -273,10 +273,19 @@ use mvm_vmm::host::process_liveness::state_dir_has_live_process;
 /// Liveness is checked again under the lock: a restore that completed between
 /// the caller's classification and here has left a running supervisor behind.
 pub fn reap_unowned_state_dir(state_dir: &Path, instance_dir: &Path) -> Result<bool, String> {
-    // Nothing to remove, and no reason to create a lock file for a machine
-    // that has no state.
-    if !state_dir.exists() {
-        return Ok(true);
+    // Only exact absence of both namespaces can avoid the lifecycle lock.
+    // Classification never reopens or removes a subsequently appearing state.
+    match std::fs::symlink_metadata(state_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if runtime_namespaces_absent(state_dir).map_err(|error| error.to_string())? {
+                return Ok(true);
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err("runtime state is not an original directory".into());
+        }
+        Ok(_) => {}
     }
     let lock = crate::vm::instance_snapshot::try_lock_resume_in(instance_dir)
         .map_err(|e| format!("{e:#}"))?;
@@ -297,22 +306,98 @@ pub fn reap_unowned_state_dir(state_dir: &Path, instance_dir: &Path) -> Result<b
 /// state dir then leaves the substitution socket behind, and the next launch
 /// under that name dies binding it with "Address already in use".
 ///
-/// Absent directories are not an error. The caller owns the decision that
-/// nothing is still running out of them.
+/// A fresh canonical-parent protection lock is held before either removal.
+/// Installed/native markers and telemetry entries refuse removal, including
+/// malformed evidence. The caller still owns the original cleanup decision;
+/// this serialization guard supplies no liveness, exit or deletion authority.
+/// Missing state can be checked under a present original parent. A missing or
+/// replaced parent refuses rather than claiming complete shortened-socket cleanup.
 pub fn remove_runtime_dirs(state_dir: &Path) -> Result<(), String> {
-    let socket_dir = mvm_core::config::vm_socket_dir_at(state_dir);
-    if socket_dir != state_dir {
-        remove_state_dir(&socket_dir)?;
-    }
-    remove_state_dir(state_dir)
+    remove_protected_runtime_dirs(state_dir).map_err(|error| error.to_string())
 }
 
-/// Best-effort recursive removal of a state dir. The dead-process
-/// discrimination already ran in [`classify`], so there is no live process
-/// to signal here — only leftover sockets / pid files / `console.log`.
+#[cfg(unix)]
+fn runtime_state_guard(
+    state_dir: &Path,
+) -> std::io::Result<mvm_core::runtime_state_protection::RuntimeStateProtection> {
+    use mvm_core::runtime_state_protection::RuntimeStateProtection;
+    use rustix::fs::{Mode, OFlags};
+    use std::fs::File;
+    let parent_path = state_dir
+        .parent()
+        .ok_or_else(|| std::io::Error::other("runtime state parent unavailable"))?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let parent = File::from(rustix::fs::open(parent_path, flags, Mode::empty())?);
+    RuntimeStateProtection::acquire(parent_path, &parent)
+}
+
+#[cfg(unix)]
+fn runtime_namespaces_absent(state_dir: &Path) -> std::io::Result<bool> {
+    let guard = runtime_state_guard(state_dir)?;
+    guard.check_missing_state(state_dir)?;
+    let socket_dir = mvm_core::config::vm_socket_dir_at(state_dir);
+    if socket_dir != state_dir {
+        match std::fs::symlink_metadata(&socket_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => return Ok(false),
+        }
+    }
+    guard.check_missing_state(state_dir)?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn runtime_namespaces_absent(_state_dir: &Path) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "protected runtime state inspection requires a qualified Unix host",
+    ))
+}
+
+#[cfg(unix)]
+fn remove_protected_runtime_dirs(state_dir: &Path) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+    use std::fs::File;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let guard = runtime_state_guard(state_dir)?;
+    let original_state = match rustix::fs::open(state_dir, flags, Mode::empty()) {
+        Ok(file) => Some(File::from(file)),
+        Err(rustix::io::Errno::NOENT) => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(state) = &original_state {
+        guard.check_removal_allowed(state_dir, state)?;
+    } else {
+        guard.check_missing_state(state_dir)?;
+    }
+    let socket_dir = mvm_core::config::vm_socket_dir_at(state_dir);
+    if socket_dir != state_dir {
+        remove_state_dir(&socket_dir).map_err(std::io::Error::other)?;
+    }
+    if let Some(state) = &original_state {
+        guard.check_removal_allowed(state_dir, state)?;
+        remove_state_dir(state_dir).map_err(std::io::Error::other)?;
+    }
+    guard.check_missing_state(state_dir)
+}
+
+#[cfg(not(unix))]
+fn remove_protected_runtime_dirs(_state_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "protected runtime state removal requires a qualified Unix host",
+    ))
+}
+
+/// Recursive removal used only while the canonical-parent guard is held.
+/// Exact absence is harmless; inspection errors never imply absence.
+#[cfg(unix)]
 fn remove_state_dir(dir: &Path) -> Result<(), String> {
-    if !dir.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+        Ok(_) => {}
     }
     std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
@@ -469,7 +554,7 @@ impl FsReconcileActions {
 
 impl ReconcileActions for FsReconcileActions {
     fn tear_down(&self, _name: &str, reg: &VmRegistration) -> Result<(), String> {
-        remove_state_dir(Path::new(&reg.vm_dir))
+        remove_runtime_dirs(Path::new(&reg.vm_dir))
     }
     fn reap_orphan(&self, dir: &str) -> Result<bool, String> {
         reap_unowned_state_dir(&self.vms_root.join(dir), &self.instances_root.join(dir))
@@ -704,11 +789,241 @@ mod tests {
     use std::cell::RefCell;
     use std::path::Path;
 
+    #[cfg(unix)]
+    #[test]
+    fn retained_records_prevent_runtime_and_short_socket_removal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::Builder::new()
+            .prefix("retained-cleanup-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let parent = home.path().join("vms");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state =
+            parent.join("synthetic-retained-state-with-long-name-for-short-socket-boundary");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let records = state.join(mvm_vmm::host::telemetry_provisioning::TELEMETRY_RECORDS_FILE);
+        let key = state.join(mvm_vmm::host::telemetry_provisioning::TELEMETRY_RECORDS_KEY_FILE);
+        std::fs::write(&records, b"synthetic sealed record").unwrap();
+        std::fs::write(&key, b"synthetic wrapped key").unwrap();
+        let sockets = mvm_core::config::vm_socket_dir_at(&state);
+        assert_ne!(sockets, state);
+        std::fs::create_dir(&sockets).unwrap();
+        struct SocketCleanup(PathBuf);
+        impl Drop for SocketCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = SocketCleanup(sockets.clone());
+        let socket_evidence = sockets.join("synthetic-socket-evidence");
+        std::fs::write(&socket_evidence, b"keep").unwrap();
+
+        let outcome = remove_runtime_dirs(&state);
+        assert!(
+            outcome.is_err(),
+            "runtime cleanup deleted retained telemetry without a marker"
+        );
+        assert_eq!(std::fs::read(&records).unwrap(), b"synthetic sealed record");
+        assert_eq!(std::fs::read(&key).unwrap(), b"synthetic wrapped key");
+        assert_eq!(std::fs::read(&socket_evidence).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    fn private_cleanup_fixture() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::Builder::new()
+            .prefix("runtime-removal-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let state = home.path().join("synthetic");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (home, state)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_runtime_state_still_removes_and_missing_state_is_idempotent() {
+        let (_home, state) = private_cleanup_fixture();
+        std::fs::write(state.join("synthetic-console"), b"disposable").unwrap();
+        remove_runtime_dirs(&state).unwrap();
+        assert!(!state.exists());
+        remove_runtime_dirs(&state).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_record_teardown_preserves_retained_telemetry() {
+        let (home, state) = private_cleanup_fixture();
+        let key = state.join(mvm_vmm::host::telemetry_provisioning::TELEMETRY_RECORDS_KEY_FILE);
+        std::fs::write(&key, b"synthetic retained key").unwrap();
+        let registry = registry_with(&[("synthetic", state.to_str().unwrap())]);
+        let actions = FsReconcileActions::new(home.path());
+        assert!(
+            actions
+                .tear_down("synthetic", registry.lookup("synthetic").unwrap())
+                .is_err()
+        );
+        assert_eq!(std::fs::read(key).unwrap(), b"synthetic retained key");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn original_publication_guard_serializes_actual_runtime_removal() {
+        use mvm_core::runtime_state_protection::{
+            RETAINED_TELEMETRY_MARKER_FILE, RuntimeStateProtection,
+        };
+        let (home, state) = private_cleanup_fixture();
+        let parent = std::fs::File::open(home.path()).unwrap();
+        let original_state = std::fs::File::open(&state).unwrap();
+        let publication = RuntimeStateProtection::acquire(home.path(), &parent).unwrap();
+        publication.check_state(&state, &original_state).unwrap();
+        assert!(remove_runtime_dirs(&state).is_err());
+        assert!(state.is_dir());
+        std::fs::write(
+            state.join(RETAINED_TELEMETRY_MARKER_FILE),
+            b"synthetic published marker",
+        )
+        .unwrap();
+        drop(publication);
+        assert!(remove_runtime_dirs(&state).is_err());
+        assert_eq!(
+            std::fs::read(state.join(RETAINED_TELEMETRY_MARKER_FILE)).unwrap(),
+            b"synthetic published marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_parent_refuses_instead_of_claiming_runtime_cleanup() {
+        let (home, _state) = private_cleanup_fixture();
+        assert!(remove_runtime_dirs(&home.path().join("missing-parent/gone")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_dangling_state_is_not_reported_as_successful_reaping() {
+        let (home, state) = private_cleanup_fixture();
+        std::fs::remove_dir(&state).unwrap();
+        std::os::unix::fs::symlink("missing", &state).unwrap();
+        let result = reap_unowned_state_dir(&state, &home.path().join("instance"));
+        assert!(result.is_err(), "dangling state was reported as reaped");
+        assert!(
+            std::fs::symlink_metadata(&state)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_inspection_error_is_not_reported_as_successful_reaping() {
+        let (home, _state) = private_cleanup_fixture();
+        let loop_path = home.path().join("loop");
+        std::os::unix::fs::symlink("loop", &loop_path).unwrap();
+        let state = loop_path.join("synthetic");
+        assert!(std::fs::symlink_metadata(&state).is_err());
+        assert!(
+            reap_unowned_state_dir(&state, &home.path().join("instance")).is_err(),
+            "inspection error was reported as reaped"
+        );
+        assert!(
+            std::fs::symlink_metadata(loop_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_missing_state_collects_its_original_short_socket_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (home, _state) = private_cleanup_fixture();
+        let parent = home.path().join("deep".repeat(30)).join("vms");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = parent.join("absent");
+        let sockets = mvm_core::config::vm_socket_dir_at(&state);
+        assert_ne!(state, sockets);
+        std::fs::create_dir(&sockets).unwrap();
+        std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        struct SocketCleanup(PathBuf);
+        impl Drop for SocketCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = SocketCleanup(sockets.clone());
+        std::fs::write(sockets.join("synthetic-socket"), b"disposable").unwrap();
+        assert_eq!(
+            reap_unowned_state_dir(&state, &home.path().join("instance")),
+            Ok(true)
+        );
+        assert!(
+            !sockets.exists(),
+            "successful reap left its short socket directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_restore_lock_keeps_absent_state_short_sockets_intact() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (home, _state) = private_cleanup_fixture();
+        let parent = home.path().join("restore".repeat(20)).join("vms");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = parent.join("restoring");
+        assert!(!state.exists());
+        let sockets = mvm_core::config::vm_socket_dir_at(&state);
+        assert_ne!(sockets, state);
+        std::fs::create_dir(&sockets).unwrap();
+        std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        struct SocketCleanup(PathBuf);
+        impl Drop for SocketCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = SocketCleanup(sockets.clone());
+        let sentinel = sockets.join("synthetic-restore-socket");
+        std::fs::write(&sentinel, b"original restore owns this socket namespace").unwrap();
+        let instance_dir = home.path().join("instances/restoring");
+        let _restore = crate::vm::instance_snapshot::try_lock_resume_in(&instance_dir)
+            .unwrap()
+            .expect("fixture owns original restore lock");
+        let result = reap_unowned_state_dir(&state, &instance_dir);
+        let readback = std::fs::read(&sentinel);
+        assert_eq!(
+            result,
+            Ok(false),
+            "restore socket readback after reap: {readback:?}"
+        );
+        assert_eq!(
+            readback.unwrap(),
+            b"original restore owns this socket namespace"
+        );
+        assert!(!state.exists());
+    }
+
     /// Create `<vms_root>/<name>/` and return its absolute path. With
     /// `pid` set, write a `libkrun.pid` pointing at that pid.
     fn make_state_dir(vms_root: &Path, name: &str, pid: Option<i32>) -> String {
         let dir = vms_root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(vms_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         if let Some(pid) = pid {
             std::fs::write(dir.join("libkrun.pid"), pid.to_string()).unwrap();
         }
@@ -1375,10 +1690,21 @@ mod tests {
     #[test]
     fn reap_unowned_state_dir_takes_no_lock_for_a_machine_with_no_state() {
         let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let instance_dir = tmp.path().join("instances").join("never-started");
+        let vms_root = tmp.path().join("vms");
+        std::fs::create_dir(&vms_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&vms_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
 
-        let reaped =
-            reap_unowned_state_dir(&tmp.path().join("vms").join("never-started"), &instance_dir);
+        let reaped = reap_unowned_state_dir(&vms_root.join("never-started"), &instance_dir);
 
         assert_eq!(reaped, Ok(true));
         assert!(!instance_dir.exists());
@@ -1544,8 +1870,14 @@ mod tests {
     #[test]
     fn fs_actions_tear_down_absent_dir_is_ok() {
         let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let absent = tmp.path().join("gone");
         let actions = FsReconcileActions::new(tmp.path());
-        let reg = RegisterParams::minimal("gone", "/nonexistent/gone", "default");
+        let reg = RegisterParams::minimal("gone", absent.to_str().unwrap(), "default");
         let mut registry = VmNameRegistry::default();
         registry.register(reg).unwrap();
         // Idempotent: tearing down already-gone state is a clean no-op.

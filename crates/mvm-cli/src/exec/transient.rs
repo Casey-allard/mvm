@@ -845,6 +845,9 @@ mod tests {
             boot_transient_vm("mailbox-launch".into(), false, &mut attempt, None, &mut sub)
         };
         let granted = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],
             epoch: ExecutionEpoch::new(1).unwrap(),

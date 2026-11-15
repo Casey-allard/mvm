@@ -64,7 +64,7 @@ use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -262,6 +262,61 @@ impl VerifiedRestoreFile {
         })
     }
 
+    /// Materialize at most the originally funded extent in the held private
+    /// directory. The issuer must independently authorize this full byte copy.
+    pub fn prepare_funded_copy(
+        source: &File,
+        directory: &File,
+        directory_path: &Path,
+        expected_sha256: &str,
+        bytes: std::num::NonZeroU64,
+    ) -> Result<Self, RestoreImageError> {
+        let checked = open_trusted_dir(directory_path)?;
+        let named = checked
+            .metadata()
+            .map_err(|e| io_err("inspect copy directory", directory_path, e))?;
+        let held = directory
+            .metadata()
+            .map_err(|e| io_err("inspect original directory", directory_path, e))?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(RestoreImageError::UntrustedDirectory(
+                directory_path.to_owned(),
+            ));
+        }
+        let source_metadata = source
+            .metadata()
+            .map_err(|e| io_err("stat copy source", directory_path, e))?;
+        // SAFETY: F_GETFL only inspects the still-borrowed descriptor.
+        let flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
+        if !source_metadata.is_file()
+            || source_metadata.len() != bytes.get()
+            || flags == -1
+            || flags & libc::O_ACCMODE != libc::O_RDONLY
+        {
+            return Err(io_err(
+                "check funded source extent",
+                directory_path,
+                io::Error::from(io::ErrorKind::InvalidInput),
+            ));
+        }
+        let name = private_name().map_err(|e| io_err("name funded copy", directory_path, e))?;
+        let mut reader = io::Read::take(source, bytes.get());
+        copy_into(
+            &mut reader,
+            directory_path,
+            directory,
+            &name,
+            directory_path,
+        )?;
+        let file = finish_private_copy(directory, &name, directory_path, &openat_readonly)?;
+        verify_private_file(&file, bytes.get(), expected_sha256)?;
+        Ok(Self {
+            file,
+            len: bytes.get(),
+            copy: PrivateCopy::Copied,
+        })
+    }
+
     /// The verified private copy.
     pub fn file(&self) -> &File {
         &self.file
@@ -439,7 +494,7 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RestoreImageError> {
     Ok(file)
 }
 
-fn open_trusted_dir(path: &Path) -> Result<File, RestoreImageError> {
+pub fn open_trusted_dir(path: &Path) -> Result<File, RestoreImageError> {
     open_trusted_dir_with(path, &host_dir_facts)
 }
 
@@ -504,7 +559,7 @@ fn host_dir_facts(dir: &File) -> io::Result<DirFacts> {
     }
     Ok(DirFacts {
         local: st.f_flags & libc::MNT_LOCAL as u32 != 0,
-        acl_grants_access: macos_acl::grants_access(dir)?,
+        acl_grants_access: fd_acl_grants_access(dir.as_fd())?,
     })
 }
 
@@ -525,18 +580,34 @@ fn host_dir_facts(dir: &File) -> io::Result<DirFacts> {
     // `f_type` is a signed long on glibc and unsigned on musl; every magic
     // number in the list is positive either way.
     let local = linux_fs_is_local(st.f_type as u64);
+    Ok(DirFacts {
+        local,
+        acl_grants_access: fd_acl_grants_access(dir.as_fd())?,
+    })
+}
+
+/// Read the SAME platform ACL facts for a borrowed original file. This is
+/// validation only; it grants no descriptor, repairs nothing and changes none
+/// of the restore-directory refusal/fallback semantics.
+#[cfg(target_os = "macos")]
+pub(crate) fn fd_acl_grants_access(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    macos_acl::grants_access(fd)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn fd_acl_grants_access(fd: BorrowedFd<'_>) -> io::Result<bool> {
     const ACL_XATTR: &[u8] = b"system.posix_acl_access\0";
-    // SAFETY: `dir` is an open descriptor, the name is NUL-terminated, and a
+    // SAFETY: `fd` is an open descriptor, the name is NUL-terminated, and a
     // zero-sized query writes nothing.
     let size = unsafe {
         libc::fgetxattr(
-            dir.as_raw_fd(),
+            fd.as_raw_fd(),
             ACL_XATTR.as_ptr().cast(),
             std::ptr::null_mut(),
             0,
         )
     };
-    let acl_grants_access = if size >= 0 {
+    Ok(if size >= 0 {
         true
     } else {
         let error = io::Error::last_os_error();
@@ -544,10 +615,6 @@ fn host_dir_facts(dir: &File) -> io::Result<DirFacts> {
             Some(libc::ENODATA) | Some(libc::ENOTSUP) => false,
             _ => return Err(error),
         }
-    };
-    Ok(DirFacts {
-        local,
-        acl_grants_access,
     })
 }
 
@@ -572,7 +639,6 @@ fn linux_fs_is_local(magic: u64) -> bool {
 #[cfg(target_os = "macos")]
 mod macos_acl {
     use std::ffi::c_void;
-    use std::fs::File;
     use std::io;
     use std::os::fd::AsRawFd;
 
@@ -597,7 +663,7 @@ mod macos_acl {
     /// A deny entry can only take access away, so an ACL made only of those
     /// (the kind macOS puts on a home directory) is harmless; any other entry
     /// may grant access the mode bits do not show.
-    pub(super) fn grants_access(file: &File) -> io::Result<bool> {
+    pub(super) fn grants_access(file: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
         // SAFETY: `file` is an open descriptor; a null result means no ACL
         // (errno ENOENT) or a failure.
         let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
@@ -817,7 +883,7 @@ fn clone_unsupported(e: &io::Error) -> bool {
 }
 
 fn copy_into(
-    src: &File,
+    mut reader: impl io::Read,
     source: &Path,
     dir: &File,
     name: &CString,
@@ -842,12 +908,11 @@ fn copy_into(
     }
     // SAFETY: `openat` just returned this descriptor and nothing else owns it.
     let mut dst = unsafe { File::from_raw_fd(fd) };
-    let mut reader = src;
     let copied = io::copy(&mut reader, &mut dst).map_err(|e| io_err("copy", source, e));
-    if copied.is_err() {
-        let _ = unlink_name(dir, name);
+    if let Err(error) = copied {
+        return Err(NamedCopy { dir, name }.remove_after(error, dir_path));
     }
-    copied.map(|_| ())
+    Ok(())
 }
 
 fn openat_readonly(dir: &File, name: &CString) -> io::Result<File> {
@@ -913,6 +978,37 @@ mod tests {
         let source = private.join("memory.bin");
         std::fs::write(&source, bytes).unwrap();
         (root, private, source)
+    }
+
+    #[test]
+    fn funded_root_copy_checks_original_directory_extent_and_exact_bytes() {
+        let payload = b"root with trailing zeros\0\0";
+        let (base, private, source) = fixture(payload);
+        let held = open_trusted_dir(&private).unwrap();
+        let other = base.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let extent = std::num::NonZeroU64::new(payload.len() as u64).unwrap();
+        let hash = sha256_hex(payload);
+        let copy = |path: &Path, len, hash: &str| {
+            VerifiedRestoreFile::prepare_funded_copy(
+                &File::open(&source).unwrap(),
+                &held,
+                path,
+                hash,
+                len,
+            )
+        };
+        assert!(copy(&other, extent, &hash).is_err());
+        assert!(copy(&private, std::num::NonZeroU64::new(1).unwrap(), &hash).is_err());
+        assert!(copy(&private, extent, &sha256_hex(b"other")).is_err());
+        let root = copy(&private, extent, &hash).unwrap();
+        assert_eq!(root.copy(), PrivateCopy::Copied);
+        let mut recovered = vec![0; payload.len()];
+        root.file().read_exact_at(&mut recovered, 0).unwrap();
+        assert_eq!(&recovered[..], payload);
+        assert_eq!(root.file().metadata().unwrap().nlink(), 0);
+        assert_eq!(std::fs::read_dir(&private).unwrap().count(), 1);
     }
 
     #[test]

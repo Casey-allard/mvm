@@ -42,6 +42,21 @@ use mvm_hostd::supervisor::endpoint::network_endpoint::{
 };
 
 fn main() -> Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments
+        .next()
+        .is_some_and(|flag| flag == "--installed-partition")
+    {
+        mvm_hostd::panic_hook::install("substitution-endpoint");
+        anyhow::ensure!(
+            arguments.next().is_none(),
+            "invalid installed endpoint arguments"
+        );
+        #[cfg(unix)]
+        return mvm_hostd::installed_endpoint::run_installed_endpoint();
+        #[cfg(not(unix))]
+        anyhow::bail!("installed endpoint requires Unix descriptor custody");
+    }
     mvm_vmm::host::helper_contract::exit_with_probe_answer_if_requested("mvm-network-endpoint");
     // First statement in the process: a panic before this line would
     // print its payload unredacted.
@@ -259,6 +274,13 @@ fn run_telemetry_only(only: mvm_hostd::telemetry_collector::TelemetryOnlyConfig)
 }
 
 fn validate_flowmux_limits(cfg: &EndpointConfig) -> Result<()> {
+    if cfg
+        .network_policy
+        .as_ref()
+        .is_some_and(|p| p.payload_mapping().is_some())
+    {
+        anyhow::bail!("selected direct TCP payload mapping requires original launcher resources");
+    }
     if cfg.egress_mode == EgressMode::FlowMux {
         cfg.network_limits
             .validate()
@@ -1380,6 +1402,7 @@ mod tests {
 
     fn uds_cfg() -> EndpointConfig {
         EndpointConfig {
+            admitted_network_plan: None,
             telemetry: None,
             tenant_id: "local".into(),
             instance_id: "test".into(),
@@ -1419,6 +1442,7 @@ mod tests {
     /// matter — this test never spawns or serves.
     fn config_with_resolver(resolver: ResolverBackend) -> EndpointConfig {
         EndpointConfig {
+            admitted_network_plan: None,
             telemetry: None,
             tenant_id: "acme".into(),
             instance_id: "test".into(),
@@ -1935,6 +1959,7 @@ mod tests {
         let host_key = [1u8; 32];
         let guest_key = [2u8; 32];
         let cfg = EndpointConfig {
+            admitted_network_plan: None,
             telemetry: None,
             tenant_id: "tenant".into(),
             instance_id: "test".into(),

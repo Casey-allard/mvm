@@ -138,6 +138,23 @@ impl<T: std::io::Read + std::io::Write + Send> DuplexStream for T {}
 
 /// VMM mechanics, written once per VMM.
 pub trait VmmDriver: Send + Sync {
+    /// Whether the native boot path retains the original installation holder.
+    fn supports_host_lifetime(&self) -> bool {
+        false
+    }
+
+    /// Keep original installation custody through a native process launch.
+    /// Unsupported drivers refuse before invoking their ordinary boot path.
+    #[cfg(unix)]
+    fn boot_custodied_with_host_lifetime(
+        &self,
+        _spec: &VmmSpec,
+        _files: crate::driver::prepared_disks::PreparedBootFiles<'_>,
+        _lease: mvm_core::host_lifetime::PreparedHostLifetimeLease,
+        _binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<Box<dyn RunningVm>> {
+        anyhow::bail!("backend does not enforce original host lifetime custody")
+    }
     /// Stable backend token (`"libkrun"`, `"firecracker"`, `"hvf"`, `"mock"`).
     fn name(&self) -> &str;
     /// The typed discriminant; branch on this, never on `name()`.
@@ -195,6 +212,7 @@ pub trait VmmDriver: Send + Sync {
         spec: &VmmSpec,
         files: crate::driver::prepared_disks::PreparedBootFiles<'_>,
     ) -> Result<Box<dyn RunningVm>> {
+        files.require_no_workload_root()?;
         files.require_no_data()?;
         anyhow::ensure!(
             files.writable.is_empty(),
@@ -357,8 +375,14 @@ pub trait VmmDriver: Send + Sync {
     }
 }
 
-/// A live VM handle. Launch-model-agnostic: an in-process VMM, a subprocess,
-/// and an external supervisor all present the same surface.
+/// Immutable original-workload observation, independent of VM custody.
+/// Holding this report grants no launch, effect or retirement authority.
+pub trait OriginalWorkloadReport: Send + Sync {
+    /// Return the original workload result, or unknown at the deadline.
+    fn wait_until(&self, until: std::time::Instant) -> Result<VmExitStatus>;
+}
+
+/// A live VM handle, retaining its backend's original resource ownership.
 pub trait RunningVm: Send {
     fn id(&self) -> &VmId;
     /// Host process that owns this VM's address space, when the driver can
@@ -369,6 +393,15 @@ pub trait RunningVm: Send {
     }
     /// Block until the VM exits; returns its status.
     fn wait(&self) -> Result<VmExitStatus>;
+    /// Observe this original handle's workload result until the supplied deadline.
+    /// Unsupported backends refuse instead of calling an unbounded wait.
+    fn wait_with_deadline(&self, _until: std::time::Instant) -> Result<VmExitStatus> {
+        anyhow::bail!("backend does not provide an original bounded workload wait")
+    }
+    /// Clone only original report evidence before releasing an outer owner lock.
+    fn original_workload_report(&self) -> Option<std::sync::Arc<dyn OriginalWorkloadReport>> {
+        None
+    }
     /// Prepare a cooperative stop while the guest is still responsive.
     fn prepare_stop(&self) -> Result<()> {
         Ok(())
@@ -388,6 +421,8 @@ pub trait RunningVm: Send {
             timing: self.terminate_with_timing()?,
             #[cfg(unix)]
             hvf_exit: None,
+            #[cfg(target_os = "linux")]
+            fc_exit: None,
         })
     }
     #[cfg(unix)]
@@ -402,6 +437,28 @@ pub trait RunningVm: Send {
     fn process_identity(&self) -> Result<Option<crate::host::process_identity::ProcessIdentity>> {
         Ok(None)
     }
+    /// Check the held original Firecracker owner before binding its canonical
+    /// generation. This observes custody only; the caller must separately verify
+    /// canonical files, current parent admission and activation policy.
+    /// No process-table identity is substituted for unavailable original custody.
+    #[cfg(target_os = "linux")]
+    fn check_original_firecracker_kernel(
+        &self,
+        _anchor: &mvm_core::host_lifetime::HostLifetimeAnchor,
+    ) -> Result<()> {
+        anyhow::bail!("original Firecracker kernel owner unavailable")
+    }
+    /// Open one retained original control session before activation. Unsupported
+    /// backends refuse; custody does not replace the caller's signed admission.
+    #[cfg(target_os = "linux")]
+    fn open_owned_entrypoint(
+        &self,
+        _anchor: std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        _identity: super::OriginalEntrypointIdentity,
+        _until: std::time::Instant,
+    ) -> Result<Box<dyn super::OriginalEntrypointChannel>> {
+        anyhow::bail!("original entrypoint control session unavailable")
+    }
     fn pause(&self) -> Result<()>;
     fn resume(&self) -> Result<()>;
     fn status(&self) -> Result<VmStatus>;
@@ -414,6 +471,8 @@ pub struct KernelStopOutcome {
     pub timing: Option<RunningVmStopTiming>,
     #[cfg(unix)]
     pub hvf_exit: Option<crate::host::hvf_stop::ConfirmedExit>,
+    #[cfg(target_os = "linux")]
+    pub fc_exit: Option<crate::host::fc_lifetime::ConfirmedExit>,
 }
 
 /// Backend-specific phases observed while terminating a running VM.

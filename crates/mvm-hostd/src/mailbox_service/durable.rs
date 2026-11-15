@@ -38,45 +38,14 @@ use super::{
 };
 
 const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
-const GUEST_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
+pub(crate) const GUEST_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_EXPIRY_RECORDS_PER_REQUEST: usize = 8;
 
-struct GuestDeadline<'a> {
-    stream: &'a mut UnixStream,
-    until: Instant,
-}
+#[cfg(feature = "durable-guest-io-witness")]
+pub(crate) mod witness_io;
 
-impl GuestDeadline<'_> {
-    fn remaining(&self) -> std::io::Result<Duration> {
-        let remaining = self.until.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "mailbox guest exchange deadline",
-            ))
-        } else {
-            Ok(remaining)
-        }
-    }
-}
-
-impl Read for GuestDeadline<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buf)
-    }
-}
-
-impl Write for GuestDeadline<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
-    }
-}
+mod guest_deadline;
+pub(crate) use guest_deadline::GuestDeadline;
 
 /// Commit delivery-state events; this callback alone cannot authorize a
 /// strong `accepted_durable` receipt.
@@ -99,12 +68,23 @@ impl JournalAnchor for FileJournalAnchor {
     }
 }
 
+pub(crate) struct JournalSocket<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) exclusive: bool,
+}
+
 struct State {
     policy: MailboxPolicy,
     journal: MailboxJournal,
 }
 
+pub(crate) struct IncomingSendGuard {
+    pub(crate) digest: [u8; 32],
+    pub(crate) revocations: PathBuf,
+}
+
 struct Shared {
+    incoming: Option<IncomingSendGuard>,
     limits: MailboxLimits,
     state: Mutex<State>,
     signer: SigningKey,
@@ -125,8 +105,13 @@ pub(crate) struct GuestReaderAuthority {
 
 /// One destination authority's bounded, journal-backed admission socket.
 pub struct DurableMailboxService {
+    #[cfg(feature = "durable-guest-io-witness")]
+    guest_meter: Option<witness_io::Recorder>,
+    #[cfg(feature = "sender-ordinal-io-witness")]
+    aggregate_meter: Option<witness_io::aggregate::Aggregate>,
     shared: Arc<Shared>,
     path: PathBuf,
+    original_socket: Option<(u64, u64)>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -162,17 +147,16 @@ impl DurableMailboxService {
             .state
             .lock()
             .expect("mailbox journal lock poisoned");
-        if state.journal.local_compaction_due(now_unix_ms)? {
-            state
-                .journal
-                .compact_local(now_unix_ms, &self.shared.signer, anchor)?;
+        state
+            .journal
+            .maintain_local_checkpoint(now_unix_ms, &self.shared.signer, anchor)?;
+        match settle_expired(&self.shared, &mut state.journal, now_unix_ms) {
+            Err(JournalError::Full) => return Err(JournalError::MaintenancePending),
+            result => result?,
         }
-        settle_expired(&self.shared, &mut state.journal, now_unix_ms)?;
-        if state.journal.local_compaction_due(now_unix_ms)? {
-            state
-                .journal
-                .compact_local(now_unix_ms, &self.shared.signer, anchor)?;
-        }
+        state
+            .journal
+            .maintain_local_checkpoint(now_unix_ms, &self.shared.signer, anchor)?;
         Ok(())
     }
 
@@ -187,12 +171,15 @@ impl DurableMailboxService {
         anchor: impl JournalAnchor + 'static,
     ) -> std::io::Result<Self> {
         Self::bind_with(
-            path,
+            JournalSocket {
+                path,
+                exclusive: false,
+            },
             limits,
-            policy,
+            State { policy, journal },
             signer,
-            journal,
             Box::new(anchor),
+            None,
             None,
         )
     }
@@ -208,6 +195,29 @@ impl DurableMailboxService {
         journal: MailboxJournal,
         anchor: FileJournalAnchor,
     ) -> std::io::Result<Self> {
+        Self::bind_local_incoming(
+            JournalSocket {
+                path,
+                exclusive: false,
+            },
+            limits,
+            policy,
+            signer,
+            journal,
+            anchor,
+            None,
+        )
+    }
+
+    pub(crate) fn bind_local_incoming(
+        socket: JournalSocket<'_>,
+        limits: MailboxLimits,
+        policy: MailboxPolicy,
+        signer: SigningKey,
+        journal: MailboxJournal,
+        anchor: FileJournalAnchor,
+        incoming: Option<IncomingSendGuard>,
+    ) -> std::io::Result<Self> {
         journal
             .local_ready(&anchor, &signer.verifying_key())
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -217,26 +227,26 @@ impl DurableMailboxService {
             move |tip| anchor.advance(tip)
         };
         Self::bind_with(
-            path,
+            socket,
             limits,
-            policy,
+            State { policy, journal },
             signer,
-            journal,
             Box::new(commit),
             Some(anchor),
+            incoming,
         )
     }
 
     fn bind_with(
-        path: &Path,
+        socket: JournalSocket<'_>,
         limits: MailboxLimits,
-        policy: MailboxPolicy,
+        state: State,
         signer: SigningKey,
-        journal: MailboxJournal,
         anchor: Box<dyn JournalAnchor>,
         local_anchor: Option<Arc<FileJournalAnchor>>,
+        incoming: Option<IncomingSendGuard>,
     ) -> std::io::Result<Self> {
-        if signer.verifying_key() != policy.authority_key {
+        if signer.verifying_key() != state.policy.authority_key {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "destination signer does not match the trusted authority",
@@ -248,15 +258,25 @@ impl DurableMailboxService {
                 "mailbox limits must be nonzero",
             ));
         }
-        let _ = std::fs::remove_file(path);
+        let JournalSocket { path, exclusive } = socket;
+        if !exclusive {
+            let _ = std::fs::remove_file(path);
+        }
         let listener = UnixListener::bind(path)?;
+        let original_socket = if exclusive {
+            let m = std::fs::symlink_metadata(path)?;
+            Some((m.dev(), m.ino()))
+        } else {
+            None
+        };
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
             limits,
-            state: Mutex::new(State { policy, journal }),
+            state: Mutex::new(state),
             signer,
             anchor,
             local_anchor,
+            incoming,
             reader: OnceLock::new(),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -284,11 +304,42 @@ impl DurableMailboxService {
             })
         };
         Ok(Self {
+            #[cfg(feature = "durable-guest-io-witness")]
+            guest_meter: None,
+            #[cfg(feature = "sender-ordinal-io-witness")]
+            aggregate_meter: None,
             shared,
             path: path.to_owned(),
+            original_socket,
             stop,
             worker: Some(worker),
         })
+    }
+
+    #[cfg(feature = "durable-guest-io-witness")]
+    pub(crate) fn with_guest_meter(
+        mut self,
+        vm_state_dir: &Path,
+        replacement: bool,
+    ) -> std::io::Result<Self> {
+        // One original and one replacement per state directory. create_new
+        // fences any further measured incarnation or preexisting endpoint.
+        let transcript = if replacement {
+            "mailbox-guest-stream-replacement-v1.counts"
+        } else {
+            witness_io::FILE_NAME
+        };
+        self.guest_meter = Some(witness_io::Recorder::create(
+            &vm_state_dir.join(transcript),
+        )?);
+        #[cfg(feature = "sender-ordinal-io-witness")]
+        {
+            self.aggregate_meter = Some(witness_io::aggregate::Aggregate::create(
+                vm_state_dir,
+                replacement,
+            )?);
+        }
+        Ok(self)
     }
 
     /// Read one guest outbox operation over its dedicated mailbox port. The
@@ -301,7 +352,13 @@ impl DurableMailboxService {
         route: &HostDialRoute,
         sealer: &mut GuestSealer,
     ) -> std::io::Result<bool> {
-        self.serve_guest_waiting(route, sealer, GUEST_EXCHANGE_TIMEOUT, || true)
+        self.serve_guest_waiting(
+            route,
+            sealer,
+            &mut super::directed_journal::SourceTurn::own(),
+            GUEST_EXCHANGE_TIMEOUT,
+            || true,
+        )
     }
 
     /// Keep one idle production connection open without redialing until this
@@ -310,48 +367,77 @@ impl DurableMailboxService {
         &self,
         route: &HostDialRoute,
         sealer: &mut GuestSealer,
+        turn: &mut super::directed_journal::SourceTurn<'_>,
         active: impl Fn() -> bool,
     ) -> std::io::Result<bool> {
-        self.serve_guest_waiting(route, sealer, GUEST_HOLD_TIMEOUT, active)
+        self.serve_guest_waiting(route, sealer, turn, GUEST_HOLD_TIMEOUT, active)
     }
 
     fn serve_guest_waiting(
         &self,
         route: &HostDialRoute,
         sealer: &mut GuestSealer,
+        turn: &mut super::directed_journal::SourceTurn<'_>,
         hold: Duration,
         active: impl Fn() -> bool,
     ) -> std::io::Result<bool> {
-        let mut stream = crate::telemetry_collector::dial_route(
+        let stream = crate::telemetry_collector::dial_route(
             route,
             mvm_contract::protocol::mailbox::MAILBOX_PORT,
         )?;
         if !await_first_byte(&stream, hold, active) {
             return Ok(false);
         }
-        let mut stream = GuestDeadline {
-            stream: &mut stream,
-            until: Instant::now() + GUEST_EXCHANGE_TIMEOUT,
-        };
-        let body = read_frame(self.shared.limits.max_frame_bytes, &mut stream);
+        let until = Instant::now() + GUEST_EXCHANGE_TIMEOUT;
+        let mut stream = GuestDeadline::new(stream, until)?;
+        #[cfg(feature = "durable-guest-io-witness")]
+        if let Some(meter) = &self.guest_meter {
+            return meter.observe(&mut stream, |io, mark| {
+                #[cfg(feature = "sender-ordinal-io-witness")]
+                if let Some(aggregate) = &self.aggregate_meter {
+                    return aggregate.observe(io, |counted| {
+                        self.exchange_guest(sealer, turn, until, counted, mark)
+                    });
+                }
+                self.exchange_guest(sealer, turn, until, io, mark)
+            });
+        }
+        self.exchange_guest(sealer, turn, until, &mut stream, &mut |_| {})
+    }
+
+    fn exchange_guest(
+        &self,
+        sealer: &mut GuestSealer,
+        turn: &mut super::directed_journal::SourceTurn<'_>,
+        until: Instant,
+        stream: &mut (impl Read + Write),
+        mark: &mut (impl FnMut(&'static str) + ?Sized),
+    ) -> std::io::Result<bool> {
+        let body = read_frame(self.shared.limits.max_frame_bytes, stream);
         let received = body.is_ok();
         let body = match body {
             Ok(body) if is_reader_frame(&body) => {
-                serve_reader(&self.shared, &mut stream, &body);
+                mark("reader_frame");
+                serve_reader(&self.shared, stream, &body, mark, turn, until);
                 return Ok(true);
             }
             other => other,
         };
         let verdict: Result<SignedDestinationReceipt, Refusal> = body
             .and_then(|body| OutboxMessage::decode(&body))
-            .and_then(|message| sealer.seal(message))
-            .and_then(|(capability, envelope)| admit(&self.shared, &capability, &envelope));
+            .and_then(|message| {
+                turn.send(message, until, |message| {
+                    let (capability, envelope) = sealer.seal(message)?;
+                    admit(&self.shared, &capability, &envelope)
+                })
+            });
         let reply = if self.shared.local_anchor.is_some() {
             serde_json::to_vec(&verdict)
         } else {
             serde_json::to_vec(&verdict.map(|_| ()))
         };
         if let Ok(reply) = reply {
+            mark("submit_verdict");
             let _ = stream.write_all(&reply);
         }
         Ok(received)
@@ -408,11 +494,30 @@ impl DurableMailboxService {
     }
 }
 
-fn serve_reader(shared: &Shared, stream: &mut (impl Read + Write), body: &[u8]) {
+fn serve_reader(
+    shared: &Shared,
+    stream: &mut (impl Read + Write),
+    body: &[u8],
+    mark: &mut (impl FnMut(&'static str) + ?Sized),
+    turn: &mut super::directed_journal::SourceTurn<'_>,
+    until: Instant,
+) {
     let result = decode_request_body(body).and_then(|request| {
+        if let ReaderRequest::SenderOrdinalV1 { request } = request {
+            return turn.ordinal_turn(*request, until);
+        }
         let reader = shared.reader.get().ok_or(Refusal::NotAuthorized)?;
         match request {
-            ReaderRequest::Receive => {
+            ReaderRequest::Receive | ReaderRequest::ReceiveObjectPairV1 { .. } => {
+                let pair = match request {
+                    ReaderRequest::ReceiveObjectPairV1 { pair } => Some(pair),
+                    _ => None,
+                };
+                if pair != reader.grant.durable_object_pair_sha256_v1
+                    || pair != reader.boot.durable_object_pair_sha256_v1
+                {
+                    return Err(Refusal::NotAuthorized);
+                }
                 {
                     let mut state = shared.state.lock().expect("mailbox journal lock poisoned");
                     let context = guest_context(&state.policy, reader)?;
@@ -439,9 +544,11 @@ fn serve_reader(shared: &Shared, stream: &mut (impl Read + Write), body: &[u8]) 
                         challenge,
                     },
                 )?;
+                mark("challenge_written");
                 let ReaderRequest::Possession { signature } = read_request(stream)? else {
                     return Err(Refusal::NotAuthorized);
                 };
+                mark("possession_received");
                 let mut state = shared.state.lock().expect("mailbox journal lock poisoned");
                 let context = guest_context(&state.policy, reader)?;
                 let scope = guest_scope(reader, &context);
@@ -467,11 +574,7 @@ fn serve_reader(shared: &Shared, stream: &mut (impl Read + Write), body: &[u8]) 
                     )
                     .map_err(reader_refusal)?;
                 Ok(match leased {
-                    Some(message) => ReaderResponse::Delivery {
-                        lease: Box::new(message.lease().clone()),
-                        content_type: message.content_type().clone(),
-                        payload: message.payload().to_vec(),
-                    },
+                    Some(message) => message.into_reader_response(pair).map_err(reader_refusal)?,
                     None => ReaderResponse::Empty,
                 })
             }
@@ -499,10 +602,33 @@ fn serve_reader(shared: &Shared, stream: &mut (impl Read + Write), body: &[u8]) 
                     .map_err(reader_refusal)?;
                 Ok(ReaderResponse::Acknowledged { ack: signed })
             }
-            ReaderRequest::Possession { .. } => Err(Refusal::NotAuthorized),
+            ReaderRequest::SenderOrdinalV1 { .. }
+            | ReaderRequest::AuthorizeObjectCallV1 { .. }
+            | ReaderRequest::GetObjectRoleV1 { .. }
+            | ReaderRequest::SubmitObjectV1 { .. }
+            | ReaderRequest::Possession { .. } => Err(Refusal::NotAuthorized),
         }
     });
     let response = result.unwrap_or_else(|reason| ReaderResponse::Refused { reason });
+    match &response {
+        ReaderResponse::Delivery { .. } | ReaderResponse::ObjectDeliveryV1 { .. } => {
+            mark("lease_created")
+        }
+        ReaderResponse::Acknowledged { .. } => mark("ack_committed"),
+        ReaderResponse::Refused { .. } => mark("reader_refused"),
+        ReaderResponse::Empty => mark("reader_empty"),
+        ReaderResponse::Challenge { .. } => mark("reader_challenge"),
+        ReaderResponse::SenderAcceptedV1 { .. } | ReaderResponse::SenderSettledV1 { .. } => {}
+        // A slot report belongs to the guest-local interface, not this host stream.
+        ReaderResponse::OutboundJournalAvailableV1 { .. }
+        | ReaderResponse::SenderPendingV1 { .. }
+        | ReaderResponse::ObjectSealAcceptedV1 { .. }
+        | ReaderResponse::ObjectCallAuthorityV1 { .. }
+        | ReaderResponse::ObjectRoleV1 { .. }
+        | ReaderResponse::ObjectPendingV1 { .. }
+        | ReaderResponse::ObjectAcceptedV1 { .. }
+        | ReaderResponse::ObjectStagedV1 { .. } => {}
+    }
     let _ = write_response(stream, &response);
 }
 
@@ -531,10 +657,10 @@ fn guest_context(
     Ok(context)
 }
 
-fn reader_revocations(path: &Path) -> Result<Vec<RevocationId>, Refusal> {
+pub(crate) fn reader_revocations(path: &Path) -> Result<Vec<RevocationId>, Refusal> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -560,7 +686,7 @@ fn reader_revocations(path: &Path) -> Result<Vec<RevocationId>, Refusal> {
     Ok(revoked)
 }
 
-fn guest_scope<'a>(
+pub(crate) fn guest_scope<'a>(
     reader: &'a GuestReaderAuthority,
     context: &OpenContext,
 ) -> MailboxGuestReaderScope<'a> {
@@ -594,11 +720,19 @@ fn settle_expired(
     journal: &mut MailboxJournal,
     now_unix_ms: i64,
 ) -> Result<(), JournalError> {
+    settle_expired_at(journal, now_unix_ms, &shared.signer, |tip| {
+        shared.anchor.commit(tip)
+    })
+}
+
+pub(crate) fn settle_expired_at(
+    journal: &mut MailboxJournal,
+    now_unix_ms: i64,
+    signer: &SigningKey,
+    anchor: impl Fn(JournalTip) -> Result<(), JournalError>,
+) -> Result<(), JournalError> {
     for _ in 0..MAX_EXPIRY_RECORDS_PER_REQUEST {
-        if journal
-            .expire_next(now_unix_ms, &shared.signer, |tip| shared.anchor.commit(tip))?
-            .is_none()
-        {
+        if journal.expire_next(now_unix_ms, signer, &anchor)?.is_none() {
             return Ok(());
         }
     }
@@ -636,7 +770,11 @@ impl Drop for DurableMailboxService {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        if self.original_socket.is_none_or(|original| {
+            std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == original)
+        }) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -662,6 +800,15 @@ fn admit(
         .as_millis();
     let now: i64 = now.try_into().map_err(|_| Refusal::Unavailable)?;
     let mut state = shared.state.lock().expect("mailbox journal lock poisoned");
+    if let Some(incoming) = &shared.incoming {
+        if mvm_core::mailbox::outbound::journal_capability_digest(capability)
+            .map_err(|_| Refusal::NotAuthorized)?
+            != incoming.digest
+        {
+            return Err(Refusal::NotAuthorized);
+        }
+        state.policy.context.revoked_capabilities = reader_revocations(&incoming.revocations)?;
+    }
     state.policy.context.now_unix_ms = now;
     let State { policy, journal } = &mut *state;
     settle_expired(shared, journal, now).map_err(reader_refusal)?;
@@ -722,11 +869,9 @@ mod reader_tests {
 
     #[test]
     fn an_expired_guest_exchange_refuses_more_reads_and_writes() {
-        let (mut socket, _peer) = UnixStream::pair().unwrap();
-        let mut expired = GuestDeadline {
-            stream: &mut socket,
-            until: Instant::now() - Duration::from_millis(1),
-        };
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut expired =
+            GuestDeadline::new(socket, Instant::now() - Duration::from_millis(1)).unwrap();
         assert_eq!(
             expired.read(&mut [0; 1]).unwrap_err().kind(),
             std::io::ErrorKind::TimedOut

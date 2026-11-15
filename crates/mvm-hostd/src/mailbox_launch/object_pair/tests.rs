@@ -1,0 +1,1168 @@
+use super::*;
+use crate::audit::host_keypair;
+use ed25519_dalek::SigningKey;
+use mvm_core::mailbox::{
+    reader::{mint_guest_receive_capability, sign_reader_possession, verify_reader_possession},
+    sign_capability,
+};
+use mvm_core::plan::{sign_plan, test_support::PlanFixture};
+
+fn public_grant(dir: &Path, mail: u8) -> MailboxGrant {
+    let mailbox = MailboxId::from_bytes([mail; 32]);
+    let epoch = ExecutionEpoch::new(1).unwrap();
+    MailboxGrant {
+        mailbox,
+        epoch,
+        authority_key: super::super::authority_key_for(dir, &mailbox, epoch)
+            .unwrap()
+            .to_bytes(),
+        report: None,
+        retention: Some(MailboxRetentionPolicy::new(60_000).unwrap()),
+        incoming_journal_policy_sha256_v1: None,
+        outbound_journal_v1: None,
+        durable_object_pair_sha256_v1: None,
+    }
+}
+
+fn flow(
+    keys: &Path,
+    to: &MailboxGrant,
+    from: &MailboxGrant,
+    kind: MailboxMessageKind,
+    op: MailboxOperation,
+    id: u8,
+    now: i64,
+) -> SignedMailboxCapability {
+    let src = super::super::derived_keys(keys, &from.mailbox, from.epoch).unwrap();
+    let dst = super::super::derived_keys(keys, &to.mailbox, to.epoch).unwrap();
+    let receive = op == MailboxOperation::Receive;
+    let address = MailboxAddress {
+        tenant: TenantId::from_bytes([1; 32]),
+        authorization_domain: AuthorizationDomainId::from_bytes([2; 32]),
+        mailbox: to.mailbox,
+        recipient: PrincipalId::from_bytes(dst.sender.verifying_key().to_bytes()),
+    };
+    sign_capability(
+        MailboxCapabilityGrant {
+            protocol_version: ProtocolVersion::V1,
+            signature_algorithm: SignatureAlgorithm::ED25519,
+            capability_id: CapabilityId::from_bytes([id; 32]),
+            revocation_id: RevocationId::from_bytes([id; 32]),
+            issuer: PrincipalId::from_bytes(to.authority_key),
+            subject: if receive {
+                address.recipient
+            } else {
+                PrincipalId::from_bytes(src.sender.verifying_key().to_bytes())
+            },
+            address,
+            operations: CapabilityOperations::from_operations(&[op]),
+            message_kinds: vec![kind],
+            content_types: vec![ContentType::parse("application/spiralcore-object", 1).unwrap()],
+            minimum_execution_epoch: to.epoch,
+            maximum_execution_epoch: to.epoch,
+            policy_epoch: 1,
+            not_before_unix_ms: now - 1000,
+            expires_at_unix_ms: now + 120_000,
+            max_payload_bytes: if kind == MailboxMessageKind::Call {
+                4152
+            } else {
+                88
+            },
+            max_messages_per_minute: 60,
+            max_outstanding_calls: 1,
+            max_queue_contribution_bytes: 8192,
+            delegation_depth: 0,
+        },
+        &dst.authority,
+    )
+    .unwrap()
+}
+
+struct Originals {
+    dir: tempfile::TempDir,
+    a: MailboxGrant,
+    b: MailboxGrant,
+    credentials: ObjectPairCredentials,
+    now: i64,
+}
+impl Originals {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        host_keypair::load_or_init_at(dir.path()).unwrap();
+        let now = super::super::now_unix_ms();
+        let a = public_grant(dir.path(), 31);
+        let b = public_grant(dir.path(), 32);
+        let credentials = ObjectPairCredentials {
+            call: flow(
+                dir.path(),
+                &b,
+                &a,
+                MailboxMessageKind::Call,
+                MailboxOperation::Send,
+                7,
+                now,
+            ),
+            reply: flow(
+                dir.path(),
+                &a,
+                &b,
+                MailboxMessageKind::Reply,
+                MailboxOperation::Reply,
+                8,
+                now,
+            ),
+            receive_at_caller: flow(
+                dir.path(),
+                &a,
+                &b,
+                MailboxMessageKind::Reply,
+                MailboxOperation::Receive,
+                9,
+                now,
+            ),
+            receive_at_callee: flow(
+                dir.path(),
+                &b,
+                &a,
+                MailboxMessageKind::Call,
+                MailboxOperation::Receive,
+                10,
+                now,
+            ),
+        };
+        Self {
+            dir,
+            a,
+            b,
+            credentials,
+            now,
+        }
+    }
+    fn prepare(&self, credentials: ObjectPairCredentials) -> Result<PreparedObjectPair> {
+        PreparedObjectPair::prepare_at(
+            self.dir.path(),
+            &self.a,
+            &Nonce::from_bytes([1; 16]),
+            &self.b,
+            &Nonce::from_bytes([2; 16]),
+            credentials,
+            self.now,
+        )
+    }
+}
+
+struct BootFixture {
+    dir: tempfile::TempDir,
+    signed: SignedExecutionPlan,
+    boot: MailboxReaderBootBinding,
+    posture: MailboxLaunchPosture,
+    ack: SigningKey,
+}
+impl BootFixture {
+    fn new(keys: &Path, grant: MailboxGrant, n: u8, now: i64) -> Self {
+        let mut plan = PlanFixture::new()
+            .workload(format!("vm-{n}"))
+            .nonce([n; 16])
+            .validity(
+                chrono::DateTime::from_timestamp_millis(now - 5000).unwrap(),
+                chrono::DateTime::from_timestamp_millis(now + 120000).unwrap(),
+            )
+            .mailbox(grant)
+            .build();
+        plan.image.name = format!("vm-{n}");
+        plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+        let signer = host_keypair::load_or_init_at(keys).unwrap();
+        let signed = sign_plan(&plan, &signer.signing, &host_keypair::host_signer_id());
+        let ack = SigningKey::from_bytes(&[n + 31; 32]);
+        let boot = MailboxReaderBootBinding::mint(
+            &plan,
+            SigningKey::from_bytes(&[n + 21; 32]).verifying_key(),
+            ack.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        boot.persist(dir.path()).unwrap();
+        let posture = MailboxLaunchPosture::for_test(&plan, Variant::Prod);
+        Self {
+            dir,
+            signed,
+            boot,
+            posture,
+            ack,
+        }
+    }
+    fn input(&self) -> BootInput<'_> {
+        BootInput {
+            plan: &self.signed,
+            state: self.dir.path(),
+            boot: &self.boot,
+            posture: &self.posture,
+            current_epoch: ExecutionEpoch::new(1).unwrap(),
+        }
+    }
+}
+
+#[test]
+fn original_installation_rejects_an_unissued_or_swapped_return_reader() {
+    let f = Originals::new();
+    let mut wrong = f.credentials.clone();
+    wrong.receive_at_caller = wrong.receive_at_callee.clone();
+    assert!(f.prepare(wrong).is_err());
+    let mut bad = f.credentials.clone();
+    bad.reply.signature[0] ^= 1;
+    assert!(f.prepare(bad).is_err());
+    let mut too_large = f.credentials.clone();
+    let aa = super::super::derived_keys(f.dir.path(), &f.a.mailbox, f.a.epoch).unwrap();
+    too_large.receive_at_caller.grant.max_payload_bytes += 1;
+    too_large.receive_at_caller =
+        sign_capability(too_large.receive_at_caller.grant, &aa.authority).unwrap();
+    assert!(f.prepare(too_large).is_err());
+    let p = f.prepare(f.credentials.clone()).unwrap();
+    let (a, b) = p.selected_grants();
+    assert!(a.durable_object_pair_sha256_v1.is_some());
+    assert_eq!(
+        a.durable_object_pair_sha256_v1,
+        b.durable_object_pair_sha256_v1
+    );
+    assert_eq!(f.a.durable_object_pair_sha256_v1, None);
+    assert!(!f.dir.path().join(super::super::ENCRYPTION_ROOT).exists());
+}
+
+#[test]
+fn independent_direction_keys_and_original_reader_possession_survive_restart() {
+    let f = Originals::new();
+    let p = f.prepare(f.credentials.clone()).unwrap();
+    let (ag, bg) = p.selected_grants();
+    let a = BootFixture::new(f.dir.path(), ag, 1, f.now);
+    let b = BootFixture::new(f.dir.path(), bg, 2, f.now);
+    let auth = super::super::derived_keys(f.dir.path(), &ag.mailbox, ag.epoch)
+        .unwrap()
+        .authority;
+    assert!(
+        mint_guest_receive_capability(
+            &ag,
+            &a.boot,
+            &f.credentials.reply,
+            f.credentials.reply.grant.address,
+            &auth
+        )
+        .is_err(),
+        "canonical own-mailbox mint must refuse Reply as a Send substitute"
+    );
+    let bind = || p.bind_at(f.dir.path(), a.input(), b.input(), f.now);
+    assert!(
+        bind().is_err(),
+        "missing KEK cannot silently create a different DEK"
+    );
+    let root = f.dir.path().join(super::super::ENCRYPTION_ROOT);
+    Key::load_or_create(&root).unwrap();
+    let first = bind().unwrap();
+    let caller_store = first.caller.custody.storage_paths(f.dir.path()).unwrap();
+    let callee_store = first.callee.custody.storage_paths(f.dir.path()).unwrap();
+    assert_ne!(caller_store.source_intents, callee_store.source_intents);
+    assert_eq!(
+        first.caller.custody.address(),
+        f.credentials.reply.grant.address
+    );
+    assert_eq!(
+        first.callee.custody.address(),
+        f.credentials.call.grant.address
+    );
+    assert_eq!(
+        first.caller.reader.capability,
+        f.credentials.receive_at_caller
+    );
+    assert_eq!(
+        first.callee.reader.capability,
+        f.credentials.receive_at_callee
+    );
+    for (original, peer) in [
+        (&first.caller, &first.callee),
+        (&first.callee, &first.caller),
+    ] {
+        assert!(original.outbound_key.expose_bytes() == peer.inbound_key.expose_bytes());
+        assert!(original.inbound_key.expose_bytes() != original.outbound_key.expose_bytes());
+    }
+    for (role, material) in [(&a, &first.caller), (&b, &first.callee)] {
+        let challenge = [81u8; 32];
+        let proof =
+            sign_reader_possession(&material.reader.enrollment, &challenge, &role.ack).unwrap();
+        verify_reader_possession(
+            &material.reader.enrollment,
+            &challenge,
+            &proof,
+            &role.ack.verifying_key(),
+        )
+        .unwrap();
+    }
+    let second = bind().unwrap();
+    assert_eq!(
+        second.caller.custody.history_reference(),
+        first.caller.custody.history_reference()
+    );
+    assert_eq!(
+        second.callee.custody.history_reference(),
+        first.callee.custody.history_reference()
+    );
+    assert_eq!(
+        first.caller.reader.enrollment,
+        second.caller.reader.enrollment
+    );
+    assert_eq!(
+        first.callee.reader.enrollment,
+        second.callee.reader.enrollment
+    );
+    assert!(first.caller.outbound_key.expose_bytes() == second.callee.inbound_key.expose_bytes());
+    let revoke = revocations_path(b.dir.path());
+    std::fs::write(
+        &revoke,
+        serde_json::to_vec(&[f.credentials.receive_at_callee.grant.revocation_id]).unwrap(),
+    )
+    .unwrap();
+    assert!(bind().is_err());
+    std::fs::remove_file(&revoke).unwrap();
+    std::fs::write(&root, [66u8; 32]).unwrap();
+    assert!(
+        bind().is_err(),
+        "changed retained directional keys must refuse"
+    );
+}
+
+struct History(mvm_core::mailbox::journal::HistoryKeyRef);
+impl mvm_core::mailbox::journal::HistoryKeyCustody for History {
+    fn load_existing(
+        &self,
+        r: &mvm_core::mailbox::journal::HistoryKeyRef,
+    ) -> std::result::Result<Key, mvm_core::mailbox::journal::JournalError> {
+        if r != &self.0 {
+            return Err(mvm_core::mailbox::journal::JournalError::HistoryKeyUnavailable);
+        }
+        Ok(Key::from_bytes([44; 32]))
+    }
+}
+
+#[test]
+fn original_seals_exact_object_bodies_and_restores_only_the_matching_retained_lease() {
+    use mvm_core::mailbox::{
+        OpenContext,
+        journal::*,
+        object_pair::role::ObjectParticipantRole::{Callee, Caller},
+        reader::*,
+        reader_wire::ObjectSubmissionV1,
+    };
+    let f = Originals::new();
+    let p = f.prepare(f.credentials.clone()).unwrap();
+    let (ag, bg) = p.selected_grants();
+    let a = BootFixture::new(f.dir.path(), ag, 1, f.now);
+    let b = BootFixture::new(f.dir.path(), bg, 2, f.now);
+    Key::load_or_create(&f.dir.path().join(super::super::ENCRYPTION_ROOT)).unwrap();
+    let material = p
+        .bind_at(f.dir.path(), a.input(), b.input(), f.now)
+        .unwrap();
+    let msg = MessageId::from_bytes([72; 32]);
+    let corr = CorrelationId::from_bytes([73; 32]);
+    let seq = SequenceNumber::new(1).unwrap();
+    let callbody = b"SC\0\x11\0";
+    let replybody = b"reply\0\0";
+    let call = material
+        .seal_turn(
+            TurnContext {
+                role: Caller,
+                now: f.now,
+            },
+            msg,
+            Some(corr),
+            seq,
+            callbody,
+            None,
+        )
+        .unwrap();
+    assert_eq!(call.header().correlation_id, corr);
+    assert!(
+        material
+            .seal_turn(
+                TurnContext {
+                    role: Caller,
+                    now: f.now
+                },
+                msg,
+                Some(CorrelationId::from_bytes([0; 32])),
+                seq,
+                callbody,
+                None
+            )
+            .is_err()
+    );
+    let sub = ObjectSubmissionV1::Call {
+        message_id: msg,
+        correlation_id: corr,
+        payload: callbody.to_vec(),
+    };
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_start = std::time::Instant::now();
+    let record_name =
+        crate::mailbox_service::object_intent::original_record_name(p.stamp, a.boot.boot, msg);
+    let (ordinal, original) = crate::mailbox_service::object_intent_slot_tests::publish_then_reopen(
+        source_dir.path(),
+        &record_name,
+        mvm_core::mailbox::reader_wire::original_object_intent_digest(&sub).unwrap(),
+        &mvm_core::mailbox::frame::encode_frame(call.capability(), call.envelope()).unwrap(),
+    );
+    let (restored_grant, restored_envelope) =
+        mvm_core::mailbox::frame::decode_frame(&original).unwrap();
+    let restored = material
+        .reopen(
+            TurnContext {
+                role: Caller,
+                now: f.now,
+            },
+            &restored_grant,
+            restored_envelope,
+            ordinal,
+            &sub,
+            None,
+        )
+        .unwrap();
+    let source_time = source_start.elapsed();
+    assert_eq!(restored.envelope(), call.envelope());
+    let incorrect = ObjectSubmissionV1::Call {
+        message_id: msg,
+        correlation_id: corr,
+        payload: b"SC\0\x11".to_vec(),
+    };
+    assert!(
+        material
+            .reopen(
+                TurnContext {
+                    role: Caller,
+                    now: f.now
+                },
+                call.capability(),
+                call.envelope().clone(),
+                seq,
+                &incorrect,
+                None
+            )
+            .is_err()
+    );
+
+    let g = &f.credentials.call.grant;
+    let address = g.address;
+    let signer = super::super::derived_keys(f.dir.path(), &bg.mailbox, bg.epoch)
+        .unwrap()
+        .authority;
+    let sender = material.caller.sender.verifying_key();
+    let context = OpenContext {
+        expected_tenant: address.tenant,
+        expected_authorization_domain: address.authorization_domain,
+        expected_mailbox: address.mailbox,
+        expected_sender: g.subject,
+        expected_recipient: address.recipient,
+        acting_principal: g.subject,
+        expected_capability_issuer: g.issuer,
+        current_execution_epoch: bg.epoch,
+        current_policy_epoch: g.policy_epoch,
+        required_operation: MailboxOperation::Send,
+        now_unix_ms: f.now,
+        accepted_content_types: g.content_types.clone(),
+        revoked_capabilities: Vec::new(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let anchor = FileJournalAnchor::open(&dir.path().join("anchor"), address, [29; 32]).unwrap();
+    let history = History(HistoryKeyRef::new(address, bg.epoch, [19; 32], 1).unwrap());
+    let mut journal = MailboxJournal::open_local_with_custody(
+        &dir.path().join("journal"),
+        history.0,
+        signer.verifying_key(),
+        JournalLimits {
+            max_records: 8,
+            max_bytes: 131072,
+        },
+        &history,
+        &anchor,
+        bg.retention.unwrap(),
+    )
+    .unwrap();
+    // Run the same immutable source ciphertext twice through a real local socket.
+    // B admits from the received frame, not from the sender's in-memory object.
+    let mut exchange = || {
+        use mvm_core::mailbox::frame::{decode_frame, send_local_receipted_frame};
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let (mut source, mut destination) = UnixStream::pair().unwrap();
+        let start = std::time::Instant::now();
+        let (received, sent, response) = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let body = crate::mailbox_service::read_frame(65536, &mut destination).unwrap();
+                let (capability, envelope) = decode_frame(&body).unwrap();
+                assert_eq!(envelope, *call.envelope());
+                let receipt = journal
+                    .admit_local(
+                        JournalAdmission {
+                            envelope: &envelope,
+                            capability: &capability,
+                            context: &context,
+                            encryption_key: &material.callee.inbound_key,
+                            sender_key: &sender,
+                            signer: &signer,
+                        },
+                        &anchor,
+                    )
+                    .unwrap();
+                let verdict =
+                    serde_json::to_vec(&Ok::<_, crate::mailbox_service::Refusal>(receipt)).unwrap();
+                destination.write_all(&verdict).unwrap();
+                destination.shutdown(std::net::Shutdown::Write).unwrap();
+                (body.len() + 4, verdict.len())
+            });
+            let response = send_local_receipted_frame(
+                &mut source,
+                restored.capability(),
+                restored.envelope(),
+                restored.header(),
+                &signer.verifying_key(),
+            )
+            .unwrap();
+            let (received, sent) = handle.join().unwrap();
+            (received, sent, response)
+        });
+        println!(
+            "original_object_store source_reopen_ns={} socket_forward_bytes={} socket_return_bytes={} through_signed_receipt_ns={}",
+            source_time.as_nanos(),
+            received,
+            sent,
+            start.elapsed().as_nanos()
+        );
+        response
+    };
+    let receipt = exchange();
+    let retry = exchange();
+    assert_eq!(receipt, retry);
+    material.verify_accepted(Caller, &call, &receipt).unwrap();
+    let a_alt_state = tempfile::tempdir().unwrap();
+    a.boot.persist(a_alt_state.path()).unwrap();
+    let b2 = BootFixture::new(f.dir.path(), bg, 2, f.now);
+    assert_ne!(b.boot.boot, b2.boot.boot);
+    let other = p
+        .bind_at(
+            f.dir.path(),
+            BootInput {
+                state: a_alt_state.path(),
+                ..a.input()
+            },
+            b2.input(),
+            f.now,
+        )
+        .unwrap();
+    assert!(
+        other.verify_accepted(Caller, &call, &receipt).is_err(),
+        "another receiver incarnation accepted this original ciphertext"
+    );
+    for t in [
+        call.header().issued_at_unix_ms - 1,
+        call.header().expires_at_unix_ms,
+    ] {
+        let mut replacement = receipt.receipt.clone();
+        replacement.observed_at_unix_ms = t;
+        let replacement = mvm_core::mailbox::sign_receipt(replacement, &signer).unwrap();
+        assert!(
+            material
+                .verify_accepted(Caller, &call, &replacement)
+                .is_err(),
+            "receipt outside original validity"
+        );
+    }
+    assert!(material.verify_accepted(Callee, &call, &receipt).is_err());
+    let reader = &material.callee.reader;
+    let enroll = &reader.enrollment;
+    let session = enroll.enrollment.consumer_session;
+    let challenge = [5; 32];
+    let proof = sign_reader_possession(enroll, &challenge, &b.ack).unwrap();
+    let mut read = context.clone();
+    read.acting_principal = address.recipient;
+    read.required_operation = MailboxOperation::Receive;
+    let (key_a, key_b) = (
+        host_keypair::load_or_init_at(f.dir.path())
+            .unwrap()
+            .verifying,
+        host_keypair::load_or_init_at(f.dir.path())
+            .unwrap()
+            .verifying,
+    );
+    let id = host_keypair::host_signer_id();
+    let trust_a = [(id.as_str(), &key_a)];
+    let trust_b = [(id.as_str(), &key_b)];
+    let live = PairAuthorityState {
+        caller_boot: a.boot.boot,
+        callee_boot: b.boot.boot,
+        caller_epoch: ag.epoch,
+        callee_epoch: bg.epoch,
+        caller_policy: 1,
+        callee_policy: 1,
+        at_caller: &[],
+        at_callee: &[],
+    };
+    let pair = ObjectPairV1::check_originals(
+        &OriginalObjectEndpoint {
+            plan: &a.signed,
+            boot: &a.boot,
+            trusted_signers: &trust_a,
+        },
+        &OriginalObjectEndpoint {
+            plan: &b.signed,
+            boot: &b.boot,
+            trusted_signers: &trust_b,
+        },
+        ObjectPairGrants {
+            call: &f.credentials.call,
+            reply: &f.credentials.reply,
+        },
+        f.now,
+        live,
+    )
+    .unwrap();
+    let read_scope = MailboxGuestReaderScope {
+        plan: &bg,
+        plan_id: &b.boot.plan_id,
+        plan_nonce: &b.boot.plan_nonce,
+        receive: &reader.capability.grant,
+        current_boot: b.boot.boot,
+        current_session: session,
+        now_unix_ms: f.now,
+    };
+    let request = JournalGuestLease {
+        plan: &bg,
+        scope: read_scope,
+        receive: JournalReceive {
+            context: &read,
+            capability: &reader.capability,
+            encryption_key: &material.callee.inbound_key,
+            sender_key: &sender,
+        },
+        enrollment: enroll,
+        challenge: &challenge,
+        possession_signature: &proof,
+        signer: &signer,
+    };
+    let leased = journal
+        .lease_next_object(
+            request,
+            ObjectLeaseScope {
+                pair: &pair,
+                destination: &b.boot,
+                state: live,
+                original_call: None,
+            },
+            |tip| anchor.advance(tip),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(leased.payload(), callbody, "destination journal readback");
+    let signed = leased.lease().clone();
+    let current = journal.original_object_call(&signed, f.now).unwrap();
+    let reply_id = MessageId::from_bytes([78; 32]);
+    let reply = material
+        .seal_turn(
+            TurnContext {
+                role: Callee,
+                now: f.now,
+            },
+            reply_id,
+            None,
+            seq,
+            replybody,
+            Some(&current),
+        )
+        .unwrap();
+    let recover = |dir: &std::path::Path, envelope: &MailboxEnvelope| {
+        super::pending::recover(
+            &material.caller,
+            dir,
+            &pair,
+            live,
+            reply.capability(),
+            envelope,
+            f.now,
+        )
+    };
+    recover(source_dir.path(), reply.envelope()).unwrap();
+    let absent = tempfile::tempdir().unwrap();
+    assert!(recover(absent.path(), reply.envelope()).is_err());
+    assert_eq!(std::fs::read_dir(absent.path()).unwrap().count(), 0);
+    let bad_reply = {
+        let mut h = reply.header().clone();
+        h.correlation_id = CorrelationId::from_bytes([164; 32]);
+        mvm_core::mailbox::seal_envelope(
+            mvm_core::mailbox::SealRequest {
+                header: h,
+                routing: reply.envelope().routing.clone(),
+                plaintext: replybody,
+            },
+            &material.callee.outbound_key,
+            &material.callee.sender,
+        )
+        .unwrap()
+    };
+    assert!(recover(source_dir.path(), &bad_reply).is_err());
+    let record_path = source_dir.path().join(&record_name);
+    let saved = std::fs::read(&record_path).unwrap();
+    for byte in [7, 8] {
+        let mut changed = saved.clone();
+        changed[byte] ^= 2;
+        std::fs::write(&record_path, &changed).unwrap();
+        assert!(recover(source_dir.path(), reply.envelope()).is_err());
+    }
+    std::fs::write(&record_path, saved).unwrap();
+    recover(source_dir.path(), reply.envelope()).unwrap();
+    let rs = ObjectSubmissionV1::Reply {
+        message_id: reply_id,
+        original_call: Box::new(signed.clone()),
+        payload: replybody.to_vec(),
+    };
+    assert_eq!(
+        material
+            .reopen(
+                TurnContext {
+                    role: Callee,
+                    now: f.now
+                },
+                reply.capability(),
+                reply.envelope().clone(),
+                seq,
+                &rs,
+                Some(&current)
+            )
+            .unwrap()
+            .envelope(),
+        reply.envelope()
+    );
+    assert_eq!(reply.header().causation_id.as_bytes(), msg.as_bytes());
+    assert_eq!(reply.header().correlation_id, corr);
+    let mut bad = signed.clone();
+    bad.lease.lease_nonce = DeliveryLeaseNonce::from_bytes([0; 16]);
+    assert!(journal.original_object_call(&bad, f.now).is_err());
+    assert!(
+        journal
+            .original_object_call(&signed, signed.lease.expires_at_unix_ms)
+            .is_err()
+    );
+}
+
+#[test]
+fn measured_originals_bind_opposite_nonces_before_signing_and_reject_substitution() {
+    let _env = mvm_core::util::test_env::TestEnv::new();
+    let f = Originals::new();
+    let installed = mvm_core::config::mvm_keys_dir();
+    std::fs::create_dir_all(&installed).unwrap();
+    for file in [super::super::SIGNER_SECRET, super::super::SIGNER_PUBLIC] {
+        std::fs::copy(f.dir.path().join(file), installed.join(file)).unwrap();
+    }
+    let prepared = f.prepare(f.credentials.clone()).unwrap();
+    let (a, b) = prepared
+        .select_original_plans("vm-1", [0x31; 32], "vm-2", [0x32; 32])
+        .unwrap();
+    let signer = host_keypair::load_or_init_at(&installed).unwrap();
+    let issuer = host_keypair::host_signer_id();
+    let trusted = [(issuer.as_str(), &signer.verifying)];
+    let mut first = None;
+    for (selection, other, n) in [(a, b, 1u8), (b, a, 2)] {
+        let mut p = PlanFixture::new()
+            .workload(format!("vm-{n}"))
+            .mailbox(selection.grant())
+            .build();
+        p.image.name = format!("vm-{n}");
+        p.image.sha256 = hex::encode([0x30 + n; 32]);
+        p.plan_id = mvm_core::plan::compute_plan_id(&p);
+        let before = p.plan_id.clone();
+        assert!(other.apply_unsigned(&mut p, f.now).is_err());
+        p.image.sha256 = hex::encode([0x40; 32]);
+        assert!(selection.apply_unsigned(&mut p, f.now).is_err());
+        p.image.sha256 = hex::encode([0x30 + n; 32]);
+        selection.apply_unsigned(&mut p, f.now).unwrap();
+        assert_ne!(p.plan_id, before);
+        assert_eq!(p.nonce, Nonce::from_bytes([n; 16]));
+        let signed = sign_plan(&p, &signer.signing, &issuer);
+        let verified = verify_plan(&signed, &trusted).unwrap();
+        selection.verify_selected_plan(&verified, f.now).unwrap();
+        assert!(other.verify_selected_plan(&verified, f.now).is_err());
+        assert!(
+            selection
+                .verify_selected_plan(&verified, f.now + 120_000)
+                .is_err()
+        );
+        if n == 1 {
+            first = Some(verified);
+        }
+    }
+    let state = mvm_core::config::vm_state_dir("vm-2");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        revocations_path(&state),
+        serde_json::to_vec(&vec![f.credentials.receive_at_callee.grant.revocation_id]).unwrap(),
+    )
+    .unwrap();
+    assert!(a.verify_selected_plan(&first.unwrap(), f.now).is_err());
+}
+
+#[test]
+fn per_role_sender_retries_the_original_seal_after_an_uncertain_carrier_result() {
+    use crate::mailbox_service::object_intent::OutboundObject;
+    use mvm_core::mailbox::reader_wire::ObjectSubmissionV1;
+    use std::time::{Duration, Instant};
+    let f = Originals::new();
+    let p = f.prepare(f.credentials.clone()).unwrap();
+    let (ag, bg) = p.selected_grants();
+    let a = BootFixture::new(f.dir.path(), ag, 1, f.now);
+    let b = BootFixture::new(f.dir.path(), bg, 2, f.now);
+    Key::load_or_create(&f.dir.path().join(super::super::ENCRYPTION_ROOT)).unwrap();
+    let pair = p
+        .bind_at(f.dir.path(), a.input(), b.input(), f.now)
+        .unwrap();
+    let dir = pair
+        .caller
+        .custody
+        .storage_paths(f.dir.path())
+        .unwrap()
+        .source_intents;
+    let sub = ObjectSubmissionV1::Call {
+        message_id: MessageId::from_bytes([72; 32]),
+        correlation_id: CorrelationId::from_bytes([73; 32]),
+        payload: b"SC\0\x11\0".to_vec(),
+    };
+    let tx = OutboundObject {
+        pair: p.stamp,
+        boot: a.boot.boot,
+        submission: &sub,
+        original: None,
+    };
+    let mut attempts = Vec::new();
+    for _ in 0..2 {
+        assert!(
+            tx.forward(
+                &pair.caller.local,
+                &dir,
+                Instant::now() + Duration::from_secs(5),
+                || Ok(f.now),
+                |original, _| {
+                    attempts.push(original.envelope().clone());
+                    anyhow::bail!("lost peer response");
+                }
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
+    let held = tx.retain(&pair.caller.local, &dir, &|| Ok(f.now)).unwrap();
+    let timeout = held
+        .send(
+            &pair.caller.local,
+            Instant::now(),
+            || Ok(f.now),
+            |_, _| panic!("expired IO deadline reached carrier"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        timeout.downcast_ref::<crate::mailbox_service::Refusal>(),
+        Some(&crate::mailbox_service::Refusal::Unavailable)
+    );
+    let owner = mvm_core::util::atomic_io::FileLock::try_acquire(&dir.join("intent"))
+        .unwrap()
+        .unwrap();
+    let error = tx
+        .forward(
+            &pair.caller.local,
+            &dir,
+            Instant::now() + Duration::from_secs(5),
+            || Ok(f.now),
+            |_, _| panic!("busy source reached carrier"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::mailbox_service::Refusal>(),
+        Some(&crate::mailbox_service::Refusal::Unavailable)
+    );
+    drop(owner);
+    let wrong = OutboundObject {
+        boot: b.boot.boot,
+        ..tx
+    };
+    assert!(
+        wrong
+            .forward(
+                &pair.caller.local,
+                &dir,
+                Instant::now() + Duration::from_secs(5),
+                || Ok(f.now),
+                |_, _| panic!("wrong boot reached carrier")
+            )
+            .is_err()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_worker_journals_admit_lease_and_ack_both_roles_with_exact_retained_call()
+-> anyhow::Result<()> {
+    use crate::mailbox_service::object_intent::OutboundObject;
+    use bootstrap::OriginalVmmId;
+    use mvm_core::mailbox::{
+        reader::sign_delivery_ack,
+        reader_wire::{ObjectSubmissionV1, ReaderResponse},
+    };
+    use std::time::{Duration, Instant};
+    let _env = mvm_core::util::test_env::TestEnv::new();
+    let f = Originals::new();
+    let keys = mvm_core::config::mvm_keys_dir();
+    mvm_core::private_fs::ensure_private_dir(&keys)?;
+    for file in [super::super::SIGNER_SECRET, super::super::SIGNER_PUBLIC] {
+        std::fs::copy(f.dir.path().join(file), keys.join(file))?;
+    }
+    Key::load_or_create(&keys.join(super::super::ENCRYPTION_ROOT))?;
+    let p = f.prepare(f.credentials.clone())?;
+    let (ag, bg) = p.selected_grants();
+    let a = BootFixture::new(&keys, ag, 1, f.now);
+    let b = BootFixture::new(&keys, bg, 2, f.now);
+    let original_state = |n, boot: &BootFixture| -> anyhow::Result<_> {
+        let d = mvm_core::config::vm_state_dir(&format!("vm-{n}"));
+        mvm_core::private_fs::ensure_private_dir(&d)?;
+        boot.boot.persist(&d)?;
+        std::fs::write(d.join("plan.json"), serde_json::to_vec(&boot.signed)?)?;
+        Ok(d)
+    };
+    let ad = original_state(1, &a)?;
+    let bd = original_state(2, &b)?;
+    let material = p.bind_at(
+        &keys,
+        BootInput {
+            state: &ad,
+            ..a.input()
+        },
+        BootInput {
+            state: &bd,
+            ..b.input()
+        },
+        f.now,
+    )?;
+    let reg = crate::mailbox_process::original_journal::object_registration::Registration::claim(
+        &keys,
+        ("vm-1", &ad),
+        ("vm-2", &bd),
+    )?;
+    let pins = reg.directory_pins()?;
+    let bootstrap = |local, d: &Path| {
+        material.local_bootstrap(
+            local,
+            &p.credentials,
+            [&a.signed, &b.signed],
+            [
+                OriginalVmmId { pid: 1, birth: 1 },
+                OriginalVmmId { pid: 2, birth: 2 },
+            ],
+            pins,
+            mvm_core::vm_backend::HostDialRoute::Mux(
+                mvm_agentd::vsock::vsock_uds_path(&d.to_string_lossy()).into(),
+            ),
+        )
+    };
+    let ca = bootstrap(&material.caller, &ad)?;
+    let mut cb = bootstrap(&material.callee, &bd)?;
+    cb.validate_current()?;
+    cb.secrets.anchor[0] ^= 1;
+    assert!(cb.open_journal().is_err());
+    cb.secrets.anchor[0] ^= 1;
+    cb.secrets.history[0] ^= 1;
+    assert!(cb.open_journal().is_err());
+    cb.secrets.history[0] ^= 1;
+    let (mut ja, aa) = ca.open_journal()?;
+    let (mut jb, ab) = cb.open_journal()?;
+    let call = ObjectSubmissionV1::Call {
+        message_id: MessageId::from_bytes([72; 32]),
+        correlation_id: CorrelationId::from_bytes([73; 32]),
+        payload: b"SC\0\x11\0".to_vec(),
+    };
+    let now = || super::super::now_unix_ms();
+    let until = Instant::now() + Duration::from_secs(10);
+    let sent = OutboundObject {
+        pair: p.stamp,
+        boot: a.boot.boot,
+        submission: &call,
+        original: None,
+    }
+    .forward(
+        &ca.endpoint_material()?,
+        &ca.local_intents,
+        until,
+        || Ok(ca.validate_current()?.now),
+        |turn, _| cb.admit_original(&mut jb, &ab, turn.capability(), turn.envelope()),
+    )?;
+    assert!(matches!(sent, ReaderResponse::ObjectSealAcceptedV1 { .. }));
+    let challenge = [19; 32];
+    let proof = sign_reader_possession(&cb.reader_enrollment, &challenge, &b.ack)?;
+    let ReaderResponse::ObjectDeliveryV1 {
+        payload,
+        lease,
+        header,
+    } = cb.lease_original(&mut jb, &ab, &challenge, &proof)?
+    else {
+        anyhow::bail!("B delivery missing")
+    };
+    assert_eq!(payload.as_slice(), call.payload());
+    assert_eq!(header.message_id, call.message_id());
+    cb.authorize_call(&jb, &lease)?;
+    let reply = ObjectSubmissionV1::Reply {
+        message_id: MessageId::from_bytes([74; 32]),
+        original_call: lease.clone(),
+        payload: b"reply\0\0".to_vec(),
+    };
+    let original = jb.original_object_call(&lease, now())?;
+    let sent = OutboundObject {
+        pair: p.stamp,
+        boot: b.boot.boot,
+        submission: &reply,
+        original: Some(original),
+    }
+    .forward(
+        &cb.endpoint_material()?,
+        &cb.local_intents,
+        until,
+        || Ok(cb.validate_current()?.now),
+        |turn, _| ca.admit_original(&mut ja, &aa, turn.capability(), turn.envelope()),
+    )?;
+    assert!(matches!(sent, ReaderResponse::ObjectSealAcceptedV1 { .. }));
+    let ack = |lease, guest| {
+        sign_delivery_ack(
+            MailboxDeliveryAck {
+                protocol_version: ProtocolVersion::V1,
+                signature_algorithm: SignatureAlgorithm::ED25519,
+                lease,
+                ack_nonce: DeliveryAckNonce::from_bytes([31; 16]),
+                acknowledged_at_unix_ms: now(),
+            },
+            guest,
+        )
+    };
+    cb.acknowledge_original(&mut jb, &ab, &ack(*lease, &b.ack)?)?;
+    let proof = sign_reader_possession(&ca.reader_enrollment, &challenge, &a.ack)?;
+    let ReaderResponse::ObjectDeliveryV1 {
+        payload,
+        lease,
+        header,
+    } = ca.lease_original(&mut ja, &aa, &challenge, &proof)?
+    else {
+        anyhow::bail!("A reply missing")
+    };
+    assert_eq!(payload.as_slice(), reply.payload());
+    assert_eq!(header.causation_id.as_bytes(), call.message_id().as_bytes());
+    ca.acknowledge_original(&mut ja, &aa, &ack(*lease, &a.ack)?)?;
+    assert!(matches!(
+        ca.lease_original(&mut ja, &aa, &challenge, &proof)?,
+        ReaderResponse::Empty
+    ));
+    let _held = ca.hold_original_directories()?;
+    std::fs::rename(&bd, bd.with_file_name("original-b"))?;
+    mvm_core::private_fs::ensure_private_dir(&bd)?;
+    assert!(ca.validate_current().is_err());
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn original_sdk_pair_wait_is_bounded_and_one_failed_start_wakes_its_peer() {
+    use std::time::{Duration, Instant};
+    let f = Originals::new();
+    let p = f.prepare(f.credentials.clone()).unwrap();
+    let now = Instant::now();
+    assert!(
+        p.reserve_original_workers("vm-1", [1; 32], "vm-2", [2; 32], now)
+            .is_err()
+    );
+    assert!(
+        p.reserve_original_workers(
+            "vm-1",
+            [1; 32],
+            "vm-2",
+            [2; 32],
+            now + Duration::from_secs(181)
+        )
+        .is_err()
+    );
+    let (caller, callee) = p
+        .reserve_original_workers(
+            "vm-1",
+            [1; 32],
+            "vm-2",
+            [2; 32],
+            now + Duration::from_secs(12),
+        )
+        .unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        // Merely owning either admission lane cannot stop a running VMM or
+        // retry a rollback that the SDK has never attempted.
+        assert!(
+            caller
+                .hvf_original()
+                .same_reservation(caller.hvf_original())
+        );
+        assert!(
+            !caller
+                .hvf_original()
+                .same_reservation(callee.hvf_original())
+        );
+        assert!(caller.retry_unserved_hvf_rollback().is_err());
+        assert!(callee.retry_unserved_hvf_rollback().is_err());
+    }
+    let boot = BootFixture::new(f.dir.path(), caller.plan().grant(), 1, f.now);
+    let host = host_keypair::load_or_init_at(f.dir.path()).unwrap();
+    let signer = host_keypair::host_signer_id();
+    let plan = verify_plan(&boot.signed, &[(signer.as_str(), &host.verifying)]).unwrap();
+    let original_id = plan.plan_id.clone();
+    let admitted = AdmittedPlan::for_test(plan, signer, boot.signed);
+    std::thread::scope(|threads| {
+        let worker = threads.spawn(|| {
+            let mut owner = None;
+            let (same, reason) = caller.join(admitted, &mut owner);
+            assert_eq!(same.plan_id(), &original_id);
+            assert!(owner.is_none());
+            assert!(reason.is_err());
+        });
+        // Wait until the original A admission is actually parked in the gate.
+        let limit = Instant::now() + Duration::from_secs(2);
+        while caller.require_open().is_ok() {
+            assert!(Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        drop(callee.guard());
+        worker.join().unwrap();
+    });
+    assert!(now.elapsed() < Duration::from_secs(5) && callee.require_open().is_err());
+}
+
+#[test]
+fn original_hvf_reader_rejects_another_boot_or_ack_key_under_identical_admission()
+-> anyhow::Result<()> {
+    let f = Originals::new();
+    let prepared = f.prepare(f.credentials.clone())?;
+    let (grant, _) = prepared.selected_grants();
+    let a = BootFixture::new(f.dir.path(), grant, 1, f.now);
+    let signer = host_keypair::load_or_init_at(f.dir.path())?;
+    let id = host_keypair::host_signer_id();
+    let plan = verify_plan(&a.signed, &[(id.as_str(), &signer.verifying)])?;
+    let mut other = a.boot.clone();
+    other.boot = BootId::from_bytes([24; 32]);
+    other.check_plan(&plan)?;
+    assert!(
+        check_hvf_reader(&plan, &a.boot, &other).is_err(),
+        "accepted a sibling cold boot"
+    );
+    other = a.boot.clone();
+    other.ack_public_key = SigningKey::from_bytes(&[89; 32]).verifying_key().to_bytes();
+    other.check_plan(&plan)?;
+    assert!(
+        check_hvf_reader(&plan, &a.boot, &other).is_err(),
+        "accepted a different workload ACK key"
+    );
+    check_hvf_reader(&plan, &a.boot, &a.boot)?;
+    Ok(())
+}

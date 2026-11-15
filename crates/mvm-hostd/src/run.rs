@@ -253,7 +253,15 @@ pub fn admit_and_boot_local(
     // against the operator-pinned signer set, never synthesized or re-signed
     // under the host key.
     if let Some(signed) = req.signed_plan.as_ref() {
-        return admit_signed_and_boot_local(backend, req, signed, &sha, ctx);
+        return admit_signed_and_boot_local(
+            backend,
+            req,
+            signed,
+            Some(&sha),
+            ctx,
+            #[cfg(unix)]
+            None,
+        );
     }
 
     // Pin the kernel into the signed plan. Deliberately the uncached digest: a
@@ -379,6 +387,62 @@ pub fn admit_and_boot_local(
     )
 }
 
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct DirectTcpPolicy {
+    pub mapping: mvm_contract::policy::network_policy::CooperatingPayloadPolicy,
+    pub peers: Vec<mvm_contract::peer::PeerBinding>,
+}
+#[cfg(unix)]
+impl DirectTcpPolicy {
+    fn project(
+        &self,
+        base: mvm_core::network_policy::NetworkPolicy,
+    ) -> Result<mvm_core::network_policy::NetworkPolicy> {
+        anyhow::ensure!(
+            self.peers.len() <= self.mapping.peers().len(),
+            "direct TCP peer routes exceed selected mappings"
+        );
+        for (index, peer) in self.peers.iter().enumerate() {
+            peer.validate()?;
+            anyhow::ensure!(
+                self.mapping.select(peer.name.as_str(), peer.port).is_some()
+                    && !self.peers[..index]
+                        .iter()
+                        .any(|p| p.admits(&peer.name, peer.port)),
+                "unselected or duplicate direct TCP peer route"
+            );
+        }
+        Ok(base
+            .with_peers(self.peers.clone())
+            .with_payload_mapping(Some(self.mapping.clone())))
+    }
+}
+
+#[cfg(unix)]
+pub struct SelectedLocalMapping<'a> {
+    pub owner: std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    pub mapping: &'a DirectTcpPolicy,
+}
+
+#[cfg(unix)]
+pub fn admit_and_boot_local_with_installed_mapping(
+    backend: &AnyBackend,
+    req: &LocalRunRequest,
+    ctx: LocalRunContext<'_>,
+    selected: SelectedLocalMapping<'_>,
+) -> Result<StartedMachine> {
+    anyhow::ensure!(
+        req.volumes.is_empty() && req.secrets.is_empty() && req.mailbox.is_none(),
+        "selected launch supports only its signed direct network"
+    );
+    let signed = req
+        .signed_plan
+        .as_ref()
+        .context("selected launch requires the externally signed original plan")?;
+    admit_signed_and_boot_local(backend, req, signed, None, ctx, Some(selected))
+}
+
 /// Admit an externally-signed plan through
 /// [`crate::plan_admission::admit_signed_plan_for_run`] and boot it on
 /// `backend` — the local-run tail for the fleet-issued seam.
@@ -393,16 +457,13 @@ fn admit_signed_and_boot_local(
     backend: &AnyBackend,
     req: &LocalRunRequest,
     signed: &mvm_core::plan::SignedExecutionPlan,
-    rootfs_sha: &str,
+    rootfs_sha: Option<&str>,
     ctx: LocalRunContext<'_>,
+    #[cfg(unix)] selected: Option<SelectedLocalMapping<'_>>,
 ) -> Result<StartedMachine> {
     use crate::plan_admission::{RunPosture, StartAdmittedParams, start_admitted};
-
-    let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind());
-    let admitted = crate::plan_admission::admit_signed_plan_for_run(
-        signed, ctx.clock, ctx.ledger, None, posture,
-    )?;
-    let plan = admitted.plan();
+    let verified = crate::plan_admission::verify_external_plan(signed)?;
+    let plan = verified.plan();
     if let Some(pin) = &req.registry_pack_image {
         anyhow::ensure!(
             plan.asset_identities.iter().any(|asset| {
@@ -418,7 +479,9 @@ fn admit_signed_and_boot_local(
     // that image. Synthesized plans get this by construction (synthesis stamps
     // the hash it just measured); an externally-signed plan gets it by
     // comparison.
-    if rootfs_sha != plan.image.sha256 {
+    if let Some(rootfs_sha) = rootfs_sha
+        && rootfs_sha != plan.image.sha256
+    {
         anyhow::bail!(
             "the signed plan pins image sha256 {} but the resolved rootfs at {} hashes to \
              {rootfs_sha}; refusing to boot an image the plan does not authorize",
@@ -450,7 +513,93 @@ fn admit_signed_and_boot_local(
         },
         ..Default::default()
     };
-    attach_guest_runtime(&mut config, &req.backend_name)?;
+    let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind());
+    #[cfg(unix)]
+    let admitted = if let Some(selected) = selected {
+        anyhow::ensure!(
+            cfg!(target_os = "linux")
+                && backend.kind() == mvm_core::vm_backend::BackendKind::Firecracker
+                && backend.supports_host_lifetime(),
+            "installed direct runtime is unavailable"
+        );
+        anyhow::ensure!(
+            plan.post_run.destroy_on_exit
+                && plan.network_mode == mvm_core::plan::NetworkMode::HostVsockProxy
+                && plan.mailbox.is_none()
+                && plan.ingress.is_empty()
+                && plan.secrets.is_empty(),
+            "selected direct scope requires transient vsock egress only"
+        );
+        config.network_policy = selected.mapping.project(config.network_policy)?;
+        mvm_core::policy::direct_plan::AdmittedNetworkPlan::from_plan(
+            plan,
+            &config.name,
+            &config.network_policy,
+        )?;
+        selected.owner.bind_to_config(&mut config)?;
+        let pin = plan
+            .bundle
+            .as_ref()
+            .context("signed portable bundle required")?;
+        let bytes = crate::host_lifetime_parent::check_portable_startup_workspace(
+            &config,
+            backend.kind(),
+            pin,
+        )?;
+        if let Some(kernel) = selected.owner.canonical_kernel() {
+            anyhow::ensure!(
+                kernel.pin() == pin
+                    && kernel.workload_root_declaration()?.sha256 == plan.image.sha256,
+                "canonical kernel and root must belong to the signed plan bundle"
+            );
+            kernel.bind_to_config(&mut config)?;
+        } else {
+            anyhow::ensure!(
+                mvm_core::crypto::image_verify::sha256_file(&req.rootfs_path)? == plan.image.sha256,
+                "selected root filesystem differs from the signed plan"
+            );
+        }
+        // For canonical inputs, attachment checks the installed root through one
+        // bounded file handle against the same signed declaration before admission.
+        mvm_runtime::bundle_runtime::attach_direct_runtime(
+            &mut config,
+            backend.name(),
+            pin,
+            bytes,
+        )?;
+        let resolver = mvm_core::plan::bundle::FsBundleResolver::default_path()?
+            .with_exact_archive(&pin.bundle_sha256, bytes)?;
+        let trust = mvm_core::plan::bundle::FsTrustStore::default_path()?;
+        let support = mvm_core::image_set::BackendImageSupport::for_backend(backend.kind())
+            .context("selected backend lacks image support")?;
+        let protocols = mvm_build::stage0_kernel::current_image_set_protocol_support();
+        let bundle = crate::plan_admission::BundleAdmissionContext {
+            resolver: &resolver,
+            trust: &trust,
+            image: Some(crate::plan_admission::BundleImageAdmissionContext {
+                arch: mvm_core::arch::GuestArch::host(),
+                backend: &support,
+                host_protocols: &protocols,
+            }),
+        };
+        verified.admit(
+            ctx.clock,
+            ctx.ledger,
+            Some(&bundle),
+            posture.with_selected_direct_owner(&config, &selected.owner),
+        )?
+    } else {
+        let admitted = verified.admit(ctx.clock, ctx.ledger, None, posture)?;
+        attach_guest_runtime(&mut config, &req.backend_name)?;
+        admitted
+    };
+    #[cfg(not(unix))]
+    let admitted = {
+        let admitted = verified.admit(ctx.clock, ctx.ledger, None, posture)?;
+        attach_guest_runtime(&mut config, &req.backend_name)?;
+        admitted
+    };
+    let plan = admitted.plan();
 
     crate::audit::durability::record_admission(
         ctx.emitter,

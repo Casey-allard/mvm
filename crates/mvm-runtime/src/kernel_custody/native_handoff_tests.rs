@@ -13,6 +13,12 @@ fn prepared_owner(backend: BackendKind) -> Arc<PreparedCanonicalLinux> {
         std::env::var_os("MVM_TEST_CANONICAL_KERNEL").expect("actual pinned public kernel"),
     )
     .unwrap();
+    let revocations = std::path::PathBuf::from(
+        std::env::var_os("MVM_TEST_CANONICAL_REVOCATIONS")
+            .expect("current signed revocations.json"),
+    );
+    let feed = std::fs::read(&revocations).unwrap();
+    let signature = std::fs::read(revocations.with_extension("json.bundle")).unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[74; 32]);
     struct Publisher(ed25519_dalek::VerifyingKey);
     impl TrustStore for Publisher {
@@ -24,8 +30,8 @@ fn prepared_owner(backend: BackendKind) -> Arc<PreparedCanonicalLinux> {
         ("kernel", kernel),
         ("linux.json", published_root::MANIFEST.to_vec()),
         ("linux.bundle", published_root::BUNDLE.to_vec()),
-        ("revocations.json", include_bytes!("../../../mvm-core/tests/fixtures/image-set-revocations/revocation-list-v1/revocations.json").to_vec()),
-        ("revocations.bundle", include_bytes!("../../../mvm-core/tests/fixtures/image-set-revocations/revocation-list-v1/revocations.json.bundle").to_vec()),
+        ("revocations.json", feed),
+        ("revocations.bundle", signature),
     ];
     for name in [
         "runtime.tar.gz",
@@ -94,7 +100,7 @@ fn prepared_owner(backend: BackendKind) -> Arc<PreparedCanonicalLinux> {
 }
 
 #[test]
-#[ignore = "actual pinned public kernel required; no VM, download, or native runtime authentication"]
+#[ignore = "actual pinned public kernel and current signed revocations required; no VM, download, or native runtime authentication"]
 fn exact_final_config_and_physical_recipe_are_checked_before_native_effects() {
     // Isolate process-wide payload registration from every other test.
     const MARKER: &str = "MVM_KERNEL_HANDOFF_UNIT_CHILD";
@@ -106,6 +112,10 @@ fn exact_final_config_and_physical_recipe_are_checked_before_native_effects() {
             .env(
                 "MVM_TEST_CANONICAL_KERNEL",
                 std::env::var_os("MVM_TEST_CANONICAL_KERNEL").unwrap(),
+            )
+            .env(
+                "MVM_TEST_CANONICAL_REVOCATIONS",
+                std::env::var_os("MVM_TEST_CANONICAL_REVOCATIONS").unwrap(),
             )
             .output()
             .unwrap();
@@ -140,7 +150,12 @@ fn exact_final_config_and_physical_recipe_are_checked_before_native_effects() {
     let home = tempfile::tempdir().unwrap();
     let mut env = TestEnv::new();
     env.isolate_mvm_home(home.path());
-    let owner = prepared_owner(BackendKind::Hvf);
+    let backend = if cfg!(target_os = "linux") {
+        BackendKind::Firecracker
+    } else {
+        BackendKind::Hvf
+    };
+    let owner = prepared_owner(backend);
     let mut config = VmStartConfig {
         name: "kernel-physical-unit".into(),
         ..Default::default()
@@ -149,7 +164,7 @@ fn exact_final_config_and_physical_recipe_are_checked_before_native_effects() {
     let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
     assert!(!has_retained_kernel(&lease).unwrap());
     assert!(KernelBoundLaunch::bind(config.clone(), BackendKind::Qemu, &lease).is_err());
-    let bound = KernelBoundLaunch::bind(config, BackendKind::Hvf, &lease).unwrap();
+    let bound = KernelBoundLaunch::bind(config, backend, &lease).unwrap();
     assert!(Arc::ptr_eq(
         bound.config().canonical_kernel.as_ref().unwrap(),
         &owner
@@ -273,7 +288,7 @@ fn bound_firecracker_launch(
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires the actual pinned public kernel in MVM_TEST_CANONICAL_KERNEL; boots no VM"]
+#[ignore = "requires the actual pinned public kernel and current signed revocations; boots no VM"]
 fn canonical_kernel_publication_requires_live_owner_and_retires_claims() {
     use crate::trusted_snapshot_service::{BootInputBudget, TrustedSnapshotService};
     use mvm_fs::snapshot_store::SnapshotId;
@@ -336,7 +351,7 @@ fn canonical_kernel_publication_requires_live_owner_and_retires_claims() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires the actual pinned public kernel in MVM_TEST_CANONICAL_KERNEL; boots no VM"]
+#[ignore = "requires the actual pinned public kernel and current signed revocations; boots no VM"]
 fn observe_booted_binds_the_firecracker_process_witness_not_an_hvf_instance() {
     let home = tempfile::tempdir().unwrap();
     let mut env = TestEnv::new();
@@ -428,4 +443,101 @@ fn observe_booted_binds_the_firecracker_process_witness_not_an_hvf_instance() {
 
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires the actual pinned public kernel and current signed revocations; no boot or external I/O"]
+fn installed_release_binds_original_generation_fd_and_exact_grant() {
+    use mvm_core::host_lifetime::{
+        HostLaunchBinding, HostLeaseExpectation, HostLifetimeInputs, PreparedHostLifetime,
+    };
+    use sha2::Digest;
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::OpenOptionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let mut env = TestEnv::new();
+    env.isolate_mvm_home(home.path());
+    let (owner, mut bound, lease) = bound_firecracker_launch("kernel-original-fc");
+    let dir = home.path().join("original-holder");
+    mvm_core::config::create_private_dir(&dir).unwrap();
+    mvm_core::util::atomic_io::write_private_new(&dir.join(".state"), b"a").unwrap();
+    let holder = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join("holder"))
+        .unwrap();
+    let binding = HostLaunchBinding {
+        installation: [8; 32],
+        profile: [7; 32],
+        generation: 9,
+        grant_serial: 4,
+        vm_name: bound.config.name.clone(),
+        backend: BackendKind::Firecracker,
+        cpus: 1,
+        memory_mib: 256,
+    };
+    let mut prepared = PreparedHostLifetime::bind(
+        HostLifetimeInputs {
+            directory: File::open(&dir).unwrap(),
+            holder,
+            expected: HostLeaseExpectation {
+                state_name: ".state".into(),
+                state_bytes: 1,
+                state_sha256: sha2::Sha256::digest(b"a").into(),
+                absent_names: [".intent".into(), ".next".into()],
+            },
+            binding: binding.clone(),
+        },
+        (),
+    )
+    .unwrap()
+    .with_portable_archive(owner.pin().clone(), std::num::NonZeroU64::new(1).unwrap())
+    .unwrap();
+    prepared.select_canonical_kernel(owner.clone()).unwrap();
+    bound.config.host_lifetime = Some(prepared.into_anchor());
+    let path = lease.canonical_kernel_record();
+    let mut record = read_record(&path).unwrap();
+    assert!(
+        bound.release_installed_kernel(&lease).is_err(),
+        "ordinary intent cannot claim installed disposal"
+    );
+    let mut wrong = binding.clone();
+    wrong.grant_serial += 1;
+    record.installed = Some(wrong);
+    let persist =
+        |record: &KernelUse| std::fs::write(&path, serde_json::to_vec(record).unwrap()).unwrap();
+    persist(&record);
+    assert!(
+        bound.release_installed_kernel(&lease).is_err(),
+        "foreign grant"
+    );
+    record.installed = Some(binding);
+    record.inode ^= 1;
+    persist(&record);
+    assert!(
+        bound.release_installed_kernel(&lease).is_err(),
+        "substituted original inode"
+    );
+    record.inode ^= 1;
+    persist(&record);
+    let generation = owner.generation_dir().to_owned();
+    let moved = generation.with_extension("held");
+    std::fs::rename(&generation, &moved).unwrap();
+    assert!(
+        bound.release_installed_kernel(&lease).is_err(),
+        "unlinked name with still-linked original"
+    );
+    mvm_core::config::create_private_dir(&generation).unwrap();
+    assert!(
+        bound.release_installed_kernel(&lease).is_err(),
+        "replacement directory"
+    );
+    assert!(path.exists() && generation.exists() && moved.exists());
+    std::fs::remove_dir(&generation).unwrap();
+    std::fs::rename(&moved, &generation).unwrap();
+    bound.release_installed_kernel(&lease).unwrap();
+    assert!(!generation.exists() && !path.exists());
 }

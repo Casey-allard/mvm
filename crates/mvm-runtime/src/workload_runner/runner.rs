@@ -60,6 +60,12 @@ mod claim_lease;
 mod cold_hvf_channel;
 mod console_boot;
 mod durability;
+#[cfg(unix)]
+mod installed;
+#[cfg(unix)]
+pub use installed::OwnedRetirement;
+#[cfg(all(test, unix))]
+mod installed_tests;
 mod parent_verify;
 mod preload;
 mod refusal;
@@ -72,7 +78,9 @@ pub use cold_hvf_channel::{ColdHvfChannel, NativeCompletion, OwnedRuntimeLaunch}
 struct PreparedWorkloadBoot {
     spec: mvm_vmm::driver::spec::VmmSpec,
     socks: sockets::StandingSockets,
-    endpoint: crate::workload_runner::claim::EndpointHandle,
+    endpoint: Option<crate::workload_runner::claim::EndpointHandle>,
+    #[cfg(unix)]
+    installed: Option<Arc<installed::InstalledSlot>>,
     trace: Option<mvm_core::launch_trace::LaunchTraceRecorder>,
 }
 
@@ -86,6 +94,9 @@ use refusal::{
     require_late_volumes_mounted,
 };
 use sockets::{gpu_endpoint_transport, standing_sockets};
+#[cfg(unix)]
+pub use spawner::InstalledSpawnedEndpoint;
+pub(crate) use spawner::OriginalObjectSpawner;
 pub use spawner::{
     FlowMuxIdentitySource, NetworkEndpointSpawnRequest, NetworkEndpointSpawner,
     RealNetworkEndpointSpawner, SpawnedEndpoint, TelemetryStart,
@@ -112,34 +123,95 @@ pub struct BrokerRegisterRequest<'a> {
     pub service_proxies: &'a [mvm_contract::protocol::broker_control::ServiceProxyBinding],
 }
 
+#[cfg(unix)]
+impl<'a> BrokerRegisterRequest<'a> {
+    fn host_agent_params(
+        &self,
+    ) -> Result<mvm_vmm::host::host_agent_spawn::HostAgentServicesParams<'a>> {
+        Ok(mvm_vmm::host::host_agent_spawn::HostAgentServicesParams {
+            workload_id: self.vm_name,
+            tenant_id: Some(self.tenant.context("installed tenant missing")?),
+            vm_name: self.vm_name,
+            state_dir: self.state_dir,
+            broker_listen_socket: self
+                .broker_listen_socket
+                .context("installed broker socket missing")?,
+            services: self.services,
+            capability_bindings: self.capability_bindings,
+            service_proxies: self.service_proxies,
+        })
+    }
+}
+
 /// Register/spawn the per-VM host-services broker for an admitted workload,
 /// returning a guard whose Drop reaps until defused. The claims-12/13 seam:
 /// Admitted host services reach the guest over `BROKER_PORT`. Behind a trait so
 /// the runner is unit-testable with no real broker subprocess.
 pub trait BrokerRegistrar: Send + Sync {
     fn register(&self, req: &BrokerRegisterRequest<'_>) -> Result<BrokerGuard>;
+    /// Installed launches must use the original resident helper. Unsupported
+    /// implementations never fall back to legacy registration or discovery.
+    #[cfg(unix)]
+    fn register_installed(
+        &self,
+        _req: &BrokerRegisterRequest<'_>,
+        _original: &mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
+    ) -> Result<BrokerGuard> {
+        anyhow::bail!("installed broker registration unsupported")
+    }
 }
 
 /// RAII guard around the registered broker services: Drop reaps them until the
 /// VM is confirmed up and `defuse`d (the `stop` path then owns teardown). Wraps
 /// the existing `ServicesGuard` so no reaping logic is duplicated.
-pub struct BrokerGuard(mvm_vmm::host::host_agent_spawn::ServicesGuard);
+pub struct BrokerGuard(BrokerCustody);
+
+enum BrokerCustody {
+    Legacy(mvm_vmm::host::host_agent_spawn::ServicesGuard),
+    #[cfg(unix)]
+    Installed(Arc<mvm_vmm::host::host_agent_spawn::OwnedVmRegistration>),
+}
 
 impl BrokerGuard {
     pub(crate) fn from_services_guard(
         guard: mvm_vmm::host::host_agent_spawn::ServicesGuard,
     ) -> Self {
-        Self(guard)
+        Self(BrokerCustody::Legacy(guard))
     }
 
     /// A guard that reaps nothing on drop — the unadmitted / spawn-failed path.
     fn defused() -> Self {
-        Self(mvm_vmm::host::host_agent_spawn::ServicesGuard::None)
+        Self::from_services_guard(mvm_vmm::host::host_agent_spawn::ServicesGuard::None)
     }
 
-    /// Disarm: the VM is up; the `stop` path now owns teardown.
+    #[cfg(unix)]
+    fn from_owned_registration(
+        guard: mvm_vmm::host::host_agent_spawn::OwnedVmRegistration,
+    ) -> Self {
+        Self(BrokerCustody::Installed(Arc::new(guard)))
+    }
+
+    /// Legacy disarm only. Installed registration always retains its original
+    /// signed cleanup owner, including if a compatibility caller invokes this.
     pub fn defuse(&mut self) {
-        self.0.defuse();
+        match &mut self.0 {
+            BrokerCustody::Legacy(guard) => guard.defuse(),
+            #[cfg(unix)]
+            BrokerCustody::Installed(_) => {}
+        }
+    }
+
+    fn shutdown_owned(&mut self) -> Result<()> {
+        match &mut self.0 {
+            BrokerCustody::Legacy(mvm_vmm::host::host_agent_spawn::ServicesGuard::None) => Ok(()),
+            #[cfg(unix)]
+            BrokerCustody::Installed(guard) => Arc::get_mut(guard)
+                .context("original broker observation in progress; registration retained")?
+                .shutdown(),
+            _ => anyhow::bail!(
+                "original broker cleanup confirmation unavailable; installed owner retained"
+            ),
+        }
     }
 
     /// Whether the launch came up with the host services it asked for.
@@ -152,7 +224,12 @@ impl BrokerGuard {
     /// sample of a healthy one.
     #[must_use]
     pub fn services_healthy(&self, requested: &[ServiceId]) -> bool {
-        requested.is_empty() || self.0.is_registered()
+        requested.is_empty()
+            || match &self.0 {
+                BrokerCustody::Legacy(guard) => guard.is_registered(),
+                #[cfg(unix)]
+                BrokerCustody::Installed(_) => true,
+            }
     }
 }
 
@@ -233,6 +310,30 @@ pub struct WorkloadRunner<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegi
     spawner: S,
     broker: B,
     console_streamer: Arc<dyn ConsoleStreamer>,
+    #[cfg(unix)]
+    installed: installed::InstalledSlots,
+    #[cfg(unix)]
+    installed_agent: std::sync::OnceLock<mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar>,
+}
+
+#[cfg(target_os = "linux")]
+impl
+    WorkloadRunner<mvm_backends::driver::FcDriver, RealNetworkEndpointSpawner, RealBrokerRegistrar>
+{
+    pub(crate) fn with_original_object_observation(
+        &self,
+        observation: mvm_backends::driver::fc::original::LaunchObservation,
+    ) -> WorkloadRunner<mvm_backends::driver::FcDriver, OriginalObjectSpawner, RealBrokerRegistrar>
+    {
+        WorkloadRunner {
+            driver: mvm_backends::driver::FcDriver::for_original_config(observation.clone()),
+            spawner: OriginalObjectSpawner(observation.reader),
+            installed: installed::InstalledSlots::default(),
+            installed_agent: std::sync::OnceLock::new(),
+            broker: RealBrokerRegistrar,
+            console_streamer: self.console_streamer.clone(),
+        }
+    }
 }
 
 /// Timings for the shared workload-runner stop sequence.
@@ -282,7 +383,27 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             spawner,
             broker,
             console_streamer: super::console_stream::active_console_streamer(),
+            #[cfg(unix)]
+            installed: installed::InstalledSlots::default(),
+            #[cfg(unix)]
+            installed_agent: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the original resident helper before installed workload launch.
+    /// This retains its typed custody; it never discovers/spawns by socket path.
+    #[cfg(unix)]
+    pub fn install_owned_host_agent(
+        &self,
+        registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.installed.has_any()?,
+            "installed workload already retained"
+        );
+        self.installed_agent
+            .set(registrar)
+            .map_err(|_| anyhow::anyhow!("original installed host agent already configured"))
     }
 
     /// Override the console-streaming hook for this runner alone, ignoring
@@ -298,6 +419,11 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
     #[must_use]
     pub fn supports_preloaded_standby(&self) -> bool {
         self.driver.supports_preloaded_standby()
+    }
+
+    #[cfg(unix)]
+    pub fn supports_host_lifetime(&self) -> bool {
+        self.driver.supports_host_lifetime()
     }
 
     /// How many read-only volumes a claim on this runner's parents can attach.
@@ -338,8 +464,38 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         writable_images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
     ) -> Result<Box<dyn RunningVm>> {
         self.require_caller_registration_shape(inputs.config)?;
+        self.check_installed_endpoint_inputs(inputs)?;
+        #[cfg(unix)]
+        let workspace = match &inputs.config.host_lifetime {
+            Some(owner)
+                if owner.canonical_kernel().is_some()
+                    || inputs.config.legacy_portable_runtime.is_some() =>
+            {
+                Some(owner.begin_startup_workspace(inputs.config, self.driver.kind())?)
+            }
+            Some(owner) => {
+                // A clone cannot omit the admitted portable selection to skip
+                // workspace admission and begin lifecycle effects.
+                owner.check_parent_current(inputs.config, self.driver.kind())?;
+                None
+            }
+            None => None,
+        };
+        #[cfg(unix)]
+        let installed = match &inputs.config.host_lifetime {
+            Some(owner) => Some(self.installed.reserve(owner)?),
+            None => None,
+        };
         let lifecycle =
             crate::runtime_evidence::RuntimeLifecycleLease::acquire(&inputs.config.name)?;
+        #[cfg(unix)]
+        if let Some(owner) = &inputs.config.host_lifetime {
+            installed::refuse_unowned(&VmId(inputs.config.name.clone()))?;
+            mvm_core::util::atomic_io::write_private_new(
+                &installed::marker(&VmId(inputs.config.name.clone())),
+                &serde_json::to_vec(owner.binding())?,
+            )?;
+        }
         anyhow::ensure!(
             !crate::kernel_custody::has_retained_kernel(&lifecycle)?,
             "canonical kernel lifetime for this VM is still unresolved"
@@ -370,8 +526,22 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             network_policy: inputs.network_policy,
             cmdline: bound_cmdline,
         };
-        let result =
-            self.boot_bound_workload_guarded(inputs, Some(&kernel_binding), writable_images);
+        let result = (|| {
+            #[cfg(unix)]
+            if let Some(workspace) = workspace {
+                workspace.complete()?;
+            }
+            self.boot_bound_workload_guarded(
+                inputs,
+                Some(&kernel_binding),
+                writable_images,
+                lifecycle.mailbox_reader(),
+            )
+        })();
+        #[cfg(unix)]
+        if let Some(slot) = installed {
+            return slot.retain_start(lifecycle, kernel_binding, result);
+        }
         result.map_err(|error| {
             cold_hvf_channel::retain_boot_error(error, (lifecycle, kernel_binding))
         })
@@ -381,7 +551,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
     /// callers must hold the lifecycle lease and pass the verifier's paths.
     #[cfg(test)]
     fn boot_bound_workload(&self, inputs: &WorkloadLaunchInputs<'_>) -> Result<Box<dyn RunningVm>> {
-        self.boot_bound_workload_guarded(inputs, None, Vec::new())
+        self.boot_bound_workload_guarded(inputs, None, Vec::new(), None)
     }
 
     fn require_caller_registration_shape(&self, config: &VmStartConfig) -> Result<()> {
@@ -400,12 +570,47 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         Ok(())
     }
 
+    fn check_installed_endpoint_inputs(&self, inputs: &WorkloadLaunchInputs<'_>) -> Result<()> {
+        #[cfg(unix)]
+        if inputs.config.host_lifetime.is_some() {
+            anyhow::ensure!(
+                self.driver.supports_host_lifetime(),
+                "installed native backend unavailable"
+            );
+            anyhow::ensure!(
+                inputs.network_policy == &inputs.config.network_policy,
+                "installed endpoint policy differs from launch configuration"
+            );
+        }
+        anyhow::ensure!(
+            !cmdline::uses_installed_payload_anchor(inputs.config)
+                || (mvm_agentd::vsock::host_signer_pub_token(&inputs.cmdline).is_none()
+                    && (!cfg!(target_os = "linux")
+                        || !inputs
+                            .cmdline
+                            .split_ascii_whitespace()
+                            .any(|token| token.starts_with("mvm.verb_grant=")
+                                || token.starts_with("mvm.require_grant=")))),
+            "installed workload cmdline contains an unbound host signer anchor"
+        );
+        #[cfg(unix)]
+        if cmdline::uses_installed_payload_anchor(inputs.config) {
+            anyhow::ensure!(
+                self.spawner.supports_registered_installed_endpoint(),
+                "registered installed endpoint startup unavailable"
+            );
+        }
+        Ok(())
+    }
+
     /// Prepare the same policy, endpoint and device mapping for both ordinary
     /// boots and the concrete owned cold channel.
     fn prepare_workload_boot(
         &self,
         inputs: &WorkloadLaunchInputs<'_>,
+        mailbox_runtime: Option<&crate::runtime_evidence::VerifiedMailboxReader>,
     ) -> Result<PreparedWorkloadBoot> {
+        self.check_installed_endpoint_inputs(inputs)?;
         // A caller times this call from outside and cannot see past it, yet the
         // VMM boot and every post-boot registration happen in here. Off unless
         // a measurement asked for it.
@@ -435,24 +640,109 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         // a cold boot does, keyed on this VM's own id. A deny-all, secret-free
         // workload receives no egress channel and therefore needs no process.
         let guards = ClaimGuards::new(&self.spawner);
-        let endpoint = guards.spawn_endpoint(
-            &VmId(inputs.config.name.clone()),
-            &EndpointSpawnInputs {
-                state_dir: &state_dir,
-                tenant: inputs.tenant,
-                secrets: inputs.secrets,
-                redaction: inputs.redaction,
-                network_policy: inputs.network_policy,
-                network_limits,
-                ingress: &ingress,
-                reader_plan: reader_plan.as_ref().filter(|plan| plan.mailbox.is_some()),
-                // A cold boot mints this guest's identity and hands it a drive.
-                identity: FlowMuxIdentitySource::Mint,
-            },
-        )?;
+        let socks = standing_sockets(&state_dir, inputs.config);
+        let endpoint_inputs = EndpointSpawnInputs {
+            state_dir: &state_dir,
+            tenant: inputs.tenant,
+            secrets: inputs.secrets,
+            redaction: inputs.redaction,
+            network_policy: inputs.network_policy,
+            network_limits,
+            ingress: &ingress,
+            reader_plan: reader_plan.as_ref().filter(|plan| plan.mailbox.is_some()),
+            mailbox_runtime,
+            // A cold boot mints this guest's identity and hands it a drive.
+            identity: FlowMuxIdentitySource::Mint,
+        };
+        #[cfg(unix)]
+        let installed = if let Some(owner) = &inputs.config.host_lifetime {
+            let slot = self
+                .installed
+                .find(&VmId(inputs.config.name.clone()))?
+                .context("original installed slot missing")?;
+            anyhow::ensure!(slot.matches(owner), "installed launch owner differs");
+            owner.verify_config(inputs.config, self.driver.kind())?;
+            Some(slot)
+        } else {
+            None
+        };
+        let mut boot_cmdline = inputs.cmdline.clone();
+        #[cfg(unix)]
+        let endpoint = if let Some(slot) = &installed {
+            let id = VmId(inputs.config.name.clone());
+            if cmdline::uses_installed_payload_anchor(inputs.config) {
+                let registrar = self
+                    .installed_agent
+                    .get()
+                    .context("original installed host agent missing")?;
+                let (services, capabilities) =
+                    admitted_broker_bindings(inputs.config.plan_json.as_deref())?;
+                let request = BrokerRegisterRequest {
+                    vm_name: &inputs.config.name,
+                    state_dir: &state_dir,
+                    tenant: inputs.config.tenant_id.as_deref(),
+                    broker_listen_socket: socks.broker.as_deref(),
+                    services: &services,
+                    capability_bindings: &capabilities,
+                    service_proxies: &inputs.config.service_proxies,
+                };
+                let broker = match self.broker.register_installed(&request, registrar) {
+                    Ok(broker) => broker,
+                    Err(error) => {
+                        let failed = error
+                            .downcast::<mvm_vmm::host::host_agent_spawn::OwnedRegistrationError>(
+                        )?;
+                        let (reason, registration) = failed.into_parts();
+                        slot.retain_broker(BrokerGuard::from_owned_registration(registration))?;
+                        return Err(reason);
+                    }
+                };
+                trace.degrade_unless("host_services", broker.services_healthy(&services));
+                slot.retain_broker(broker)?;
+                trace.mark("broker_register");
+                let registration = slot.broker_registration()?;
+                let original = mvm_vmm::host::network_endpoint_spawn::InstalledHostServices::new(
+                    registrar,
+                    &registration,
+                    request.host_agent_params()?,
+                )?;
+                original.append_host_signer_cmdline(&mut boot_cmdline)?;
+                #[cfg(target_os = "linux")]
+                crate::microvm::activation::append_registered_boot_grant(
+                    inputs.config,
+                    &mut boot_cmdline,
+                )
+                .context(installed::StartupStage::RegisteredBootGrant)?;
+                slot.begin_endpoint_start()?;
+                guards.spawn_endpoint_installed(
+                    &id,
+                    &endpoint_inputs,
+                    inputs.config,
+                    Some(&original),
+                )?
+            } else {
+                slot.begin_endpoint_start()?;
+                guards.spawn_endpoint_installed(&id, &endpoint_inputs, inputs.config, None)?
+            }
+        } else {
+            guards.spawn_endpoint(&VmId(inputs.config.name.clone()), &endpoint_inputs)?
+        };
+        #[cfg(not(unix))]
+        let endpoint =
+            guards.spawn_endpoint(&VmId(inputs.config.name.clone()), &endpoint_inputs)?;
+        let identity_drive = endpoint.identity_drive().map(Path::to_path_buf);
+        let egress_uds = endpoint.egress_uds().map(Path::to_path_buf);
+        #[cfg(unix)]
+        let endpoint = if let Some(slot) = &installed {
+            slot.retain_endpoint(endpoint)?;
+            None
+        } else {
+            Some(endpoint)
+        };
+        #[cfg(not(unix))]
+        let endpoint = Some(endpoint);
         trace.mark("endpoint_spawn");
 
-        let mut boot_cmdline = inputs.cmdline.clone();
         if let Some(token) =
             mvm_vmm::host::egress_bridge::telemetry_cmdline_token(&inputs.config.name)
         {
@@ -476,11 +766,10 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             )
             .context("spawning the GPU endpoint")?;
         }
-        let socks = standing_sockets(&state_dir, inputs.config);
         let spec = workload_spec(&WorkloadSpecInputs {
             config: inputs.config,
-            identity_drive: endpoint.identity_drive(),
-            sockets: socks.with_egress(endpoint.egress_uds()),
+            identity_drive: identity_drive.as_deref(),
+            sockets: socks.with_egress(egress_uds.as_deref()),
             cmdline: boot_cmdline,
             console_log: socks.console_log.clone(),
         });
@@ -491,6 +780,8 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             spec,
             socks,
             endpoint,
+            #[cfg(unix)]
+            installed,
             trace: Some(trace),
         })
     }
@@ -502,6 +793,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         inputs: &WorkloadLaunchInputs<'_>,
         kernel: Option<&crate::kernel_custody::KernelBoundLaunch>,
         writable_images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        mailbox_runtime: Option<&crate::runtime_evidence::VerifiedMailboxReader>,
     ) -> Result<Box<dyn RunningVm>> {
         anyhow::ensure!(
             (inputs.config.canonical_kernel.is_none()
@@ -519,8 +811,10 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             spec,
             socks,
             mut endpoint,
+            #[cfg(unix)]
+            installed,
             trace,
-        } = self.prepare_workload_boot(inputs)?;
+        } = self.prepare_workload_boot(inputs, mailbox_runtime)?;
         let mut trace = trace.context("prepared workload launch trace missing")?;
         let state_dir = vm_state_dir(&inputs.config.name);
         // Unconditional and best-effort. The follower can wait for a console
@@ -548,6 +842,9 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
             || {
                 #[cfg(unix)]
                 {
+                    if let Some(slot) = &installed {
+                        slot.begin_native_dispatch()?;
+                    }
                     match kernel {
                         Some(kernel) => kernel.boot_custodied(&self.driver, &spec, disks),
                         None => {
@@ -556,6 +853,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                                 &spec,
                                 mvm_vmm::driver::prepared_disks::PreparedBootFiles {
                                     kernel: None,
+                                    workload_root: None,
                                     writable: disks,
                                     data: None,
                                 },
@@ -583,8 +881,21 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                 ));
             }
         };
+        #[cfg(unix)]
+        let vm = if let Some(slot) = &installed {
+            slot.retain_vm(vm)?
+        } else {
+            vm
+        };
         if let Some(kernel) = kernel {
-            kernel.observe_booted(&*vm)?;
+            let observation = kernel.observe_booted(&*vm);
+            #[cfg(unix)]
+            let observation = if installed.is_some() {
+                observation.context(installed::StartupStage::KernelObservation)
+            } else {
+                observation
+            };
+            observation?;
         }
         trace.mark("console_stream_start");
 
@@ -595,20 +906,56 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         // resolved was refused at launch resolution, before the VMM started.
         if crate::microvm::booted_with_universal_initramfs(inputs.config) {
             durability::wait_for_activation(inputs.config, &*vm, &*self.console_streamer)?;
+            #[cfg(unix)]
+            if let Some(owner) = &inputs.config.host_lifetime {
+                owner.check_parent_current(inputs.config, self.driver.kind())?;
+            }
             trace.mark("admission_durable");
-            crate::microvm::activate_workload(&*vm, inputs.config)
-                .context("activate workload after boot")?;
+            #[cfg(target_os = "linux")]
+            let retained = if let Some(slot) = installed.as_ref() {
+                slot.activate_entrypoint(&*vm, inputs.config, &spec.cmdline)
+                    .context(installed::StartupStage::GuestActivation)?
+            } else {
+                false
+            };
+            #[cfg(not(target_os = "linux"))]
+            let retained = false;
+            if !retained {
+                let activation = crate::microvm::activate_workload(&*vm, inputs.config);
+                #[cfg(unix)]
+                let activation = if installed.is_some() {
+                    activation.context(installed::StartupStage::GuestActivation)
+                } else {
+                    activation
+                };
+                activation.context("activate workload after boot")?;
+            }
         }
         trace.mark("activate_workload");
+
+        #[cfg(unix)]
+        if cmdline::uses_installed_payload_anchor(inputs.config) {
+            trace.write_to(&state_dir);
+            return Ok(vm);
+        }
 
         // Register the per-VM broker for the exact admitted host-service set.
         // The guard's Drop reaps on any early return until it is defused. A
         // requested service whose broker cannot start fails the launch closed.
         let (mut broker_guard, services) = self.register_workload_broker(inputs.config, &socks)?;
-        endpoint.defuse();
-        broker_guard.defuse();
         trace.mark("broker_register");
         trace.degrade_unless("host_services", broker_guard.services_healthy(&services));
+        #[cfg(unix)]
+        if let Some(slot) = installed {
+            slot.retain_broker(broker_guard)?;
+            trace.write_to(&state_dir);
+            return Ok(vm);
+        }
+        endpoint
+            .as_mut()
+            .context("legacy endpoint missing")?
+            .defuse();
+        broker_guard.defuse();
         trace.write_to(&state_dir);
         Ok(vm)
     }
@@ -776,6 +1123,15 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         )
         .map_err(refuse)?;
 
+        // Preserve the established baseline warm path. New reader extensions
+        // require a fresh plan/boot/ACK binding, which this restore path cannot
+        // install in the guest's already-restored memory and identity drive.
+        if let Some(grant) = &plan.mailbox {
+            mvm_core::mailbox::reader::require_mailbox_reader_grant(None, grant)
+                .map_err(|error| StandbyError::ClaimFailed(format!(
+                    "restored mailbox extension requires original independent reader rekey: {error:#}"
+                )))?;
+        }
         // (6a) Fresh, registry-unique identity for the child.
         let child = match preloaded_child_name.clone() {
             Some(name) => {
@@ -910,6 +1266,7 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
                     // A warm child must rekey and enroll independently; it
                     // cannot inherit a parent's mailbox ACK authority.
                     reader_plan: None,
+                    mailbox_runtime: None,
                     // A restored child already holds its parent's signing key
                     // in the memory image it woke from, and there is no way to
                     // put a different one there. Its endpoint pins what the
@@ -1661,7 +2018,7 @@ mod tests {
     /// A guard that did register — the only inner variant a test can build
     /// without a live daemon, and its Drop is a no-op.
     fn registered_guard() -> BrokerGuard {
-        BrokerGuard(mvm_vmm::host::host_agent_spawn::ServicesGuard::Agent(
+        BrokerGuard::from_services_guard(mvm_vmm::host::host_agent_spawn::ServicesGuard::Agent(
             mvm_vmm::host::host_agent_spawn::HostAgentServicesGuard::defused(),
         ))
     }

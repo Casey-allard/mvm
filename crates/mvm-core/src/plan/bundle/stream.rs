@@ -459,6 +459,8 @@ impl VerifiedBundleFile {
 #[derive(Debug)]
 pub struct CapturedCanonicalLinuxInputs {
     _archive: File,
+    #[cfg(unix)]
+    directory_file: File,
     directory_path: PathBuf,
     directory_guard: std::sync::Mutex<Option<tempfile::TempDir>>,
     manifest: BundleManifest,
@@ -472,6 +474,11 @@ impl CapturedCanonicalLinuxInputs {
     /// Resource location only, not execution or cleanup authority.
     pub fn generation_dir(&self) -> &Path {
         &self.directory_path
+    }
+
+    #[cfg(unix)]
+    pub fn generation_directory_file(&self) -> &File {
+        &self.directory_file
     }
 
     /// One-way retention before a native reader can exist.
@@ -506,7 +513,6 @@ impl CapturedCanonicalLinuxInputs {
     /// Reopen a retained regular file without following a link and verify the
     /// actual stream against its signed inventory. No ambient path is returned.
     pub fn open_artifact(&self, name: &str) -> Result<File> {
-        use std::io::{Seek, SeekFrom};
         let path = self
             .selected
             .get(name)
@@ -515,29 +521,45 @@ impl CapturedCanonicalLinuxInputs {
             .manifest
             .find_by_name(name)
             .context("artifact declaration missing")?;
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let mut file = options.open(path)?;
-        let metadata = file.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file() && metadata.len() == declaration.size_bytes,
-            "retained artifact is not regular or has changed size"
-        );
-        let mut digest = HashingWriter::new(io::sink());
-        io::copy(
-            &mut Read::by_ref(&mut file).take(declaration.size_bytes + 1),
-            &mut digest,
-        )?;
-        let (size, hash) = digest.finish();
-        check_artifact_digest(declaration, size, hash)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
+        open_verified_bundle_artifact(path, declaration)
     }
+}
+
+/// Verify the declared extent and digest through one open regular file and rewind it.
+pub fn open_verified_bundle_artifact(path: &Path, declaration: &BundleArtifact) -> Result<File> {
+    use std::io::{Seek, SeekFrom};
+    #[cfg(not(unix))]
+    anyhow::ensure!(
+        std::fs::symlink_metadata(path)?.is_file(),
+        "bundle artifact is not a regular file"
+    );
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() == declaration.size_bytes,
+        "retained artifact is not regular or has changed size"
+    );
+    let mut digest = HashingWriter::new(io::sink());
+    io::copy(
+        &mut Read::by_ref(&mut file).take(
+            declaration
+                .size_bytes
+                .checked_add(1)
+                .context("artifact extent overflow")?,
+        ),
+        &mut digest,
+    )?;
+    let (size, hash) = digest.finish();
+    check_artifact_digest(declaration, size, hash)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
 }
 
 /// Snapshot a pinned archive with bounded streaming I/O, then retain only the
@@ -552,6 +574,17 @@ pub fn capture_canonical_linux_inputs(
     pin: &super::PlanArtifact,
     trust: &dyn TrustStore,
 ) -> Result<CapturedCanonicalLinuxInputs> {
+    capture_canonical_with_extent(archive, pin, trust, None)
+}
+
+#[cfg(feature = "host-state")]
+pub(crate) fn capture_canonical_with_extent(
+    archive: &Path,
+    pin: &super::PlanArtifact,
+    trust: &dyn TrustStore,
+    quoted: Option<std::num::NonZeroU64>,
+) -> Result<CapturedCanonicalLinuxInputs> {
+    use std::io::Seek;
     anyhow::ensure!(
         cfg!(unix),
         "canonical Linux proof capture is unsupported on this platform"
@@ -565,16 +598,17 @@ pub fn capture_canonical_linux_inputs(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let source = options.open(archive)?;
-    let metadata = source.metadata()?;
+    let mut source = options.open(archive)?;
+    let limit = quoted.map_or(MAX_RAW_ARCHIVE, |extent| extent.get());
     anyhow::ensure!(
-        metadata.is_file() && metadata.len() <= MAX_RAW_ARCHIVE,
-        "bundle archive is not regular or exceeds the capture bound"
+        limit <= MAX_RAW_ARCHIVE,
+        "decoded archive quote exceeds capture bound"
     );
-    // An authenticated metadata preflight can refuse an oversized selected
-    // kernel before copying a multi-GiB workload archive. It is not authority
-    // for the later snapshot: that exact snapshot is independently verified.
-    let (head, signature) = read_manifest_entries(open_archive(archive)?)?;
+    // Keep the original open source for both passes, including gzip decoding.
+    let (head, signature) = read_manifest_entries(
+        decoded_archive_reader(archive, source.try_clone()?, quoted)?.take(limit),
+    )?;
+    source.rewind()?;
     let (head, key) = verify_signed_manifest(&head, &signature, trust)?;
     let pinned_signature = pin.signature_bytes().context("invalid pinned signature")?;
     anyhow::ensure!(
@@ -604,21 +638,29 @@ pub fn capture_canonical_linux_inputs(
         .prefix("kernel-")
         .tempdir_in(&parent)?;
     crate::config::create_private_dir(directory.path())?;
+    #[cfg(unix)]
+    let directory_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(directory.path())?
+    };
     let snapshot_path = directory.path().join("archive.mvmpkg");
     let mut snapshot = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .open(&snapshot_path)?;
+    let mut reader = decoded_archive_reader(archive, source, quoted)?;
     let mut writer = HashingWriter::new(&mut snapshot);
-    io::copy(
-        &mut open_archive(archive)?.take(MAX_RAW_ARCHIVE + 1),
-        &mut writer,
-    )?;
+    io::copy(&mut Read::by_ref(&mut reader).take(limit), &mut writer)?;
     let (size, digest) = writer.finish();
     anyhow::ensure!(
-        size <= MAX_RAW_ARCHIVE && digest == pin.bundle_sha256,
-        "captured archive differs from its exact pin or exceeds the capture bound"
+        reader.read(&mut [0])? == 0
+            && quoted.is_none_or(|extent| extent.get() == size)
+            && digest == pin.bundle_sha256,
+        "captured archive differs from its exact pin or decoded extent"
     );
     snapshot.sync_all()?;
     #[cfg(unix)]
@@ -697,6 +739,8 @@ pub fn capture_canonical_linux_inputs(
         }
     }
     Ok(CapturedCanonicalLinuxInputs {
+        #[cfg(unix)]
+        directory_file,
         _archive: snapshot,
         directory_path: directory.path().to_owned(),
         directory_guard: std::sync::Mutex::new(Some(directory)),
@@ -710,6 +754,14 @@ pub fn capture_canonical_linux_inputs(
 
 #[cfg(feature = "host-state")]
 pub fn open_archive(path: &Path) -> Result<Box<dyn Read>, BundleVerifyError> {
+    open_quoted_archive(path, None)
+}
+
+#[cfg(feature = "host-state")]
+pub(super) fn open_quoted_archive(
+    path: &Path,
+    quoted: Option<std::num::NonZeroU64>,
+) -> Result<Box<dyn Read>, BundleVerifyError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -720,6 +772,15 @@ pub fn open_archive(path: &Path) -> Result<Box<dyn Read>, BundleVerifyError> {
     let file = options.open(path).map_err(|e| {
         BundleVerifyError::ManifestParse(format!("opening bundle archive {}: {e}", path.display()))
     })?;
+    decoded_archive_reader(path, file, quoted)
+}
+
+#[cfg(feature = "host-state")]
+fn decoded_archive_reader(
+    path: &Path,
+    file: File,
+    quoted: Option<std::num::NonZeroU64>,
+) -> Result<Box<dyn Read>, BundleVerifyError> {
     let metadata = file.metadata().map_err(|e| {
         BundleVerifyError::ManifestParse(format!("stat bundle archive {}: {e}", path.display()))
     })?;
@@ -733,6 +794,11 @@ pub fn open_archive(path: &Path) -> Result<Box<dyn Read>, BundleVerifyError> {
             super::MAX_BUNDLE_TOTAL_BYTES + 64 * 1024 * 1024 + 1,
         )))
     } else {
+        if quoted.is_some_and(|n| n.get() != metadata.len()) {
+            return Err(BundleVerifyError::ManifestParse(
+                "plain bundle differs from quoted archive length".into(),
+            ));
+        }
         Ok(Box::new(file))
     }
 }
@@ -781,11 +847,54 @@ pub fn verify_bundle_file(
     trust_store: &dyn TrustStore,
 ) -> Result<VerifiedBundleFile, BundleVerifyError> {
     let (manifest, key_id, _, signature) = verify_head(path, trust_store)?;
+    verify_streamed_bundle(manifest, key_id, signature, open_archive(path)?, || {
+        archive_sha256(path)
+    })
+}
+
+/// Verify the installed archive within its quoted length using the same
+/// immutable bytes for the original digest, manifest, and artifact passes.
+#[cfg(feature = "host-state")]
+pub fn verify_exact_bundle_file(
+    path: &Path,
+    trust_store: &dyn TrustStore,
+    pin: &super::PlanArtifact,
+    bytes: std::num::NonZeroU64,
+) -> Result<VerifiedBundleFile, BundleVerifyError> {
+    let archive = super::read_exact_bundle_archive(path, bytes)
+        .map_err(|e| BundleVerifyError::ManifestParse(format!("reading quoted bundle: {e}")))?;
+    let digest = super::sha256_hex(&archive);
+    if digest != pin.bundle_sha256 {
+        return Err(BundleVerifyError::ManifestParse(
+            "quoted bundle differs from signed archive digest".into(),
+        ));
+    }
+    let (manifest_bytes, signature) = read_manifest_entries(archive.as_slice())?;
+    let (manifest, key_id) = verify_signed_manifest(&manifest_bytes, &signature, trust_store)?;
+    let verified = verify_streamed_bundle(manifest, key_id, signature, archive.as_slice(), || {
+        Ok(digest)
+    })?;
+    if &verified.plan_artifact() != pin {
+        return Err(BundleVerifyError::ManifestParse(
+            "quoted bundle differs from signed bundle pin".into(),
+        ));
+    }
+    Ok(verified)
+}
+
+#[cfg(feature = "host-state")]
+fn verify_streamed_bundle(
+    manifest: BundleManifest,
+    key_id: KeyId,
+    signature: Vec<u8>,
+    archive: impl Read,
+    digest: impl FnOnce() -> Result<String, BundleVerifyError>,
+) -> Result<VerifiedBundleFile, BundleVerifyError> {
     let manifest_signature = signature.try_into().map_err(|_| {
         BundleVerifyError::ManifestParse("verified manifest signature has invalid length".into())
     })?;
     let capture = image_set_manifest_paths(&manifest);
-    let captured = stream_artifacts(open_archive(path)?, &manifest, |artifact| {
+    let captured = stream_artifacts(archive, &manifest, |artifact| {
         if capture.contains(&artifact.path) {
             Destination::Capture
         } else {
@@ -795,7 +904,7 @@ pub fn verify_bundle_file(
     let embedded_image_sets = verify_embedded_image_sets(&manifest, &InMemoryArtifacts(&captured))?;
     let boot_assets = super::verify_boot_assets(&manifest, &InMemoryArtifacts(&captured))?;
     Ok(VerifiedBundleFile {
-        bundle_sha256: archive_sha256(path)?,
+        bundle_sha256: digest()?,
         manifest,
         key_id,
         embedded_image_sets,
@@ -1453,6 +1562,35 @@ mod tests {
             sha256: sha256_hex(bytes),
             size_bytes: bytes.len() as u64,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_extent_uses_one_regular_file_and_preserves_trailing_zeroes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("root");
+        let body = b"original\0\0";
+        let decl = artifact("root", ArtifactRole::Rootfs, body);
+        std::fs::write(&path, body).unwrap();
+        let mut file = open_verified_bundle_artifact(&path, &decl).unwrap();
+        std::fs::rename(&path, directory.path().join("retained")).unwrap();
+        std::fs::write(&path, b"oversized replacement").unwrap();
+        assert!(open_verified_bundle_artifact(&path, &decl).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(directory.path().join("retained"), &path).unwrap();
+        assert!(open_verified_bundle_artifact(&path, &decl).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(open_verified_bundle_artifact(&path, &decl).is_err());
+        let mut readback = Vec::new();
+        file.read_to_end(&mut readback).unwrap();
+        assert_eq!(readback, body);
     }
 
     fn manifest(artifacts: Vec<BundleArtifact>) -> BundleManifest {

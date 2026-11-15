@@ -85,6 +85,19 @@ where
     S: AsyncRead + Unpin + ?Sized,
     T: serde::de::DeserializeOwned,
 {
+    read_json_frame_checked(stream, max_frame_bytes, |_| Ok(())).await
+}
+
+/// Additive pre-typed-parse validation of the same bounded canonical body.
+pub async fn read_json_frame_checked<S, T>(
+    stream: &mut S,
+    max_frame_bytes: usize,
+    check: impl FnOnce(&[u8]) -> Result<(), serde_json::Error>,
+) -> Result<T, FrameError>
+where
+    S: AsyncRead + Unpin + ?Sized,
+    T: serde::de::DeserializeOwned,
+{
     let mut len_buf = [0u8; FRAME_LEN_BYTES];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -96,7 +109,48 @@ where
     }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).await?;
+    check(&body).map_err(FrameError::Decode)?;
     serde_json::from_slice(&body).map_err(FrameError::Decode)
+}
+
+/// Same wire bytes, with output capacity enforced during serialization.
+pub async fn write_json_frame_bounded<S, T>(
+    stream: &mut S,
+    value: &T,
+    cap: usize,
+) -> Result<(), FrameError>
+where
+    S: AsyncWrite + Unpin + ?Sized,
+    T: serde::Serialize,
+{
+    if cap == 0 || cap > u32::MAX as usize {
+        return Err(FrameError::LengthOverflow);
+    }
+    struct Bounded {
+        bytes: Vec<u8>,
+        cap: usize,
+    }
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.cap.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other("bounded frame output limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut body = Bounded {
+        bytes: Vec::with_capacity(cap),
+        cap,
+    };
+    serde_json::to_writer(&mut body, value).map_err(FrameError::Encode)?;
+    let length = u32::try_from(body.bytes.len()).map_err(|_| FrameError::LengthOverflow)?;
+    stream.write_all(&length.to_be_bytes()).await?;
+    stream.write_all(&body.bytes).await?;
+    Ok(())
 }
 
 // NB: the *sync* length-prefixed framing the libkrun supervisor control channel uses

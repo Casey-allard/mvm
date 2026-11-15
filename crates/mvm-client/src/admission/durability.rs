@@ -35,7 +35,7 @@ pub fn admit_plan_for_boot_syncing_beside_boot(
     mvm_core::admission_durability::AdmissionDurability,
 )> {
     let phase = mvm_runtime::ui::activity::start("Signing and admitting the execution plan");
-    let admitted = admit(p, Vec::new(), AdmissionSync::BesideBoot)?;
+    let admitted = admit(p, Vec::new(), AdmissionSync::BesideBoot, None)?;
     phase.finish();
     Ok(admitted)
 }

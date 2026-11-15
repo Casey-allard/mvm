@@ -55,6 +55,80 @@ The [Vsock message reference](/reference/vsock-messages/) contains every
 request, response and nested field, plus authentication, other typed services,
 builder protocols, raw channels and their availability restrictions.
 
+Boot-binding file authority and local journal storage currently require the supported Unix filesystem checks. Portable clients can verify mailbox signatures and receipts on Windows. Loading a host or guest boot-binding file on an unsupported platform returns an explicit unsupported-operation error.
+
+### Original Firecracker entrypoint control
+
+The Linux Firecracker driver can open one `OriginalEntrypointChannel` from its
+retained `RunningVm` and original host-lifetime anchor. It binds the connected
+vsock multiplexer to the held VMM process and inherited lease, checks the
+original registered host identity, and retains the authenticated control
+session through `ActivateEnvironment`, one non-streaming `RunEntrypoint`, and
+an optional terminal `SyncFilesystems`. The guest control key is established
+on that connection; it is separate from the FlowMux identity drive's key.
+
+For an installed direct TCP guest, the admitted plan selects ephemeral output
+and grants exactly `activate-environment` and `run-entrypoint`. After VM
+registration, the host checks its existing signing key against the registered
+public key and issues the guest-specific grant once. The host puts that grant
+and `mvm.require_grant=1` in the original boot arguments. Activation verifies
+the same envelope against the VM name, plan nonce, validity window and
+registered host. A previous launch's per-name grant file plays no role.
+
+The embedding caller still owns signed-plan admission, current authorization,
+the admitted workload entrypoint, input/environment limits, and audit routing.
+The channel grants no arbitrary command execution, shell or guest network
+interface. Unsupported backends refuse this API. A failed or unwound operation
+closes its actual stream and spends the session; reconnecting cannot retry an
+activation or entrypoint whose outcome is uncertain. Socket operations share
+an absolute deadline without a separate watchdog thread. The caller must bound
+its synchronous output observer; the socket deadline cannot interrupt arbitrary
+callback code or guarantee filesystem and scheduler latency.
+
+Installed startup errors report a fixed stage name when the failing operation
+is tagged. Backend error text stays with the original cleanup owner. An
+untagged failure retains the generic startup error rather than guessing a cause.
+
+The installed Linux or macOS controller can interrupt and replace one of its owned mailbox helpers through `OriginalJournalSourceHost::restart_helper`. It retains the original guest boots, launch claims and signed credentials. Readiness is fenced before interruption, the original child is collected through its exit observer, and replacement revalidates current authority before readiness. Retry an unsettled operation with its original identity. Controlled live restart returns `Unsupported` on other platforms before interrupting a helper. `reconnect_helper` remains available for an already-collected helper whose original socket can be retired safely.
+
+### Original mailbox sender settlement
+
+A signed outbound journal direction can select `OrdinalV1` for its original sender. On cold boot the host projects that choice into the kernel command line as `mvm.mailbox.sender=ordinal-v1`. Before workload activation the agent checks it against the original mailbox identity and requires the matching ACK key. A missing or inconsistent ordinal identity refuses activation. The application talks to `/run/mvm/mailbox/receive.sock` using the versioned application reader frame. The agent forwards the corresponding requests over the admitted mailbox vsock port 5257.
+
+| Local request | Application contract |
+|---|---|
+| `Stage` | Supply the committed direction, next contiguous ordinal starting at one, and original payload. The agent permits one active operation and enforces both the signed direction limit and an 8,192-byte ceiling. `SenderPendingV1` confirms local staging. Repeat the same handle and bytes if this reply is lost. |
+| `Status` | Ask about the original handle. The agent contacts the host, verifies the destination's signed V2 receipt and records it before returning `SenderAcceptedV1`. A pending response permits retry. |
+| `Settle` | After the application accepts the receipt, supply its exact canonical digest and original handle. The agent records its signed statement before sending it. A matching `SenderSettledV1` confirms retirement. A lost reply can be recovered by retrying the same settlement. |
+
+The versioned application request carries no signing keys. B's durable mailbox admission, B's application ACK and A's retirement are distinct events. This profile disables the arbitrary-ID sender path on A. Original guest state belongs to the admitted boot. Restarting a mailbox helper leaves the guest running. A new guest boot requires fresh admission.
+
+For a local directed journal pair, the installed SDK controller can call
+`OriginalJournalSourceHost::reconnect_helper(JournalHelper::Source, deadline)`
+or select `JournalHelper::Destination`. It first collects that helper's exit
+status and checks both retained VM process identities, boot records, signed
+credentials, revocations and original reader enrollments. The successor opens
+the same journal and returns through the existing mailbox service. The caller
+keeps the same owner for cleanup if startup or readiness fails. A disconnected
+guest operation can still report a transport failure. Its caller retries with
+the original message identity and checks the signed destination receipt.
+
+A vacant service socket can be rebound. On Linux the controller also holds the
+original socket inode and can retire its stale pathname after helper exit.
+The host operator and root are trusted. The executable and its ancestors must be
+protected against modification by other users, including any extended ACLs.
+The SDK checks owner and POSIX mode along the canonical executable path.
+On macOS the controller watches the private socket directory held by the SDK.
+It arms the directory watch after readiness and checks the live original peer
+before and after arming. An unchanged socket that returns a kernel connection
+refusal after the helper exits can be removed through that directory descriptor.
+Any observed directory entry change, even an unrelated one or a rename that is
+later reversed, fences interruption of a live helper and retirement of an
+occupied socket. The controller keeps that refusal for the life of the helper.
+A genuinely vacant name still permits exclusive bind after collection.
+A controller restart loses the
+original process handles and requires separate recovery.
+
 ### Guest telemetry
 
 Every workload boot carries telemetry from the guest to the host by default.

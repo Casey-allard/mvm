@@ -34,13 +34,13 @@ use std::process::Command;
 
 use crate::rust_source::{CommentSyntax, blank_comments};
 
-// CI witness, overclaim, snapshot-owner, Yocto importer, and CLI option-source
-// tests remain measured; the library health/signing path adds regressions.
-// Leave room for main changes; physical lines have operator-approved headroom.
+// Count first-party, generated, vendored, and test source in this total.
+// Confined store and cleanup lifecycle regression controls stay visible here.
+// Tight ceilings keep future source growth explicit without removing tests.
 /// Ceiling on total SLOC, all categories.
-const MAX_TOTAL_SLOC: usize = 991_000;
+const MAX_TOTAL_SLOC: usize = 1_040_800;
 /// Ceiling on total physical lines, all categories.
-const MAX_TOTAL_PHYSICAL: usize = 1_259_000;
+const MAX_TOTAL_PHYSICAL: usize = 1_311_900;
 /// How far under a ceiling the tree may sit before the ceiling must drop.
 const SLACK: usize = 10_000;
 

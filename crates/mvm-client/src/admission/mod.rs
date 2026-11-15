@@ -399,7 +399,30 @@ pub fn admit_plan_for_boot_configured_ingress(
     p: AdmitPlanForBootParams<'_>,
     ingress: Vec<mvm_core::plan::IngressMapping>,
 ) -> Result<AdmissionContext> {
-    let (context, durability) = admit(p, ingress, durability::AdmissionSync::Inline)?;
+    admit_persistent_ingress(p, ingress, None)
+}
+
+pub(crate) fn admit_persistent_ingress(
+    p: AdmitPlanForBootParams<'_>,
+    ingress: Vec<mvm_core::plan::IngressMapping>,
+    journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
+) -> Result<AdmissionContext> {
+    admit_persistent_ingress_with_retention(p, ingress, journal, StreamRetention::Persist)
+}
+
+pub(crate) fn admit_persistent_ingress_with_retention(
+    p: AdmitPlanForBootParams<'_>,
+    ingress: Vec<mvm_core::plan::IngressMapping>,
+    journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
+    retention: StreamRetention,
+) -> Result<AdmissionContext> {
+    let (context, durability) = admit_with_stream_retention(
+        p,
+        ingress,
+        durability::AdmissionSync::Inline,
+        journal,
+        retention,
+    )?;
     debug_assert!(
         durability.is_settled(),
         "an inline admission is already durable"
@@ -411,6 +434,20 @@ fn admit(
     p: AdmitPlanForBootParams<'_>,
     ingress: Vec<mvm_core::plan::IngressMapping>,
     sync: durability::AdmissionSync,
+    journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
+) -> Result<(
+    AdmissionContext,
+    mvm_core::admission_durability::AdmissionDurability,
+)> {
+    admit_with_stream_retention(p, ingress, sync, journal, StreamRetention::Persist)
+}
+
+fn admit_with_stream_retention(
+    p: AdmitPlanForBootParams<'_>,
+    ingress: Vec<mvm_core::plan::IngressMapping>,
+    sync: durability::AdmissionSync,
+    journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
+    retention: StreamRetention,
 ) -> Result<(
     AdmissionContext,
     mvm_core::admission_durability::AdmissionDurability,
@@ -758,12 +795,10 @@ fn admit(
         }),
         services: p.services.clone(),
         extensions: Vec::new(),
-        // Recorded, always, and not reachable from a flag. A caller who could
-        // turn the transcript off from the command line would leave an absent
-        // recording indistinguishable from a suppressed one; opting out is a
-        // decision for whoever authors and signs the plan, and it lands in the
-        // chain as `plan.admitted`'s retention label either way.
-        stream_retention: StreamRetention::Persist,
+        // The internal launch owner selects this before signing. Ordinary
+        // callers retain recording; installed ephemeral entrypoints carry
+        // their explicit nonrecording contract in the same admitted plan.
+        stream_retention: retention,
         attestation_mode: mvm_contract::plan::AttestationMode::Noop,
     };
     let admission_ctx = match (&bundle_resolver, &bundle_trust) {
@@ -791,13 +826,29 @@ fn admit(
         ms = (t_pre_sign - t_sha).as_secs_f64() * 1000.0,
         "admit: synthesis inputs"
     );
+    let posture =
+        crate::admission::run_grants::run_posture(variant, p.backend_kind, p.runtime_config);
+    let posture = journal.map_or(posture, |endpoint| endpoint.authorize(posture));
+    #[cfg(unix)]
+    let posture = if retention == StreamRetention::Ephemeral && journal.is_some() {
+        let config = p
+            .runtime_config
+            .context("original journal runtime configuration missing")?;
+        let owner = config
+            .host_lifetime
+            .as_ref()
+            .context("original journal resource owner missing")?;
+        posture.with_installed_journal_owner(config, owner)?
+    } else {
+        posture
+    };
     let admitted = admit_for_run(
         &input,
         &SystemClock,
         p.ledger,
         p.keys_dir,
         admission_ctx.as_ref(),
-        crate::admission::run_grants::run_posture(variant, p.backend_kind, p.runtime_config),
+        posture,
     )
     .or_else(|err| -> Result<_> {
         if let Some(refused) =
@@ -1164,6 +1215,9 @@ pub fn resolve_policy_for_admission(
 // is the bridge between CLI args and admission, so verifying it
 // in isolation covers the contract the dispatcher depends on without
 // pulling in VMM selection + start dispatch.
+
+#[cfg(test)]
+mod installed_retention_tests;
 
 #[cfg(test)]
 pub(crate) mod admit_plan_tests {

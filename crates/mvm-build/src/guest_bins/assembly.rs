@@ -20,7 +20,32 @@ pub(crate) fn verify_protocol_source(workspace: &std::path::Path) -> Result<(), 
                 .into(),
         ));
     }
+    for &(relative, compiled) in mvm_core::mailbox::reader::COMPILED_MAILBOX_READER_INPUTS
+        .iter()
+        .chain(mvm_contract::protocol::mailbox::COMPILED_MAILBOX_READER_INPUTS)
+        .chain(mvm_agentd::COMPILED_MAILBOX_READER_INPUTS)
+    {
+        if std::fs::read(workspace.join(relative))?.as_slice() != compiled {
+            return Err(GuestBinsError::Assembly("guest mailbox reader source differs from the producer; rebuild from the selected checkout".into()));
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn current_mailbox_reader_compatibility()
+-> mvm_core::mailbox::reader::MailboxReaderCompatibilityV1 {
+    use mvm_core::mailbox::reader::{
+        MAX_MAILBOX_READER_BOOT_BYTES, MailboxReaderCompatibilityV1, MailboxReaderFeatureV1,
+    };
+    MailboxReaderCompatibilityV1 {
+        format: 1,
+        max_boot_bytes: MAX_MAILBOX_READER_BOOT_BYTES,
+        features: vec![
+            MailboxReaderFeatureV1::DirectedJournalV1,
+            MailboxReaderFeatureV1::ObjectPairV1,
+            MailboxReaderFeatureV1::SenderOrdinalV1,
+        ],
+    }
 }
 
 /// These claims become authenticated only when the containing archive is signed.
@@ -35,6 +60,8 @@ pub struct RuntimeAssembly {
     pub overlay_verity_sha256: String,
     pub overlay_roothash: String,
     pub initramfs_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_reader_v1: Option<mvm_core::mailbox::reader::MailboxReaderCompatibilityV1>,
 }
 
 impl RuntimeAssembly {
@@ -56,6 +83,11 @@ impl RuntimeAssembly {
             return Err(GuestBinsError::Assembly(format!(
                 "invalid runtime declaration for {arch}"
             )));
+        }
+        if let Some(profile) = &self.mailbox_reader_v1 {
+            profile
+                .validate()
+                .map_err(|error| GuestBinsError::Assembly(error.to_string()))?;
         }
         Ok(())
     }
@@ -122,6 +154,7 @@ pub(crate) fn derive_runtime_assembly(
     )
     .map_err(|error| GuestBinsError::Assembly(error.to_string()))?;
     let declaration = RuntimeAssembly {
+        mailbox_reader_v1: None,
         assembly_format: RUNTIME_ASSEMBLY_FORMAT,
         arch,
         protocol_version: mvm_agentd::vsock::PROTOCOL_VERSION,
@@ -207,6 +240,7 @@ mod tests {
         assert_eq!(first.to_bytes().unwrap(), second.to_bytes().unwrap());
         for (arch, declaration) in &first.assemblies {
             declaration.validate(*arch).unwrap();
+            assert!(declaration.mailbox_reader_v1.is_none());
             assert_eq!(
                 declaration.protocol_version,
                 mvm_agentd::vsock::PROTOCOL_VERSION
@@ -250,12 +284,62 @@ mod tests {
     }
 
     #[test]
+    fn optional_reader_profile_preserves_legacy_declarations_and_validates_new_ones() {
+        let mut artifact = artifact();
+        artifact.declare_runtime_assemblies().unwrap();
+        let mut declaration = artifact.assemblies[&GuestArch::X86_64].clone();
+        let legacy = serde_json::to_value(&declaration).unwrap();
+        assert!(legacy.get("mailbox_reader_v1").is_none());
+        assert!(
+            serde_json::from_value::<RuntimeAssembly>(legacy)
+                .unwrap()
+                .mailbox_reader_v1
+                .is_none()
+        );
+        declaration.mailbox_reader_v1 = Some(current_mailbox_reader_compatibility());
+        declaration.validate(GuestArch::X86_64).unwrap();
+        let bytes = serde_json::to_vec(&declaration).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RuntimeAssembly>(&bytes).unwrap(),
+            declaration
+        );
+        declaration.mailbox_reader_v1.as_mut().unwrap().format = 2;
+        assert!(declaration.validate(GuestArch::X86_64).is_err());
+    }
+
+    #[test]
     fn foreign_protocol_source_is_not_labeled_with_producer_constants() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("crates/mvm-agentd/src/vsock/mod.rs");
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, mvm_agentd::vsock::COMPILED_PROTOCOL_SOURCE).unwrap();
+        for &(relative, compiled) in mvm_core::mailbox::reader::COMPILED_MAILBOX_READER_INPUTS
+            .iter()
+            .chain(mvm_contract::protocol::mailbox::COMPILED_MAILBOX_READER_INPUTS)
+            .chain(mvm_agentd::COMPILED_MAILBOX_READER_INPUTS)
+        {
+            let path = dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, compiled).unwrap();
+        }
         verify_protocol_source(dir.path()).unwrap();
+        for &(relative, compiled) in mvm_agentd::COMPILED_MAILBOX_READER_INPUTS {
+            let path = dir.path().join(relative);
+            std::fs::write(&path, b"stale guest reader implementation").unwrap();
+            assert!(
+                verify_protocol_source(dir.path()).is_err(),
+                "accepted stale {relative}"
+            );
+            std::fs::write(&path, compiled).unwrap();
+        }
+        let reader = dir.path().join("crates/mvm-core/src/mailbox/reader.rs");
+        std::fs::write(&reader, b"foreign reader").unwrap();
+        assert!(verify_protocol_source(dir.path()).is_err());
+        std::fs::write(
+            &reader,
+            mvm_core::mailbox::reader::COMPILED_MAILBOX_READER_INPUTS[0].1,
+        )
+        .unwrap();
         std::fs::write(&source, b"pub const PROTOCOL_VERSION: u32 = 99;").unwrap();
         assert!(verify_protocol_source(dir.path()).is_err());
     }

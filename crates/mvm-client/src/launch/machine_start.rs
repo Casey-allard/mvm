@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use mvm_runtime::backend::AnyBackend;
 use mvm_runtime::machine::persist as mp;
 
-use super::persistent::{PersistentImageStartParams, start_persistent_oci_machine};
+use super::persistent::{self, PersistentImageStartParams, journal::InstalledJournal};
 use crate::secret::SecretService;
 use crate::volume::LaunchPreparation;
 
@@ -239,8 +239,45 @@ pub fn start_machine_spec(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
+    let reservation = super::PairedBootReservation::for_lifecycle_mutation(&spec.name)?;
+    start_machine_spec_with_journal(spec, host, params, None, &reservation)
+}
+
+pub(super) fn start_machine_spec_with_journal(
+    spec: &mp::MachineSpec,
+    host: &dyn StartHost,
+    params: MachineStartParams<'_>,
+    journal: Option<&mut InstalledJournal<'_>>,
+    reservation: &super::PairedBootReservation,
+) -> Result<MachineStart> {
+    start_machine_spec_with_journal_context(
+        spec,
+        host,
+        params,
+        journal,
+        reservation,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+pub(super) fn start_machine_spec_with_journal_context(
+    spec: &mp::MachineSpec,
+    host: &dyn StartHost,
+    params: MachineStartParams<'_>,
+    journal: Option<&mut InstalledJournal<'_>>,
+    reservation: &super::PairedBootReservation,
+    #[cfg(unix)] installed: Option<&mut persistent::journal::JournalStartContext>,
+) -> Result<MachineStart> {
+    reservation.require_name(&spec.name)?;
+    persistent::journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     AnyBackend::require_hypervisor_selectable(params.hypervisor)?;
-    super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
+    let fresh_state = if journal.is_some() {
+        Some(reservation.prepare_journal_runtime(&spec.name)?)
+    } else {
+        super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
+        None
+    };
     validate_registry_pack_source(spec)?;
     let network_policy = persisted_network_policy(spec)?;
     let (memory_mib, mem_initial_mib) =
@@ -273,7 +310,7 @@ pub fn start_machine_spec(
         .prepare_volumes(&spec.name, &spec.volumes)
         .context("resolving registered local volumes before admission")?;
     let workload_dir = persistent_workload_dir(spec);
-    let admitted = start_persistent_oci_machine(PersistentImageStartParams {
+    let boot_params = PersistentImageStartParams {
         name: &spec.name,
         image_label: &boot.label,
         resolved_digest: &boot.digest,
@@ -298,7 +335,19 @@ pub fn start_machine_spec(
         workload_dir: workload_dir.as_deref(),
         secrets,
         backend: host.backend(params.hypervisor),
-    })?;
+    };
+    #[cfg(unix)]
+    let admitted = if let Some(installed) = installed {
+        let boot_params = PersistentImageStartParams {
+            agent_verb: installed.agent_verbs(&spec.agent_verb)?,
+            ..boot_params
+        };
+        installed.start(boot_params, journal, fresh_state)?
+    } else {
+        persistent::start_persistent(boot_params, journal, fresh_state)?
+    };
+    #[cfg(not(unix))]
+    let admitted = persistent::start_persistent(boot_params, journal, fresh_state)?;
     Ok(MachineStart {
         resolved_digest: boot.digest,
         admitted,

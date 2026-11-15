@@ -11,8 +11,8 @@ use std::io::{Read, Write};
 
 use base64::Engine as _;
 use mvm_contract::protocol::mailbox::{
-    ContentType, SignedMailboxCapability, SignedMailboxDeliveryAck, SignedMailboxDeliveryLease,
-    SignedMailboxGuestReaderEnrollment,
+    ContentType, SignedDestinationReceipt, SignedMailboxCapability, SignedMailboxDeliveryAck,
+    SignedMailboxDeliveryLease, SignedMailboxGuestReaderEnrollment,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -25,12 +25,120 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Guest-local socket for explicit application Receive and ACK-after-processing.
 pub const GUEST_READER_SOCKET_PATH: &str = "/run/mvm/mailbox/receive.sock";
 
+/// An application operation for one already selected durable object pair. The
+/// original sender, recipient, signing keys and return route come from MVM's
+/// retained owners. The application supplies only its own stable logical IDs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObjectSubmissionV1 {
+    Call {
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+        correlation_id: mvm_contract::protocol::mailbox::CorrelationId,
+        #[serde(with = "payload_base64")]
+        payload: Vec<u8>,
+    },
+    Reply {
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+        original_call: Box<SignedMailboxDeliveryLease>,
+        #[serde(with = "payload_base64")]
+        payload: Vec<u8>,
+    },
+}
+impl ObjectSubmissionV1 {
+    pub fn message_id(&self) -> mvm_contract::protocol::mailbox::MessageId {
+        match self {
+            Self::Call { message_id, .. } | Self::Reply { message_id, .. } => *message_id,
+        }
+    }
+    pub fn payload(&self) -> &[u8] {
+        match self {
+            Self::Call { payload, .. } | Self::Reply { payload, .. } => payload,
+        }
+    }
+}
+impl std::fmt::Debug for ObjectSubmissionV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(match self {
+            Self::Call { .. } => "ObjectCallV1",
+            Self::Reply { .. } => "ObjectReplyV1",
+        })
+        .field("payload_len", &self.payload().len())
+        .finish_non_exhaustive()
+    }
+}
+
+/// The original source custodian supplies these public identifiers from the
+/// retained sealed request on its authenticated, host-CID connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalObjectSealV1 {
+    pub pair: [u8; 32],
+    pub sender_boot: mvm_contract::protocol::mailbox::BootId,
+    pub intent_sha256: [u8; 32],
+    pub delivery_id: mvm_contract::protocol::mailbox::DeliveryId,
+    pub ciphertext_commitment: [u8; 32],
+}
+
+pub fn original_object_intent_digest(submission: &ObjectSubmissionV1) -> Result<[u8; 32], Refusal> {
+    use sha2::{Digest, Sha256};
+    if submission.payload().len() > MAX_REQUEST_BYTES {
+        return Err(Refusal::Oversized(MAX_REQUEST_BYTES));
+    }
+    let serialized = serde_jcs::to_vec(submission).map_err(|_| Refusal::Malformed)?;
+    if serialized.len() > MAX_REQUEST_BYTES {
+        return Err(Refusal::Oversized(MAX_REQUEST_BYTES));
+    }
+    let mut h = Sha256::new();
+    h.update(b"mvm.mailbox.original-object-intent.v1\0");
+    h.update(serialized);
+    Ok(h.finalize().into())
+}
+
+impl OriginalObjectSealV1 {
+    /// Call with the source original's immutable retained envelope, independently
+    /// of any returned receipt. This value confers no forward or receive authority.
+    pub fn from_original(
+        pair: [u8; 32],
+        sender_boot: mvm_contract::protocol::mailbox::BootId,
+        submission: &ObjectSubmissionV1,
+        stored: &mvm_contract::protocol::mailbox::MailboxEnvelope,
+    ) -> Result<Self, Refusal> {
+        Ok(Self {
+            pair,
+            sender_boot,
+            intent_sha256: original_object_intent_digest(submission)?,
+            delivery_id: stored.routing.delivery_id,
+            ciphertext_commitment: stored.ciphertext_commitment,
+        })
+    }
+}
+
 /// One on-demand guest request. `Possession` answers the immediately preceding
 /// destination challenge on the same connection, not an arbitrary old one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderRequest {
+    SenderOrdinalV1 {
+        request: Box<super::sender_ordinal::SenderRequestV1>,
+    },
+    /// Fresh, read-only sample for the exact retained, unacknowledged Call.
+    AuthorizeObjectCallV1 {
+        pair: [u8; 32],
+        lease: Box<SignedMailboxDeliveryLease>,
+        challenge: [u8; 32],
+    },
+    GetObjectRoleV1 {
+        pair: [u8; 32],
+        boot: mvm_contract::protocol::mailbox::BootId,
+    },
     Receive,
+    SubmitObjectV1 {
+        pair: [u8; 32],
+        submission: Box<ObjectSubmissionV1>,
+    },
+    ReceiveObjectPairV1 {
+        pair: [u8; 32],
+    },
     Possession {
         signature: Vec<u8>,
     },
@@ -44,6 +152,32 @@ pub enum ReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApplicationReaderRequest {
+    SenderOrdinalV1 {
+        request: Box<super::sender_ordinal::ApplicationSenderRequestV1>,
+    },
+    /// Fresh, read-only sample for the exact retained, unacknowledged Call.
+    AuthorizeObjectCallV1 {
+        pair: [u8; 32],
+        lease: Box<SignedMailboxDeliveryLease>,
+        challenge: [u8; 32],
+    },
+    ObjectSubmissionStatusV1 {
+        pair: [u8; 32],
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+    },
+    StageObjectV1 {
+        pair: [u8; 32],
+        submission: Box<ObjectSubmissionV1>,
+    },
+    ReceiveObjectPairV1 {
+        pair: [u8; 32],
+    },
+    /// Feature availability only. The guest verifies the same boot again on dispatch.
+    CheckOutboundJournalV1 {
+        commitment: [u8; 32],
+        recipient: mvm_contract::protocol::mailbox::PrincipalId,
+        payload_bytes: u32,
+    },
     Receive,
     Ack {
         lease: Box<SignedMailboxDeliveryLease>,
@@ -54,6 +188,40 @@ pub enum ApplicationReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReaderResponse {
+    SenderPendingV1 {
+        handle: super::sender_ordinal::SenderOrdinalV1,
+    },
+    SenderAcceptedV1 {
+        handle: super::sender_ordinal::SenderOrdinalV1,
+        receipt: Box<SignedDestinationReceipt>,
+    },
+    SenderSettledV1 {
+        handle: super::sender_ordinal::SenderOrdinalV1,
+        retired_through: u64,
+    },
+    /// Guest proof of a current check against its enrolled original host.
+    ObjectCallAuthorityV1 {
+        role: Box<super::object_pair::role::SignedObjectRoleV1>,
+        enrollment: Box<SignedMailboxGuestReaderEnrollment>,
+        capability: Box<SignedMailboxCapability>,
+        signature: Vec<u8>,
+    },
+    /// Original source service -> guest agent only. Applications receive the verified V2.
+    ObjectSealAcceptedV1 {
+        original: OriginalObjectSealV1,
+        receipt: Box<mvm_contract::protocol::mailbox::SignedDestinationReceipt>,
+    },
+    ObjectRoleV1 {
+        signed: Box<super::object_pair::role::SignedObjectRoleV1>,
+    },
+    ObjectPendingV1 {
+        pair: [u8; 32],
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+    },
+    /// Returned only on the original local reader socket; never a delivery receipt.
+    OutboundJournalAvailableV1 {
+        commitment: [u8; 32],
+    },
     Challenge {
         enrollment: Box<SignedMailboxGuestReaderEnrollment>,
         capability: Box<SignedMailboxCapability>,
@@ -62,6 +230,21 @@ pub enum ReaderResponse {
     Delivery {
         lease: Box<SignedMailboxDeliveryLease>,
         content_type: ContentType,
+        #[serde(with = "payload_base64")]
+        payload: Vec<u8>,
+    },
+    /// Original destination-signed local-durable custody.
+    ObjectAcceptedV1 {
+        receipt: Box<mvm_contract::protocol::mailbox::SignedDestinationReceipt>,
+    },
+    /// The original guest has durably staged the operation locally.
+    ObjectStagedV1 {
+        pair: [u8; 32],
+        message_id: mvm_contract::protocol::mailbox::MessageId,
+    },
+    ObjectDeliveryV1 {
+        lease: Box<SignedMailboxDeliveryLease>,
+        header: Box<mvm_contract::protocol::mailbox::MailboxEnvelopeHeader>,
         #[serde(with = "payload_base64")]
         payload: Vec<u8>,
     },
@@ -176,15 +359,18 @@ impl Write for BoundedBytes {
     }
 }
 
-mod payload_base64 {
+pub(super) mod payload_base64 {
     use super::*;
     use serde::{Deserializer, Serializer, de::Error as _};
 
-    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(in crate::mailbox) fn serialize<S: Serializer>(
+        bytes: &[u8],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(in crate::mailbox) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(deserializer)?;
@@ -194,19 +380,31 @@ mod payload_base64 {
     }
 }
 
+/// During an original submission an incomplete verdict leaves acceptance unknown.
+/// A completely received invalid value is still a protocol refusal.
+pub fn read_submission_response(stream: &mut impl Read) -> Result<ReaderResponse, Refusal> {
+    read_frame_with_io(stream, MAX_RESPONSE_BYTES, Refusal::Unavailable)
+}
+
 fn read_frame<T: DeserializeOwned>(stream: &mut impl Read, limit: usize) -> Result<T, Refusal> {
+    read_frame_with_io(stream, limit, Refusal::Malformed)
+}
+
+fn read_frame_with_io<T: DeserializeOwned>(
+    stream: &mut impl Read,
+    limit: usize,
+    io_failure: Refusal,
+) -> Result<T, Refusal> {
     let mut len = [0u8; 4];
     stream
         .read_exact(&mut len)
-        .map_err(|_| Refusal::Malformed)?;
+        .map_err(|_| io_failure.clone())?;
     let len = u32::from_be_bytes(len) as usize;
     if !(READER_MAGIC.len()..=limit).contains(&len) {
         return Err(Refusal::Oversized(limit));
     }
     let mut body = vec![0; len];
-    stream
-        .read_exact(&mut body)
-        .map_err(|_| Refusal::Malformed)?;
+    stream.read_exact(&mut body).map_err(|_| io_failure)?;
     decode_body(&body)
 }
 

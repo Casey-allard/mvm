@@ -110,6 +110,7 @@ pub(super) fn boot_prepared(
     spec: &VmmSpec,
     files: mvm_vmm::driver::prepared_disks::PreparedBootFiles<'_>,
 ) -> Result<Box<dyn mvm_vmm::driver::traits::RunningVm>> {
+    files.require_no_workload_root()?;
     files.writable.validate_spec(spec)?;
     if let Some(data) = &files.data {
         data.validate_spec(spec)?;
@@ -443,6 +444,13 @@ impl ColdHvfOwner {
         )
     }
 
+    pub fn original_mailbox_target(
+        &self,
+    ) -> Result<mvm_vmm::host::hvf_stop::mailbox::OriginalMailboxTarget> {
+        self.validate_live()?;
+        self.inner().owned()?.mailbox_target()
+    }
+
     pub fn call_unary(
         &mut self,
         request: &mvm_agentd::vsock::GuestRequest,
@@ -769,6 +777,7 @@ mod tests {
                     &spec,
                     PreparedBootFiles {
                         kernel: None,
+                        workload_root: None,
                         writable: PreparedWritableDisks::empty(),
                         data: Some(data),
                     },

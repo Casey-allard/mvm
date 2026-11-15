@@ -1160,6 +1160,16 @@ pub fn mvm_keys_dir_at(mvm_home: impl AsRef<std::path::Path>) -> std::path::Path
     mvm_home.as_ref().join("keys")
 }
 
+/// Protected custody directory for a mailbox helper's original launcher.
+pub fn vm_mailbox_original_owner_at(keys_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    keys_dir
+        .join("mailbox-original-owners-v1")
+        .join(hex::encode(Sha256::digest(name.as_bytes())))
+}
+
+pub const ORIGINAL_MAILBOX_CLAIM: &str = "mailbox-paired-original-v1";
+
 /// Immutable checkpoint store: `<mvm_home>/checkpoints/`. Each checkpoint is
 /// a subdirectory `<id>/` holding `meta.json` + cloned `content/`.
 pub fn checkpoints_dir() -> std::path::PathBuf {

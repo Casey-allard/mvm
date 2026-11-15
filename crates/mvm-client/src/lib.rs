@@ -154,11 +154,18 @@ pub use drive::{DriveError, LocalDrive};
 pub use grants::{enforced_grants_of, record_enforced_grants};
 pub use inventory::{MachineInventoryRecord, WorkloadPosture};
 pub use launch::{
-    AccessMode, ExitReport, LaunchNetworkPolicy, LaunchOutcome, LaunchRequest,
+    AccessMode, ExitReport, HostLifetimeIntent, LaunchNetworkPolicy, LaunchOutcome, LaunchRequest,
     LaunchRequestBuilder, LaunchSource, LaunchVolumeSpec, LifecycleMode, MachineSecretRef,
     RemoveOptions,
 };
+#[cfg(unix)]
+pub use launch::{HostLifetimeLaunchFailure, UnusedHostLifetimePreparation};
 pub use local::{LocalBackend, auto_selected_backend_name, default_vcpus};
+#[cfg(unix)]
+pub use mvm_hostd::run::DirectTcpPolicy;
+#[cfg(unix)]
+pub use mvm_runtime::workload_runner::OwnedRetirement;
+
 pub use mvm_hostd::parent_death::exit_when_orphaned;
 pub use mvm_hostd::supervisor::inspection::secrets_scanner::SecretsScanner;
 pub use mvm_runtime::agent_session::replay_input;
@@ -188,6 +195,8 @@ pub use mvm_runtime::{
     WarmArtifactBuildPlan, WarmArtifactKey, WarmArtifactPlanResolver, WarmArtifactStore,
     WarmArtifactWorker, WarmGoldenVmFactory,
 };
+#[cfg(unix)]
+pub use mvm_vmm::host::network_endpoint_spawn::EndpointRetirement;
 pub use oci_bundle::{
     MaterializedOciBundle, OciBundleRequest, OciBundleResult, export_materialized_oci_bundle,
     materialize_and_export_oci_bundle, materialize_oci_bundle,

@@ -39,6 +39,9 @@ fn fixture() -> (
     };
     let epoch = ExecutionEpoch::new(7).unwrap();
     let plan = MailboxGrant {
+        durable_object_pair_sha256_v1: None,
+        incoming_journal_policy_sha256_v1: None,
+        outbound_journal_v1: None,
         mailbox: address.mailbox,
         authority_key: authority.verifying_key().to_bytes(),
         epoch,
@@ -94,6 +97,8 @@ fn fixture() -> (
 fn own_mailbox_grant_mints_a_distinct_boot_bound_receive_capability() {
     let (authority, guest, grant, plan_id, plan_nonce, mut send, mut enrollment) = fixture();
     let binding = MailboxReaderBootBinding {
+        durable_object_pair_sha256_v1: None,
+        outbound_journal_v1: None,
         plan_id: plan_id.clone(),
         plan_nonce: plan_nonce.clone(),
         mailbox: grant.mailbox,
@@ -398,6 +403,7 @@ fn lease_and_ack_signatures_bind_committed_ciphertext_and_consumer() {
     .unwrap();
     let lease = sign_delivery_lease(
         MailboxDeliveryLease {
+            object_projection_v1: None,
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
             address: receive.address,
@@ -418,6 +424,14 @@ fn lease_and_ack_signatures_bind_committed_ciphertext_and_consumer() {
         &authority,
     )
     .unwrap();
+    // A legacy Cast never acquires header projection or an object response.
+    assert!(
+        serde_json::to_value(&lease.lease)
+            .unwrap()
+            .get("object_projection_v1")
+            .is_none()
+    );
+    test_object_projection(&header, &lease, &authority);
     let authority_vk = authority.verifying_key();
     let context = ReaderDeliveryContext {
         plan: &plan,
@@ -577,5 +591,72 @@ fn lease_and_ack_signatures_bind_committed_ciphertext_and_consumer() {
     assert!(
         verify_ack(&ack, ConsumerSessionId::from_bytes([47; 32])).is_err(),
         "an inherited or stale reader session must not ACK this lease"
+    );
+}
+
+fn test_object_projection(
+    original: &MailboxEnvelopeHeader,
+    legacy: &SignedMailboxDeliveryLease,
+    key: &SigningKey,
+) {
+    use mvm_contract::protocol::mailbox::ReplyRoute;
+    use mvm_core::mailbox::reader::{
+        object_delivery_commitment, verify_object_delivery_projection,
+    };
+    let pair = [0xe5; 32];
+    let mut header = original.clone();
+    header.kind = MailboxMessageKind::Call;
+    header.content_type = ContentType::parse("application/spiralcore-object", 1).unwrap();
+    header.reply_to = Some(ReplyRoute {
+        address: legacy.lease.address,
+        capability_id: CapabilityId::from_bytes([55; 32]),
+    });
+    let mut projected = legacy.lease.clone();
+    projected.object_projection_v1 =
+        Some(object_delivery_commitment(&pair, &header, b"hello").unwrap());
+    let signed = sign_delivery_lease(projected, key).unwrap();
+    let check = |pair: &[u8; 32],
+                 h: &MailboxEnvelopeHeader,
+                 data: &[u8],
+                 lease: &SignedMailboxDeliveryLease| {
+        verify_object_delivery_projection(pair, h, data, lease, &key.verifying_key())
+    };
+    check(&pair, &header, b"hello", &signed).unwrap();
+    assert!(check(&pair, &header, b"hello", legacy).is_err());
+    assert!(check(&pair, &header, b"hell!", &signed).is_err());
+    assert!(check(&[8; 32], &header, b"hello", &signed).is_err());
+    let mut changed = header.clone();
+    changed.correlation_id = CorrelationId::from_bytes([91; 32]);
+    assert!(check(&pair, &changed, b"hello", &signed).is_err());
+    changed = header.clone();
+    changed.reply_to.as_mut().unwrap().capability_id = CapabilityId::from_bytes([93; 32]);
+    assert!(check(&pair, &changed, b"hello", &signed).is_err());
+    let mut forged = signed.clone();
+    forged.lease.object_projection_v1 =
+        Some(object_delivery_commitment(&pair, &changed, b"hello").unwrap());
+    assert!(check(&pair, &changed, b"hello", &forged).is_err());
+}
+
+#[cfg(not(unix))]
+#[test]
+fn unsupported_host_refuses_boot_file_authority() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let error = MailboxReaderBootBinding::load(directory.path())
+        .expect_err("unsupported boot file loading");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .expect("typed refusal")
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    let error = MailboxReaderBootBinding::load_guest_original()
+        .expect_err("unsupported guest boot authority");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .expect("typed refusal")
+            .kind(),
+        std::io::ErrorKind::Unsupported
     );
 }

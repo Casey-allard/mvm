@@ -9,7 +9,6 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -73,7 +72,7 @@ pub(super) struct UdpRelayParams {
     pub(super) socket: std::net::UdpSocket,
     pub(super) poll: Poll,
     pub(super) session: Arc<Mutex<Session>>,
-    pub(super) writer: Arc<Mutex<UnixStream>>,
+    pub(super) writer: Arc<super::wire::SharedWriter>,
     pub(super) idle_timeout: Duration,
     pub(super) max_peers: usize,
     pub(super) peer_admission: UdpPeerAdmission,

@@ -1563,6 +1563,7 @@ mod tests {
             manifest.assemblies.insert(
                 arch,
                 guest_bins::assembly::RuntimeAssembly {
+                    mailbox_reader_v1: None,
                     assembly_format: guest_bins::assembly::RUNTIME_ASSEMBLY_FORMAT,
                     arch,
                     protocol_version: mvm_agentd::vsock::PROTOCOL_VERSION,

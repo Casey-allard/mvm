@@ -75,10 +75,21 @@ impl PreparedCanonicalLinux {
     pub fn generation_dir(&self) -> &Path {
         self.inputs.generation_dir()
     }
+    #[cfg(unix)]
+    pub fn generation_directory_file(&self) -> &std::fs::File {
+        self.inputs.generation_directory_file()
+    }
     pub fn kernel_path(&self) -> std::path::PathBuf {
         self.view_path
             .join(self.declaration.artifacts[0].name.as_str())
     }
+    pub fn workload_root_declaration(&self) -> Result<&crate::plan::bundle::BundleArtifact> {
+        self.inputs
+            .manifest()
+            .find_by_role(&crate::plan::bundle::ArtifactRole::Rootfs)
+            .ok_or_else(|| anyhow::anyhow!("canonical bundle has no signed workload root"))
+    }
+
     /// Digest selected by the canonical signed Linux root, not by the app key.
     pub fn kernel_sha256(&self) -> &str {
         self.declaration.artifacts[0].sha256.as_str()
@@ -317,6 +328,21 @@ pub fn prepare_canonical_linux(
     trust: &dyn TrustStore,
 ) -> Result<PreparedCanonicalLinux> {
     let inputs = capture_canonical_linux_inputs(archive, pin, trust)?;
+    prepare_with_clock(inputs, backend, host_protocols, Utc::now)
+}
+
+/// Capture and authenticate at most the funded decoded archive extent.
+#[cfg(feature = "host-state")]
+pub fn prepare_funded_canonical_linux(
+    archive: &Path,
+    pin: &PlanArtifact,
+    backend: BackendKind,
+    host_protocols: HostProtocolSupport,
+    trust: &dyn TrustStore,
+    bytes: std::num::NonZeroU64,
+) -> Result<PreparedCanonicalLinux> {
+    let inputs =
+        crate::plan::bundle::capture_canonical_with_extent(archive, pin, trust, Some(bytes))?;
     prepare_with_clock(inputs, backend, host_protocols, Utc::now)
 }
 
@@ -573,6 +599,22 @@ mod tests {
         feed_signature: &[u8],
         canonical: bool,
     ) -> Frame {
+        frame_with_feed(
+            kernel,
+            linux,
+            root_signature,
+            (FEED, feed_signature),
+            canonical,
+        )
+    }
+
+    fn frame_with_feed(
+        kernel: &[u8],
+        linux: &[u8],
+        root_signature: &[u8],
+        (feed, feed_signature): (&[u8], &[u8]),
+        canonical: bool,
+    ) -> Frame {
         let directory = tempfile::tempdir().unwrap();
         let archive = directory.path().join("app.mvmpkg");
         let key = SigningKey::from_bytes(&[73; 32]);
@@ -602,9 +644,10 @@ mod tests {
         }
         let mut payload: Vec<(String, Vec<u8>)> = [
             ("kernel", kernel),
+            ("rootfs", b"fixture workload filesystem"),
             ("linux.json", linux),
             ("linux.bundle", root_signature),
-            ("revocations.json", FEED),
+            ("revocations.json", feed),
             ("revocations.bundle", feed_signature),
         ]
         .into_iter()
@@ -643,6 +686,7 @@ mod tests {
                         path: path.clone(),
                         role: match name {
                             "kernel" => ArtifactRole::Kernel,
+                            "rootfs" => ArtifactRole::Rootfs,
                             "initrd" => ArtifactRole::Initrd,
                             _ => ArtifactRole::Other,
                         },
@@ -664,6 +708,43 @@ mod tests {
             trust,
         }
     }
+    #[test]
+    fn funded_canonical_capture_bounds_actual_plain_and_decoded_gzip_extent() {
+        use std::io::Write;
+        let home = tempfile::tempdir().unwrap();
+        let mut env = TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        let kernel = b"unit kernel";
+        let original = frame(
+            kernel,
+            &coherent_application_replacement(kernel),
+            published_root::BUNDLE,
+            FEED_SIGNATURE,
+            true,
+        );
+        let archive = std::fs::read(&original.archive).unwrap();
+        let gz = original.archive.with_extension("gz");
+        let mut encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&gz).unwrap(),
+            flate2::Compression::fast(),
+        );
+        encoder.write_all(&archive).unwrap();
+        encoder.finish().unwrap();
+        for source in [&original.archive, &gz] {
+            let capture = |size| {
+                crate::plan::bundle::capture_canonical_with_extent(
+                    source,
+                    &original.pin,
+                    &original.trust,
+                    std::num::NonZeroU64::new(size),
+                )
+            };
+            assert!(capture(archive.len() as u64 - 1).is_err());
+            assert!(capture(archive.len() as u64 + 1).is_err());
+            assert_eq!(capture(archive.len() as u64).unwrap().pin(), &original.pin);
+        }
+    }
+
     fn coherent_application_replacement(kernel: &[u8]) -> Vec<u8> {
         let mut linux: ImageSetManifest = serde_json::from_slice(published_root::MANIFEST).unwrap();
         let member = linux
@@ -798,7 +879,7 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "requires the actual pinned public kernel in MVM_TEST_CANONICAL_KERNEL; no download"]
+    #[ignore = "requires MVM_TEST_CANONICAL_KERNEL and current MVM_TEST_CANONICAL_REVOCATIONS with its adjacent signature"]
     fn genuine_owner_rejects_substitution_and_retains_failed_start_generation() {
         let kernel = std::fs::read(
             std::env::var_os("MVM_TEST_CANONICAL_KERNEL").expect("public kernel path"),
@@ -807,36 +888,47 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut env = TestEnv::new();
         env.isolate_mvm_home(home.path());
-        let frame = frame(
+        let feed_path = PathBuf::from(
+            std::env::var_os("MVM_TEST_CANONICAL_REVOCATIONS")
+                .expect("current signed revocations.json path"),
+        );
+        let feed = std::fs::read(&feed_path).unwrap();
+        let signature = std::fs::read(feed_path.with_extension("json.bundle")).unwrap();
+        let frame = frame_with_feed(
             &kernel,
             published_root::MANIFEST,
             published_root::BUNDLE,
-            FEED_SIGNATURE,
+            (&feed, &signature),
             true,
         );
-        let owner = Arc::new(
-            prepare_with_clock(frame.capture().unwrap(), BackendKind::Hvf, inside_window).unwrap(),
-        );
+        let backend = if cfg!(target_os = "linux") {
+            BackendKind::Firecracker
+        } else {
+            BackendKind::Hvf
+        };
+        let owner =
+            Arc::new(prepare_with_clock(frame.capture().unwrap(), backend, Utc::now).unwrap());
+        let root = owner.workload_root_declaration().unwrap();
+        assert_eq!(root.sha256, sha256_hex(b"fixture workload filesystem"));
+        assert_eq!(root.size_bytes, b"fixture workload filesystem".len() as u64);
         let mut config = crate::vm_backend::VmStartConfig {
             name: "canonical-owner-unit".into(),
             ..Default::default()
         };
         owner.bind_to_config(&mut config).unwrap();
-        owner
-            .verify_config(&config, BackendKind::Hvf, &test_host())
-            .unwrap();
+        owner.verify_config(&config, backend, &test_host()).unwrap();
         let mut replaced = config.clone();
         replaced.kernel_path = Some("/tmp/not-the-owned-kernel".into());
         assert!(
             owner
-                .verify_config(&replaced, BackendKind::Hvf, &test_host())
+                .verify_config(&replaced, backend, &test_host())
                 .is_err()
         );
         replaced = config.clone();
         replaced.name = "another-vm".into();
         assert!(
             owner
-                .verify_config(&replaced, BackendKind::Hvf, &test_host())
+                .verify_config(&replaced, backend, &test_host())
                 .is_err()
         );
         assert!(
@@ -846,29 +938,24 @@ mod tests {
         );
         let mut protocols = test_host();
         protocols.builder_cache_contract += 1;
-        assert!(
-            owner
-                .verify_config(&config, BackendKind::Hvf, &protocols)
-                .is_err()
-        );
-        let other = Arc::new(
-            prepare_with_clock(frame.capture().unwrap(), BackendKind::Hvf, inside_window).unwrap(),
-        );
+        assert!(owner.verify_config(&config, backend, &protocols).is_err());
+        let other =
+            Arc::new(prepare_with_clock(frame.capture().unwrap(), backend, Utc::now).unwrap());
         replaced = config.clone();
         replaced.canonical_kernel = Some(other);
         assert!(
             owner
-                .verify_config(&replaced, BackendKind::Hvf, &test_host())
+                .verify_config(&replaced, backend, &test_host())
                 .is_err()
         );
         let generation = owner.generation_dir().to_owned();
         let selected = owner.kernel_path();
         owner
-            .retain_for_native_handoff(&config, BackendKind::Hvf, &test_host())
+            .retain_for_native_handoff(&config, backend, &test_host())
             .unwrap();
         assert!(
             owner
-                .retain_for_native_handoff(&config, BackendKind::Hvf, &test_host())
+                .retain_for_native_handoff(&config, backend, &test_host())
                 .is_err()
         );
         assert!(owner.bind_to_config(&mut config).is_err());

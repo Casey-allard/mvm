@@ -45,8 +45,15 @@ pub async fn serve(
         let workload_id = workload_id.clone();
         let tenant_id = tenant_id.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, registry, workload_id, tenant_id, max_frame_bytes).await
+            if let Err(e) = handle_connection(
+                stream,
+                registry,
+                workload_id,
+                tenant_id,
+                max_frame_bytes,
+                None,
+            )
+            .await
             {
                 warn!(error = %e, "mvm-broker connection terminated with error");
             }
@@ -68,14 +75,111 @@ pub async fn serve_on_listener(
     serve(listener, registry, workload_id, tenant_id, max_frame_bytes).await
 }
 
-async fn handle_connection(
-    mut stream: UnixStream,
+/// Local workspaces and I/O fence shared by both owned VM queues.
+/// This pair is not a managed parent reservation.
+pub struct OwnedBrokerResources {
+    pub workspaces: crate::owned_resources::WorkspacePool,
+    pub admission: Arc<crate::owned_resources::registered::RegistrationAdmission>,
+}
+
+/// Owned accept loop: stop closes admission and joins every accepted task.
+pub async fn serve_owned_on_listener(
+    listener: crate::owned_resources::registered::RegisteredListener,
     registry: Arc<Registry>,
     workload_id: String,
     tenant_id: String,
     max_frame_bytes: usize,
+    resources: OwnedBrokerResources,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
-    let call = read_frame::<ServiceCall>(&mut stream, max_frame_bytes).await?;
+    let OwnedBrokerResources {
+        workspaces,
+        admission,
+    } = resources;
+    let mut calls = tokio::task::JoinSet::new();
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop => break Ok(()),
+            _ = admission.closed() => break Err(anyhow::anyhow!("owned I/O admission fenced")),
+            Some(result) = calls.join_next(), if !calls.is_empty() => {
+                if let Err(error) = result {
+                    break Err(anyhow::anyhow!("owned broker task failed: {error}"));
+                }
+            }
+            accepted = listener.accept(), if calls.len() < 32 => {
+                let stream = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error).context("owned broker accept"),
+                };
+                let registry = registry.clone();
+                let workload_id = workload_id.clone();
+                let tenant_id = tenant_id.clone();
+                let workspaces = workspaces.clone();
+                let future = async move {
+                    if let Err(error) = handle_connection(
+                        stream, registry, workload_id, tenant_id, max_frame_bytes, Some(workspaces),
+                    ).await {
+                        warn!(error = %error, "owned broker connection terminated");
+                    }
+                };
+                if let Err(error) = crate::owned_resources::task_size(&future) { break Err(error); }
+                calls.spawn(future);
+            }
+        }
+    };
+    drop(listener);
+    calls.abort_all();
+    let mut joined = Ok(());
+    while let Some(result) = calls.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            joined = Err(anyhow::anyhow!("owned broker task join failed: {error}"));
+        }
+    }
+    outcome
+        .and(joined)
+        .and(admission.check().map_err(anyhow::Error::from))
+}
+
+async fn handle_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    registry: Arc<Registry>,
+    workload_id: String,
+    tenant_id: String,
+    max_frame_bytes: usize,
+    workspaces: Option<crate::owned_resources::WorkspacePool>,
+) -> Result<()> {
+    let _workspace = if let Some(pool) = &workspaces {
+        Some(pool.acquire().await?)
+    } else {
+        None
+    };
+    let call = if workspaces.is_some() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::framing::read_json_frame_checked::<_, ServiceCall>(
+                &mut stream,
+                max_frame_bytes,
+                crate::owned_resources::validate_shape,
+            ),
+        )
+        .await
+        .context("owned broker parse deadline")??
+    } else {
+        crate::framing::read_json_frame::<_, ServiceCall>(&mut stream, max_frame_bytes)
+            .await
+            .context("mvm-broker frame read failed")?
+    };
+    if workspaces.is_some() {
+        anyhow::ensure!(
+            call.service.as_str().len() <= 256
+                && call.verb.len() <= 256
+                && call.correlation_id.as_str().len() <= 128,
+            "owned persistent service key limit"
+        );
+    }
     // Reassign a server-authoritative correlation id at ingress: the
     // guest-supplied `call.correlation_id` is NEVER trusted — a workload could
     // otherwise choose an id that collides with or impersonates another entry
@@ -136,7 +240,13 @@ async fn handle_connection(
         },
     };
 
-    write_frame(&mut stream, &response).await?;
+    if workspaces.is_some() {
+        crate::framing::write_json_frame_bounded(&mut stream, &response, max_frame_bytes).await?;
+    } else {
+        crate::framing::write_json_frame(&mut stream, &response)
+            .await
+            .context("mvm-broker frame write failed")?;
+    }
     stream
         .shutdown()
         .await

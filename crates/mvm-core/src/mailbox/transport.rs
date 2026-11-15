@@ -480,6 +480,12 @@ impl ChannelLimits {
         self.max_frame_bytes
     }
 
+    /// Maximum encoded bytes the original channel may keep pending.
+    #[must_use]
+    pub const fn max_pending_bytes(self) -> usize {
+        self.max_pending_bytes
+    }
+
     pub fn new(max_frame_bytes: usize, max_pending_bytes: usize) -> Result<Self, TransportError> {
         if max_frame_bytes == 0
             || max_frame_bytes > MAX_ENCODED_ENVELOPE_BYTES
@@ -528,6 +534,13 @@ pub struct PreparedMailboxEnvelope {
 }
 
 impl PreparedMailboxEnvelope {
+    /// Borrow the exact header paired with this prepared outbound envelope.
+    /// Capability and transport authorization are still required before send.
+    #[must_use]
+    pub fn header(&self) -> &MailboxEnvelopeHeader {
+        &self.header
+    }
+
     #[must_use]
     pub fn envelope(&self) -> &MailboxEnvelope {
         &self.envelope
@@ -556,6 +569,12 @@ pub struct AuthorizedMailboxFrame {
 }
 
 impl AuthorizedMailboxFrame {
+    /// Borrow the canonical envelope bytes that passed outbound admission.
+    #[must_use]
+    pub fn encoded_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+
     /// Canonical envelope length, excluding the separately carried capability.
     #[must_use]
     pub fn encoded_len(&self) -> usize {

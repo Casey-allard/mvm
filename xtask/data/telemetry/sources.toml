@@ -392,7 +392,7 @@ note = "The host-dial allow-list admits machine control, telemetry and the dev c
 
 [[backend_endpoint]]
 backend = "firecracker"
-file = "crates/mvm-backends/src/driver/fc.rs"
+file = "crates/mvm-backends/src/driver/fc/running.rs"
 anchor = "host_dialable_port"
 note = "Host-dialed ports, telemetry included, ride the single vsock UDS CONNECT handshake."
 

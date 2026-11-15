@@ -13,6 +13,43 @@ service available; omitting it leaves networking closed. Retired raw-stack
 fields and packet-tunnel plan values are rejected with migration guidance
 instead of silently selecting another path.
 
+The contributor SDK exposes an opt-in direct TCP payload mapping through
+`LocalBackend::try_launch_with_host_lifetime_and_direct_policy`. The operator
+provides an externally signed plan for a local portable bundle, the cooperating
+peer mapping and routes covered by its signed `network_policy` digest, and an
+installation owner that funds the endpoint. A mapped `OpenTcp` first passes
+the ordinary destination and protocol checks. The installed endpoint authenticates
+the enrolled peer on that same TCP connection before exchanging object data.
+Omitting the mapping keeps the ordinary FlowMux path.
+
+The selected endpoint uses the original registration's audit signer and bounded
+worker and cache allocation. On Linux, the process address-space limit must fit
+within the reservation. A failed peer handshake closes that connection and
+returns the stream reservation. Guest ingress, UDP, typed HTTP, secret
+substitution and delegated proxies have no selected mapping in this profile.
+Starting the endpoint binary alone cannot select it.
+
+The installed SmallV1 object receiver keeps the parent and child directory
+descriptors admitted by that owner. Store operations and retirement stay
+relative to those held descriptors. Before spawning the selected endpoint,
+the original partition guard must confirm funding for one serial receiver:
+seven descriptors and a 1 MiB store workspace in addition to the codec operation
+charge. Providers that do not implement this check refuse activation. A
+projection or cache digest does not grant resource or mailbox authority.
+
+Cancellation closes the original guest transport through one shared wake
+handle. Setup, relay and lease fencing reuse a successful shutdown; a failed
+kernel shutdown remains an error. Shutdown alone does not release storage:
+the owner must collect the original reader and verify retirement of the
+original store. An uncertain join or changed directory retains its charge.
+
+The SDK checks the native backend's lifetime support before launch. Releasing a
+VM reservation requires the original owner's proof of disposal or a proved
+pre-spawn refusal. A successful endpoint shutdown settles its own allocation.
+For a Linux VMM that has started, the kernel exit observation must match both
+the launch binding and the held installation lease. A missing process ID or
+socket cannot settle the VM reservation.
+
 ```sh
 mvmctl machine run \
   --allow-host api.example.com:443 \
@@ -155,3 +192,22 @@ guest application
 Control and data share the authenticated FlowMux protocol but retain bounded,
 independent progress. Saturating one flow cannot create an unbounded queue or
 silently widen another flow's authority.
+
+
+### Canonical Linux input for an installed direct TCP endpoint
+
+The local SDK entry `try_launch_with_canonical_direct_policy` takes the externally
+signed request, the original prepared host lifetime, its direct TCP mapping, and the
+same `Arc<PreparedCanonicalLinux>` created for the installed signed bundle. The
+parent checks its reservation before MVM resolves installed artifacts. The kernel,
+CLI runtime release, workload root digest and length must agree with the original
+signed inputs.
+
+The parent also authorizes one full private copy of the workload root into the
+original kernel-generation directory. MVM caps writes at the signed length,
+checks the private file digest, unlinks it and passes its read-only descriptor to
+the backend. The storage reservation must cover this copy through final release.
+Preparing the archive, kernel, runtime and temporary files consumes additional
+resources. A deployment providing this profile must fund and enforce those
+resources separately. Canonical FlowMux still applies destination and tenant policy
+on each network operation.

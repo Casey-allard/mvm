@@ -4,7 +4,36 @@
 //! Callers must obtain the scope from an authenticated current guest boot and
 //! persist one-time challenge use before publishing a lease.
 
+mod compatibility;
+pub use compatibility::{
+    LEGACY_MAILBOX_READER_BOOT_BYTES, MailboxReaderCompatibilityV1, MailboxReaderFeatureV1,
+    require_mailbox_reader_compatibility, require_mailbox_reader_grant,
+};
+
+/// Compiled reader definitions and parser used for runtime declarations.
+pub const COMPILED_MAILBOX_READER_INPUTS: &[(&str, &[u8])] = &[
+    (
+        "crates/mvm-core/src/mailbox/reader.rs",
+        include_bytes!("reader.rs"),
+    ),
+    (
+        "crates/mvm-core/src/mailbox/reader/compatibility.rs",
+        include_bytes!("reader/compatibility.rs"),
+    ),
+    (
+        "crates/mvm-core/src/mailbox/reader/platforms/unix.rs",
+        include_bytes!("reader/platforms/unix.rs"),
+    ),
+];
+
 use std::path::Path;
+
+#[cfg(unix)]
+#[path = "reader/platforms/unix.rs"]
+mod platform;
+#[cfg(not(unix))]
+#[path = "reader/platforms/unsupported.rs"]
+mod platform;
 
 use anyhow::{Context as _, Result as AnyResult};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -20,16 +49,80 @@ use sha2::{Digest as _, Sha256};
 
 use super::{MailboxError, canonical_bytes, sign_capability, verify_capability_signature};
 
+/// Digest committed by the original destination lease after canonical opening.
+pub fn object_delivery_commitment(
+    pair: &[u8; 32],
+    header: &MailboxEnvelopeHeader,
+    payload: &[u8],
+) -> Result<[u8; 32], MailboxError> {
+    use mvm_contract::protocol::mailbox::MailboxMessageKind;
+    if header.content_type.name() != "application/spiralcore-object"
+        || header.content_type.version() != 1
+        || !matches!(
+            (header.kind, header.reply_to.is_some()),
+            (MailboxMessageKind::Call, true) | (MailboxMessageKind::Reply, false)
+        )
+    {
+        return Err(MailboxError::UnsupportedContentType);
+    }
+    if payload.len() != header.plaintext_len as usize {
+        return Err(MailboxError::PlaintextLengthMismatch);
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"mvm.mailbox.object-reader-lease.v1\0");
+    digest.update(pair);
+    let data = canonical_bytes(b"mvm.mailbox.object-reader-header.v1\0", header)?;
+    digest.update((data.len() as u64).to_be_bytes());
+    digest.update(data);
+    digest.update(header.plaintext_len.to_be_bytes());
+    digest.update(payload);
+    Ok(digest.finalize().into())
+}
+
+/// Check the returned application metadata against this authenticated destination narrowing.
+/// The caller separately verifies the current Receive grant, guest boot and consumer session.
+pub fn verify_object_delivery_projection(
+    pair: &[u8; 32],
+    header: &MailboxEnvelopeHeader,
+    payload: &[u8],
+    signed: &SignedMailboxDeliveryLease,
+    authority: &VerifyingKey,
+) -> Result<(), MailboxError> {
+    verify_delivery_lease_signature(signed, authority)?;
+    let lease = &signed.lease;
+    if lease.object_projection_v1 != Some(object_delivery_commitment(pair, header, payload)?)
+        || lease.address
+            != (MailboxAddress {
+                tenant: header.tenant,
+                authorization_domain: header.authorization_domain,
+                mailbox: header.mailbox,
+                recipient: header.recipient,
+            })
+        || lease.message_id != header.message_id
+        || lease.sender != header.sender
+        || lease.sender_boot != header.sender_boot
+        || lease.execution_epoch != header.execution_epoch
+    {
+        return Err(MailboxError::DeliveryLeaseMismatch);
+    }
+    Ok(())
+}
+
 /// Name shared by the host writer and guest reader of one public boot binding.
 pub const MAILBOX_READER_BOOT_FILE: &str = "mailbox-reader-boot.json";
 /// Maximum encoded size before parsing a guest-visible boot binding.
-pub const MAX_MAILBOX_READER_BOOT_BYTES: u64 = 2048;
+pub const MAX_MAILBOX_READER_BOOT_BYTES: u64 = 8192;
 
 /// Public plan/boot/ACK-key binding projected into one cold guest identity
 /// drive and retained privately by the host for helper restart.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxReaderBootBinding {
+    /// Original signed pair selector. Legacy boot records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_object_pair_sha256_v1: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_journal_v1: Option<mvm_contract::protocol::mailbox::MailboxJournalDirectionV1>,
     pub plan_id: crate::plan::PlanId,
     pub plan_nonce: crate::plan::Nonce,
     pub mailbox: MailboxId,
@@ -59,7 +152,12 @@ impl MailboxReaderBootBinding {
         rand::rngs::SysRng
             .try_fill_bytes(&mut boot)
             .context("drawing system entropy for the mailbox reader boot")?;
+        if let Some(direction) = grant.outbound_journal_v1 {
+            super::outbound::check_projection(&grant, &direction)?;
+        }
         Ok(Self {
+            durable_object_pair_sha256_v1: grant.durable_object_pair_sha256_v1,
+            outbound_journal_v1: grant.outbound_journal_v1,
             plan_id: plan.plan_id.clone(),
             plan_nonce: plan.nonce.clone(),
             mailbox: grant.mailbox,
@@ -84,31 +182,19 @@ impl MailboxReaderBootBinding {
     }
 
     /// Reopen a bounded host record without following a symlink.
-    #[cfg(unix)]
     pub fn load(state_dir: &Path) -> AnyResult<Self> {
-        use std::io::Read as _;
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-        let path = state_dir.join(MAILBOX_READER_BOOT_FILE);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
-        let metadata = file.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file()
-                && metadata.nlink() == 1
-                && metadata.len() <= MAX_MAILBOX_READER_BOOT_BYTES,
-            "mailbox reader boot binding is not a bounded regular file"
-        );
-        let mut bytes = Vec::new();
-        file.take(MAX_MAILBOX_READER_BOOT_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        anyhow::ensure!(
-            bytes.len() as u64 <= MAX_MAILBOX_READER_BOOT_BYTES,
-            "mailbox reader boot binding exceeds the encoded bound"
-        );
-        serde_json::from_slice(&bytes).context("decode mailbox reader boot binding")
+        Self::load_binding(state_dir, false)
+    }
+
+    /// The workload reads only the public projection installed by the guest
+    /// agent from its identity drive. The original boot is never supplied in
+    /// application input or learned from the peer that is proving possession.
+    pub fn load_guest_original() -> AnyResult<Self> {
+        platform::load_guest_original()
+    }
+
+    fn load_binding(state_dir: &Path, guest_original: bool) -> AnyResult<Self> {
+        platform::load_binding(state_dir, guest_original)
     }
 
     /// Refuse a stale parent or moved mailbox before this boot can enroll.
@@ -120,6 +206,8 @@ impl MailboxReaderBootBinding {
             plan.plan_id == crate::plan::compute_plan_id(plan)
                 && self.plan_id == plan.plan_id
                 && self.plan_nonce == plan.nonce
+                && self.durable_object_pair_sha256_v1 == grant.durable_object_pair_sha256_v1
+                && self.outbound_journal_v1 == grant.outbound_journal_v1
                 && self.mailbox == grant.mailbox
                 && self.authority_key == grant.authority_key
                 && self.execution_epoch == grant.epoch
@@ -263,6 +351,149 @@ pub fn verify_guest_reader_enrollment(
         .map_err(|_| MailboxError::ReaderEnrollmentSignatureInvalid)?;
     VerifyingKey::from_bytes(&signed.enrollment.ack_public_key)
         .map_err(|_| MailboxError::ReaderKeyInvalid)
+}
+
+/// Bind the existing guest-held possession key to a fresh application nonce and
+/// an exact signed lease. An application challenge can never be passed directly
+/// to the destination's independent Receive possession exchange.
+pub fn object_call_challenge(
+    pair: &[u8; 32],
+    lease: &SignedMailboxDeliveryLease,
+    role: &super::object_pair::role::SignedObjectRoleV1,
+    nonce: &[u8; 32],
+) -> AnyResult<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(
+        *nonce != [0; 32] && lease.lease.object_projection_v1.is_some(),
+        "invalid object authorization challenge"
+    );
+    let mut h = Sha256::new();
+    h.update(b"mvm.mailbox.object-call-application.v1\0");
+    h.update(pair);
+    h.update(nonce);
+    h.update(lease.encode()?);
+    anyhow::ensure!(role.signature.len() == 64, "invalid signed object role");
+    h.update(&role.signature);
+    Ok(h.finalize().into())
+}
+
+/// Original guest and pair selected by the application before checking a delivery.
+pub struct ObjectCallAuthorityBuilder<'a> {
+    boot: &'a MailboxReaderBootBinding,
+    pair: &'a [u8; 32],
+}
+
+/// Borrowed evidence for one delivered Call. Construction alone grants no authority.
+pub struct ObjectCallAuthority<'a> {
+    original: ObjectCallAuthorityBuilder<'a>,
+    lease: &'a SignedMailboxDeliveryLease,
+    header: &'a MailboxEnvelopeHeader,
+    payload: &'a [u8],
+}
+
+impl<'a> ObjectCallAuthorityBuilder<'a> {
+    pub fn with_delivery(
+        self,
+        lease: &'a SignedMailboxDeliveryLease,
+        header: &'a MailboxEnvelopeHeader,
+        payload: &'a [u8],
+    ) -> ObjectCallAuthority<'a> {
+        ObjectCallAuthority {
+            original: self,
+            lease,
+            header,
+            payload,
+        }
+    }
+}
+
+impl<'a> ObjectCallAuthority<'a> {
+    pub fn builder(
+        boot: &'a MailboxReaderBootBinding,
+        pair: &'a [u8; 32],
+    ) -> ObjectCallAuthorityBuilder<'a> {
+        ObjectCallAuthorityBuilder { boot, pair }
+    }
+
+    /// Verify both original grants, the independent Receive, possession key,
+    /// signed header and body, and return route for the same still-live Call.
+    pub fn verify(
+        self,
+        nonce: &[u8; 32],
+        response: &super::reader_wire::ReaderResponse,
+        now: i64,
+    ) -> AnyResult<()> {
+        let Self {
+            original: ObjectCallAuthorityBuilder { boot, pair },
+            lease,
+            header,
+            payload,
+        } = self;
+        use super::{object_pair::role::ObjectParticipantRole, reader_wire::ReaderResponse};
+        use mvm_contract::protocol::mailbox::*;
+        let ReaderResponse::ObjectCallAuthorityV1 {
+            role,
+            enrollment,
+            capability,
+            signature,
+        } = response
+        else {
+            anyhow::bail!("missing original Call authorization")
+        };
+        let bound_challenge = object_call_challenge(pair, lease, role, nonce)?;
+        let role = role.verify(boot, now)?;
+        let l = &lease.lease;
+        let authority = VerifyingKey::from_bytes(&boot.authority_key)?;
+        anyhow::ensure!(
+            role.role == ObjectParticipantRole::Callee
+                && boot.durable_object_pair_sha256_v1 == Some(*pair)
+                && enrollment.enrollment.ack_public_key == boot.ack_public_key
+                && l.consumer_session == enrollment.enrollment.consumer_session
+                && header.kind == MailboxMessageKind::Call
+                && header.sender_boot == role.caller.boot
+                && header.sender == role.call.grant.subject
+                && header.capability_id == role.call.grant.capability_id
+                && l.address == role.call.grant.address
+                && header.policy_epoch == role.call.grant.policy_epoch
+                && header.content_type == role.call.grant.content_types[0]
+                && header.reply_to
+                    == Some(ReplyRoute {
+                        address: role.reply.grant.address,
+                        capability_id: role.reply.grant.capability_id
+                    })
+                && (header.issued_at_unix_ms..header.expires_at_unix_ms).contains(&now)
+                && payload.len() <= capability.grant.max_payload_bytes as usize
+                && capability
+                    .grant
+                    .content_types
+                    .contains(&header.content_type),
+            "unexpected original Call authority"
+        );
+        let grant = MailboxGrant {
+            durable_object_pair_sha256_v1: Some(*pair),
+            outbound_journal_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            mailbox: boot.mailbox,
+            authority_key: boot.authority_key,
+            epoch: boot.execution_epoch,
+            report: None,
+            retention: None,
+        };
+        let scope = MailboxGuestReaderScope {
+            plan: &grant,
+            plan_id: &boot.plan_id,
+            plan_nonce: &boot.plan_nonce,
+            receive: &capability.grant,
+            current_boot: boot.boot,
+            current_session: l.consumer_session,
+            now_unix_ms: now,
+        };
+        let ack = verify_guest_reader_enrollment(enrollment, capability, &scope, &authority, &[])?;
+        l.check_scope(&grant, &capability.grant, l.consumer_session, now)?;
+        verify_object_delivery_projection(pair, header, payload, lease, &authority)?;
+        verify_reader_possession(enrollment, &bound_challenge, signature, &ack)?;
+        Ok(())
+    }
 }
 
 fn possession_bytes(

@@ -33,6 +33,21 @@ use crate::host::broker_services_spawn::{
 };
 use crate::host::process_liveness::pid_is_alive;
 
+pub const OWNED_ASYNC_WORKERS_PER_PROCESS: usize = 2;
+pub const OWNED_BLOCKING_WORKERS_PER_PROCESS: usize = 2;
+/// Daemon and signer each have one main and one bounded Tokio runtime.
+pub const OWNED_TENANT_MAX_THREADS: usize =
+    2 * (1 + OWNED_ASYNC_WORKERS_PER_PROCESS + OWNED_BLOCKING_WORKERS_PER_PROCESS);
+
+mod owned;
+pub(crate) use owned::require_live_event;
+pub use owned::{
+    HostAgentParentPermit, OwnedAuditSideband, OwnedHostAgent, OwnedHostAgentInputs,
+    OwnedHostAgentRegistrar, OwnedHostAgentSpawnError, OwnedRegistrationError, OwnedVmRegistration,
+    PreparedEndpointAudit, RegisteredAuditFile, RegisteredEndpointOwner, owned_host_agent_service,
+    validate_owned_host_agent_services,
+};
+
 /// PID file for the per-tenant host-agent daemon, under `host_agent_dir`.
 pub const DAEMON_PID_FILE: &str = "daemon.pid";
 /// Executable name of the per-tenant host-agent daemon. A PID recorded in

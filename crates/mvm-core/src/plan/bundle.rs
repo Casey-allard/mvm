@@ -117,6 +117,8 @@ pub use declarations::{
 };
 #[cfg(feature = "host-state")]
 pub use lookup::existing_local_build_key;
+#[cfg(feature = "host-state")]
+pub use lookup::read_exact_bundle_archive;
 pub use lookup::{
     BundleResolveError, BundleResolver, FsBundleResolver, FsTrustStore, LocalBundleTrustStore,
     TrustStore,
@@ -131,11 +133,15 @@ pub(crate) use stream::archive_sha256;
 #[cfg(feature = "host-state")]
 pub(crate) use stream::HashingWriter;
 #[cfg(feature = "host-state")]
+pub(crate) use stream::capture_canonical_with_extent;
+#[cfg(feature = "host-state")]
 pub use stream::{
     BundlePayload, VerifiedBundleFile, capture_canonical_linux_inputs, open_archive,
-    read_bundle_archive, verify_bundle_file, write_bundle_to,
+    read_bundle_archive, verify_bundle_file, verify_exact_bundle_file, write_bundle_to,
 };
-pub use stream::{CapturedCanonicalLinuxInputs, MAX_IMAGE_SET_MANIFEST_BYTES};
+pub use stream::{
+    CapturedCanonicalLinuxInputs, MAX_IMAGE_SET_MANIFEST_BYTES, open_verified_bundle_artifact,
+};
 pub use verify_error::{BundleVerifyError, ensure_safe_path};
 
 /// Signed manifest label written by the local build front door.
@@ -745,7 +751,20 @@ pub fn verify_plan_bundle(
     resolver: &dyn BundleResolver,
     trust: &dyn TrustStore,
 ) -> Result<VerifiedBundle, PlanBundleError> {
-    verify_plan_bundle_checked(pin, resolver, trust, |verified| {
+    let archive = resolver
+        .resolve(&pin.bundle_sha256)
+        .map_err(PlanBundleError::Resolve)?;
+    verify_plan_bundle_bytes(pin, &archive, trust)
+}
+
+/// Verify already-read immutable archive bytes without cloning the source.
+#[cfg(feature = "host-state")]
+pub fn verify_plan_bundle_bytes(
+    pin: &PlanArtifact,
+    archive: &[u8],
+    trust: &dyn TrustStore,
+) -> Result<VerifiedBundle, PlanBundleError> {
+    verify_plan_bundle_checked_bytes(pin, archive, trust, |verified| {
         if verified
             .manifest
             .members
@@ -809,7 +828,17 @@ fn verify_plan_bundle_checked(
         .resolve(&pin.bundle_sha256)
         .map_err(PlanBundleError::Resolve)?;
 
-    let actual_sha = sha256_hex(&archive);
+    verify_plan_bundle_checked_bytes(pin, &archive, trust, admit_kernel)
+}
+
+#[cfg(feature = "host-state")]
+fn verify_plan_bundle_checked_bytes(
+    pin: &PlanArtifact,
+    archive: &[u8],
+    trust: &dyn TrustStore,
+    admit_kernel: impl FnOnce(&VerifiedBundle) -> Result<(), PlanBundleError>,
+) -> Result<VerifiedBundle, PlanBundleError> {
+    let actual_sha = sha256_hex(archive);
     if actual_sha != pin.bundle_sha256 {
         return Err(PlanBundleError::BundleSha256Mismatch {
             pinned: pin.bundle_sha256.clone(),
@@ -817,7 +846,7 @@ fn verify_plan_bundle_checked(
         });
     }
 
-    let verified = read_and_verify_bundle(&archive, trust).map_err(PlanBundleError::Verify)?;
+    let verified = read_and_verify_bundle(archive, trust).map_err(PlanBundleError::Verify)?;
 
     if verified.key_id != pin.key_id {
         return Err(PlanBundleError::KeyIdMismatch {
@@ -834,7 +863,7 @@ fn verify_plan_bundle_checked(
     // pin so a publisher who re-signs the same content with a new
     // envelope can't satisfy an old plan.
     let archive_sig =
-        extract_manifest_signature(&archive).map_err(|reason| PlanBundleError::SignatureRead {
+        extract_manifest_signature(archive).map_err(|reason| PlanBundleError::SignatureRead {
             reason: reason.to_string(),
         })?;
     let pin_sig = pin

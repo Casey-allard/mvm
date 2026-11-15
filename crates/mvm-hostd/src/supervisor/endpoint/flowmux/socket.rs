@@ -7,10 +7,8 @@
 //! frames and keeps receiving framed bytes without knowing that its peer is a
 //! process on this host rather than the destination.
 //!
-//! An enum rather than a boxed trait object: `try_clone` returns `Self`, which
-//! a trait object cannot express without another allocation and a second
-//! indirection, and there are exactly two backings — a third would be a new
-//! transport, not a new case to hide behind a vtable.
+//! There are two physical backings. An explicitly authenticated payload mapping
+//! decorates the admitted TCP connection; it does not add a third network route.
 
 use std::io::{Read, Result, Write};
 use std::net::{Shutdown, TcpStream};
@@ -20,9 +18,15 @@ use std::os::unix::net::UnixStream;
 #[derive(Debug)]
 pub(super) enum FlowSocket {
     /// The admitted upstream connection an opaque flow relays to.
-    Upstream(TcpStream),
+    Upstream(UpstreamPayload),
     /// The endpoint's half of the pair a terminated flow is driven over.
     Terminated(UnixStream),
+}
+
+#[derive(Debug)]
+pub(super) enum UpstreamPayload {
+    Plain(TcpStream),
+    Mapped(Box<dyn super::AuthenticatedTcpPayloadIo>),
 }
 
 impl FlowSocket {
@@ -30,7 +34,8 @@ impl FlowSocket {
     /// the session thread writes.
     pub(super) fn try_clone(&self) -> Result<Self> {
         match self {
-            Self::Upstream(stream) => stream.try_clone().map(Self::Upstream),
+            Self::Upstream(UpstreamPayload::Plain(stream)) => stream.try_clone().map(Self::from),
+            Self::Upstream(UpstreamPayload::Mapped(stream)) => stream.try_clone().map(Self::mapped),
             Self::Terminated(stream) => stream.try_clone().map(Self::Terminated),
         }
     }
@@ -39,15 +44,36 @@ impl FlowSocket {
     /// makes a blocked peer read unwind, on either backing.
     pub(super) fn shutdown(&self, how: Shutdown) -> Result<()> {
         match self {
-            Self::Upstream(stream) => stream.shutdown(how),
+            Self::Upstream(UpstreamPayload::Plain(stream)) => stream.shutdown(how),
+            Self::Upstream(UpstreamPayload::Mapped(stream)) => stream.shutdown(how),
             Self::Terminated(stream) => stream.shutdown(how),
         }
+    }
+    pub(super) fn mapped(stream: Box<dyn super::AuthenticatedTcpPayloadIo>) -> Self {
+        Self::Upstream(UpstreamPayload::Mapped(stream))
+    }
+    pub(super) fn close_reader_until(&self, until: std::time::Instant) -> Result<()> {
+        match self {
+            Self::Upstream(UpstreamPayload::Mapped(stream)) => stream.close_and_join_until(until),
+            Self::Upstream(UpstreamPayload::Plain(_)) | Self::Terminated(_) => Ok(()),
+        }
+    }
+    pub(super) fn mapped_clone(&self) -> Result<Option<Self>> {
+        match self {
+            Self::Upstream(UpstreamPayload::Mapped(stream)) => {
+                stream.try_clone().map(|stream| Some(Self::mapped(stream)))
+            }
+            Self::Upstream(UpstreamPayload::Plain(_)) | Self::Terminated(_) => Ok(None),
+        }
+    }
+    pub(super) fn is_mapped(&self) -> bool {
+        matches!(self, Self::Upstream(UpstreamPayload::Mapped(_)))
     }
 }
 
 impl From<TcpStream> for FlowSocket {
     fn from(stream: TcpStream) -> Self {
-        Self::Upstream(stream)
+        Self::Upstream(UpstreamPayload::Plain(stream))
     }
 }
 
@@ -60,7 +86,8 @@ impl From<UnixStream> for FlowSocket {
 impl Read for FlowSocket {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match self {
-            Self::Upstream(stream) => stream.read(buf),
+            Self::Upstream(UpstreamPayload::Plain(stream)) => stream.read(buf),
+            Self::Upstream(UpstreamPayload::Mapped(stream)) => stream.read(buf),
             Self::Terminated(stream) => stream.read(buf),
         }
     }
@@ -69,14 +96,16 @@ impl Read for FlowSocket {
 impl Write for FlowSocket {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         match self {
-            Self::Upstream(stream) => stream.write(buf),
+            Self::Upstream(UpstreamPayload::Plain(stream)) => stream.write(buf),
+            Self::Upstream(UpstreamPayload::Mapped(stream)) => stream.write(buf),
             Self::Terminated(stream) => stream.write(buf),
         }
     }
 
     fn flush(&mut self) -> Result<()> {
         match self {
-            Self::Upstream(stream) => stream.flush(),
+            Self::Upstream(UpstreamPayload::Plain(stream)) => stream.flush(),
+            Self::Upstream(UpstreamPayload::Mapped(stream)) => stream.flush(),
             Self::Terminated(stream) => stream.flush(),
         }
     }

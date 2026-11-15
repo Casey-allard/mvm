@@ -61,6 +61,7 @@ impl MailboxJournal {
             tip: JournalTip::genesis(),
             bytes: 0,
             records: 0,
+            deferred_retirees: None,
             seen: BTreeMap::new(),
             order: Vec::new(),
             used_challenges: BTreeMap::new(),
@@ -121,6 +122,9 @@ impl MailboxJournal {
             paths.into_iter().partition(|(cursor, _)| *cursor > start);
         paths.sort();
         let mut suffix_synced = false;
+        if paths.len() > limits.max_records.saturating_sub(journal.records) {
+            return Err(JournalError::Full);
+        }
         for (_, path) in paths {
             let cursor = journal
                 .tip
@@ -173,6 +177,9 @@ impl MailboxJournal {
                     receipt,
                     authorization_signature,
                 } => {
+                    if journal.seen.len() >= limits.max_records {
+                        return Err(JournalError::Full);
+                    }
                     let expected_outcome = match journal.tier {
                         AcceptanceTier::Independent => DeliveryOutcome::AcceptedDurable,
                         AcceptanceTier::Local => DeliveryOutcome::AcceptedLocalDurable,

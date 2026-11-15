@@ -287,12 +287,6 @@ const RAW_SITES: &[RawSite] = &[
     ),
     guest(
         "crates/mvm-agentd/src/lifecycle_hooks.rs",
-        "status",
-        "Command::new(script_path)",
-        "a workload lifecycle hook, run by the guest agent",
-    ),
-    guest(
-        "crates/mvm-agentd/src/lifecycle_hooks.rs",
         "spawn",
         "Command::new(script_path)",
         "a workload lifecycle hook, run by the guest agent",

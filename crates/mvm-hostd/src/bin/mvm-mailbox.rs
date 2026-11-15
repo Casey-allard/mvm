@@ -16,7 +16,27 @@ fn main() -> Result<()> {
     // First statement in the process: a panic before this line would print
     // its payload unredacted.
     mvm_hostd::panic_hook::install("mailbox");
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--original-object-endpoint-v1"))
+    {
+        anyhow::ensure!(
+            std::env::args_os().len() == 2,
+            "unexpected object worker arguments"
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return mvm_hostd::mailbox_process::serve_original_object();
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("original object worker unavailable on this platform");
+    }
     let raw = mvm_hostd::read_launch_config("mvm-mailbox")?;
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            mvm_hostd::mailbox_process::ORIGINAL_JOURNAL_V1,
+        ))
+    {
+        return mvm_hostd::mailbox_process::serve_original_launch(&raw)
+            .context("original mailbox service failed");
+    }
     let config = parse(&raw).context("mvm-mailbox config parse failed")?;
     std::process::exit(serve(config));
 }

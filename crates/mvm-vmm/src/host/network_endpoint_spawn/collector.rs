@@ -14,17 +14,80 @@ use super::{
 /// The collector's inputs for the VM at `state_dir`, without its records key.
 /// The collector authenticates through the tenant's resident signer helper.
 pub(super) fn telemetry_section(tenant: &str, state_dir: &Path) -> serde_json::Value {
-    serde_json::json!({
-        "state_dir": state_dir,
-        "telemetry_sock": mvm_core::config::vm_hvf_vsock_port_socket_at(
+    serde_json::to_value(TelemetrySection::canonical(tenant, state_dir, None))
+        .expect("canonical telemetry section serializes")
+}
+
+/// One canonical field projection, borrowed directly by installed encoding.
+/// This view conveys neither service authority nor a retained-disk grant.
+#[derive(serde::Serialize)]
+pub(super) struct TelemetrySection<'a> {
+    state_dir: &'a Path,
+    telemetry_sock: std::path::PathBuf,
+    signer_sock: std::path::PathBuf,
+    host_anchor_path: std::path::PathBuf,
+    records_byte_cap: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    records_key_b64: Option<&'a str>,
+}
+impl<'a> TelemetrySection<'a> {
+    fn canonical(tenant: &str, state_dir: &'a Path, records_key_b64: Option<&'a str>) -> Self {
+        Self {
             state_dir,
-            mvm_core::protocol::telemetry::TELEMETRY_PORT,
-        ),
-        "signer_sock": mvm_core::config::host_agent_signer_helper_socket(tenant),
-        "host_anchor_path": mvm_core::config::mvm_keys_dir()
-            .join(crate::host::broker_services_spawn::HOST_SIGNER_PUB),
-        "records_byte_cap": crate::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP,
-    })
+            telemetry_sock: mvm_core::config::vm_hvf_vsock_port_socket_at(
+                state_dir,
+                mvm_core::protocol::telemetry::TELEMETRY_PORT,
+            ),
+            signer_sock: mvm_core::config::host_agent_signer_helper_socket(tenant),
+            host_anchor_path: mvm_core::config::mvm_keys_dir()
+                .join(crate::host::broker_services_spawn::HOST_SIGNER_PUB),
+            records_byte_cap: crate::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP,
+            records_key_b64,
+        }
+    }
+    pub(super) fn owned(tenant: &str, state_dir: &'a Path, key: &'a str) -> Result<Self> {
+        use base64::Engine as _;
+        anyhow::ensure!(
+            state_dir.as_os_str().len() <= 4096 && key.len() == 44,
+            "installed telemetry configuration shape refused"
+        );
+        // 44 encoded bytes have a conservative 33-byte decode estimate;
+        // the canonical padded key must still decode to exactly 32 bytes.
+        let mut decoded = zeroize::Zeroizing::new([0; 33]);
+        anyhow::ensure!(
+            base64::engine::general_purpose::STANDARD
+                .decode_slice(key, &mut decoded[..])
+                .ok()
+                == Some(32),
+            "installed telemetry key encoding refused"
+        );
+        let section = Self::canonical(tenant, state_dir, Some(key));
+        anyhow::ensure!(
+            [
+                &section.telemetry_sock,
+                &section.signer_sock,
+                &section.host_anchor_path
+            ]
+            .into_iter()
+            .all(|path| path.as_os_str().len() <= 4096),
+            "installed telemetry paths exceed bound"
+        );
+        Ok(section)
+    }
+    pub(super) fn keys_directory(&self) -> Result<&Path> {
+        self.host_anchor_path
+            .parent()
+            .ok_or_else(|| anyhow!("installed canonical key directory missing"))
+    }
+    pub(super) fn with_key<'b>(self, key: &'b str) -> Result<TelemetrySection<'b>>
+    where
+        'a: 'b,
+    {
+        anyhow::ensure!(key.len() == 44, "installed telemetry key encoding refused");
+        let mut section: TelemetrySection<'b> = self;
+        section.records_key_b64 = Some(key);
+        Ok(section)
+    }
 }
 
 /// Provision what the collector needs beyond its config: the tenant's

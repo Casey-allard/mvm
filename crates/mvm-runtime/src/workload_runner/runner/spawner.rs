@@ -41,8 +41,32 @@ pub struct NetworkEndpointSpawnRequest<'a> {
     pub ingress: &'a [mvm_core::plan::IngressMapping],
     /// Verified cold plan for optional per-boot mailbox reader key delivery.
     pub reader_plan: Option<&'a mvm_core::plan::ExecutionPlan>,
+    /// Opaque compatibility from the same checked runtime lifecycle, not a DTO.
+    pub mailbox_runtime: Option<&'a crate::runtime_evidence::VerifiedMailboxReader>,
     /// Where the guest's half of the authenticated session comes from.
     pub identity: FlowMuxIdentitySource<'a>,
+}
+
+impl NetworkEndpointSpawnRequest<'_> {
+    pub(crate) fn require_mailbox_reader(
+        &self,
+        binding: Option<&mvm_core::mailbox::reader::MailboxReaderBootBinding>,
+    ) -> Result<()> {
+        let Some(plan) = self.reader_plan else {
+            anyhow::ensure!(binding.is_none(), "reader projection has no admitted plan");
+            return Ok(());
+        };
+        if matches!(self.identity, FlowMuxIdentitySource::InheritFrom(_))
+            && let Some(grant) = &plan.mailbox
+        {
+            mvm_core::mailbox::reader::require_mailbox_reader_grant(None, grant)
+                .context("restored mailbox extensions require independent reader rekey")?;
+        }
+        match self.mailbox_runtime {
+            Some(runtime) => runtime.require(plan, binding),
+            None => crate::runtime_evidence::require_mailbox_profile(None, plan, binding),
+        }
+    }
 }
 
 /// A stood-up endpoint: the channel, and the drive the guest reads its identity
@@ -55,12 +79,33 @@ pub struct SpawnedEndpoint {
     pub identity_drive: Option<PathBuf>,
 }
 
+#[cfg(unix)]
+pub struct InstalledSpawnedEndpoint {
+    pub(crate) egress_uds: Option<PathBuf>,
+    pub(crate) identity_drive: Option<PathBuf>,
+    pub(crate) owner: Option<mvm_vmm::host::network_endpoint_spawn::OwnedEndpoint>,
+    pub(crate) telemetry: bool,
+}
+
 /// Stand up the per-VM gating endpoint. The one host-side egress bridge
 /// (claim-10 gate + claims 12/13 substitution).
 pub trait NetworkEndpointSpawner: Send + Sync {
     fn spawn(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<SpawnedEndpoint>;
     /// Provision authentication without starting an endpoint or granting egress.
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>>;
+    #[cfg(unix)]
+    fn supports_registered_installed_endpoint(&self) -> bool {
+        false
+    }
+    #[cfg(unix)]
+    fn spawn_installed(
+        &self,
+        _req: &NetworkEndpointSpawnRequest<'_>,
+        _config: &VmStartConfig,
+        _original: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
+    ) -> Result<InstalledSpawnedEndpoint> {
+        anyhow::bail!("original installed endpoint spawner unavailable")
+    }
     /// For a boot with no endpoint, start its VM-lifetime telemetry collector
     /// on its own and record whether the boot is provisioned for it. Never
     /// fails a launch: a collector that cannot start costs telemetry only.
@@ -194,6 +239,7 @@ pub(super) fn prepare_standby_identity(
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
             reader_plan: None,
+            mailbox_runtime: None,
             identity: FlowMuxIdentitySource::Mint,
         })
         .map_err(|error| {
@@ -202,12 +248,112 @@ pub(super) fn prepare_standby_identity(
 }
 
 impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
+    #[cfg(unix)]
+    fn supports_registered_installed_endpoint(&self) -> bool {
+        cfg!(target_os = "linux")
+    }
+    #[cfg(unix)]
+    fn spawn_installed(
+        &self,
+        req: &NetworkEndpointSpawnRequest<'_>,
+        config: &VmStartConfig,
+        original: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
+    ) -> Result<InstalledSpawnedEndpoint> {
+        use mvm_vmm::host::network_endpoint_spawn::{
+            AdmittedNetworkPlan, EndpointLifetime, spawn_network_endpoint_installed_registered,
+            spawn_telemetry_collector_installed_registered,
+        };
+
+        let original =
+            original.context("installed endpoint requires signed host-service registration")?;
+        original.check_endpoint_binding(req.vm_name, req.tenant, req.state_dir)?;
+        let anchor = config
+            .host_lifetime
+            .as_ref()
+            .context("installed direct endpoint original lifetime missing")?;
+        let collector_only = req.network_policy == &NetworkPolicy::deny_all();
+        anyhow::ensure!(
+            self.supports_registered_installed_endpoint()
+                && anchor.binding().backend == BackendKind::Firecracker
+                && req.network_policy == &config.network_policy
+                && (collector_only || req.network_policy.payload_mapping().is_some())
+                && req.secrets.is_empty()
+                && req.ingress.is_empty()
+                && matches!(req.identity, FlowMuxIdentitySource::Mint),
+            "unsupported original installed endpoint launch"
+        );
+        anchor.check_parent_current(config, BackendKind::Firecracker)?;
+        let plan = mvm_core::plan::plan_from_admitted_json(
+            config
+                .plan_json
+                .as_deref()
+                .context("original admitted plan missing")?,
+        )?;
+        let handoff = anchor.prepare_endpoint_handoff(config, BackendKind::Firecracker)?;
+        let facts = if collector_only {
+            handoff.check_telemetry_only(req.redaction)?;
+            anyhow::ensure!(
+                handoff.partition().projection().limits.cache_disk_bytes
+                    >= mvm_vmm::host::telemetry_provisioning::DEFAULT_RECORDS_BYTE_CAP
+                        + mvm_core::runtime_state_protection::INSTALLED_TELEMETRY_SIDECAR_BYTES,
+                "original installed collector retained credit missing"
+            );
+            None
+        } else {
+            let facts = AdmittedNetworkPlan::from_plan(&plan, req.vm_name, req.network_policy)?;
+            handoff.check_direct_network(&facts, &req.network_limits, req.redaction)?;
+            Some(facts)
+        };
+        let session = hex::encode(handoff.partition().projection().session);
+        let uds = vm_network_endpoint_socket(req.vm_name);
+        let (identity, drive) = prepare_endpoint_identity(
+            req,
+            None,
+            &BootEgressCa(None),
+            &session,
+            Some((original, &handoff)),
+        )?;
+        mvm_vmm::host::telemetry_registration::register_telemetry_boot(
+            req.state_dir,
+            req.vm_name,
+            &identity.guest_verifying_key_base64,
+        )?;
+        mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(req.state_dir, true)?;
+        let params = SubstitutionSpawnParams {
+            vm_name: req.vm_name,
+            state_dir: req.state_dir,
+            lifetime: EndpointLifetime::Launcher,
+            telemetry: true,
+            tenant: req.tenant,
+            secrets: req.secrets,
+            redaction: req.redaction,
+            transport: EndpointTransport::Uds { path: uds.clone() },
+            egress_proxy: None,
+            session_marker: None,
+            tls_intermediate: None,
+            admitted_network_plan: facts,
+            network_policy: (!collector_only).then_some(req.network_policy),
+            network_limits: req.network_limits,
+            ingress: req.ingress,
+            resolver_remote: None,
+            binding_store_dir: None,
+            flowmux_identity: (!collector_only).then_some(identity),
+        };
+        let endpoint = if collector_only {
+            spawn_telemetry_collector_installed_registered(params, handoff, original)?
+        } else {
+            spawn_network_endpoint_installed_registered(params, handoff, original)?
+        };
+        Ok(InstalledSpawnedEndpoint {
+            egress_uds: (!collector_only).then_some(uds),
+            identity_drive: drive,
+            owner: Some(endpoint),
+            telemetry: true,
+        })
+    }
+
     fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>> {
-        let anchor_path = mvm_core::config::mvm_keys_dir()
-            .join(mvm_vmm::host::broker_services_spawn::HOST_SIGNER_PUB);
-        mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(req.state_dir, false)
-            .context("clearing telemetry provisioning for a boot without an endpoint")?;
-        prepare_observation_identity(req, &anchor_path)
+        prepare_local_identity(req, None)
     }
 
     fn start_telemetry_without_endpoint(
@@ -277,100 +423,171 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
     }
 
     fn spawn(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<SpawnedEndpoint> {
-        use mvm_vmm::host::flowmux_identity::{
-            FlowMuxIdentityMaterial, IDENTITY_DRIVE_FILE, IdentityDriveContents,
-            load_inheritable_identity,
-        };
-        use mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig;
+        spawn_local_endpoint(req, None)
+    }
+}
 
-        let uds = vm_network_endpoint_socket(req.vm_name);
-        let egress_ca = BootEgressCa::resolve(req)?;
-        let (identity, identity_drive) = match req.identity {
-            FlowMuxIdentitySource::Mint => {
-                let material = FlowMuxIdentityMaterial::mint_from_host_signer(req.vm_name)
-                    .context("minting this boot's FlowMux identity")?;
-                let reader_boot = mint_mailbox_reader_boot(req, material.guest_verifying_key())?;
-                let drive = req.state_dir.join(IDENTITY_DRIVE_FILE);
-                material.write_drive_with(
-                    &drive,
-                    &IdentityDriveContents {
-                        ingress: req.ingress,
-                        egress_ca_cert_pem: egress_ca.guest_cert_pem(),
-                        mailbox_ack_key: reader_boot.as_ref().map(|(key, _)| key),
-                        mailbox_reader_boot: reader_boot.as_ref().map(|(_, binding)| binding),
-                    },
-                )?;
-                persist_mailbox_reader_boot(req, reader_boot.as_ref().map(|(_, binding)| binding))?;
-                // Persisted so a warm child claimed from this VM pins the key
-                // its restored guest actually holds.
-                material.persist_inheritable(req.state_dir)?;
-                (material.spawn_config().clone(), Some(drive))
+type ReaderBoot = mvm_core::mailbox::reader::MailboxReaderBootBinding;
+type Capture = std::sync::OnceLock<ReaderBoot>;
+fn observe_original(capture: Option<&Capture>, boot: Option<&ReaderBoot>) -> Result<()> {
+    if let Some(slot) = capture {
+        let boot = boot.context("original identity drive did not carry a reader binding")?;
+        anyhow::ensure!(
+            boot.durable_object_pair_sha256_v1.is_some(),
+            "ordinary mailbox cannot enter selected reader slot"
+        );
+        slot.set(boot.clone())
+            .map_err(|_| anyhow::anyhow!("original reader binding already filled"))?;
+    }
+    Ok(())
+}
+pub(crate) struct OriginalObjectSpawner(pub std::sync::Arc<Capture>);
+impl NetworkEndpointSpawner for OriginalObjectSpawner {
+    fn prepare_identity(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<Option<PathBuf>> {
+        prepare_local_identity(req, Some(&self.0))
+    }
+    fn spawn(&self, req: &NetworkEndpointSpawnRequest<'_>) -> Result<SpawnedEndpoint> {
+        spawn_local_endpoint(req, Some(&self.0))
+    }
+    fn start_telemetry_without_endpoint(
+        &self,
+        req: &NetworkEndpointSpawnRequest<'_>,
+    ) -> TelemetryStart {
+        RealNetworkEndpointSpawner.start_telemetry_without_endpoint(req)
+    }
+}
+fn prepare_local_identity(
+    req: &NetworkEndpointSpawnRequest<'_>,
+    capture: Option<&Capture>,
+) -> Result<Option<PathBuf>> {
+    let anchor_path = mvm_core::config::mvm_keys_dir()
+        .join(mvm_vmm::host::broker_services_spawn::HOST_SIGNER_PUB);
+    mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(req.state_dir, false)
+        .context("clearing telemetry provisioning for a boot without an endpoint")?;
+    prepare_observation_identity_inner(req, &anchor_path, capture)
+}
+
+fn spawn_local_endpoint(
+    req: &NetworkEndpointSpawnRequest<'_>,
+    capture: Option<&Capture>,
+) -> Result<SpawnedEndpoint> {
+    let uds = vm_network_endpoint_socket(req.vm_name);
+    let egress_ca = BootEgressCa::resolve(req)?;
+    let (identity, identity_drive) =
+        prepare_endpoint_identity(req, capture, &egress_ca, req.vm_name, None)?;
+
+    // Same seam for minted and inherited identities: the boot the endpoint
+    // authenticates is the boot the telemetry dialer must expect.
+    mvm_vmm::host::telemetry_registration::register_telemetry_boot(
+        req.state_dir,
+        req.vm_name,
+        &identity.guest_verifying_key_base64,
+    )
+    .context("registering this boot's telemetry identity")?;
+
+    let telemetry = telemetry_for_boot(
+        mvm_vmm::host::telemetry_provisioning::telemetry_collection_enabled(),
+        req.identity,
+    );
+    spawn_network_endpoint(SubstitutionSpawnParams {
+        vm_name: req.vm_name,
+        state_dir: req.state_dir,
+        // A detached machine outlives the `mvmctl` that started it; its
+        // endpoint must too, and must stop when the machine does.
+        lifetime: mvm_vmm::host::network_endpoint_spawn::EndpointLifetime::Vm,
+        telemetry,
+        tenant: req.tenant,
+        secrets: req.secrets,
+        redaction: req.redaction,
+        transport: EndpointTransport::Uds { path: uds.clone() },
+        // None ⇒ resolve host config, then ambient proxy variables inside
+        // `spawn_network_endpoint` for every backend.
+        egress_proxy: None,
+        session_marker: None,
+        tls_intermediate: egress_ca.endpoint_tls(),
+        admitted_network_plan: None,
+        network_policy: Some(req.network_policy),
+        network_limits: req.network_limits,
+        ingress: req.ingress,
+        resolver_remote: None,
+        binding_store_dir: None,
+        flowmux_identity: Some(identity),
+    })?;
+    mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(req.state_dir, telemetry)
+        .context("recording this boot's telemetry provisioning")?;
+    Ok(SpawnedEndpoint {
+        egress_uds: uds,
+        identity_drive,
+    })
+}
+
+/// Mint or inherit the identity once for the existing gated endpoint and guest drive.
+fn prepare_endpoint_identity(
+    req: &NetworkEndpointSpawnRequest<'_>,
+    capture: Option<&Capture>,
+    egress_ca: &BootEgressCa,
+    session_id: &str,
+    registered: Option<(
+        &mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>,
+        &mvm_core::host_lifetime::PreparedEndpointHandoff,
+    )>,
+) -> Result<(
+    mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig,
+    Option<PathBuf>,
+)> {
+    use mvm_vmm::host::flowmux_identity::{
+        FlowMuxIdentityMaterial, IDENTITY_DRIVE_FILE, IdentityDriveContents,
+        load_inheritable_identity,
+    };
+    use mvm_vmm::host::network_endpoint_spawn::FlowMuxIdentitySpawnConfig;
+
+    Ok(match req.identity {
+        FlowMuxIdentitySource::Mint => {
+            let material = FlowMuxIdentityMaterial::mint_from_host_signer(session_id)
+                .context("minting this boot's FlowMux identity")?;
+            if let Some((original, handoff)) = registered {
+                let host = material.host_signer_verifying_key()?.to_bytes();
+                original.check_flowmux_host_anchor(&host)?;
+                handoff.observe_flowmux_guest(material.guest_verifying_key().to_bytes(), host)?;
             }
-            FlowMuxIdentitySource::InheritFrom(parent_state_dir) => {
-                clear_mailbox_reader_boot(req.state_dir)?;
-                let inherited =
-                    load_inheritable_identity(parent_state_dir)?.with_context(|| {
-                        format!(
-                            "parent at {} persisted no FlowMux identity, so a claimed child's \
+            let reader_boot = mint_mailbox_reader_boot(req, material.guest_verifying_key())?;
+            observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
+            let drive = req.state_dir.join(IDENTITY_DRIVE_FILE);
+            material.write_drive_with(
+                &drive,
+                &IdentityDriveContents {
+                    ingress: req.ingress,
+                    egress_ca_cert_pem: egress_ca.guest_cert_pem(),
+                    mailbox_ack_key: reader_boot.as_ref().map(|(key, _)| key),
+                    mailbox_reader_boot: reader_boot.as_ref().map(|(_, binding)| binding),
+                },
+            )?;
+            persist_mailbox_reader_boot(req, reader_boot.as_ref().map(|(_, binding)| binding))?;
+            // Persisted so a warm child claimed from this VM pins the key
+            // its restored guest actually holds.
+            material.persist_inheritable(req.state_dir)?;
+            (material.spawn_config().clone(), Some(drive))
+        }
+        FlowMuxIdentitySource::InheritFrom(parent_state_dir) => {
+            clear_mailbox_reader_boot(req.state_dir)?;
+            let inherited = load_inheritable_identity(parent_state_dir)?.with_context(|| {
+                format!(
+                    "parent at {} persisted no FlowMux identity, so a claimed child's \
                          endpoint has no key to pin — refusing rather than minting one the \
                          restored guest does not hold",
-                            parent_state_dir.display()
-                        )
-                    })?;
-                (
-                    FlowMuxIdentitySpawnConfig {
-                        session_id: inherited.session_id,
-                        host_signing_key_base64: host_signer_key_base64()?,
-                        guest_verifying_key_base64: inherited.guest_verifying_key_base64,
-                    },
-                    None,
+                    parent_state_dir.display()
                 )
-            }
-        };
-
-        // Same seam for minted and inherited identities: the boot the endpoint
-        // authenticates is the boot the telemetry dialer must expect.
-        mvm_vmm::host::telemetry_registration::register_telemetry_boot(
-            req.state_dir,
-            req.vm_name,
-            &identity.guest_verifying_key_base64,
-        )
-        .context("registering this boot's telemetry identity")?;
-
-        let telemetry = telemetry_for_boot(
-            mvm_vmm::host::telemetry_provisioning::telemetry_collection_enabled(),
-            req.identity,
-        );
-        spawn_network_endpoint(SubstitutionSpawnParams {
-            vm_name: req.vm_name,
-            state_dir: req.state_dir,
-            // A detached machine outlives the `mvmctl` that started it; its
-            // endpoint must too, and must stop when the machine does.
-            lifetime: mvm_vmm::host::network_endpoint_spawn::EndpointLifetime::Vm,
-            telemetry,
-            tenant: req.tenant,
-            secrets: req.secrets,
-            redaction: req.redaction,
-            transport: EndpointTransport::Uds { path: uds.clone() },
-            // None ⇒ resolve host config, then ambient proxy variables inside
-            // `spawn_network_endpoint` for every backend.
-            egress_proxy: None,
-            session_marker: None,
-            tls_intermediate: egress_ca.endpoint_tls(),
-            network_policy: Some(req.network_policy),
-            network_limits: req.network_limits,
-            ingress: req.ingress,
-            resolver_remote: None,
-            binding_store_dir: None,
-            flowmux_identity: Some(identity),
-        })?;
-        mvm_vmm::host::telemetry_provisioning::record_boot_provisioning(req.state_dir, telemetry)
-            .context("recording this boot's telemetry provisioning")?;
-        Ok(SpawnedEndpoint {
-            egress_uds: uds,
-            identity_drive,
-        })
-    }
+            })?;
+            (
+                FlowMuxIdentitySpawnConfig {
+                    session_id: inherited.session_id,
+                    host_signing_key_base64: host_signer_key_base64()?,
+                    guest_verifying_key_base64: inherited.guest_verifying_key_base64,
+                },
+                None,
+            )
+        }
+    })
 }
 
 fn mint_mailbox_reader_boot(
@@ -391,6 +608,7 @@ fn mint_mailbox_reader_boot(
                 guest_identity,
                 key.verifying_key().to_bytes(),
             )?;
+            req.require_mailbox_reader(Some(&binding))?;
             Ok((key, binding))
         })
         .transpose()
@@ -419,9 +637,17 @@ fn persist_mailbox_reader_boot(
     }
 }
 
+#[cfg(test)]
 fn prepare_observation_identity(
     req: &NetworkEndpointSpawnRequest<'_>,
     anchor_path: &Path,
+) -> Result<Option<PathBuf>> {
+    prepare_observation_identity_inner(req, anchor_path, None)
+}
+fn prepare_observation_identity_inner(
+    req: &NetworkEndpointSpawnRequest<'_>,
+    anchor_path: &Path,
+    capture: Option<&Capture>,
 ) -> Result<Option<PathBuf>> {
     use base64::Engine as _;
     use mvm_vmm::host::flowmux_identity::{
@@ -435,6 +661,7 @@ fn prepare_observation_identity(
                 .context("guest observations require the host signer public anchor")?;
             let guest = GuestIdentityMaterial::mint(anchor)?;
             let reader_boot = mint_mailbox_reader_boot(req, guest.verifying_key())?;
+            observe_original(capture, reader_boot.as_ref().map(|(_, binding)| binding))?;
             let drive = req.state_dir.join(IDENTITY_DRIVE_FILE);
             guest.write_drive_with(
                 &drive,
@@ -689,6 +916,7 @@ mod tests {
                 network_limits: mvm_core::plan::NetworkLimits::default(),
                 ingress: &[],
                 reader_plan: None,
+                mailbox_runtime: None,
                 identity,
             },
             anchor,
@@ -766,6 +994,9 @@ mod tests {
         std::fs::write(&anchor, host.verifying_key().as_bytes()).unwrap();
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([9; 32]),
             authority_key: host.verifying_key().to_bytes(),
             epoch: ExecutionEpoch::new(3).unwrap(),
@@ -786,6 +1017,7 @@ mod tests {
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
             reader_plan: Some(&plan),
+            mailbox_runtime: None,
             identity: FlowMuxIdentitySource::Mint,
         };
         let drive = prepare_observation_identity(&request, &anchor)
@@ -814,6 +1046,7 @@ mod tests {
                     state_dir: &child,
                     identity: FlowMuxIdentitySource::InheritFrom(&parent),
                     reader_plan: None,
+                    mailbox_runtime: None,
                     ..request
                 },
                 &anchor,
@@ -822,6 +1055,131 @@ mod tests {
             .is_none()
         );
         assert!(!child.join(MAILBOX_READER_BOOT_FILE).exists());
+    }
+
+    #[test]
+    fn original_selected_reader_is_the_boot_written_to_its_single_cold_drive() {
+        use mvm_contract::protocol::mailbox::{
+            ExecutionEpoch, MailboxGrant, MailboxId, MailboxRetentionPolicy,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let anchor = root.path().join("signer.pub");
+        let host = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+        std::fs::write(&anchor, host.verifying_key().as_bytes()).unwrap();
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.mailbox = Some(MailboxGrant {
+            durable_object_pair_sha256_v1: Some([4; 32]),
+            mailbox: MailboxId::from_bytes([5; 32]),
+            authority_key: host.verifying_key().to_bytes(),
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: Some(MailboxRetentionPolicy::new(60_000).unwrap()),
+            outbound_journal_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+        });
+        plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+        let state = root.path().join("selected");
+        let mut request = NetworkEndpointSpawnRequest {
+            vm_name: &plan.image.name,
+            state_dir: &state,
+            tenant: "tenant",
+            secrets: &[],
+            redaction: &RedactionPolicy::default(),
+            network_policy: &NetworkPolicy::deny_all(),
+            network_limits: Default::default(),
+            ingress: &[],
+            reader_plan: Some(&plan),
+            mailbox_runtime: None,
+            identity: FlowMuxIdentitySource::Mint,
+        };
+        // Legacy runtime metadata cannot publish even a small object selector.
+        assert!(prepare_observation_identity_inner(&request, &anchor, None).is_err());
+        assert!(
+            !state.exists(),
+            "compatibility refusal must precede drive/boot publication"
+        );
+        // This fixture selects policy only; it is not release-verification evidence.
+        let compatibility = crate::runtime_evidence::VerifiedMailboxReader::fixture(Some(
+            mvm_core::mailbox::reader::MailboxReaderCompatibilityV1 {
+                format: 1,
+                max_boot_bytes: 8192,
+                features: vec![mvm_core::mailbox::reader::MailboxReaderFeatureV1::ObjectPairV1],
+            },
+        ));
+        request.mailbox_runtime = Some(&compatibility);
+        let slot = Capture::new();
+        let drive = prepare_observation_identity_inner(&request, &anchor, Some(&slot))
+            .unwrap()
+            .unwrap();
+        let expected = slot.get().unwrap();
+        let image = std::fs::read(&drive).unwrap();
+        let encoded = serde_json::to_vec(expected).unwrap();
+        assert!(image.windows(encoded.len()).any(|bytes| bytes == encoded));
+        assert_eq!(ReaderBoot::load(&state).unwrap(), *expected);
+        assert!(prepare_observation_identity_inner(&request, &anchor, Some(&slot)).is_err());
+        assert_eq!(std::fs::read(&drive).unwrap(), image);
+        assert_eq!(ReaderBoot::load(&state).unwrap(), *expected);
+
+        let sibling_state = root.path().join("sibling");
+        let sibling_req = NetworkEndpointSpawnRequest {
+            state_dir: &sibling_state,
+            ..request
+        };
+        let sibling_slot = Capture::new();
+        let sibling_drive =
+            prepare_observation_identity_inner(&sibling_req, &anchor, Some(&sibling_slot))
+                .unwrap()
+                .unwrap();
+        let sibling = sibling_slot.get().unwrap();
+        sibling.check_plan(&plan).unwrap();
+        assert_ne!(sibling, expected);
+        assert_ne!(std::fs::read(sibling_drive).unwrap(), image);
+        assert_eq!(slot.get().unwrap(), expected);
+        assert_eq!(std::fs::read(drive).unwrap(), image);
+    }
+
+    #[test]
+    fn inherited_baseline_reader_is_preserved_but_new_extensions_require_rekey() {
+        use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.mailbox = Some(MailboxGrant {
+            mailbox: MailboxId::from_bytes([5; 32]),
+            authority_key: [6; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: None,
+            durable_object_pair_sha256_v1: None,
+            outbound_journal_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+        });
+        let check = |plan: &mvm_core::plan::ExecutionPlan| {
+            NetworkEndpointSpawnRequest {
+                vm_name: "inherited",
+                state_dir: Path::new("/unused-child"),
+                tenant: "tenant",
+                secrets: &[],
+                redaction: &RedactionPolicy::default(),
+                network_policy: &NetworkPolicy::deny_all(),
+                network_limits: Default::default(),
+                ingress: &[],
+                reader_plan: Some(plan),
+                mailbox_runtime: None,
+                identity: FlowMuxIdentitySource::InheritFrom(Path::new("/unused-parent")),
+            }
+            .require_mailbox_reader(None)
+        };
+        check(&plan).unwrap();
+        plan.mailbox
+            .as_mut()
+            .unwrap()
+            .incoming_journal_policy_sha256_v1 = Some([7; 32]);
+        assert!(check(&plan).is_err());
+        plan.mailbox
+            .as_mut()
+            .unwrap()
+            .incoming_journal_policy_sha256_v1 = None;
+        plan.mailbox.as_mut().unwrap().durable_object_pair_sha256_v1 = Some([8; 32]);
+        assert!(check(&plan).is_err());
     }
 
     #[test]

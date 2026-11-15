@@ -13,6 +13,48 @@ fn has_vm_marker(state_dir: &std::path::Path) -> bool {
             .any(|name| state_dir.join(name).exists())
 }
 
+impl
+    WorkloadRunner<mvm_backends::driver::HvfDriver, RealNetworkEndpointSpawner, RealBrokerRegistrar>
+{
+    /// Only this concrete production spawner can project a reader into an
+    /// opaque native launch. A mock spawner cannot attach a substituted boot.
+    pub(crate) fn prepare_owned_hvf_original(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::host::boot_images::FrozenBootImageBytes,
+    ) -> Result<ColdHvfChannel> {
+        let plan = config
+            .plan_json
+            .as_deref()
+            .map(mvm_core::plan::plan_from_admitted_json)
+            .transpose()?;
+        let Some(plan) = plan.filter(|p| {
+            p.mailbox
+                .is_some_and(|g| g.durable_object_pair_sha256_v1.is_some())
+        }) else {
+            return self.prepare_cold_hvf_channel(config, images);
+        };
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let runner = WorkloadRunner {
+            driver: self.driver.clone(),
+            spawner: OriginalObjectSpawner(Arc::clone(&slot)),
+            installed: installed::InstalledSlots::default(),
+            installed_agent: std::sync::OnceLock::new(),
+            broker: RealBrokerRegistrar,
+            console_streamer: Arc::clone(&self.console_streamer),
+        };
+        let mut owner = runner.prepare_cold_hvf_channel(config, images)?;
+        // prepare_cold_hvf_channel has completed writing the original identity
+        // drive, before any HVF child or control handshake exists.
+        let reader = slot
+            .get()
+            .context("selected HVF drive did not receive its original reader")?;
+        reader.check_plan(&plan)?;
+        owner.capture_original_reader(reader.clone())?;
+        Ok(owner)
+    }
+}
+
 impl<S: NetworkEndpointSpawner + 'static, B: BrokerRegistrar + 'static>
     WorkloadRunner<mvm_backends::driver::hvf::HvfDriver, S, B>
 {
@@ -70,7 +112,7 @@ impl<S: NetworkEndpointSpawner + 'static, B: BrokerRegistrar + 'static>
                 self.driver.workload_base_bootargs(has_disk)
             }),
         };
-        let prepared = self.prepare_workload_boot(&inputs)?;
+        let prepared = self.prepare_workload_boot(&inputs, lifecycle.mailbox_reader())?;
         let (broker, _) = self.register_workload_broker(config, &prepared.socks)?;
         Ok(ColdHvfChannel::new(cold_hvf_channel::ColdHvfPreparation {
             launch,
@@ -129,8 +171,154 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
         self.terminate_with_timing(id, false)
     }
 
+    #[cfg(unix)]
+    fn original_installed_slot(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<Arc<installed::InstalledSlot>> {
+        let slot = self
+            .installed
+            .find(id)?
+            .context("original installed native owner unavailable")?;
+        anyhow::ensure!(
+            slot.matches(owner),
+            "foreign original installed native owner"
+        );
+        Ok(slot)
+    }
+
+    /// Invoke only the already-activated signed entrypoint on this original slot.
+    #[cfg(target_os = "linux")]
+    pub fn run_owned_entrypoint(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: Instant,
+        event: &mut dyn FnMut(&mvm_agentd::vsock::EntrypointEvent),
+    ) -> Result<mvm_agentd::vsock::EntrypointEvent> {
+        self.original_installed_slot(id, owner)?
+            .run_entrypoint(until, event)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn check_owned_journal_ready(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: Instant,
+    ) -> Result<()> {
+        self.original_installed_slot(id, owner)?
+            .journal_ready(until)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn run_owned_journal_entrypoint(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        input: &[u8],
+        until: Instant,
+        event: &mut dyn FnMut(&mvm_agentd::vsock::EntrypointEvent),
+    ) -> Result<mvm_agentd::vsock::EntrypointEvent> {
+        self.original_installed_slot(id, owner)?
+            .journal_entrypoint(input, until, event)
+    }
+
+    /// Observe only the originally retained native workload, until the supplied deadline.
+    #[cfg(unix)]
+    pub fn wait_owned_until(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: std::time::Instant,
+    ) -> Result<VmExitStatus> {
+        let report = self.original_installed_slot(id, owner)?.with_vm(|vm| {
+            vm.original_workload_report()
+                .context("original installed workload report unavailable")
+        })?;
+        report.wait_until(until)
+    }
+
+    #[cfg(unix)]
+    pub fn stop_owned(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<()> {
+        self.original_installed_slot(id, owner)?
+            .stop(&*self.console_streamer)
+    }
+
+    /// Select retained failed startup custody in this runner only. This exact
+    /// binding is an index, not authority reconstructed from a persisted DTO.
+    #[cfg(unix)]
+    pub fn stop_owned_pending(
+        &self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<()> {
+        let slot = self
+            .installed
+            .find(&VmId(binding.vm_name.clone()))?
+            .context("original installed startup unavailable")?;
+        anyhow::ensure!(
+            slot.binding() == binding,
+            "foreign installed startup binding"
+        );
+        slot.stop(&*self.console_streamer)
+    }
+
+    /// Consume completed original custody once. A binding or marker alone can
+    /// never produce this receipt, and active records are retained on refusal.
+    #[cfg(unix)]
+    pub fn take_owned_retirement(
+        &self,
+        id: &VmId,
+        owner: &Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<OwnedRetirement> {
+        let slot = self
+            .installed
+            .find(id)?
+            .context("original retirement unavailable")?;
+        anyhow::ensure!(
+            slot.matches(owner),
+            "foreign original installed native owner"
+        );
+        self.installed.take_retired(&slot)
+    }
+
+    /// The exact binding selects an already completed record in this original
+    /// runner only; it cannot attach a VM or manufacture a missing exit proof.
+    #[cfg(unix)]
+    pub fn take_owned_retirement_pending(
+        &self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<OwnedRetirement> {
+        let slot = self
+            .installed
+            .find(&VmId(binding.vm_name.clone()))?
+            .context("original pending retirement unavailable")?;
+        anyhow::ensure!(
+            slot.binding() == binding,
+            "foreign installed startup binding"
+        );
+        self.installed.take_retired(&slot)
+    }
+
     fn terminate_with_timing(&self, id: &VmId, prepare_guest: bool) -> Result<StopTiming> {
         mvm_core::naming::validate_vm_name(&id.0)?;
+        #[cfg(unix)]
+        {
+            if let Some(slot) = self.installed.find(id)? {
+                let started = Instant::now();
+                slot.stop(&*self.console_streamer)?;
+                return Ok(StopTiming {
+                    total: started.elapsed(),
+                    ..Default::default()
+                });
+            }
+            installed::refuse_unowned(id)?;
+        }
         let lifecycle = crate::runtime_evidence::RuntimeLifecycleLease::acquire(&id.0)?;
         // Measurement is diagnostic, never permission to terminate or delete.
         // Keep the lifecycle lease even if retention accounting fails.
@@ -246,6 +434,14 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
         config: &VmStartConfig,
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
     ) -> Result<VmId> {
+        #[cfg(unix)]
+        if let Some(owner) = &config.host_lifetime {
+            anyhow::ensure!(
+                self.driver.supports_host_lifetime(),
+                "backend has no original installed native lifetime"
+            );
+            owner.verify_config(config, self.driver.kind())?;
+        }
         let state_dir = vm_state_dir(&config.name);
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
@@ -352,10 +548,24 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
     }
 
     fn host_process_id(&self, id: &VmId) -> Result<Option<u32>> {
+        #[cfg(unix)]
+        {
+            if let Some(slot) = self.installed.find(id)? {
+                return Ok(slot.view().host_process_id());
+            }
+            installed::refuse_unowned(id)?;
+        }
         Ok(self.driver.attach(id)?.host_process_id())
     }
 
     fn wait(&self, id: &VmId) -> Result<VmExitStatus> {
+        #[cfg(unix)]
+        {
+            if let Some(slot) = self.installed.find(id)? {
+                return slot.view().wait();
+            }
+            installed::refuse_unowned(id)?;
+        }
         self.driver.attach(id)?.wait()
     }
 
@@ -375,14 +585,35 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
     }
 
     fn pause(&self, id: &VmId) -> Result<()> {
+        #[cfg(unix)]
+        {
+            if let Some(slot) = self.installed.find(id)? {
+                return slot.view().pause();
+            }
+            installed::refuse_unowned(id)?;
+        }
         self.driver.attach(id)?.pause()
     }
 
     fn resume(&self, id: &VmId) -> Result<()> {
+        #[cfg(unix)]
+        {
+            if let Some(slot) = self.installed.find(id)? {
+                return slot.view().resume();
+            }
+            installed::refuse_unowned(id)?;
+        }
         self.driver.attach(id)?.resume()
     }
 
     fn status(&self, id: &VmId) -> Result<VmStatus> {
+        #[cfg(unix)]
+        {
+            if let Some(slot) = self.installed.find(id)? {
+                return slot.view().status();
+            }
+            installed::refuse_unowned(id)?;
+        }
         self.driver.attach(id)?.status()
     }
 

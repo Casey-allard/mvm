@@ -1147,25 +1147,6 @@ pub(crate) fn signal_process_group(child: &Child, signal: libc::c_int) {
     }
 }
 
-/// Blocking SIGTERM → grace → SIGKILL → reap.
-///
-/// Callers that must keep servicing something else while the child winds down
-/// cannot use this — it owns the calling thread for up to `grace`. The stream
-/// pump drives the same ladder step-by-step from its own loop for exactly that
-/// reason.
-pub(crate) fn kill_and_reap(child: &mut Child, grace: Duration) {
-    signal_process_group(child, libc::SIGTERM);
-    let escalate_at = Instant::now() + grace;
-    while Instant::now() < escalate_at {
-        if let Ok(Some(_)) = crate::child_wait::try_wait(child) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    signal_process_group(child, libc::SIGKILL);
-    let _ = crate::child_wait::wait(child);
-}
-
 #[cfg(unix)]
 pub(crate) fn signal_of(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;

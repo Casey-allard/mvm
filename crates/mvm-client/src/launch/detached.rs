@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use mvm_runtime::machine::persist::{self as mp, MachineSpec, SpecReconcile};
 
-use super::machine_start::{MachineStart, MachineStartParams, StartHost, start_machine_spec};
+use super::machine_start::{
+    MachineStart, MachineStartParams, StartHost, start_machine_spec_with_journal,
+};
 use crate::secret::MachineSecretRef;
 
 /// How long a boot command waits for the guest agent to answer before giving
@@ -69,13 +71,29 @@ pub fn require_serving_guest(
     started: &crate::StartedVm,
     timeout: std::time::Duration,
 ) -> std::result::Result<(), DetachedReadinessError> {
-    // The in-memory backend has no guest transport. It is a lifecycle test
-    // double, not a production detached lane.
-    let ready = started.backend().kind() == mvm_core::vm_backend::BackendKind::Mock
-        || crate::readiness::wait_for_guest_agent_for(name, timeout);
-    require_serving_guest_result(name, timeout, ready, || {
+    require_serving_guest_with_rollback(name, started, timeout, || {
         started.backend().abort_start(started.vm_id()).map(|_| ())
     })
+}
+
+pub(super) fn require_serving_guest_with_rollback(
+    name: &str,
+    started: &crate::StartedVm,
+    timeout: std::time::Duration,
+    rollback: impl FnOnce() -> Result<()>,
+) -> std::result::Result<(), DetachedReadinessError> {
+    require_serving_guest_on(name, started.backend(), timeout, rollback)
+}
+
+pub(super) fn require_serving_guest_on(
+    name: &str,
+    backend: &mvm_runtime::AnyBackend,
+    timeout: std::time::Duration,
+    rollback: impl FnOnce() -> Result<()>,
+) -> std::result::Result<(), DetachedReadinessError> {
+    let ready = backend.kind() == mvm_core::vm_backend::BackendKind::Mock
+        || crate::readiness::wait_for_guest_agent_for(name, timeout);
+    require_serving_guest_result(name, timeout, ready, rollback)
 }
 
 fn require_serving_guest_result(
@@ -225,7 +243,18 @@ pub fn boot_recorded(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
-    let started = start_machine_spec(spec, host, params)?;
+    let reservation = super::PairedBootReservation::for_lifecycle_mutation(&spec.name)?;
+    boot_recorded_with_journal(spec, host, params, None, &reservation)
+}
+
+pub(super) fn boot_recorded_with_journal(
+    spec: &mut MachineSpec,
+    host: &dyn StartHost,
+    params: MachineStartParams<'_>,
+    journal: Option<&mut super::persistent::journal::InstalledJournal<'_>>,
+    reservation: &super::PairedBootReservation,
+) -> Result<MachineStart> {
+    let started = start_machine_spec_with_journal(spec, host, params, journal, reservation)?;
     super::machine_start::record_machine_started(spec, started.resolved_digest.clone());
     if let Err(err) = mp::overwrite_machine_spec(spec) {
         tracing::warn!(error = %err, machine = %spec.name, "updating machine start metadata failed (non-fatal)");

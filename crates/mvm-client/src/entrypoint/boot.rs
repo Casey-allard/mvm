@@ -82,6 +82,49 @@ impl OwnedClientBoot {
         }
     }
 
+    /// Borrow both the signed admission and the original activated native owner.
+    /// This accessor never reattaches to a process or looks one up by VM name.
+    pub fn object_participant<'a>(
+        &'a self,
+        boot: &'a mvm_core::mailbox::reader::MailboxReaderBootBinding,
+    ) -> Result<mvm_hostd::mailbox_launch::object_pair::InstalledParticipant<'a>> {
+        let (admitted, runtime) = self.admitted_hvf_original()?;
+        mvm_hostd::mailbox_launch::object_pair::InstalledParticipant::from_owned_hvf(
+            admitted, runtime, boot,
+        )
+    }
+
+    /// Borrow the public reader from the original activated HVF owner.
+    pub fn original_hvf_object_participant(
+        &self,
+    ) -> Result<mvm_hostd::mailbox_launch::object_pair::InstalledParticipant<'_>> {
+        let (admitted, runtime) = self.admitted_hvf_original()?;
+        mvm_hostd::mailbox_launch::object_pair::InstalledParticipant::from_original_hvf(
+            admitted, runtime,
+        )
+    }
+
+    fn admitted_hvf_original(
+        &self,
+    ) -> Result<(
+        &mvm_hostd::plan_admission::AdmittedPlan,
+        &mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch,
+    )> {
+        let group = self
+            .custody
+            .as_ref()
+            .context("original client custody released")?;
+        let resources = group
+            .resources
+            .as_ref()
+            .context("original admission released")?;
+        let runtime = group
+            .runtime
+            .as_ref()
+            .context("original runtime not present")?;
+        Ok((&resources.admission.admitted, runtime))
+    }
+
     pub(crate) fn resources(&self) -> &ClientBootResources {
         self.custody
             .as_ref()

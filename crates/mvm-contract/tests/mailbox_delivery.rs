@@ -20,6 +20,9 @@ fn address() -> MailboxAddress {
 
 fn plan_grant() -> MailboxGrant {
     MailboxGrant {
+        durable_object_pair_sha256_v1: None,
+        incoming_journal_policy_sha256_v1: None,
+        outbound_journal_v1: None,
         mailbox: address().mailbox,
         authority_key: [5; 32],
         epoch: ExecutionEpoch::new(7).expect("epoch"),
@@ -136,6 +139,7 @@ fn current_session() -> ConsumerSessionId {
 
 fn lease() -> MailboxDeliveryLease {
     MailboxDeliveryLease {
+        object_projection_v1: None,
         protocol_version: ProtocolVersion::V1,
         signature_algorithm: SignatureAlgorithm::ED25519,
         address: address(),

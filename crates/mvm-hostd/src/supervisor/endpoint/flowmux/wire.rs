@@ -10,6 +10,34 @@ use mvm_core::net::session::Session;
 
 use super::FlowMuxError;
 use super::registry::StreamRegistry;
+use mvm_vmm::host::network_endpoint_spawn::InstalledEndpointAudit;
+
+/// The same optional original capability guards every session and relay write.
+pub(super) struct SharedWriter {
+    stream: Mutex<UnixStream>,
+    audit: Option<InstalledEndpointAudit>,
+}
+impl std::fmt::Debug for SharedWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedWriter").finish_non_exhaustive()
+    }
+}
+impl SharedWriter {
+    pub(super) fn new(stream: UnixStream, audit: Option<InstalledEndpointAudit>) -> Self {
+        Self {
+            stream: Mutex::new(stream),
+            audit,
+        }
+    }
+    pub(super) fn check_current(&self) -> Result<(), FlowMuxError> {
+        if let Some(audit) = &self.audit {
+            audit.check_current().map_err(|_| {
+                FlowMuxError::FrameRefused("installed audit authority unavailable".into())
+            })?;
+        }
+        Ok(())
+    }
+}
 
 /// Returns true for the common "peer closed the connection" I/O errors that
 /// can race with an in-flight read when the guest drops its socket.
@@ -24,8 +52,11 @@ pub(super) fn is_peer_disconnect(error: &std::io::Error) -> bool {
 
 /// Lock the shared writer, recovering from poison so a crashed relay thread
 /// does not silence the whole session.
-pub(super) fn lock_writer(writer: &Mutex<UnixStream>) -> MutexGuard<'_, UnixStream> {
-    writer.lock().unwrap_or_else(|error| error.into_inner())
+pub(super) fn lock_writer(writer: &SharedWriter) -> MutexGuard<'_, UnixStream> {
+    writer
+        .stream
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
 }
 
 /// Lock the shared session, recovering from poison.
@@ -52,7 +83,7 @@ pub(super) fn lock_registry(registry: &Mutex<StreamRegistry>) -> MutexGuard<'_, 
 /// once the frame is flushed.
 pub(super) fn write_frame_to(
     session: &Mutex<Session>,
-    writer: &Mutex<UnixStream>,
+    writer: &SharedWriter,
     opcode: Opcode,
     stream_id: u32,
     payload: &[u8],
@@ -72,7 +103,7 @@ pub(super) fn write_frame_to(
 /// stream it had already closed — every other flow on it with it.
 pub(super) fn write_stream_frame_to(
     session: &Mutex<Session>,
-    writer: &Mutex<UnixStream>,
+    writer: &SharedWriter,
     retired: &AtomicBool,
     opcode: Opcode,
     stream_id: u32,
@@ -83,12 +114,13 @@ pub(super) fn write_stream_frame_to(
 
 fn write_frame_unless(
     session: &Mutex<Session>,
-    writer: &Mutex<UnixStream>,
+    writer: &SharedWriter,
     retired: Option<&AtomicBool>,
     opcode: Opcode,
     stream_id: u32,
     payload: &[u8],
 ) -> Result<bool, FlowMuxError> {
+    writer.check_current()?;
     let mut frame = Vec::new();
     mvm_contract::protocol::network_flow::encode_into(&mut frame, opcode, stream_id, payload)
         .map_err(|error| FlowMuxError::FrameRefused(error.to_string()))?;
@@ -97,6 +129,7 @@ fn write_frame_unless(
     if retired.is_some_and(|retired| retired.load(Ordering::Acquire)) {
         return Ok(false);
     }
+    writer.check_current()?;
     let sealed = session
         .seal(&frame)
         .map_err(|error| FlowMuxError::FrameRefused(error.to_string()))?;
@@ -107,10 +140,12 @@ fn write_frame_unless(
     let len = u32::try_from(sealed_bytes.len())
         .map_err(|_| FlowMuxError::FrameRefused("sealed frame too large".into()))?;
 
-    let mut writer = lock_writer(writer);
-    writer.write_all(&len.to_be_bytes())?;
-    writer.write_all(&sealed_bytes)?;
-    writer.flush()?;
+    let mut stream = lock_writer(writer);
+    writer.check_current()?;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(&sealed_bytes)?;
+    stream.flush()?;
+    writer.check_current()?;
     Ok(true)
 }
 
@@ -154,7 +189,7 @@ mod tests {
     fn a_retired_stream_gets_no_further_relay_frames() {
         let (session, _guest) = session_pair();
         let (ours, mut theirs) = UnixStream::pair().unwrap();
-        let writer = Mutex::new(ours);
+        let writer = SharedWriter::new(ours, None);
         let retired = AtomicBool::new(true);
 
         let sent =
@@ -173,7 +208,7 @@ mod tests {
     fn a_live_stream_gets_its_relay_frame() {
         let (session, _guest) = session_pair();
         let (ours, mut theirs) = UnixStream::pair().unwrap();
-        let writer = Mutex::new(ours);
+        let writer = SharedWriter::new(ours, None);
         let retired = AtomicBool::new(false);
 
         let sent =

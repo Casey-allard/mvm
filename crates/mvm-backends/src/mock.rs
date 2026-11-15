@@ -446,6 +446,7 @@ impl VmmDriver for MockDriver {
         spec: &VmmSpec,
         files: mvm_vmm::driver::prepared_disks::PreparedBootFiles<'_>,
     ) -> Result<Box<dyn RunningVm>> {
+        files.require_no_workload_root()?;
         files.require_no_data()?;
         let mvm_vmm::driver::prepared_disks::PreparedBootFiles {
             kernel,
@@ -693,6 +694,20 @@ mod tests {
     use super::*;
 
     use mvm_vmm::driver::spec::{ConsoleCapture, KernelImage};
+
+    #[test]
+    fn a_backend_without_bounded_wait_support_cannot_substitute_its_scripted_exit() {
+        let driver = MockDriver::with_exit(VmExitStatus {
+            code: Some(0),
+            success: true,
+        });
+        let vm = driver
+            .boot(&sample_spec("bounded-wait-unsupported"))
+            .unwrap();
+        assert!(vm.wait_with_deadline(std::time::Instant::now()).is_err());
+        assert!(vm.original_workload_report().is_none());
+        assert_eq!(vm.wait().unwrap().code, Some(0));
+    }
 
     fn sample_spec(name: &str) -> VmmSpec {
         VmmSpec {

@@ -6,10 +6,11 @@
 //! acceptance only after the journal and independent anchor commit. A hash
 //! chain alone cannot detect deletion of its suffix.
 
+use crate::private_fs;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
@@ -335,6 +336,24 @@ impl ReplayProtector for Probe {
     }
 }
 
+/// Borrowed ciphertext and exact signed lease for an active original journal
+/// row. Cannot be constructed from a guest-supplied receipt or header.
+pub struct RetainedObjectCall<'a> {
+    entry: &'a Seen,
+    active: &'a LeaseState,
+}
+impl RetainedObjectCall<'_> {
+    pub fn envelope(&self) -> &MailboxEnvelope {
+        &self.entry.envelope
+    }
+    pub fn capability(&self) -> &SignedMailboxCapability {
+        &self.entry.capability
+    }
+    pub fn lease(&self) -> &SignedMailboxDeliveryLease {
+        &self.active.signed
+    }
+}
+
 /// An exclusive writer. Records contain only canonical ciphertext, capability
 /// and signed metadata; plaintext never enters the journal.
 pub struct MailboxJournal {
@@ -349,6 +368,8 @@ pub struct MailboxJournal {
     tip: JournalTip,
     bytes: u64,
     records: usize,
+    // Retry a space-limited snapshot once another signed identity can be retired.
+    deferred_retirees: Option<usize>,
     seen: BTreeMap<ReplayIdentity, Seen>,
     order: Vec<ReplayIdentity>,
     used_challenges: BTreeMap<[u8; 32], ReplayIdentity>,
@@ -399,6 +420,110 @@ pub struct JournalGuestAck<'a> {
     pub signed: &'a SignedMailboxDeliveryAck,
 }
 
+/// Original installed authority for one retained object delivery. A Reply also
+/// requires the pending identity of A's original authenticated Call.
+pub struct ObjectLeaseScope<'a> {
+    pub pair: &'a super::object_pair::ObjectPairV1<'a>,
+    pub destination: &'a super::reader::MailboxReaderBootBinding,
+    pub state: super::object_pair::PairAuthorityState<'a>,
+    pub original_call: Option<&'a super::object_pair::PendingObjectCall>,
+}
+
+impl ObjectLeaseScope<'_> {
+    fn operation(&self) -> MailboxOperation {
+        if self.original_call.is_some() {
+            MailboxOperation::Reply
+        } else {
+            MailboxOperation::Send
+        }
+    }
+    fn check_original(
+        &self,
+        scope: &MailboxGuestReaderScope<'_>,
+        entry: &Seen,
+        request: &JournalReceive<'_>,
+    ) -> Result<(), JournalError> {
+        if &entry.capability != self.pair.retained_capability(self.original_call)
+            || self.destination.boot != scope.current_boot
+            || self.destination.durable_object_pair_sha256_v1
+                != scope.plan.durable_object_pair_sha256_v1
+            || &self.destination.plan_id != scope.plan_id
+            || &self.destination.plan_nonce != scope.plan_nonce
+        {
+            return Err(JournalError::WrongAuthority);
+        }
+        self.pair
+            .check_retained_envelope(
+                self.destination,
+                &entry.envelope,
+                scope.now_unix_ms,
+                self.state,
+                request.encryption_key,
+                self.original_call,
+            )
+            .map_err(|_| JournalError::WrongAuthority)
+    }
+}
+
+/// Resolves A's original Call from its durable encrypted record. Resolution
+/// runs only after reader possession (lease) or the guest's signed ACK has
+/// been verified. The callback receives the journal's actual retained row.
+pub type OriginalCallResolver<'a> = dyn FnMut(
+        &SignedMailboxCapability,
+        &MailboxEnvelope,
+    ) -> Result<super::object_pair::PendingObjectCall, JournalError>
+    + 'a;
+
+enum ObjectCheck<'a, 'r> {
+    Fixed(ObjectLeaseScope<'a>),
+    ResolveReply(ObjectLeaseScope<'a>, &'r mut OriginalCallResolver<'r>),
+}
+
+impl ObjectCheck<'_, '_> {
+    fn operation(&self) -> MailboxOperation {
+        match self {
+            Self::Fixed(scope) => scope.operation(),
+            Self::ResolveReply(..) => MailboxOperation::Reply,
+        }
+    }
+    fn check_original(
+        self,
+        reader: &MailboxGuestReaderScope<'_>,
+        entry: &Seen,
+        receive: &JournalReceive<'_>,
+    ) -> Result<(), JournalError> {
+        match self {
+            Self::Fixed(scope) => scope.check_original(reader, entry, receive),
+            Self::ResolveReply(scope, resolve) => {
+                if scope.original_call.is_some()
+                    || scope.destination.boot != reader.current_boot
+                    || &scope.destination.plan_id != reader.plan_id
+                    || &scope.destination.plan_nonce != reader.plan_nonce
+                    || scope.destination.durable_object_pair_sha256_v1
+                        != reader.plan.durable_object_pair_sha256_v1
+                {
+                    return Err(JournalError::WrongAuthority);
+                }
+                scope
+                    .pair
+                    .require_reply_reader(
+                        scope.destination,
+                        &entry.capability,
+                        reader.now_unix_ms,
+                        scope.state,
+                    )
+                    .map_err(|_| JournalError::WrongAuthority)?;
+                let original = resolve(&entry.capability, &entry.envelope)?;
+                ObjectLeaseScope {
+                    original_call: Some(&original),
+                    ..scope
+                }
+                .check_original(reader, entry, receive)
+            }
+        }
+    }
+}
+
 /// A message whose signed lease was durably committed before payload release.
 pub struct LeasedMailboxMessage {
     message: ReceivedMailboxMessage,
@@ -414,6 +539,40 @@ impl LeasedMailboxMessage {
     #[must_use]
     pub fn lease(&self) -> &SignedMailboxDeliveryLease {
         &self.lease
+    }
+
+    /// The header and bytes come from the same reopened, canonically verified journal entry.
+    pub fn into_reader_response(
+        self,
+        pair: Option<[u8; 32]>,
+    ) -> Result<super::reader_wire::ReaderResponse, JournalError> {
+        use super::reader_wire::ReaderResponse;
+        let header = self.message.opened.header();
+        let payload = self.message.payload();
+        match pair {
+            Some(pair)
+                if self.lease.lease.object_projection_v1
+                    == Some(super::reader::object_delivery_commitment(
+                        &pair, header, payload,
+                    )?) =>
+            {
+                Ok(ReaderResponse::ObjectDeliveryV1 {
+                    header: Box::new(header.clone()),
+                    payload: payload.to_vec(),
+                    lease: Box::new(self.lease),
+                })
+            }
+            None if self.lease.lease.object_projection_v1.is_none() => {
+                Ok(ReaderResponse::Delivery {
+                    content_type: header.content_type.clone(),
+                    payload: payload.to_vec(),
+                    lease: Box::new(self.lease),
+                })
+            }
+            _ => Err(JournalError::Mailbox(
+                super::MailboxError::DeliveryLeaseMismatch,
+            )),
+        }
     }
 
     #[must_use]
@@ -521,6 +680,9 @@ fn verify_recovered_lease(
     now_unix_ms: i64,
 ) -> Result<VerifyingKey, JournalError> {
     let plan = MailboxGrant {
+        durable_object_pair_sha256_v1: None,
+        incoming_journal_policy_sha256_v1: None,
+        outbound_journal_v1: None,
         mailbox: lease.lease.address.mailbox,
         authority_key: authority.to_bytes(),
         epoch: lease.lease.execution_epoch,
@@ -821,7 +983,14 @@ impl MailboxJournal {
                 signer,
             )?);
         }
-        if self.tip.cursor >= self.limits.max_records as u64 {
+        // Local checkpoints advance the authenticated cursor even when they
+        // retire old records. Charge every retained replay identity; append
+        // separately enforces the resident record and byte limits.
+        let at_capacity = match tier {
+            AcceptanceTier::Local => self.seen.len() >= self.limits.max_records,
+            AcceptanceTier::Independent => self.tip.cursor >= self.limits.max_records as u64,
+        };
+        if at_capacity {
             return Err(JournalError::Full);
         }
         let accepted = receipt(match tier {
@@ -1071,6 +1240,13 @@ impl MailboxJournal {
         &self,
         request: JournalReceive<'_>,
     ) -> Result<Option<ReceivedMailboxMessage>, JournalError> {
+        self.receive_next_for(request, MailboxOperation::Send)
+    }
+    fn receive_next_for(
+        &self,
+        request: JournalReceive<'_>,
+        original_operation: MailboxOperation,
+    ) -> Result<Option<ReceivedMailboxMessage>, JournalError> {
         if self.poisoned {
             return Err(JournalError::Uncertain);
         }
@@ -1082,7 +1258,7 @@ impl MailboxJournal {
             {
                 continue;
             }
-            let opened = self.open_for_reader(*identity, entry, &request)?;
+            let opened = self.open_for_reader(*identity, entry, &request, original_operation)?;
             return Ok(Some(ReceivedMailboxMessage {
                 identity: *identity,
                 opened,
@@ -1098,6 +1274,81 @@ impl MailboxJournal {
         request: JournalGuestLease<'_>,
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
+        self.lease_next_inner(request, None, anchor)
+    }
+
+    /// A Reply must be anchored to the current lease of the exact original
+    /// unacknowledged row. The borrow keeps this journal generation locked.
+    pub fn original_object_call(
+        &self,
+        signed: &SignedMailboxDeliveryLease,
+        now: i64,
+    ) -> Result<RetainedObjectCall<'_>, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Uncertain);
+        }
+        let l = &signed.lease;
+        if l.address != self.address
+            || l.object_projection_v1.is_none()
+            || !(l.issued_at_unix_ms..l.expires_at_unix_ms).contains(&now)
+        {
+            return Err(JournalError::NoActiveLease);
+        }
+        let id = ReplayIdentity {
+            sender: l.sender,
+            sender_boot: l.sender_boot,
+            execution_epoch: l.execution_epoch,
+            message_id: l.message_id,
+        };
+        let entry = self.seen.get(&id).ok_or(JournalError::NoActiveLease)?;
+        let active = entry.lease.as_ref().ok_or(JournalError::NoActiveLease)?;
+        if entry.acknowledged
+            || entry.expired_at_unix_ms.is_some()
+            || active.signed != *signed
+            || entry.envelope.ciphertext_commitment != l.ciphertext_commitment
+            || entry.envelope.routing.delivery_id != l.delivery_id
+        {
+            return Err(JournalError::NoActiveLease);
+        }
+        Ok(RetainedObjectCall { entry, active })
+    }
+
+    /// Lease the next original record for the opted-in pair. The independent
+    /// Receive enrollment and possession checks are identical to ordinary delivery.
+    pub fn lease_next_object(
+        &mut self,
+        request: JournalGuestLease<'_>,
+        scope: ObjectLeaseScope<'_>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
+        self.lease_next_inner(request, Some(ObjectCheck::Fixed(scope)), anchor)
+    }
+
+    /// The installed caller recovers the correct pending Call from the immutable
+    /// source seal for the specific row chosen by this journal.
+    pub fn lease_next_object_reply<'r>(
+        &mut self,
+        request: JournalGuestLease<'_>,
+        scope: ObjectLeaseScope<'_>,
+        resolve: &'r mut OriginalCallResolver<'r>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
+        self.lease_next_inner(
+            request,
+            Some(ObjectCheck::ResolveReply(scope, resolve)),
+            anchor,
+        )
+    }
+
+    fn lease_next_inner(
+        &mut self,
+        request: JournalGuestLease<'_>,
+        paired: Option<ObjectCheck<'_, '_>>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<Option<LeasedMailboxMessage>, JournalError> {
+        if request.plan.durable_object_pair_sha256_v1.is_some() != paired.is_some() {
+            return Err(JournalError::WrongAuthority);
+        }
         if self.poisoned {
             return Err(JournalError::Uncertain);
         }
@@ -1124,11 +1375,20 @@ impl MailboxJournal {
             request.possession_signature,
             &key,
         )?;
-        let Some(message) = self.receive_next(request.receive)? else {
+        let Some(message) = self.receive_next_for(
+            request.receive,
+            paired
+                .as_ref()
+                .map_or(MailboxOperation::Send, ObjectCheck::operation),
+        )?
+        else {
             return Ok(None);
         };
         let identity = message.identity;
         let entry = self.seen.get(&identity).ok_or(JournalError::Corrupt)?;
+        if let Some(scope) = paired {
+            scope.check_original(&request.scope, entry, &request.receive)?;
+        }
         let now = request.scope.now_unix_ms;
         if let Some(active) = &entry.lease
             && active.signed.lease.expires_at_unix_ms > now
@@ -1180,6 +1440,13 @@ impl MailboxJournal {
         }
         let signed = sign_delivery_lease(
             MailboxDeliveryLease {
+                object_projection_v1: request
+                    .plan
+                    .durable_object_pair_sha256_v1
+                    .map(|pair| {
+                        super::reader::object_delivery_commitment(&pair, header, message.payload())
+                    })
+                    .transpose()?,
                 protocol_version: ProtocolVersion::V1,
                 signature_algorithm: SignatureAlgorithm::ED25519,
                 address: self.address,
@@ -1257,7 +1524,7 @@ impl MailboxJournal {
         if entry.expired_at_unix_ms.is_some() {
             return Err(JournalError::Mailbox(MailboxError::Expired));
         }
-        let _opened = self.open_for_reader(identity, entry, &request)?;
+        let _opened = self.open_for_reader(identity, entry, &request, MailboxOperation::Send)?;
         if entry.lease.is_some() {
             return Err(JournalError::GuestAckRequired);
         }
@@ -1285,6 +1552,41 @@ impl MailboxJournal {
         request: JournalGuestAck<'_>,
         anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
     ) -> Result<JournalTip, JournalError> {
+        self.acknowledge_signed_inner(request, None, anchor)
+    }
+    /// Record the canonical guest signature only under the same selected
+    /// original Call/Reply route and still-current independent Receive authority.
+    pub fn acknowledge_signed_object(
+        &mut self,
+        request: JournalGuestAck<'_>,
+        scope: ObjectLeaseScope<'_>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<JournalTip, JournalError> {
+        self.acknowledge_signed_inner(request, Some(ObjectCheck::Fixed(scope)), anchor)
+    }
+    /// Recover only the original Call for the row matched by the verified ACK.
+    pub fn acknowledge_signed_object_reply<'r>(
+        &mut self,
+        request: JournalGuestAck<'_>,
+        scope: ObjectLeaseScope<'_>,
+        resolve: &'r mut OriginalCallResolver<'r>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<JournalTip, JournalError> {
+        self.acknowledge_signed_inner(
+            request,
+            Some(ObjectCheck::ResolveReply(scope, resolve)),
+            anchor,
+        )
+    }
+    fn acknowledge_signed_inner(
+        &mut self,
+        request: JournalGuestAck<'_>,
+        paired: Option<ObjectCheck<'_, '_>>,
+        anchor: impl FnOnce(JournalTip) -> Result<(), JournalError>,
+    ) -> Result<JournalTip, JournalError> {
+        if request.plan.durable_object_pair_sha256_v1.is_some() != paired.is_some() {
+            return Err(JournalError::WrongAuthority);
+        }
         if self.poisoned {
             return Err(JournalError::Uncertain);
         }
@@ -1323,7 +1625,10 @@ impl MailboxJournal {
         {
             return Err(JournalError::Mailbox(MailboxError::CapabilityRevoked));
         }
-        let opened = self.open_for_reader(identity, entry, &request.receive)?;
+        let operation = paired
+            .as_ref()
+            .map_or(MailboxOperation::Send, ObjectCheck::operation);
+        let opened = self.open_for_reader(identity, entry, &request.receive, operation)?;
         let guest_key = VerifyingKey::from_bytes(&request.enrollment.enrollment.ack_public_key)
             .map_err(|_| JournalError::Mailbox(MailboxError::ReaderKeyInvalid))?;
         verify_delivery_ack(
@@ -1343,6 +1648,9 @@ impl MailboxJournal {
             request.enrollment,
             &guest_key,
         )?;
+        if let Some(scope) = paired {
+            scope.check_original(&request.scope, entry, &request.receive)?;
+        }
         if entry.acknowledged {
             return if entry.signed_ack.as_ref() == Some(request.signed) {
                 Ok(self.tip)
@@ -1368,6 +1676,7 @@ impl MailboxJournal {
         identity: ReplayIdentity,
         entry: &Seen,
         request: &JournalReceive<'_>,
+        original_operation: MailboxOperation,
     ) -> Result<super::OpenedMailboxMessage, JournalError> {
         if request.context.required_operation != MailboxOperation::Receive
             || request.context.expected_tenant != self.address.tenant
@@ -1380,7 +1689,7 @@ impl MailboxJournal {
         let mut send_context = request.context.clone();
         send_context.acting_principal = entry.capability.grant.subject;
         send_context.expected_capability_issuer = entry.capability.grant.issuer;
-        send_context.required_operation = MailboxOperation::Send;
+        send_context.required_operation = original_operation;
         let opened = open_authenticated_envelope(
             &entry.envelope,
             &entry.capability,
@@ -1434,12 +1743,12 @@ fn record_path(root: &Path, cursor: u64) -> PathBuf {
 }
 
 fn read_record(path: &Path) -> Result<Vec<u8>, JournalError> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    let file = private_fs::open_readonly_nofollow(path)?;
     let meta = file.metadata()?;
-    if !meta.file_type().is_file() || meta.nlink() != 1 || meta.len() > MAX_RECORD_BYTES as u64 {
+    if !meta.file_type().is_file()
+        || private_fs::hard_link_count(&meta)? != 1
+        || meta.len() > MAX_RECORD_BYTES as u64
+    {
         return Err(JournalError::Corrupt);
     }
     let mut bytes = Vec::new();
@@ -1612,13 +1921,27 @@ mod anchor_tests {
         VerifyingKey,
         SigningKey,
     ) {
+        message_at(9, 1, 1_800_000_000_000)
+    }
+
+    fn message_at(
+        id: u8,
+        sequence: u64,
+        now: i64,
+    ) -> (
+        MailboxEnvelope,
+        SignedMailboxCapability,
+        OpenContext,
+        Key,
+        VerifyingKey,
+        SigningKey,
+    ) {
         let destination = address();
         let signer = SigningKey::from_bytes(&[6; 32]);
         let sender = SigningKey::from_bytes(&[7; 32]);
         let sender_id = PrincipalId::from_bytes(sender.verifying_key().to_bytes());
         let content_type = ContentType::parse("application/vnd.mvm.test", 1).expect("content type");
         let epoch = ExecutionEpoch::new(1).expect("epoch");
-        let now = 1_800_000_000_000;
         let header = MailboxEnvelopeHeader {
             protocol_version: ProtocolVersion::V1,
             signature_algorithm: SignatureAlgorithm::ED25519,
@@ -1629,16 +1952,16 @@ mod anchor_tests {
             mailbox: destination.mailbox,
             sender_boot: BootId::from_bytes([8; 32]),
             execution_epoch: epoch,
-            message_id: MessageId::from_bytes([9; 32]),
+            message_id: MessageId::from_bytes([id; 32]),
             correlation_id: CorrelationId::from_bytes([10; 32]),
             causation_id: CausationId::from_bytes([11; 32]),
             kind: MailboxMessageKind::Cast,
             reply_to: None,
             ordering_scope: OrderingScope::parse("test").expect("scope"),
-            sequence: SequenceNumber::new(1).expect("sequence"),
+            sequence: SequenceNumber::new(sequence).expect("sequence"),
             issued_at_unix_ms: now - 1,
             expires_at_unix_ms: now + 10_000,
-            nonce: ReplayNonce::from_bytes([12; 16]),
+            nonce: ReplayNonce::from_bytes([id.wrapping_add(3); 16]),
             content_type: content_type.clone(),
             capability_id: CapabilityId::from_bytes([13; 32]),
             policy_epoch: 1,
@@ -1652,7 +1975,7 @@ mod anchor_tests {
             protocol_version: ProtocolVersion::V1,
             authorization_domain_route_label: AuthorizationDomainRouteLabel::from_bytes([15; 32]),
             destination_route_token: DestinationRouteToken::from_bytes([16; 32]),
-            delivery_id: DeliveryId::from_bytes([17; 32]),
+            delivery_id: DeliveryId::from_bytes([id.wrapping_add(8); 32]),
             ciphertext_len: 0,
             padding: CiphertextPadding::Exact,
             expires_at_unix_ms: header.expires_at_unix_ms,
@@ -2069,6 +2392,7 @@ mod anchor_tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovery_never_follows_a_replaced_record_outside_its_private_directory() {
         let dir = tempfile::tempdir().expect("journal root");
@@ -2168,6 +2492,323 @@ mod anchor_tests {
         .expect("empty retired generation reopens");
         assert!(recovered.seen.is_empty());
         assert_eq!(recovered.tip(), anchor.tip());
+    }
+
+    #[test]
+    fn retained_local_credit_survives_restart_without_resetting_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let anchor = FileJournalAnchor::open(
+            &dir.path().join("anchor").join("tip.json"),
+            address(),
+            [22; 32],
+        )
+        .unwrap();
+        let policy = local_retention();
+        let open = |limits| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                SigningKey::from_bytes(&[6; 32]).verifying_key(),
+                limits,
+                &custody,
+                &anchor,
+                policy,
+            )
+        };
+        let (old, send, context, key, a, b) = message();
+        let mut journal = open(limits()).unwrap();
+        let old_request = |context| admission(&old, &send, context, &key, &a, &b);
+        let original = journal.admit_local(old_request(&context), &anchor).unwrap();
+        journal
+            .compact_local(context.now_unix_ms, &b, &anchor)
+            .unwrap();
+        assert_eq!(
+            journal.admit_local(old_request(&context), &anchor).unwrap(),
+            original
+        );
+        let expiry = old.routing.expires_at_unix_ms;
+        journal
+            .expire_next(expiry, &b, |next| anchor.advance(next))
+            .unwrap();
+        let horizon = policy.retained_until(expiry).unwrap();
+        journal.compact_local(horizon, &b, &anchor).unwrap();
+        assert_eq!(
+            journal.seen.len(),
+            1,
+            "signed window includes its last millisecond"
+        );
+        journal.compact_local(horizon + 1, &b, &anchor).unwrap();
+        assert!(journal.seen.is_empty());
+        drop(journal);
+        let mut journal = open(limits()).unwrap();
+        let tip = anchor.tip();
+        assert!(tip.cursor >= limits().max_records as u64);
+        assert_eq!(journal.records, 1);
+        let mut stale = context.clone();
+        stale.now_unix_ms = horizon + 1;
+        assert!(matches!(
+            journal.admit_local(old_request(&stale), &anchor),
+            Err(JournalError::Mailbox(_))
+        ));
+        assert_eq!(anchor.tip(), tip);
+        let (fresh, grant, current, key2, a2, b2) = message_at(10, 2, horizon + 1);
+        let request = || admission(&fresh, &grant, &current, &key2, &a2, &b2);
+        let receipt = journal
+            .admit_local(request(), &anchor)
+            .expect("free retained capacity must admit a fresh signed identity");
+        assert_eq!(receipt.receipt.message_id, MessageId::from_bytes([10; 32]));
+        assert_eq!(journal.tip().cursor, tip.cursor + 1);
+        assert_eq!(journal.tip(), anchor.tip());
+        drop(journal);
+        let mut recovered = open(limits()).unwrap();
+        assert_eq!(recovered.admit_local(request(), &anchor).unwrap(), receipt);
+        assert_eq!(recovered.seen.len(), 1);
+    }
+
+    #[test]
+    fn local_checkpoints_keep_retained_identity_and_physical_quotas_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let b = SigningKey::from_bytes(&[6; 32]);
+        let anchor = FileJournalAnchor::open(
+            &dir.path().join("anchor").join("tip.json"),
+            address(),
+            [22; 32],
+        )
+        .unwrap();
+        let quota = JournalLimits {
+            max_records: 3,
+            max_bytes: 512 * 1024,
+        };
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                b.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
+                local_retention(),
+            )
+        };
+        let mut journal = open(quota).unwrap();
+        let now = 1_800_000_000_000;
+        let mut receipts = Vec::new();
+        for id in 1..=3 {
+            let (e, c, x, k, a, b) = message_at(id, id.into(), now);
+            receipts.push(
+                journal
+                    .admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor)
+                    .unwrap(),
+            );
+            if id < 3 {
+                journal.compact_local(now, &b, &anchor).unwrap();
+            }
+        }
+        // The checkpoint retains two identities, and one more was appended. A lower
+        // recovery quota must reject this combination even though its two files fit.
+        drop(journal);
+        let lower = JournalLimits {
+            max_records: 2,
+            ..quota
+        };
+        assert!(matches!(open(lower), Err(JournalError::Full)));
+        let mut journal = open(quota).unwrap();
+        journal.compact_local(now, &b, &anchor).unwrap();
+        drop(journal);
+        assert!(matches!(open(lower), Err(JournalError::Full)));
+        let mut journal = open(quota).unwrap();
+        assert_eq!(journal.records, 1);
+        assert_eq!(journal.seen.len(), 3);
+        let tip = anchor.tip();
+        let (e, c, x, k, a, b) = message_at(4, 4, now);
+        assert!(matches!(
+            journal.admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor),
+            Err(JournalError::Full)
+        ));
+        assert_eq!(anchor.tip(), tip);
+        // Fresh sealing under a prior identity conflicts; the old proof remains intact.
+        let (e, c, x, k, a, b) = message_at(1, 4, now);
+        assert!(matches!(
+            journal.admit_local(admission(&e, &c, &x, &k, &a, &b), &anchor),
+            Err(JournalError::ConflictingRetry)
+        ));
+        assert_eq!(anchor.tip(), tip);
+        assert_eq!(
+            receipts[0].receipt.message_id,
+            MessageId::from_bytes([1; 32])
+        );
+    }
+
+    #[test]
+    fn full_opportunistic_checkpoint_preserves_live_receipts_and_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (envelope, capability, mut context, key, sender, signer) = message();
+        let (reference, custody) = versioned_custody();
+        let anchor =
+            FileJournalAnchor::open(&dir.path().join("anchor/tip"), address(), [22; 32]).unwrap();
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                signer.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
+                local_retention(),
+            )
+            .unwrap()
+        };
+        let mut journal = open(limits());
+        let original = || admission(&envelope, &capability, &context, &key, &sender, &signer);
+        let receipt = journal.admit_local(original(), &anchor).unwrap();
+        let (other, cap, ctx, dek, a, b) = message_at(3, 2, context.now_unix_ms);
+        journal
+            .admit_local(admission(&other, &cap, &ctx, &dek, &a, &b), &anchor)
+            .unwrap();
+        let retained_tip = anchor.tip();
+        // A checkpoint needs temporary space beside the complete retained prefix.
+        let quota = JournalLimits {
+            max_records: 100,
+            max_bytes: journal.bytes + 1,
+        };
+        drop(journal);
+        let mut journal = open(quota);
+        assert!(journal.local_compaction_due(context.now_unix_ms).unwrap());
+        journal
+            .maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor)
+            .unwrap();
+        assert!(!journal.local_compaction_due(context.now_unix_ms).unwrap());
+        assert!(matches!(
+            journal.compact_local(context.now_unix_ms, &signer, &anchor),
+            Err(JournalError::Full)
+        ));
+        assert_eq!(journal.admit_local(original(), &anchor).unwrap(), receipt);
+        let (next, cap, ctx, dek, a, b) = message_at(2, 2, context.now_unix_ms);
+        assert!(matches!(
+            journal.admit_local(admission(&next, &cap, &ctx, &dek, &a, &b), &anchor),
+            Err(JournalError::Full)
+        ));
+        assert_eq!(anchor.tip(), retained_tip);
+        assert!(record_path(&root, 1).exists());
+        drop(journal);
+        let mut journal = open(quota);
+        journal
+            .maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor)
+            .unwrap();
+        assert_eq!(journal.admit_local(original(), &anchor).unwrap(), receipt);
+        // A pre-publication capacity refusal must never mask anchor disagreement.
+        let mut wrong = retained_tip;
+        wrong.cursor += 1;
+        anchor.advance(wrong).unwrap();
+        context.now_unix_ms += 1;
+        assert!(matches!(
+            journal.maintain_local_checkpoint(context.now_unix_ms, &signer, &anchor),
+            Err(JournalError::Rollback)
+        ));
+    }
+
+    #[test]
+    fn deferred_checkpoint_retries_after_one_acknowledged_horizon() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("journal");
+        let (reference, custody) = versioned_custody();
+        let (old, send, context, key, sender, signer) = message();
+        let anchor =
+            FileJournalAnchor::open(&dir.path().join("anchor/tip"), address(), [22; 32]).unwrap();
+        let retention = local_retention();
+        let open = |quota| {
+            MailboxJournal::open_local_with_custody(
+                &root,
+                reference,
+                signer.verifying_key(),
+                quota,
+                &custody,
+                &anchor,
+                retention,
+            )
+            .unwrap()
+        };
+        let mut journal = open(limits());
+        journal
+            .admit_local(
+                admission(&old, &send, &context, &key, &sender, &signer),
+                &anchor,
+            )
+            .unwrap();
+        let mut grant = send.grant.clone();
+        grant.subject = address().recipient;
+        grant.capability_id = CapabilityId::from_bytes([31; 32]);
+        grant.operations = CapabilityOperations::from_operations(&[MailboxOperation::Receive]);
+        let receive = super::super::sign_capability(grant, &signer).unwrap();
+        let mut reader = context.clone();
+        reader.acting_principal = address().recipient;
+        reader.required_operation = MailboxOperation::Receive;
+        let old_id = journal.order[0];
+        journal
+            .acknowledge(
+                old_id,
+                JournalReceive {
+                    capability: &receive,
+                    context: &reader,
+                    encryption_key: &key,
+                    sender_key: &sender,
+                },
+                |tip| anchor.advance(tip),
+            )
+            .unwrap();
+
+        let horizon = retention
+            .retained_until(old.routing.expires_at_unix_ms)
+            .unwrap();
+        let (active, cap, mut ctx, dek, a, b) = message_at(3, 2, horizon - 1);
+        let original = journal
+            .admit_local(admission(&active, &cap, &ctx, &dek, &a, &b), &anchor)
+            .unwrap();
+        let active_id = journal.order[1];
+        // Room for one checkpoint entry plus its signed wrapper, but not both retained identities.
+        let one = serde_json::to_vec(&journal.seen[&active_id]).unwrap().len() as u64;
+        let quota = JournalLimits {
+            max_records: 100,
+            max_bytes: journal.bytes + one + 3000,
+        };
+        drop(journal);
+        let mut journal = open(quota);
+        let before = anchor.tip();
+        assert!(journal.local_compaction_due(horizon).unwrap());
+        journal
+            .maintain_local_checkpoint(horizon, &signer, &anchor)
+            .unwrap();
+        assert_eq!(anchor.tip(), before);
+        assert_eq!(journal.deferred_retirees, Some(0));
+        for _ in 0..64 {
+            assert!(!journal.local_compaction_due(horizon).unwrap());
+            journal
+                .maintain_local_checkpoint(horizon, &signer, &anchor)
+                .unwrap();
+        }
+        assert!(journal.seen.contains_key(&old_id));
+        ctx.now_unix_ms = horizon + 1;
+        assert!(journal.local_compaction_due(ctx.now_unix_ms).unwrap());
+        journal
+            .maintain_local_checkpoint(ctx.now_unix_ms, &signer, &anchor)
+            .unwrap();
+        assert_eq!(anchor.tip().cursor, before.cursor + 1);
+        assert_eq!(journal.records, 1);
+        assert!(!journal.seen.contains_key(&old_id));
+        drop(journal);
+        let mut recovered = open(quota);
+        assert_eq!(recovered.seen.len(), 1);
+        assert_eq!(
+            recovered
+                .admit_local(admission(&active, &cap, &ctx, &dek, &a, &b), &anchor)
+                .unwrap(),
+            original
+        );
     }
 
     #[test]

@@ -2486,18 +2486,19 @@ mod tests {
     /// A release that passes the pre-install smoke test and then fails once it
     /// sits at the installed path must be rolled back, leaving the previous
     /// binary runnable and no backup behind. The fixture answers `--version`
-    /// only while no `.installed` marker sits beside it; the test puts that
-    /// marker in the install directory, so the binary breaks exactly once it is
-    /// installed, whatever the temporary directory's path looks like.
+    /// while its sibling `.installed` marker is absent. The synthetic release
+    /// checks the marker with shell builtins under a child-local restricted
+    /// PATH. The environment guard keeps the host tar invocations independent.
     #[test]
     fn a_release_that_fails_its_post_install_smoke_test_is_rolled_back() {
+        let _env = TestEnv::new();
         let tmp = tempfile::tempdir().unwrap();
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let archive = build_release_archive_with_binary(
             tmp.path(),
             "unit-test",
-            "#!/bin/sh\nif [ -e \"$(dirname \"$0\")/.installed\" ]; then echo broken >&2; exit 1; fi\necho 'mvmctl 9.9.9'\n",
+            "#!/bin/sh\nPATH=/dev/null\nif [ -e \"${0%/*}/.installed\" ]; then echo broken >&2; exit 1; fi\necho 'mvmctl 9.9.9'\n",
             false,
             false,
         );

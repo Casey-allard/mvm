@@ -41,14 +41,24 @@ impl FcCapabilities {
     pub fn probe(socket: &Path) -> Result<Self> {
         Ok(Self::for_version(&running_version(socket)?))
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn probe_session(session: &mut crate::fc::fc_api::FcSession) -> Result<Self> {
+        let body = session.call("GET", "/version", None)?;
+        Ok(Self::for_version(&version_from_body(&body)?))
+    }
 }
 
 /// The version the Firecracker serving `socket` reports, e.g. `1.17.0`.
 pub fn running_version(socket: &Path) -> Result<String> {
     let body = crate::fc::call(socket, "GET", "/version", None)
         .context("GET /version from Firecracker")?;
+    version_from_body(&body)
+}
+
+fn version_from_body(body: &str) -> Result<String> {
     let reported: VersionResponse =
-        serde_json::from_str(&body).context("parsing Firecracker's /version response")?;
+        serde_json::from_str(body).context("parsing Firecracker's /version response")?;
     Ok(reported.firecracker_version)
 }
 
@@ -105,5 +115,16 @@ mod tests {
         let reported: VersionResponse =
             serde_json::from_str(r#"{"firecracker_version": "1.17.0"}"#).unwrap();
         assert!(FcCapabilities::for_version(&reported.firecracker_version).block_discard);
+    }
+
+    #[test]
+    fn malformed_version_responses_are_refused_instead_of_selecting_capabilities() {
+        for body in ["", "{}", r#"{"firecracker_version":17}"#] {
+            assert!(version_from_body(body).is_err());
+        }
+        assert_eq!(
+            version_from_body(r#"{"firecracker_version":"1.17.0"}"#).unwrap(),
+            "1.17.0"
+        );
     }
 }

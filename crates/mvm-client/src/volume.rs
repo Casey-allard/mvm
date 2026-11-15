@@ -106,6 +106,130 @@ mod tests {
     }
 
     #[test]
+    fn launch_volume_contention_keeps_original_owner_at_deadline_and_propagates_io_errors() {
+        use mvm_core::util::atomic_io::FileLock;
+        use std::time::{Duration, Instant};
+
+        let _home = TestVolumeHome::new();
+        let path = LocalVolumeCatalog::path();
+        let held = super::lifecycle::acquire_volume_lifecycle_lock().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let err = FileLock::acquire_until(&path, deadline).err().unwrap();
+        assert!(Instant::now() >= deadline);
+        assert!(err.to_string().contains("deadline expired"));
+        assert!(FileLock::try_acquire(&path).unwrap().is_none());
+        assert!(!AttachmentLeaseCatalog::path().exists());
+        drop(held);
+
+        let name = path.with_extension("lock");
+        let previous = path.with_extension("old");
+        fs::rename(&name, &previous).unwrap();
+        std::os::unix::fs::symlink(&previous, &name).unwrap();
+        let err = service()
+            .acquire_launch_lease(&jit_launch("vm-2"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("failed to open lock file"));
+        fs::remove_file(&name).unwrap();
+        fs::create_dir(&name).unwrap();
+        let err = service()
+            .acquire_launch_lease(&jit_launch("vm-2"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("failed to open lock file"));
+        assert!(!AttachmentLeaseCatalog::path().exists());
+    }
+
+    #[test]
+    fn launch_volume_special_file_dangling_link_never_creates_target() {
+        let _home = TestVolumeHome::new();
+        let lock_name = LocalVolumeCatalog::path().with_extension("lock");
+        fs::create_dir_all(lock_name.parent().unwrap()).unwrap();
+        let absent = lock_name.with_extension("absent");
+        std::os::unix::fs::symlink(&absent, &lock_name).unwrap();
+        assert!(service().acquire_launch_lease(&jit_launch("vm-2")).is_err());
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn launch_volume_special_file_fifo_refuses_before_reader_opens() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let _home = TestVolumeHome::new();
+        let lock_name = LocalVolumeCatalog::path().with_extension("lock");
+        fs::create_dir_all(lock_name.parent().unwrap()).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&lock_name)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (started, ready) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                started.send(()).unwrap();
+                finished
+                    .send(service().acquire_launch_lease(&jit_launch("vm-2")).is_err())
+                    .unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let before_reader = result.recv_timeout(Duration::from_millis(500));
+            // Release a regressed blocking open before joining that thread.
+            let _reader = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&lock_name)
+                .unwrap();
+            if before_reader.is_err() {
+                result.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            assert_eq!(before_reader, Ok(true));
+        });
+    }
+
+    #[test]
+    fn launch_volume_contention_waits_and_reads_committed_catalog() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let _home = TestVolumeHome::new();
+        for corrupt in [false, true] {
+            let lock = super::lifecycle::acquire_volume_lifecycle_lock().unwrap();
+            let (started, ready) = mpsc::channel();
+            let (result, completed) = mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    started.send(()).unwrap();
+                    let outcome = service()
+                        .acquire_launch_lease(&jit_launch("vm-2"))
+                        .map(|prepared| prepared.volumes.len())
+                        .map_err(|error| format!("{error:#}"));
+                    result.send(outcome).unwrap();
+                });
+                ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                let early = completed.recv_timeout(Duration::from_millis(75));
+                if corrupt {
+                    fs::write(AttachmentLeaseCatalog::path(), b"invalid catalog").unwrap();
+                }
+                drop(lock);
+                assert_eq!(early, Err(RecvTimeoutError::Timeout));
+                let outcome = completed.recv_timeout(Duration::from_secs(2)).unwrap();
+                if corrupt {
+                    assert!(outcome.unwrap_err().contains("parsing volume leases"));
+                    assert_eq!(
+                        fs::read(AttachmentLeaseCatalog::path()).unwrap(),
+                        b"invalid catalog"
+                    );
+                } else {
+                    assert_eq!(outcome.unwrap(), 0);
+                }
+            });
+        }
+    }
+
+    #[test]
     fn create_refuses_default_and_custom_roots_without_verified_storage() {
         let home = TestVolumeHome::new();
         for custom in [false, true] {

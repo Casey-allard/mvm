@@ -2,6 +2,49 @@
 // Depends on mvm-core
 
 #![deny(unreachable_pub)]
+/// Compiled guest implementations used when declaring mailbox reader support.
+pub const COMPILED_MAILBOX_READER_INPUTS: &[(&str, &[u8])] = &[
+    (
+        "crates/mvm-agentd/src/bin/mvm-guest-agent/mailbox.rs",
+        include_bytes!("bin/mvm-guest-agent/mailbox.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/bin/mvm-guest-agent/mailbox_reader.rs",
+        include_bytes!("bin/mvm-guest-agent/mailbox_reader.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/bin/mvm-guest-agent/mailbox_reader/ordinal.rs",
+        include_bytes!("bin/mvm-guest-agent/mailbox_reader/ordinal.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/bin/mvm-guest-agent/mailbox_reader/object_submit.rs",
+        include_bytes!("bin/mvm-guest-agent/mailbox_reader/object_submit.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/bin/mvm-guest-agent/mailbox_reader/validity.rs",
+        include_bytes!("bin/mvm-guest-agent/mailbox_reader/validity.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/mailbox_outbox.rs",
+        include_bytes!("mailbox_outbox.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/mailbox_outbox/journal_direction.rs",
+        include_bytes!("mailbox_outbox/journal_direction.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/mailbox_outbox/object_pair.rs",
+        include_bytes!("mailbox_outbox/object_pair.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/mailbox_outbox/ordinal.rs",
+        include_bytes!("mailbox_outbox/ordinal.rs"),
+    ),
+    (
+        "crates/mvm-agentd/src/flowmux_drive.rs",
+        include_bytes!("flowmux_drive.rs"),
+    ),
+];
 /// Loopback DNS resolver (`mvm-addon-dns`).
 #[cfg(feature = "addons")]
 pub mod addon_dns;

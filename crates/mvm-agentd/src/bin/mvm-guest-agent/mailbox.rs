@@ -9,17 +9,19 @@
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
-use std::sync::{OnceLock, atomic::Ordering};
+use std::sync::{Arc, Mutex, OnceLock, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use mvm_agentd::flowmux_drive::{MAILBOX_ACK_SIGNING_KEY_FILE, RUN_MVM_DIR};
 use mvm_agentd::mailbox_outbox::{
     LOCAL_OUTBOX_PATH, MAILBOX_CMDLINE_TOKEN, MAILBOX_HOLD, MAILBOX_IO_TIMEOUT, OUTBOX_PATH,
-    forward_local_outbox, forward_outbox, peer_gone, wait_for_outbox,
+    forward_local_outbox, forward_outbox,
+    journal_direction::{JournalAttempts, forward_for_original_boot},
+    peer_gone, wait_for_outbox,
 };
 use mvm_agentd::telemetry_capture::session::TimedStream;
-use mvm_contract::protocol::mailbox::MAILBOX_PORT;
+use mvm_contract::protocol::mailbox::{MAILBOX_ORDINAL_CMDLINE_TOKEN, MAILBOX_PORT};
 use mvm_core::mailbox::frame::Refusal;
 use mvm_core::mailbox::reader::MailboxReaderBootBinding;
 use zeroize::Zeroizing;
@@ -30,35 +32,125 @@ use crate::transport::{accept_vsock, bind_vsock_listener, unix_transport_selecte
 
 static ACK_SEED: OnceLock<Zeroizing<[u8; 32]>> = OnceLock::new();
 static READER_BOOT: OnceLock<MailboxReaderBootBinding> = OnceLock::new();
+static ORDINAL_OUTBOX: OnceLock<Arc<Mutex<mvm_agentd::mailbox_outbox::ordinal::OrdinalOutbox>>> =
+    OnceLock::new();
 
-/// Retain the root-only ACK key before PID 1 drops to the workload UID.
-/// A missing or malformed key disables Receive; the existing Send path
-/// remains available, and warm children never inherit reader authority.
-pub(crate) fn capture_ack_key_before_privilege_drop() {
+pub(super) fn ordinal_outbox_for_boot(
+    boot: &MailboxReaderBootBinding,
+) -> Option<Arc<Mutex<mvm_agentd::mailbox_outbox::ordinal::OrdinalOutbox>>> {
+    if READER_BOOT.get() == Some(boot)
+        && boot
+            .outbound_journal_v1
+            .is_some_and(|d| d.sender_settlement.is_some())
+    {
+        ORDINAL_OUTBOX.get().cloned()
+    } else {
+        None
+    }
+}
+
+fn capture_ordinal_outbox(
+    boot: &MailboxReaderBootBinding,
+) -> Result<(), mvm_agentd::guest_mount::MountError> {
+    use mvm_agentd::guest_mount::MountError;
+    use mvm_agentd::mailbox_outbox::ordinal::OrdinalOutbox;
+    use std::os::unix::fs::DirBuilderExt;
+    let denied =
+        || MountError::InvalidConfig("cannot provision original ordinal sender state".into());
+    if boot.durable_object_pair_sha256_v1.is_some()
+        || MailboxReaderBootBinding::load_guest_original()
+            .ok()
+            .as_ref()
+            != Some(boot)
+    {
+        return Err(denied());
+    }
+    // Only original PID 1 activation creates this private boot directory. A
+    // helper restart reuses the live guest. Refuse any previously present name.
+    let root = Path::new(RUN_MVM_DIR).join("sender-ordinal-private-v1");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .map_err(|_| denied())?;
+    let key = Arc::new(mvm_core::crypto::aead::Key::random());
+    let store = OrdinalOutbox::create(&root, boot, key).map_err(|_| denied())?;
+    mvm_core::util::atomic_io::sync_dir(Path::new(RUN_MVM_DIR)).map_err(|_| denied())?;
+    ORDINAL_OUTBOX
+        .set(Arc::new(Mutex::new(store)))
+        .map_err(|_| denied())
+}
+
+fn boot_projection(
+    dir: &Path,
+    expected_ordinal: bool,
+) -> Result<Option<MailboxReaderBootBinding>, mvm_agentd::guest_mount::MountError> {
+    use mvm_agentd::guest_mount::MountError;
+    use mvm_core::mailbox::reader::MAILBOX_READER_BOOT_FILE;
+    let missing = |name: &str| {
+        dir.join(name)
+            .symlink_metadata()
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    };
+    if !expected_ordinal
+        && missing(MAILBOX_READER_BOOT_FILE)
+        && missing(MAILBOX_ACK_SIGNING_KEY_FILE)
+    {
+        return Ok(None);
+    }
+    let binding = MailboxReaderBootBinding::load(dir).map_err(|_| {
+        MountError::InvalidConfig("original mailbox boot identity unavailable".into())
+    })?;
+    let ordinal = binding
+        .outbound_journal_v1
+        .is_some_and(|direction| direction.sender_settlement.is_some());
+    if ordinal != expected_ordinal {
+        return Err(MountError::InvalidConfig(
+            "mailbox boot identity disagrees with the admitted sender profile".into(),
+        ));
+    }
+    Ok(Some(binding))
+}
+
+/// Capture the original mailbox identity before PID 1 drops to the workload UID.
+pub(crate) fn capture_ack_key_before_privilege_drop()
+-> Result<(), mvm_agentd::guest_mount::MountError> {
     let dir = Path::new(RUN_MVM_DIR);
-    let binding = match MailboxReaderBootBinding::load(dir) {
-        Ok(binding) => binding,
-        Err(error) => {
-            if dir
-                .join(mvm_core::mailbox::reader::MAILBOX_READER_BOOT_FILE)
-                .exists()
-            {
-                eprintln!("mvm-guest-agent: mailbox reader boot unavailable: {error}");
-            }
-            return;
-        }
+    let cmdline = std::fs::read_to_string("/proc/cmdline").map_err(|_| {
+        mvm_agentd::guest_mount::MountError::InvalidConfig(
+            "cannot read admitted guest command line".into(),
+        )
+    })?;
+    let ordinal = cmdline_asserts(&cmdline, MAILBOX_ORDINAL_CMDLINE_TOKEN);
+    let Some(binding) = boot_projection(dir, ordinal)? else {
+        return Ok(());
     };
     match load_ack_seed(&dir.join(MAILBOX_ACK_SIGNING_KEY_FILE), 0) {
         Ok(seed)
             if SigningKey::from_bytes(&seed).verifying_key().to_bytes()
                 == binding.ack_public_key =>
         {
+            if ordinal {
+                capture_ordinal_outbox(&binding)?;
+            }
             if ACK_SEED.set(seed).is_err() || READER_BOOT.set(binding).is_err() {
-                eprintln!("mvm-guest-agent: mailbox ACK identity already initialized");
+                return Err(mvm_agentd::guest_mount::MountError::InvalidConfig(
+                    "mailbox ACK identity already initialized".into(),
+                ));
             }
         }
-        Ok(_) | Err(_) => eprintln!("mvm-guest-agent: mailbox ACK key does not match this boot"),
+        Ok(_) | Err(_) => {
+            if ordinal {
+                return Err(mvm_agentd::guest_mount::MountError::InvalidConfig(
+                    "original ordinal sender has no matching mailbox key".into(),
+                ));
+            }
+            if binding.durable_object_pair_sha256_v1.is_some() {
+                let _ = READER_BOOT.set(binding);
+            }
+            eprintln!("mvm-guest-agent: mailbox ACK key does not match this boot");
+        }
     }
+    Ok(())
 }
 
 /// The workload runs under the same UID as the agent. A captured ACK key must
@@ -213,13 +305,21 @@ pub(crate) fn init_mailbox() {
         return;
     }
     let reader_boot = READER_BOOT.get().cloned();
+    let selected = reader_boot
+        .as_ref()
+        .is_some_and(|b| b.durable_object_pair_sha256_v1.is_some());
+    if selected && ACK_SEED.get().is_none() {
+        return;
+    }
     let ack_seed = ACK_SEED.get();
     let _ =
         mvm_agentd::detached::spawn_named("mailbox-listener", move || {
             match bind_vsock_listener(MAILBOX_PORT) {
                 Ok(fd) => {
                     let reader = match (reader_boot.clone(), ack_seed) {
-                        (Some(binding), Some(seed)) => crate::mailbox_reader::start(binding, seed),
+                        (Some(binding), Some(seed)) if !selected => {
+                            crate::mailbox_reader::start(binding, seed, None)
+                        }
                         _ => None,
                     };
                     accept_loop(fd, reader, reader_boot);
@@ -240,10 +340,11 @@ fn logs_refusal(refused: u32) -> bool {
 /// One host connection at a time, each answered from the outbox.
 fn accept_loop(
     listener_fd: RawFd,
-    reader: Option<std::sync::mpsc::Receiver<crate::mailbox_reader::PendingReader>>,
+    mut reader: Option<std::sync::mpsc::Receiver<crate::mailbox_reader::PendingReader>>,
     reader_boot: Option<MailboxReaderBootBinding>,
 ) {
     let mut refused = 0u32;
+    let mut attempts = JournalAttempts::default();
     while !SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
         let Some(cfd) = accept_vsock(listener_fd, "mailbox") else {
             continue;
@@ -256,8 +357,21 @@ fn accept_loop(
             continue;
         }
         let mut deadline = MailboxDeadline::new(&mut stream);
+        if reader.is_none()
+            && let Some(boot) = reader_boot
+                .as_ref()
+                .filter(|b| b.durable_object_pair_sha256_v1.is_some())
+        {
+            if let Ok(role) = crate::mailbox_reader::object_submit::fetch_role(&mut deadline, boot)
+                && let Some(seed) = ACK_SEED.get()
+            {
+                reader = crate::mailbox_reader::start(boot.clone(), seed, Some(role));
+            }
+            continue;
+        }
         let result = wait_for_operation(
             &mut deadline,
+            &mut attempts,
             reader.as_ref(),
             reader_boot.as_ref(),
             Path::new(LOCAL_OUTBOX_PATH),
@@ -277,13 +391,53 @@ fn accept_loop(
 
 fn wait_for_operation(
     stream: &mut (impl Read + Write + AsRawFd),
+    attempts: &mut JournalAttempts,
     reader: Option<&std::sync::mpsc::Receiver<crate::mailbox_reader::PendingReader>>,
     reader_boot: Option<&MailboxReaderBootBinding>,
     local_outbox: &Path,
     outbox: &Path,
 ) -> Result<(), Refusal> {
     let until = Instant::now() + MAILBOX_HOLD;
+    if reader_boot.is_some_and(|b| {
+        b.durable_object_pair_sha256_v1.is_some()
+            || b.outbound_journal_v1
+                .is_some_and(|direction| direction.sender_settlement.is_some())
+    }) {
+        let rx = reader.ok_or(Refusal::NotAuthorized)?;
+        loop {
+            if let Ok(pending) = rx.try_recv() {
+                return crate::mailbox_reader::exchange(stream, pending);
+            }
+            if peer_gone(stream.as_raw_fd())
+                || SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                || Instant::now() >= until
+            {
+                return Err(Refusal::Unavailable);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let directed = reader_boot
+        .filter(|b| b.outbound_journal_v1.is_some())
+        .map(|b| {
+            mvm_agentd::mailbox_outbox::journal_direction::slot_name(b)
+                .map(|name| (local_outbox.with_file_name(name), b))
+        })
+        .transpose()?;
     loop {
+        if let Some((path, boot)) = &directed
+            && path.exists()
+        {
+            return forward_for_original_boot(
+                stream,
+                path,
+                boot,
+                attempts,
+                crate::mailbox_reader::now_unix_ms,
+            )
+            .map(|_| ());
+        }
+
         // A local-durable request cannot be downgraded to the older unit
         // verdict even when both requests share the guest mailbox port.
         if local_outbox.exists()
@@ -336,6 +490,23 @@ mod tests {
     }
 
     #[test]
+    fn original_sender_projection_refuses_missing_or_malformed_identity_before_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(boot_projection(dir.path(), false).unwrap().is_none());
+        assert!(boot_projection(dir.path(), true).is_err());
+        std::fs::write(dir.path().join(MAILBOX_ACK_SIGNING_KEY_FILE), [3; 32]).unwrap();
+        assert!(boot_projection(dir.path(), false).is_err());
+        std::fs::write(
+            dir.path()
+                .join(mvm_core::mailbox::reader::MAILBOX_READER_BOOT_FILE),
+            b"{",
+        )
+        .unwrap();
+        for selected in [true, false] {
+            assert!(boot_projection(dir.path(), selected).is_err());
+        }
+    }
+    #[test]
     fn an_idle_guest_logs_a_bounded_number_of_refusals() {
         assert_eq!((0..1000).filter(|&n| logs_refusal(n)).count(), 3 + 10 - 1);
     }
@@ -383,37 +554,47 @@ mod tests {
 
     #[test]
     fn a_pending_send_still_uses_the_existing_port_when_receive_is_enabled() {
-        use mvm_contract::protocol::mailbox::PrincipalId;
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = dir.path().join("outbox");
-        let local_outbox = dir.path().join("outbox-local");
-        stage_pending_outbox(
-            &outbox,
-            &OutboxMessage::new(PrincipalId::from_bytes([0; 32]), b"hello".to_vec()),
-        );
-        stage_pending_outbox(
-            &local_outbox,
-            &OutboxMessage::new(PrincipalId::from_bytes([0; 32]), b"local".to_vec()),
-        );
-        let (mut guest, mut host) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (_sender, reader) = std::sync::mpsc::sync_channel(1);
-        let peer = std::thread::spawn(move || {
-            let mut len = [0; 4];
-            host.read_exact(&mut len).unwrap();
-            let mut body = vec![0; u32::from_be_bytes(len) as usize];
-            host.read_exact(&mut body).unwrap();
-            assert!(!mvm_core::mailbox::reader_wire::is_reader_frame(&body));
-            assert_eq!(OutboxMessage::decode(&body).unwrap().body, b"hello");
-            host.write_all(&serde_json::to_vec(&Ok::<(), Refusal>(())).unwrap())
-                .unwrap();
+        mvm_core::util::test_env::isolated_lock_probe(|| {
+            use mvm_contract::protocol::mailbox::PrincipalId;
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = dir.path().join("outbox");
+            let local_outbox = dir.path().join("outbox-local");
+            stage_pending_outbox(
+                &outbox,
+                &OutboxMessage::new(PrincipalId::from_bytes([0; 32]), b"hello".to_vec()),
+            );
+            stage_pending_outbox(
+                &local_outbox,
+                &OutboxMessage::new(PrincipalId::from_bytes([0; 32]), b"local".to_vec()),
+            );
+            let (mut guest, mut host) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (_sender, reader) = std::sync::mpsc::sync_channel(1);
+            let peer = std::thread::spawn(move || {
+                let mut len = [0; 4];
+                host.read_exact(&mut len).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(len) as usize];
+                host.read_exact(&mut body).unwrap();
+                assert!(!mvm_core::mailbox::reader_wire::is_reader_frame(&body));
+                assert_eq!(OutboxMessage::decode(&body).unwrap().body, b"hello");
+                host.write_all(&serde_json::to_vec(&Ok::<(), Refusal>(())).unwrap())
+                    .unwrap();
+            });
+            wait_for_operation(
+                &mut guest,
+                &mut JournalAttempts::default(),
+                Some(&reader),
+                None,
+                &local_outbox,
+                &outbox,
+            )
+            .unwrap();
+            peer.join().unwrap();
+            assert!(!outbox.exists(), "accepted Send is removed as before");
+            assert!(
+                local_outbox.exists(),
+                "missing boot authority cannot downgrade a local request"
+            );
         });
-        wait_for_operation(&mut guest, Some(&reader), None, &local_outbox, &outbox).unwrap();
-        peer.join().unwrap();
-        assert!(!outbox.exists(), "accepted Send is removed as before");
-        assert!(
-            local_outbox.exists(),
-            "missing boot authority cannot downgrade a local request"
-        );
     }
 
     #[test]
@@ -433,7 +614,14 @@ mod tests {
         stage_pending_outbox(&local, &operation);
         let (mut guest, _host) = std::os::unix::net::UnixStream::pair().expect("socket");
         assert_eq!(
-            wait_for_operation(&mut guest, None, None, &local, &legacy),
+            wait_for_operation(
+                &mut guest,
+                &mut JournalAttempts::default(),
+                None,
+                None,
+                &local,
+                &legacy
+            ),
             Err(Refusal::Unavailable)
         );
         assert!(local.exists(), "no boot authority means no acceptance");
@@ -442,6 +630,8 @@ mod tests {
         let signer = SigningKey::from_bytes(&[51; 32]);
         let plan = mvm_core::plan::test_support::PlanFixture::new().build();
         let boot = MailboxReaderBootBinding {
+            durable_object_pair_sha256_v1: None,
+            outbound_journal_v1: None,
             plan_id: plan.plan_id,
             plan_nonce: plan.nonce,
             mailbox: MailboxId::from_bytes([52; 32]),
@@ -451,6 +641,12 @@ mod tests {
             guest_identity_key: [54; 32],
             ack_public_key: [55; 32],
         };
+        boot.persist(dir.path()).unwrap();
+        assert_eq!(
+            boot_projection(dir.path(), false).unwrap().as_ref(),
+            Some(&boot)
+        );
+        assert!(boot_projection(dir.path(), true).is_err());
         let (mut guest, mut host) = std::os::unix::net::UnixStream::pair().expect("socket");
         let responder = std::thread::spawn(move || {
             let mut length = [0; 4];
@@ -481,8 +677,15 @@ mod tests {
             host.write_all(&serde_json::to_vec(&Ok::<_, Refusal>(signed)).expect("receipt wire"))
                 .expect("reply");
         });
-        wait_for_operation(&mut guest, None, Some(&boot), &local, &legacy)
-            .expect("boot-pinned signed acceptance");
+        wait_for_operation(
+            &mut guest,
+            &mut JournalAttempts::default(),
+            None,
+            Some(&boot),
+            &local,
+            &legacy,
+        )
+        .expect("boot-pinned signed acceptance");
         responder.join().expect("host reply");
         assert!(!local.exists(), "verified V2 receipt closes pending send");
     }

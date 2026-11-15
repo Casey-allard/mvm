@@ -19,6 +19,10 @@
 //! `outbox-local` is a separate, single-operation request that is removed only
 //! after [`forward_local_outbox`] verifies a boot-bound signed V2 receipt.
 
+pub mod journal_direction;
+pub mod object_pair;
+pub mod ordinal;
+
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
@@ -139,7 +143,11 @@ fn forward_with<S: Read + Write, R>(
     Ok(accepted)
 }
 
-fn archive_outbox(outbox: &Path, message: &OutboxMessage, prefix: &str) -> Result<(), Refusal> {
+fn archive_path(
+    outbox: &Path,
+    message: &OutboxMessage,
+    prefix: &str,
+) -> Result<std::path::PathBuf, Refusal> {
     let dir = outbox.parent().ok_or(Refusal::Malformed)?;
     let id = message
         .message_id
@@ -147,7 +155,19 @@ fn archive_outbox(outbox: &Path, message: &OutboxMessage, prefix: &str) -> Resul
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let archived = dir.join(format!("{prefix}-{id}"));
+    let scope = outbox
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("outbox-directed-v1-"));
+    Ok(match scope {
+        Some(scope) => dir.join(format!("{prefix}-directed-v1-{scope}-{id}")),
+        None => dir.join(format!("{prefix}-{id}")),
+    })
+}
+
+fn archive_outbox(outbox: &Path, message: &OutboxMessage, prefix: &str) -> Result<(), Refusal> {
+    let dir = outbox.parent().ok_or(Refusal::Malformed)?;
+    let archived = archive_path(outbox, message, prefix)?;
     let bytes = message.encode();
     let mut previous = Vec::new();
     match open_outbox(&archived)
@@ -397,6 +417,13 @@ fn write_single_outbox(outbox: &Path, message: &OutboxMessage) -> Result<(), Ref
         .filter(|d| d.is_dir())
         .ok_or(Refusal::Malformed)?;
     let _lock = lock_outbox_dir(dir)?;
+    if outbox
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("outbox-directed-v1-"))
+    {
+        journal_direction::require_unarchived(outbox, message)?;
+    }
     let mut existing = Vec::new();
     match open_outbox(outbox)
         .and_then(|file| file.take(MAX_OUTBOX_BYTES + 1).read_to_end(&mut existing))

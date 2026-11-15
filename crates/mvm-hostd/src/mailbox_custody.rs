@@ -106,6 +106,15 @@ fn existing_host_signer(keys_dir: &Path) -> Result<SigningKey> {
     Ok(signer)
 }
 
+fn storage_paths_for(keys_dir: &Path, identity: &Identity<'_>) -> Result<MailboxStoragePaths> {
+    let (bundle, _) = paths(keys_dir, identity)?;
+    Ok(MailboxStoragePaths {
+        journal: bundle.with_extension("journal"),
+        anchor: bundle.with_extension("anchor"),
+        source_intents: bundle.with_extension("intents"),
+    })
+}
+
 fn read_private(path: &Path, maximum: u64) -> Result<Zeroizing<Vec<u8>>> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -180,7 +189,64 @@ impl RetainedMailboxKeys {
         address: MailboxAddress,
     ) -> Result<Self> {
         posture.verify(plan, vm_name)?;
+        posture
+            .handoff(current_boot)
+            .verify(plan, vm_name, current_boot)?;
         let identity = identity(keys_dir, plan, vm_name, address)?;
+        Self::provision_or_open_identity(keys_dir, plan, identity)
+    }
+
+    /// This entry point is available after both original plans, boots and
+    /// independent direction credentials are bound. The local reciprocal
+    /// credential supplies the destination address for this durable journal.
+    pub(crate) fn for_object_role(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        posture: &MailboxLaunchPosture,
+        boot: &mvm_core::mailbox::reader::MailboxReaderBootBinding,
+        descriptor: &mvm_core::mailbox::object_pair::role::SignedObjectRoleV1,
+        now: i64,
+    ) -> Result<Self> {
+        use mvm_core::mailbox::object_pair::role::ObjectParticipantRole;
+        let vm_name = &plan.image.name;
+        posture.verify(plan, vm_name)?;
+        ensure!(
+            posture.variant() == mvm_core::plan::Variant::Prod,
+            "object custody requires production admission"
+        );
+        boot.check_plan(plan)?;
+        let role = descriptor.verify(boot, now)?;
+        let inbound = match role.role {
+            ObjectParticipantRole::Caller => &role.reply,
+            ObjectParticipantRole::Callee => &role.call,
+        };
+        let address = inbound.grant.address;
+        let grant = plan.mailbox.context("original mailbox grant absent")?;
+        ensure!(
+            grant.durable_object_pair_sha256_v1.is_some()
+                && address.mailbox == grant.mailbox
+                && inbound.grant.issuer.as_bytes() == &grant.authority_key,
+            "retained journal differs from signed pair destination"
+        );
+        let identity = Identity {
+            plan_id: &plan.plan_id,
+            plan_nonce: &plan.nonce,
+            vm_name,
+            address,
+            epoch: grant.epoch,
+            retention_ms: grant
+                .retention
+                .context("signed retention absent")?
+                .retention_ms(),
+        };
+        Self::provision_or_open_identity(keys_dir, plan, identity)
+    }
+
+    fn provision_or_open_identity(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        identity: Identity<'_>,
+    ) -> Result<Self> {
         let (bundle, manifest) = paths(keys_dir, &identity)?;
         let mut existing = false;
         for path in [&bundle, &manifest] {
@@ -191,17 +257,20 @@ impl RetainedMailboxKeys {
             }
         }
         if existing {
-            Self::open_existing(
-                keys_dir,
-                plan,
-                vm_name,
-                &posture.handoff(current_boot),
-                current_boot,
-                address,
-            )
+            Self::open_bound(keys_dir, plan, identity)
         } else {
-            Self::provision(keys_dir, plan, vm_name, posture, address)
+            Self::provision_bound(keys_dir, plan, identity)
         }
+    }
+
+    pub(crate) fn matches_original(&self, plan: &ExecutionPlan, address: MailboxAddress) -> bool {
+        self.binding.plan_id == plan.plan_id
+            && self.binding.plan_nonce == plan.nonce
+            && self.binding.vm_name == plan.image.name
+            && self.binding.address == address
+            && plan.mailbox.is_some_and(|g| {
+                self.binding.epoch == g.epoch && self.binding.authority_key == g.authority_key
+            })
     }
 
     /// Host-local storage remains outside the per-VM state directory so a VM
@@ -216,17 +285,40 @@ impl RetainedMailboxKeys {
             epoch: binding.epoch,
             retention_ms: binding.retention_ms,
         };
-        let (bundle, _) = paths(keys_dir, &identity)?;
-        Ok(MailboxStoragePaths {
-            journal: bundle.with_extension("journal"),
-            anchor: bundle.with_extension("anchor"),
-            source_intents: bundle.with_extension("intents"),
-        })
+        storage_paths_for(keys_dir, &identity)
+    }
+    /// Derive only the three paths of this signed original's local storage.
+    /// No key bundle is opened or minted in the per-VM worker.
+    pub(crate) fn object_storage_paths(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        address: MailboxAddress,
+    ) -> Result<MailboxStoragePaths> {
+        let g = plan.mailbox.context("missing original mailbox")?;
+        ensure!(
+            g.durable_object_pair_sha256_v1.is_some() && g.mailbox == address.mailbox,
+            "different selected mailbox"
+        );
+        storage_paths_for(
+            keys_dir,
+            &Identity {
+                plan_id: &plan.plan_id,
+                plan_nonce: &plan.nonce,
+                vm_name: &plan.image.name,
+                address,
+                epoch: g.epoch,
+                retention_ms: g
+                    .retention
+                    .context("missing original retention")?
+                    .retention_ms(),
+            },
+        )
     }
 
     /// Provision once under a verified launch posture; an interrupted first
     /// provision leaves an orphan bundle and refuses instead of replacing it.
-    pub(crate) fn provision(
+    #[cfg(test)]
+    fn provision(
         keys_dir: &Path,
         plan: &ExecutionPlan,
         vm_name: &str,
@@ -235,6 +327,15 @@ impl RetainedMailboxKeys {
     ) -> Result<Self> {
         posture.verify(plan, vm_name)?;
         let identity = identity(keys_dir, plan, vm_name, address)?;
+        Self::provision_bound(keys_dir, plan, identity)
+    }
+    fn provision_bound(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        identity: Identity<'_>,
+    ) -> Result<Self> {
+        let vm_name = identity.vm_name;
+        let address = identity.address;
         let signer = existing_host_signer(keys_dir)?;
         let (bundle_path, manifest_path) = paths(keys_dir, &identity)?;
         mvm_core::private_fs::ensure_private_dir(
@@ -294,40 +395,12 @@ impl RetainedMailboxKeys {
     ) -> Result<Self> {
         posture.verify(plan, vm_name, current_boot)?;
         let identity = identity(keys_dir, plan, vm_name, address)?;
+        Self::open_bound(keys_dir, plan, identity)
+    }
+    fn open_bound(keys_dir: &Path, plan: &ExecutionPlan, identity: Identity<'_>) -> Result<Self> {
         let signer = existing_host_signer(keys_dir)?;
-        let (bundle_path, manifest_path) = paths(keys_dir, &identity)?;
-        let directory = bundle_path.parent().context("mailbox custody directory")?;
-        let directory_meta = std::fs::symlink_metadata(directory)?;
-        ensure!(
-            directory_meta.file_type().is_dir() && directory_meta.permissions().mode() & 0o077 == 0,
-            "retained mailbox custody directory is not private"
-        );
-        let manifest: SignedBinding =
-            serde_json::from_slice(&read_private(&manifest_path, MAX_MANIFEST_BYTES)?)?;
-        let signature: [u8; 64] = manifest.signature.as_slice().try_into().map_err(|_| {
-            Error::new(ErrorKind::InvalidData, "invalid mailbox manifest signature")
-        })?;
-        signer.verifying_key().verify(
-            &signed_bytes(&manifest.binding)?,
-            &Signature::from_bytes(&signature),
-        )?;
-        let binding = manifest.binding;
-        ensure!(
-            binding.plan_id == *identity.plan_id
-                && binding.plan_nonce == *identity.plan_nonce
-                && binding.vm_name == identity.vm_name
-                && binding.address == address
-                && binding.epoch == identity.epoch
-                && binding.retention_ms == identity.retention_ms
-                && binding.authority_key == plan.mailbox.context("mailbox grant")?.authority_key
-                && binding.host_signer == signer.verifying_key().to_bytes()
-                && binding.key_version == KEY_VERSION
-                && binding.history.address() == address
-                && binding.history.execution_epoch() == identity.epoch
-                && binding.history.algorithm() == EncryptionAlgorithm::AES_256_GCM
-                && binding.history.version() == KEY_VERSION,
-            "retained mailbox custody scope or authority changed"
-        );
+        let (binding, bundle_path) =
+            Self::verified_binding(keys_dir, plan, &identity, &signer.verifying_key())?;
         let bytes = read_private(&bundle_path, KEY_BYTES as u64)?;
         ensure!(
             bytes.len() == KEY_BYTES,
@@ -345,6 +418,79 @@ impl RetainedMailboxKeys {
             "retained mailbox purpose key changed"
         );
         Ok(Self { binding, material })
+    }
+
+    fn verified_binding(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        identity: &Identity<'_>,
+        signer: &ed25519_dalek::VerifyingKey,
+    ) -> Result<(Binding, std::path::PathBuf)> {
+        let address = identity.address;
+        let (bundle_path, manifest_path) = paths(keys_dir, identity)?;
+        let directory = bundle_path.parent().context("mailbox custody directory")?;
+        let directory_meta = std::fs::symlink_metadata(directory)?;
+        ensure!(
+            directory_meta.file_type().is_dir() && directory_meta.permissions().mode() & 0o077 == 0,
+            "retained mailbox custody directory is not private"
+        );
+        let manifest: SignedBinding =
+            serde_json::from_slice(&read_private(&manifest_path, MAX_MANIFEST_BYTES)?)?;
+        let signature: [u8; 64] = manifest.signature.as_slice().try_into().map_err(|_| {
+            Error::new(ErrorKind::InvalidData, "invalid mailbox manifest signature")
+        })?;
+        signer.verify(
+            &signed_bytes(&manifest.binding)?,
+            &Signature::from_bytes(&signature),
+        )?;
+        let binding = manifest.binding;
+        ensure!(
+            binding.plan_id == *identity.plan_id
+                && binding.plan_nonce == *identity.plan_nonce
+                && binding.vm_name == identity.vm_name
+                && binding.address == address
+                && binding.epoch == identity.epoch
+                && binding.retention_ms == identity.retention_ms
+                && binding.authority_key == plan.mailbox.context("mailbox grant")?.authority_key
+                && binding.host_signer == signer.to_bytes()
+                && binding.key_version == KEY_VERSION
+                && binding.history.address() == address
+                && binding.history.execution_epoch() == identity.epoch
+                && binding.history.algorithm() == EncryptionAlgorithm::AES_256_GCM
+                && binding.history.version() == KEY_VERSION,
+            "retained mailbox custody scope or authority changed"
+        );
+        Ok((binding, bundle_path))
+    }
+
+    pub(crate) fn verify_object_worker_storage(
+        keys_dir: &Path,
+        plan: &ExecutionPlan,
+        address: MailboxAddress,
+        signer: &ed25519_dalek::VerifyingKey,
+        history: &HistoryKeyRef,
+        anchor: &[u8; 32],
+    ) -> Result<()> {
+        let grant = plan.mailbox.context("missing selected mailbox")?;
+        ensure!(
+            grant.durable_object_pair_sha256_v1.is_some() && grant.mailbox == address.mailbox,
+            "wrong selected original storage"
+        );
+        let identity = Identity {
+            plan_id: &plan.plan_id,
+            plan_nonce: &plan.nonce,
+            vm_name: &plan.image.name,
+            address,
+            epoch: grant.epoch,
+            retention_ms: grant.retention.context("missing retention")?.retention_ms(),
+        };
+        let (binding, _) = Self::verified_binding(keys_dir, plan, &identity, signer)?;
+        ensure!(
+            binding.history == *history
+                && binding.anchor_key_id == <[u8; 32]>::from(Sha256::digest(anchor)),
+            "changed original worker journal custody"
+        );
+        Ok(())
     }
 
     pub(crate) fn history_reference(&self) -> HistoryKeyRef {
@@ -415,6 +561,9 @@ mod tests {
         let mailbox = MailboxId::from_bytes([4; 32]);
         let mut plan = PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
             mailbox,
             authority_key: crate::mailbox_launch::authority_key_for(
                 dir.path(),

@@ -1,0 +1,611 @@
+//! Real private-pipe/holder qualification only, not a boot or aggregate quota
+//! witness. The fixture constructs bounded control records, never a permit.
+use super::*;
+use anyhow::ensure;
+use mvm_core::host_lifetime::{EndpointPartitionLimits, HostLaunchBinding};
+use std::{
+    fs::OpenOptions,
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        net::UnixStream,
+        process::CommandExt,
+    },
+    process::{Child, Command, Stdio},
+};
+
+const FIXTURE: &str = "MVM_INSTALLED_ENDPOINT_PIPE_FIXTURE";
+const COORD: &str = "MVM_INSTALLED_ENDPOINT_COORD_FD";
+
+#[test]
+fn installed_endpoint_fixture_child() {
+    let Some(mode) = std::env::var_os(FIXTURE) else {
+        return;
+    };
+    // SAFETY: the original fixture's pre_exec reserved its protocol stdout on
+    // fd199 while libtest wrote banners to stderr. Restore before FIRST read.
+    assert!(unsafe { libc::dup2(199, 1) } >= 0);
+    let context = InstalledEndpointChild::from_stdio();
+    if mode == "wrong-nonce" {
+        assert!(context.is_err());
+        std::process::exit(0);
+    }
+    let mut context = context.unwrap();
+    context
+        .with_verification_state(|state| {
+            assert!(state.metadata()?.is_file());
+            Ok(())
+        })
+        .unwrap();
+    let lease = context.lease();
+    let alias = lease.clone();
+    assert_eq!(lease.projection(), context.projection());
+    lease.check_current().unwrap();
+    lease.claim_payload_pool().unwrap();
+    assert!(
+        alias.claim_payload_pool().is_err(),
+        "one pool across aliases"
+    );
+    assert_eq!(
+        context.take_config().unwrap(),
+        serde_json::json!({"fixture":true})
+    );
+    assert!(context.take_config().is_err());
+    let guest_wake = (mode == "stale-holder").then(|| {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let wake = lease.bind_guest_transport(&stream).unwrap();
+        assert!(Arc::ptr_eq(
+            &wake,
+            alias
+                .authority
+                .guest
+                .lock()
+                .unwrap()
+                .original
+                .as_ref()
+                .unwrap()
+        ));
+        assert!(alias.bind_guest_transport(&stream).is_err());
+        (wake, peer, stream)
+    });
+    context
+        .send_ready(
+            EndpointHandshake::default(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    if mode == "ready-drain" {
+        assert!(!context.parent_closed().unwrap());
+        lease.close_admission_only();
+        assert!(alias.check_current().is_err());
+        alias.check_store_cleanup().unwrap();
+        let fd: i32 = std::env::var(COORD).unwrap().parse().unwrap();
+        // SAFETY: the fixture inherited this owned coordination socket once.
+        let mut coord = unsafe { UnixStream::from_raw_fd(fd) };
+        coord.write_all(&[1]).unwrap();
+    }
+    if mode == "stale-holder" {
+        let fd: i32 = std::env::var(COORD).unwrap().parse().unwrap();
+        // SAFETY: only this fixture's pre_exec inherited its owned Unix socket.
+        let mut coord = unsafe { UnixStream::from_raw_fd(fd) };
+        let mut event = [0; 1];
+        coord.read_exact(&mut event).unwrap();
+        assert!(lease.check_current().is_err());
+        let (wake, mut peer, _original) = guest_wake.unwrap();
+        assert_eq!(peer.read(&mut event).unwrap(), 0);
+        wake.shutdown().unwrap();
+        coord.write_all(&[1]).unwrap();
+        coord.read_exact(&mut event).unwrap();
+        assert!(
+            alias.check_current().is_err(),
+            "restored bytes cannot reset fence"
+        );
+        lease.close_admission_only();
+        assert!(
+            alias.check_store_cleanup().is_err(),
+            "Failed dominates Closing"
+        );
+        coord.write_all(&[1]).unwrap();
+    }
+    if mode == "extra-input" {
+        loop {
+            match context.parent_closed() {
+                Err(_) => break,
+                Ok(true) => panic!("unexpected control bytes classified as clean EOF"),
+                Ok(false) => assert!(Instant::now() < deadline),
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        assert!(context.check_parent().is_err());
+        assert!(alias.check_store_cleanup().is_err());
+        assert!(context.send_drained(deadline).is_err());
+        std::process::exit(0);
+    }
+    while !context.parent_closed().unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+    assert!(context.check_parent().is_err());
+    if mode == "stale-holder" {
+        assert!(context.send_drained(deadline).is_err());
+        std::process::exit(0);
+    }
+    alias.check_store_cleanup().unwrap();
+    assert!(lease.check_current().is_err());
+    context.send_drained(deadline).unwrap();
+    assert!(context.send_drained(deadline).is_err());
+    drop(context);
+    std::process::exit(0);
+}
+
+struct ChildGuard(Option<Child>);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn fixture_handoff(
+    directory: &File,
+    holder: &File,
+    expected: HostLeaseExpectation,
+) -> (
+    PreparedEndpointHandoff,
+    std::sync::Arc<dyn mvm_core::host_lifetime::EndpointPartitionGuard>,
+) {
+    use mvm_core::{
+        host_lifetime::{
+            CoreCurrentParentPermit, EndpointPartitionGuard, HostLifetimeInputs,
+            PreparedEndpointPartition, PreparedHostLifetime,
+        },
+        plan::{sign_plan, test_support::PlanFixture},
+        vm_backend::VmStartConfig,
+    };
+    use std::sync::Arc;
+    struct Guard(EndpointPartitionProjection);
+    impl EndpointPartitionGuard for Guard {
+        fn check_current(&self, facts: &EndpointPartitionProjection) -> Result<()> {
+            ensure!(facts == &self.0, "foreign fixture partition");
+            Ok(())
+        }
+    }
+    struct Parent(EndpointPartitionProjection, Arc<dyn EndpointPartitionGuard>);
+    impl CoreCurrentParentPermit for Parent {
+        fn check_current(&self, binding: &HostLaunchBinding) -> Result<()> {
+            ensure!(binding == &self.0.binding, "foreign fixture parent");
+            Ok(())
+        }
+        fn prepare_endpoint_partition(
+            &self,
+            binding: &HostLaunchBinding,
+        ) -> Result<PreparedEndpointPartition> {
+            self.check_current(binding)?;
+            PreparedEndpointPartition::new(self.0.clone(), self.1.clone())
+        }
+    }
+    // This real holder/pipe fixture tests ownership movement, not aggregate
+    // admission: its trusted test guards do not represent a host resource pool.
+    let mut facts = projection();
+    let mut plan = PlanFixture::new().runtime_profile("firecracker").build();
+    plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+    facts.admitted_plan_id = plan.plan_id.0.clone();
+    let anchor = PreparedHostLifetime::bind(
+        HostLifetimeInputs {
+            directory: directory.try_clone().unwrap(),
+            holder: holder.try_clone().unwrap(),
+            expected,
+            binding: facts.binding.clone(),
+        },
+        (),
+    )
+    .unwrap()
+    .into_anchor();
+    let mut config = VmStartConfig {
+        name: facts.binding.vm_name.clone(),
+        cpus: facts.binding.cpus,
+        memory_mib: facts.binding.memory_mib,
+        ..Default::default()
+    };
+    anchor.bind_to_config(&mut config).unwrap();
+    config.plan_json = Some(
+        serde_json::to_string(&sign_plan(
+            &plan,
+            &ed25519_dalek::SigningKey::from_bytes(&[8; 32]),
+            "fixture",
+        ))
+        .unwrap(),
+    );
+    anchor
+        .bind_admitted(&config, facts.binding.backend, &plan)
+        .unwrap();
+    let guard: Arc<dyn EndpointPartitionGuard> = Arc::new(Guard(facts.clone()));
+    anchor
+        .bind_parent_permit(
+            &config,
+            facts.binding.backend,
+            Arc::new(Parent(facts.clone(), guard.clone())),
+        )
+        .unwrap();
+    (
+        anchor
+            .prepare_endpoint_handoff(&config, facts.binding.backend)
+            .unwrap(),
+        guard,
+    )
+}
+
+fn projection() -> EndpointPartitionProjection {
+    EndpointPartitionProjection {
+        version: 1,
+        binding: HostLaunchBinding {
+            installation: [1; 32],
+            profile: [2; 32],
+            generation: 1,
+            grant_serial: 1,
+            vm_name: "endpoint-pipe".into(),
+            backend: mvm_core::vm_backend::BackendKind::Firecracker,
+            cpus: 1,
+            memory_mib: 128,
+        },
+        admitted_plan_id: "fixture-control-not-admission".into(),
+        session: [3; 32],
+        partition_serial: 1,
+        profile: 2,
+        store: Some(mvm_core::host_lifetime::EndpointStoreLocator {
+            version: 1,
+            path: "/nonexistent-endpoint-fixture/store".into(),
+            device: 1,
+            inode: 1,
+            reservation_serial: 1,
+            tenant: [0; 32],
+            session: [3; 32],
+        }),
+        limits: EndpointPartitionLimits {
+            host_plaintext_bytes: 1,
+            host_codec_bytes: 1,
+            host_carrier_bytes: 1,
+            host_metadata_bytes: INSTALLED_CONTROL_BUFFER_BYTES,
+            host_stack_bytes: 1,
+            cache_disk_bytes: 0,
+            staging_disk_bytes: 0,
+            workers: 1,
+            max_streams: 1,
+        },
+    }
+}
+
+fn pipe_exchange(mode: &str) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state = root.path().join(".state");
+    std::fs::write(&state, b"a").unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let directory = File::open(root.path()).unwrap();
+    let holder_path = root.path().join("holders.lock");
+    let holder = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&holder_path)
+        .unwrap();
+    let expected = HostLeaseExpectation {
+        state_name: ".state".into(),
+        state_bytes: 1,
+        state_sha256: hex::decode(
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap(),
+        absent_names: [".state.intent".into(), ".state.next".into()],
+    };
+    let mut handoff =
+        (mode == "retirement").then(|| fixture_handoff(&directory, &holder, expected.clone()));
+    let facts = handoff
+        .as_ref()
+        .map(|(handoff, _)| handoff.partition().projection().clone())
+        .unwrap_or_else(projection);
+    let target = format!(
+        "{}::installed_endpoint_fixture_child",
+        module_path!().split_once("::").unwrap().1
+    );
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    let (mut coord, child_coord) = UnixStream::pair().unwrap();
+    coord
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    coord
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    child_coord
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    child_coord
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    command
+        .args(["--exact", &target, "--nocapture", "--test-threads=1"])
+        .env(FIXTURE, mode)
+        .env(COORD, child_coord.as_raw_fd().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::host::restore_image::inherit_descriptors(
+        &mut command,
+        vec![
+            directory.as_raw_fd(),
+            holder.as_raw_fd(),
+            child_coord.as_raw_fd(),
+        ],
+    );
+    // SAFETY: only duplicate/redirect fixed descriptors in this owned fixture.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::dup2(1, 199) < 0 || libc::dup2(2, 1) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = ChildGuard(Some(command.spawn().unwrap()));
+    drop(child_coord);
+    let original = child.0.as_mut().unwrap();
+    let observer = ProcessExitObserver::arm(original.id().try_into().unwrap()).unwrap();
+    let mut input = original.stdin.take().unwrap();
+    let mut output = original.stdout.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let challenge: Challenge = read_frame(&mut output, CONTROL_LIMIT, deadline).unwrap();
+    assert_ne!(challenge.nonce, [0; 32]);
+    let nonce = if mode == "wrong-nonce" {
+        [0; 32]
+    } else {
+        challenge.nonce
+    };
+    write_frame(
+        &mut input,
+        &Prepare {
+            version: 1,
+            nonce,
+            projection: facts.clone(),
+            directory: directory.as_raw_fd(),
+            holder: holder.as_raw_fd(),
+            expected,
+            config: serde_json::json!({"fixture":true}),
+            telemetry_records: None,
+            audit: None,
+        },
+        CONFIG_LIMIT,
+        deadline,
+    )
+    .unwrap();
+    if mode != "wrong-nonce" {
+        let ready: Ready = read_frame(&mut output, CONFIG_LIMIT, deadline).unwrap();
+        assert_eq!(ready.nonce, challenge.nonce);
+        assert_eq!(ready.session, projection().session);
+        if mode == "ready-drain" {
+            coord.read_exact(&mut [0; 1]).unwrap();
+        }
+        if mode == "stale-holder" {
+            std::fs::write(&state, b"b").unwrap();
+            coord.write_all(&[1]).unwrap();
+            coord.read_exact(&mut [0; 1]).unwrap();
+            std::fs::write(&state, b"a").unwrap();
+            coord.write_all(&[1]).unwrap();
+            coord.read_exact(&mut [0; 1]).unwrap();
+        }
+        drop(directory);
+        drop(holder);
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&holder_path)
+            .unwrap();
+        assert!(
+            probe.try_lock().is_err(),
+            "child retains original SH after parent files drop"
+        );
+        if let Some((handoff, guard)) = handoff.take() {
+            let mut endpoint = OwnedEndpoint::new(child.0.take().unwrap());
+            endpoint.installed = Some(InstalledCustody {
+                handoff,
+                audit: None,
+                telemetry: None,
+                input: Some(input),
+                output: Some(output),
+                nonce: challenge.nonce,
+                drained: false,
+            });
+            assert!(endpoint.take_retirement().is_err());
+            endpoint.shutdown().unwrap();
+            let receipt = endpoint.take_retirement().unwrap();
+            assert_eq!(receipt.projection(), &facts);
+            assert!(receipt.retains_partition_guard(&guard));
+            assert!(endpoint.take_retirement().is_err());
+            drop(endpoint);
+            assert!(probe.try_lock().is_err(), "receipt retains original SH");
+            drop(receipt);
+            probe.try_lock().unwrap();
+            return;
+        }
+        if mode == "extra-input" {
+            input.write_all(&[1]).unwrap();
+        }
+        drop(input);
+        if matches!(mode, "extra-input" | "stale-holder") {
+            assert_eq!(
+                observer.wait_event(deadline).unwrap(),
+                ProcessExitWait::Exited
+            );
+            assert!(child.0.as_mut().unwrap().wait().unwrap().success());
+            assert!(read_frame::<_, Drained>(&mut output, CONTROL_LIMIT, deadline).is_err());
+            probe.try_lock().unwrap();
+            return;
+        }
+        let drained: Drained = read_frame(&mut output, CONTROL_LIMIT, deadline).unwrap();
+        assert_eq!(drained.nonce, challenge.nonce);
+        assert_eq!(drained.session, projection().session);
+        assert_eq!(drained.serial, 1);
+        assert_eq!(
+            observer.wait_event(deadline).unwrap(),
+            ProcessExitWait::Exited
+        );
+        assert!(child.0.as_mut().unwrap().wait().unwrap().success());
+        probe.try_lock().unwrap();
+    } else {
+        drop(input);
+        assert_eq!(
+            observer.wait_event(deadline).unwrap(),
+            ProcessExitWait::Exited
+        );
+        assert!(child.0.as_mut().unwrap().wait().unwrap().success());
+        assert!(read_frame::<_, Ready>(&mut output, CONFIG_LIMIT, deadline).is_err());
+    }
+}
+
+#[test]
+fn private_endpoint_handshake_holds_original_sh_until_drained_and_child_exit() {
+    mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("ready-drain"));
+}
+#[test]
+fn unexpected_control_byte_followed_by_eof_cannot_prove_drain() {
+    mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("extra-input"));
+}
+#[test]
+fn wrong_private_parent_nonce_refuses_before_readiness() {
+    pipe_exchange("wrong-nonce");
+}
+
+#[test]
+fn endpoint_retirement_requires_drained_and_original_child_and_retains_sh() {
+    mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("retirement"));
+}
+
+#[test]
+fn real_child_lease_checks_original_holder_and_never_resets_after_failure() {
+    mvm_core::util::test_env::isolated_lock_probe(|| pipe_exchange("stale-holder"));
+}
+
+#[test]
+fn installed_guest_wake_reuses_positive_shutdown_across_aliases() {
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let wake = Arc::new(InstalledGuestWake::new(socket));
+    let alias = wake.clone();
+    wake.shutdown().unwrap();
+    assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+    alias.shutdown().unwrap();
+}
+
+#[test]
+fn installed_guest_wake_preserves_the_first_kernel_failure_on_retry() {
+    // Deliberately pass an owned regular file description. Both shutdown calls
+    // must reach the kernel and report that this descriptor is not a socket.
+    let fd: std::os::fd::OwnedFd = tempfile::tempfile().unwrap().into();
+    let wake = InstalledGuestWake::new(UnixStream::from(fd));
+    for _ in 0..2 {
+        assert_eq!(
+            wake.shutdown().unwrap_err().raw_os_error(),
+            Some(libc::ENOTSOCK)
+        );
+    }
+}
+
+#[test]
+fn control_prefix_partial_deadline_and_encode_limit_preserve_bounds() {
+    let (mut writer, mut reader) = UnixStream::pair().unwrap();
+    writer.write_all(&u32::MAX.to_be_bytes()).unwrap();
+    assert!(
+        read_frame::<_, Challenge>(
+            &mut reader,
+            CONTROL_LIMIT,
+            Instant::now() + Duration::from_secs(1)
+        )
+        .is_err()
+    );
+    let (mut writer, mut reader) = UnixStream::pair().unwrap();
+    writer.write_all(&[0, 0]).unwrap();
+    let began = Instant::now();
+    assert!(
+        read_frame::<_, Challenge>(
+            &mut reader,
+            CONTROL_LIMIT,
+            began + Duration::from_millis(20)
+        )
+        .is_err()
+    );
+    assert!(began.elapsed() < Duration::from_secs(1));
+    let (mut writer, mut reader) = UnixStream::pair().unwrap();
+    assert!(
+        write_frame(
+            &mut writer,
+            &vec![b'x'; CONTROL_LIMIT * 2],
+            CONTROL_LIMIT,
+            Instant::now() + Duration::from_secs(1)
+        )
+        .is_err()
+    );
+    reader.set_nonblocking(true).unwrap();
+    assert_eq!(
+        reader.read(&mut [0; 4]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_child_keeps_the_stricter_original_address_space_limit() {
+    use rustix::process::{Resource, getrlimit};
+    const PROBE: &str = "MVM_TEST_ORIGINAL_ADDRESS_LIMIT";
+    if let Some(expected) = std::env::var_os(PROBE) {
+        let expected: u64 = expected.to_str().unwrap().parse().unwrap();
+        let limit = getrlimit(Resource::As);
+        assert_eq!(limit.current, Some(expected));
+        assert_eq!(limit.maximum, Some(expected));
+        return;
+    }
+    let inherited = getrlimit(Resource::As);
+    for (first, second) in [
+        (512_u64 << 20, 256_u64 << 20),
+        (256_u64 << 20, 512_u64 << 20),
+    ] {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        let expected = [
+            Some(first),
+            Some(second),
+            inherited.current,
+            inherited.maximum,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap();
+        child
+            .args([
+                "--exact",
+                concat!(
+                    module_path!(),
+                    "::selected_child_keeps_the_stricter_original_address_space_limit"
+                )
+                .split_once("::")
+                .unwrap()
+                .1,
+            ])
+            .env(PROBE, expected.to_string());
+        limit_original_address_space(&mut child, first).unwrap();
+        limit_original_address_space(&mut child, second).unwrap();
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+}

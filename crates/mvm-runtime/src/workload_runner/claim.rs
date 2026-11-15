@@ -97,7 +97,7 @@ pub fn bind_claim_policy_to_plan(
         .filter(|asset| asset.kind == mvm_core::plan::AssetKind::Policy)
         .peekable();
     let bound = match recorded.peek() {
-        None => !policy.admits_outbound(),
+        None => !policy.admits_outbound() && policy.payload_mapping().is_none(),
         Some(_) => recorded.any(|asset| asset.digest == got),
     };
     if bound {
@@ -206,6 +206,7 @@ pub struct EndpointSpawnInputs<'a> {
     pub ingress: &'a [mvm_core::plan::IngressMapping],
     /// The admitted plan for a cold boot that grants a guest mailbox.
     pub reader_plan: Option<&'a mvm_core::plan::ExecutionPlan>,
+    pub mailbox_runtime: Option<&'a crate::runtime_evidence::VerifiedMailboxReader>,
     /// Where this boot's FlowMux identity comes from. A cold boot mints one; a
     /// warm claim inherits its parent's, because the restored child already
     /// holds the parent's signing key in memory.
@@ -218,6 +219,8 @@ pub struct EndpointSpawnInputs<'a> {
 /// A deny-all, secret-free workload has no egress channel at all and carries
 /// `None`; the guest-side connect then fails closed without starting a process.
 pub struct EndpointHandle {
+    #[cfg(unix)]
+    owned: Option<mvm_vmm::host::network_endpoint_spawn::OwnedEndpoint>,
     egress_uds: Option<PathBuf>,
     identity_drive: Option<PathBuf>,
     telemetry: TelemetryStart,
@@ -255,6 +258,42 @@ impl EndpointHandle {
         // The collector start stays in flight: joining here would put it on
         // the launch path it was moved off. Dropping the handle joins it.
         self.guard.defuse();
+    }
+
+    /// A compatibility PID guard is never installed-child exit evidence.
+    pub(crate) fn shutdown_owned(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(owner) = self.owned.as_mut() {
+            return owner.shutdown();
+        }
+        anyhow::ensure!(
+            self.egress_uds.is_none()
+                && !self.telemetry.provisioned
+                && self.guard.vm_name.is_none(),
+            "original endpoint child custody unavailable; installed owner retained"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn close_owned_admission(&mut self) -> Result<()> {
+        match self.owned.as_mut() {
+            Some(owner) => owner.close_admission(),
+            None => self.shutdown_owned(),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn take_owned_retirement(
+        &mut self,
+    ) -> Result<Option<mvm_vmm::host::network_endpoint_spawn::EndpointRetirement>> {
+        match self.owned.as_mut() {
+            Some(owner) => owner.take_retirement().map(Some),
+            None => {
+                self.shutdown_owned()?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -314,8 +353,10 @@ impl<'a> ClaimGuards<'a> {
             network_limits: inputs.network_limits,
             ingress: inputs.ingress,
             reader_plan: inputs.reader_plan,
+            mailbox_runtime: inputs.mailbox_runtime,
             identity: inputs.identity,
         };
+        request.require_mailbox_reader(None)?;
         if inputs.secrets.is_empty()
             && !inputs.network_policy.admits_outbound()
             && inputs.ingress.is_empty()
@@ -325,6 +366,8 @@ impl<'a> ClaimGuards<'a> {
             // not depend on whether the workload has egress to mediate.
             let telemetry = self.spawner.start_telemetry_without_endpoint(&request);
             return Ok(EndpointHandle {
+                #[cfg(unix)]
+                owned: None,
                 egress_uds: None,
                 identity_drive,
                 guard: if telemetry.provisioned {
@@ -342,10 +385,56 @@ impl<'a> ClaimGuards<'a> {
         // guest and the host disagree.
         let spawned = self.spawner.spawn(&request)?;
         Ok(EndpointHandle {
+            #[cfg(unix)]
+            owned: None,
             egress_uds: Some(spawned.egress_uds),
             identity_drive: spawned.identity_drive,
             telemetry: TelemetryStart::default(),
             guard: EndpointGuard::new(&vm.0),
+        })
+    }
+
+    /// Dispatch only through installed ownership. The concrete spawner receives
+    /// the original anchored config and actual resident signer custody.
+    #[cfg(unix)]
+    pub fn spawn_endpoint_installed(
+        &self,
+        vm: &VmId,
+        inputs: &EndpointSpawnInputs<'_>,
+        config: &mvm_core::vm_backend::VmStartConfig,
+        original: Option<&mvm_vmm::host::network_endpoint_spawn::InstalledHostServices<'_>>,
+    ) -> Result<EndpointHandle> {
+        let anchor = config
+            .host_lifetime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("installed endpoint original anchor missing"))?;
+        anyhow::ensure!(vm.0 == config.name, "installed endpoint VM differs");
+        anchor.verify_config(config, anchor.binding().backend)?;
+        let request = NetworkEndpointSpawnRequest {
+            vm_name: &vm.0,
+            state_dir: inputs.state_dir,
+            tenant: inputs.tenant,
+            secrets: inputs.secrets,
+            redaction: inputs.redaction,
+            reader_plan: inputs.reader_plan,
+            mailbox_runtime: inputs.mailbox_runtime,
+            network_policy: inputs.network_policy,
+            network_limits: inputs.network_limits,
+            ingress: inputs.ingress,
+            identity: inputs.identity,
+        };
+        request.require_mailbox_reader(None)?;
+        let spawned = self.spawner.spawn_installed(&request, config, original)?;
+        anyhow::ensure!(
+            spawned.owner.is_some() || (spawned.egress_uds.is_none() && !spawned.telemetry),
+            "installed helper effects have no original child"
+        );
+        Ok(EndpointHandle {
+            owned: spawned.owner,
+            egress_uds: spawned.egress_uds,
+            identity_drive: spawned.identity_drive,
+            telemetry: TelemetryStart::provisioned(spawned.telemetry),
+            guard: EndpointGuard::defused(),
         })
     }
 }
@@ -397,6 +486,31 @@ mod tests {
             bind_claim_policy_to_plan(&[], &NetworkPolicy::unrestricted()),
             Err(ClaimRefusal::PolicyNotAdmitted { .. })
         ));
+    }
+
+    #[test]
+    fn selected_direct_mapping_requires_the_original_policy_asset_even_on_deny_all() {
+        use mvm_contract::policy::network_policy::{
+            CooperatingPayloadPolicy, CooperatingTcpPeer, PayloadMappingProfile,
+        };
+
+        let selected = |spki_sha256| {
+            let peer = CooperatingTcpPeer {
+                host: "peer.example".into(),
+                port: 443,
+                server_name: "peer.example".into(),
+                spki_sha256,
+                profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
+            };
+            NetworkPolicy::deny_all()
+                .with_payload_mapping(Some(CooperatingPayloadPolicy::new(vec![peer]).unwrap()))
+        };
+        let admitted = selected([7; 32]);
+        let recorded = [policy_identity(&admitted)];
+        assert!(bind_claim_policy_to_plan(&[], &admitted).is_err());
+        assert!(bind_claim_policy_to_plan(&recorded, &selected([8; 32])).is_err());
+        assert!(bind_claim_policy_to_plan(&recorded, &admitted).is_ok());
+        assert!(!admitted.admits_outbound());
     }
 
     #[test]
@@ -523,6 +637,7 @@ mod tests {
             network_limits: mvm_core::plan::NetworkLimits::default(),
             ingress: &[],
             reader_plan: None,
+            mailbox_runtime: None,
         }
     }
 
@@ -560,6 +675,38 @@ mod tests {
 
         // Disarm the reaper so drop doesn't chase a nonexistent endpoint.
         child.defuse();
+    }
+
+    #[test]
+    fn unsupported_mailbox_profile_refuses_before_any_spawner_call() {
+        use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
+        let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
+        plan.mailbox = Some(MailboxGrant {
+            mailbox: MailboxId::from_bytes([4; 32]),
+            authority_key: [5; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: None,
+            durable_object_pair_sha256_v1: Some([6; 32]),
+            outbound_journal_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+        });
+        plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
+        let spawner = FakeSpawner::default();
+        let guards = ClaimGuards::new(&spawner);
+        let state = tempfile::tempdir().unwrap();
+        let redaction = RedactionPolicy::default();
+        let policy = NetworkPolicy::deny_all();
+        let mut inputs = endpoint_inputs(state.path(), &redaction, &policy);
+        inputs.reader_plan = Some(&plan);
+        assert!(
+            guards
+                .spawn_endpoint(&VmId("unsupported-mailbox".into()), &inputs)
+                .is_err()
+        );
+        assert!(spawner.seen_vm.lock().unwrap().is_none());
+        assert!(spawner.identity_vm.lock().unwrap().is_none());
+        assert!(spawner.telemetry_vm.lock().unwrap().is_none());
     }
 
     #[test]

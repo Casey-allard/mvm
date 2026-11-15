@@ -49,7 +49,14 @@ use crate::mailbox_service::durable::DurableMailboxService;
 use crate::plan_admission::{MailboxLaunchPosture, MailboxPostureHandoff};
 use crate::vm_lifetime::{endpoint_needed, launcher_is_alive};
 
-mod reader;
+mod lifetime;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod object_worker;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use object_worker::serve_original_object;
+pub mod original_journal;
+pub mod paired_incoming;
+pub(crate) mod reader;
 
 /// The helper binary this module spawns.
 pub const MAILBOX_BIN: &str = "mvm-mailbox";
@@ -68,7 +75,7 @@ const LOCAL_JOURNAL_LIMITS: JournalLimits = JournalLimits {
 
 /// What the process reads on stdin. `deny_unknown_fields`, so a field a newer
 /// launcher adds fails closed here.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxProcessConfig {
     pub grant: MailboxGrant,
@@ -92,7 +99,7 @@ pub fn parse(raw: &[u8]) -> serde_json::Result<MailboxProcessConfig> {
     serde_json::from_slice(raw)
 }
 
-fn load_admitted_plan(state_dir: &Path) -> Result<ExecutionPlan> {
+pub(crate) fn load_admitted_plan(state_dir: &Path) -> Result<ExecutionPlan> {
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
@@ -134,6 +141,35 @@ pub fn serve(config: MailboxProcessConfig) -> i32 {
 }
 
 fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
+    serve_with_lifetime(config, None, None)
+}
+
+pub const ORIGINAL_JOURNAL_V1: &str = "--original-journal-v1";
+
+/// This private original-launch message is never a guest or relay frame.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalJournalStartup<C> {
+    config: C,
+    original_vmm_v1: lifetime::OriginalVmm,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_reader_sha256: Option<[u8; 32]>,
+}
+
+pub fn serve_original_launch(raw: &[u8]) -> Result<()> {
+    let launch: OriginalJournalStartup<MailboxProcessConfig> = serde_json::from_slice(raw)?;
+    serve_with_lifetime(
+        launch.config,
+        Some(launch.original_vmm_v1),
+        launch.required_reader_sha256,
+    )
+}
+
+fn serve_with_lifetime(
+    config: MailboxProcessConfig,
+    lifetime: Option<lifetime::OriginalVmm>,
+    required_reader: Option<[u8; 32]>,
+) -> Result<()> {
     // SAFETY: `getppid` is async-signal-safe and infallible.
     let launcher = unsafe { libc::getppid() };
     let MailboxProcessConfig {
@@ -179,6 +215,8 @@ fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
     if posture.variant() == Variant::Prod {
         return serve_local(
             launcher,
+            lifetime,
+            required_reader,
             &plan,
             MailboxProcessConfig {
                 grant,
@@ -192,7 +230,7 @@ fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
             },
         );
     }
-    if posture.variant() != Variant::Dev {
+    if posture.variant() != Variant::Dev || lifetime.is_some() {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             "invalid mailbox posture",
@@ -218,12 +256,14 @@ fn serve_verified(config: MailboxProcessConfig) -> Result<()> {
 
 fn serve_local(
     launcher: libc::pid_t,
+    lifetime: Option<lifetime::OriginalVmm>,
+    required_reader: Option<[u8; 32]>,
     plan: &ExecutionPlan,
     config: MailboxProcessConfig,
 ) -> Result<()> {
     let MailboxProcessConfig {
         grant,
-        keys,
+        mut keys,
         keys_dir,
         socket,
         route,
@@ -231,6 +271,12 @@ fn serve_local(
         reader_boot,
         vm_state_dir,
     } = config;
+    let original = lifetime.map(lifetime::OriginalVmm::observe).transpose()?;
+    let active = || match &original {
+        Some(lifetime) => vm_state_dir.exists() && lifetime.alive_until(std::time::Instant::now()),
+        None => keep_serving(launcher, &vm_state_dir),
+    };
+
     let posture = posture.ok_or_else(|| {
         Error::new(
             ErrorKind::PermissionDenied,
@@ -282,6 +328,7 @@ fn serve_local(
         ));
     }
     let paths = retained.storage_paths(&keys_dir).map_err(Error::other)?;
+    let delegated = keys.outbound_source.take();
     let derived = keys.with_retained(&retained)?;
     let (signer, _, _) = derived.durable_material();
     let (policy, sealer) = derived.trust();
@@ -300,37 +347,121 @@ fn serve_local(
         retention,
     )
     .map_err(Error::other)?;
-    let reader = reader::load_or_enroll(
+    let reader = reader::load_reader(
         &vm_state_dir,
         &grant,
         binding.clone(),
         &sealer.capability,
         &signer,
+        required_reader,
     )?;
-    let service = DurableMailboxService::bind_local(
-        &socket,
+    let mut directed = if let Some(private) = delegated.as_ref() {
+        let d = binding.outbound_journal_v1.ok_or_else(|| {
+            Error::new(
+                ErrorKind::PermissionDenied,
+                "A has no verified journal direction",
+            )
+        })?;
+        mvm_core::naming::validate_vm_name(&private.destination_name).map_err(Error::other)?;
+        let mut inbound = policy.context.clone();
+        inbound.expected_tenant = d.address.tenant;
+        inbound.expected_authorization_domain = d.address.authorization_domain;
+        inbound.expected_mailbox = d.address.mailbox;
+        inbound.expected_recipient = d.address.recipient;
+        inbound.expected_sender = d.source;
+        inbound.expected_capability_issuer =
+            mvm_contract::protocol::mailbox::PrincipalId::from_bytes(d.receipt_key);
+        inbound.current_execution_epoch = d.execution_epoch;
+        inbound.current_policy_epoch = d.policy_epoch;
+        use crate::mailbox_service::directed_journal::{DirectedJournalSource, JournalPeer};
+        let source = DirectedJournalSource::from_original(
+            plan,
+            binding,
+            &sealer,
+            JournalPeer {
+                context: &policy.context,
+                state: &vm_state_dir,
+            },
+            JournalPeer {
+                context: &inbound,
+                state: &vm_state_dir.with_file_name(&private.destination_name),
+            },
+            private.grants.clone(),
+            private.material(),
+        )
+        .map_err(Error::other)?;
+        Some(source)
+    } else {
+        None
+    };
+    let mut policy = policy.with_grant(&grant)?;
+    let enrolled =
+        paired_incoming::EnrolledIncoming::open(&keys_dir, &grant, &retained, binding, &reader)
+            .map_err(Error::other)?;
+    let inbound = if let Some(enrolled) = enrolled {
+        enrolled.apply(&mut policy).map_err(Error::other)?;
+        Some(
+            enrolled
+                .send_guard(reader.revocations_path.clone())
+                .map_err(Error::other)?,
+        )
+    } else {
+        None
+    };
+    let service = DurableMailboxService::bind_local_incoming(
+        crate::mailbox_service::durable::JournalSocket {
+            path: &socket,
+            exclusive: original.is_some(),
+        },
         LAUNCH_LIMITS,
-        policy.with_grant(&grant)?,
+        policy,
         signer,
         journal,
         anchor,
+        inbound,
     )?;
+    #[cfg(feature = "durable-guest-io-witness")]
+    // Only a reconnect by the original controller supplies a pinned prior
+    // reader digest. load_reader has already verified it against this boot.
+    let service = service.with_guest_meter(&vm_state_dir, required_reader.is_some())?;
     service.install_guest_reader(reader)?;
+    let mut dial = |until| {
+        delegated
+            .as_ref()
+            .ok_or(crate::mailbox_service::Refusal::Unavailable)?
+            .connect(&vm_state_dir, until)
+    };
+    let mut turn = crate::mailbox_service::directed_journal::SourceTurn::from_boot(binding)
+        .map_err(Error::other)?;
+    if let Some(endpoint) = directed.as_mut() {
+        turn = turn.attach(endpoint, &mut dial).map_err(Error::other)?;
+    } else if binding.outbound_journal_v1.is_some() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "directed A helper lacks original delegated transport",
+        ));
+    }
     std::io::stdout().write_all(READY_MARKER)?;
-    while keep_serving(launcher, &vm_state_dir) {
+    while active() {
         if service
-            .serve_guest_while(&route, &mut sealer, || {
-                keep_serving(launcher, &vm_state_dir)
-            })
+            .serve_guest_while(&route, &mut sealer, &mut turn, active)
             .is_err()
         {
-            std::thread::sleep(POLL_INTERVAL);
+            if let Some(lifetime) = &original {
+                lifetime.alive_until(std::time::Instant::now() + POLL_INTERVAL);
+            } else {
+                std::thread::sleep(POLL_INTERVAL);
+            }
         }
         match service.maintain_local() {
             Ok(()) | Err(JournalError::MaintenancePending) => {}
             Err(error) => return Err(Error::other(error)),
         }
     }
+    if let Some(lifetime) = original {
+        lifetime.finish()?;
+    }
+
     Ok(())
 }
 
@@ -543,9 +674,59 @@ pub fn spawn_for_launch(
     vm_name: &str,
     posture: Option<&MailboxLaunchPosture>,
 ) -> Result<Option<u32>> {
+    spawn_with_original(plan, backend, vm_name, posture, false, |config, _, _| {
+        Ok(spawn_serving(config, &config.vm_state_dir)?.id())
+    })
+}
+
+// Both entry points use the canonical backend, actual admitted posture, boot
+// binding and retained-key provisioning before any original child is spawned.
+fn spawn_with_original<T>(
+    plan: &ExecutionPlan,
+    backend: &AnyBackend,
+    vm_name: &str,
+    posture: Option<&MailboxLaunchPosture>,
+    exclusive: bool,
+    start: impl FnOnce(
+        &mut MailboxProcessConfig,
+        &ExecutionPlan,
+        std::sync::Arc<original_journal::LaunchClaim>,
+    ) -> Result<T>,
+) -> Result<Option<T>> {
+    spawn_with_original_tracked(
+        plan,
+        backend,
+        vm_name,
+        posture,
+        exclusive,
+        None,
+        |config, plan, guard, _| start(config, plan, guard),
+    )
+}
+
+fn spawn_with_original_tracked<T>(
+    plan: &ExecutionPlan,
+    backend: &AnyBackend,
+    vm_name: &str,
+    posture: Option<&MailboxLaunchPosture>,
+    exclusive: bool,
+    mut attempt: Option<&mut original_journal::JournalStartAttempt>,
+    start: impl FnOnce(
+        &mut MailboxProcessConfig,
+        &ExecutionPlan,
+        std::sync::Arc<original_journal::LaunchClaim>,
+        Option<&mut original_journal::JournalStartAttempt>,
+    ) -> Result<T>,
+) -> Result<Option<T>> {
     let Some(grant) = &plan.mailbox else {
         return Ok(None);
     };
+    if grant.outbound_journal_v1.is_some() && !exclusive {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "directed A requires its original paired launcher",
+        ));
+    }
     let posture = posture.ok_or_else(|| {
         Error::new(
             ErrorKind::PermissionDenied,
@@ -572,6 +753,13 @@ pub fn spawn_for_launch(
                 ),
             )
         })?;
+    let owner_dir = original_journal::owner_dir(&mvm_core::config::mvm_keys_dir(), vm_name)?;
+    let guard = original_journal::claim_launch(&state_dir, &owner_dir, exclusive)?;
+    if let Some(attempt) = attempt.as_deref_mut() {
+        attempt
+            .arm(plan, &state_dir, guard.clone())
+            .map_err(std::io::Error::other)?;
+    }
     let mut config = build_config(&mvm_core::config::mvm_keys_dir(), grant, &state_dir, route)?;
     let started = (|| {
         config.reader_boot = load_reader_boot_for_plan(&state_dir, plan)?;
@@ -601,48 +789,55 @@ pub fn spawn_for_launch(
         }
         config.posture =
             Some(posture.handoff(config.reader_boot.as_ref().map(|binding| binding.boot)));
-        spawn_serving(&config, &state_dir)
+        start(&mut config, plan, guard.clone(), attempt).map(Some)
     })();
-    if started.is_err() {
+    if started.is_err()
+        && matches!(std::fs::symlink_metadata(owner_dir.join(original_journal::MARKER)), Err(ref e) if e.kind() == ErrorKind::NotFound)
+    {
         let _ = shred_epoch_secret(&state_dir);
     }
     started
 }
 
-fn spawn_serving(config: &MailboxProcessConfig, state_dir: &Path) -> Result<Option<u32>> {
+fn serving_command() -> Result<Command> {
     let bin = mvm_vmm::host::broker_services_spawn::resolve_subprocess_bin_to_spawn(&AuxBin::new(
         MAILBOX_BIN,
         MAILBOX_BIN_ENV,
         "mvm-hostd",
     ))
     .map_err(|e| Error::new(ErrorKind::NotFound, format!("{e:#}")))?;
-    let mut child = command(&bin).spawn()?;
-    let written = child
+    Ok(command(&bin))
+}
+
+// Keep this handshake separate from exec: a rejected configuration can have
+// a real Child while a failed executable lookup or failed exec has none.
+fn configure_serving(
+    config: &impl serde::Serialize,
+    child: &mut std::process::Child,
+) -> Result<()> {
+    let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| Error::other("mvm-mailbox stdin was not piped"))
-        .and_then(|mut stdin| stdin.write_all(&serde_json::to_vec(config)?));
-    if let Err(error) = written {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    let ready = child
+        .ok_or_else(|| Error::other("mvm-mailbox stdin was not piped"))?;
+    stdin.write_all(&zeroize::Zeroizing::new(serde_json::to_vec(config)?))?;
+    drop(stdin);
+    let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| Error::other("mvm-mailbox stdout was not piped"))
-        .and_then(|stdout| wait_ready(stdout, READY_TIMEOUT));
-    if let Err(error) = ready {
+        .ok_or_else(|| Error::other("mvm-mailbox stdout was not piped"))?;
+    wait_ready(stdout, READY_TIMEOUT)
+}
+
+fn spawn_serving(config: &MailboxProcessConfig, state_dir: &Path) -> Result<std::process::Child> {
+    let mut child = serving_command()?.spawn()?;
+    let setup = configure_serving(config, &mut child)
+        .and_then(|()| std::fs::write(state_dir.join(MAILBOX_PID_FILE), child.id().to_string()));
+    if let Err(error) = setup {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
     }
-    if let Err(error) = std::fs::write(state_dir.join(MAILBOX_PID_FILE), child.id().to_string()) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    Ok(Some(child.id()))
+    Ok(child)
 }
 
 #[cfg(test)]
@@ -674,6 +869,25 @@ mod tests {
             ErrorKind::TimedOut
         );
         drop(peer);
+    }
+
+    #[test]
+    fn post_exec_handshake_failure_retains_original_child_and_marker() {
+        let keys = keys_dir();
+        let state = tempfile::tempdir().unwrap();
+        let config =
+            build_config(keys.path(), &grant(keys.path()), state.path(), test_route()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("15");
+        let (mut child, mut marker) = original_journal::spawn_claimed(dir.path(), command).unwrap();
+        assert!(configure_serving(&config, &mut child).is_err());
+        assert!(marker.collect(&mut child).unwrap().is_none());
+        assert!(dir.path().join(original_journal::MARKER).is_file());
+        assert!(!state.path().join(MAILBOX_PID_FILE).exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(marker.collect(&mut child).unwrap().is_some());
     }
 
     fn test_route() -> HostDialRoute {
@@ -745,6 +959,9 @@ mod tests {
     fn grant(dir: &Path) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes([4; 32]);
         MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
             mailbox,
             authority_key: crate::mailbox_launch::authority_key_for(
                 dir,
@@ -1500,17 +1717,10 @@ mod tests {
                 "{name}"
             );
         }
-        let name = "wasm";
-        let backend = backend_named(name);
-        assert!(!backend.capabilities().guest_mailbox, "{name}");
-        assert!(
-            require_servable(&granted, &backend, posture.as_ref()).is_err(),
-            "{name}"
-        );
-        assert!(
-            require_servable(&config_for(None), &backend, None).is_ok(),
-            "{name}"
-        );
+        let wasm = backend_named("wasm");
+        assert!(!wasm.capabilities().guest_mailbox);
+        assert!(require_servable(&granted, &wasm, posture.as_ref()).is_err());
+        assert!(require_servable(&config_for(None), &wasm, None).is_ok());
     }
 
     #[test]

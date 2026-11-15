@@ -4,6 +4,12 @@
 //! Cryptography, clocks, replay storage, routing, and transport live in
 //! `mvm_core::mailbox` and its runtime consumers.
 
+/// Compiled grant and wire definitions used for runtime declarations.
+pub const COMPILED_MAILBOX_READER_INPUTS: &[(&str, &[u8])] = &[(
+    "crates/mvm-contract/src/protocol/mailbox.rs",
+    include_bytes!("mailbox.rs"),
+)];
+
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -16,6 +22,8 @@ use crate::plan::{Nonce, PlanId};
 /// shares a queue or credit with machine control (5252), `NetworkFlow` (5253),
 /// telemetry (5254), display (5255) or GPU (5256).
 pub const MAILBOX_PORT: u32 = 5257;
+/// Boot assertion for the original sender's signed ordinal settlement direction.
+pub const MAILBOX_ORDINAL_CMDLINE_TOKEN: &str = "mvm.mailbox.sender=ordinal-v1";
 /// Current mailbox protocol version.
 pub const MAILBOX_PROTOCOL_VERSION: u16 = 1;
 /// Receipt-only version for a locally fsynced, trusted-host acceptance.
@@ -305,6 +313,37 @@ impl From<MailboxRetentionPolicy> for MailboxRetentionPolicyWire {
     }
 }
 
+/// Opt-in, original-sender allocation and settlement. A missing choice keeps
+/// the legacy arbitrary message-ID path and its existing retention limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SenderSettlementProfile {
+    OrdinalV1,
+}
+
+/// One approved outbound trusted-host journal direction. B is admitted before A
+/// so none of these immutable fields refer circularly to A's eventual plan ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxJournalDirectionV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_settlement: Option<SenderSettlementProfile>,
+    pub source: PrincipalId,
+    pub destination_plan_sha256: [u8; 32],
+    pub destination_plan_nonce: [u8; 16],
+    pub destination_boot: BootId,
+    pub address: MailboxAddress,
+    pub execution_epoch: ExecutionEpoch,
+    pub policy_epoch: u64,
+    pub receipt_key: [u8; 32],
+    pub source_scope_grant_sha256: [u8; 32],
+    pub send_grant_sha256: [u8; 32],
+    pub receive_grant_sha256: [u8; 32],
+    pub not_before_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+    pub max_payload_bytes: u32,
+}
+
 /// What a signed `ExecutionPlan` admits for one workload's mailbox: which
 /// mailbox, the key whose capabilities are honored, and the execution epoch.
 /// Presence grants that workload its own mailbox, including the ability for
@@ -316,6 +355,18 @@ impl From<MailboxRetentionPolicy> for MailboxRetentionPolicyWire {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxGrant {
+    /// Both original plan signers select the same digest of the ordered plan
+    /// nonces and independently signed Call and Reply credentials. Absence
+    /// preserves existing grant encodings; this selector alone admits no service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_object_pair_sha256_v1: Option<[u8; 32]>,
+    /// Canonical hash of a separately provisioned, destination operator-approved incoming policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_journal_policy_sha256_v1: Option<[u8; 32]>,
+    /// A single explicitly admitted remote direction. Existing signed bytes
+    /// and the legacy own-mailbox operation remain unchanged when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_journal_v1: Option<MailboxJournalDirectionV1>,
     pub mailbox: MailboxId,
     /// Ed25519 verifying key that must have signed any accepted capability.
     pub authority_key: [u8; 32],
@@ -1059,6 +1110,9 @@ pub struct MailboxDeliveryLease {
     pub consumer_session: ConsumerSessionId,
     pub receive_capability_id: CapabilityId,
     pub policy_epoch: u64,
+    /// Present only for the separately admitted durable object service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_projection_v1: Option<[u8; 32]>,
     pub ciphertext_commitment: [u8; 32],
     pub issued_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,

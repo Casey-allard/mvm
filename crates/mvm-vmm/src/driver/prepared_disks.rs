@@ -29,12 +29,91 @@ pub struct PreparedWritableDisks {
     disks: Vec<PreparedDisk>,
 }
 
+/// Original unlinked, verified workload filesystem bound to its physical root slot.
+#[derive(Debug)]
+pub struct PreparedWorkloadRoot {
+    block: BlockDev,
+    sealed: crate::host::restore_image::VerifiedRestoreFile,
+}
+
+impl PreparedWorkloadRoot {
+    pub fn bind(
+        spec: &VmmSpec,
+        source: &std::path::Path,
+        sealed: crate::host::restore_image::VerifiedRestoreFile,
+    ) -> Result<Self> {
+        let block = Self::root(spec)?;
+        ensure!(
+            block.source == source && !sealed.is_empty(),
+            "original workload root differs"
+        );
+        Ok(Self {
+            block: block.clone(),
+            sealed,
+        })
+    }
+
+    fn root(spec: &VmmSpec) -> Result<&BlockDev> {
+        let mut roots = spec.blocks.iter().filter(|block| block.slot == 0);
+        let root = roots.next().context("missing workload root slot")?;
+        ensure!(
+            roots.next().is_none() && root.read_only && !root.ephemeral,
+            "ambiguous or writable workload root"
+        );
+        Ok(root)
+    }
+
+    pub fn validate_spec(&self, spec: &VmmSpec) -> Result<()> {
+        ensure!(
+            Self::root(spec)? == &self.block,
+            "original workload root recipe changed"
+        );
+        crate::host::restore_image::validate_private_descriptor(self.file().as_raw_fd())?;
+        Ok(())
+    }
+
+    /// Check for the inherited root and the opened drive in the live writer.
+    /// The caller verifies original process identity around this observation.
+    #[cfg(target_os = "linux")]
+    pub fn verify_writer_descriptors(&self, pid: u32) -> Result<()> {
+        let fds = std::path::PathBuf::from(format!("/proc/{pid}/fd"));
+        self.verify_writer_descriptor_objects(&writer_descriptor_inventory(&fds)?)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn verify_writer_descriptor_objects(
+        &self,
+        observed: &std::collections::BTreeMap<(u64, u64), usize>,
+    ) -> Result<()> {
+        let metadata = self.file().metadata()?;
+        ensure!(
+            observed
+                .get(&(metadata.dev(), metadata.ino()))
+                .copied()
+                .unwrap_or(0)
+                >= 2,
+            "actual writer is missing its second reference to the original workload root"
+        );
+        Ok(())
+    }
+
+    pub fn file(&self) -> &std::fs::File {
+        self.sealed.file()
+    }
+
+    pub fn slot(&self) -> u8 {
+        self.block.slot
+    }
+}
+
 /// Original prepared files for one boot, not admission or native ownership proof.
 #[derive(Debug)]
 #[must_use = "retain prepared files through the selected boot handoff"]
 pub struct PreparedBootFiles<'a> {
     /// Borrowed original kernel; its producer retains custody through launch.
     pub kernel: Option<&'a crate::host::restore_image::VerifiedRestoreFile>,
+    /// Original immutable workload root, separate from the optional DATA disk.
+    pub workload_root: Option<PreparedWorkloadRoot>,
     /// Owned original writable backing/sidecar pairs.
     pub writable: PreparedWritableDisks,
     /// Owned private read-only input DATA file, when explicitly supplied.
@@ -42,6 +121,14 @@ pub struct PreparedBootFiles<'a> {
 }
 
 impl PreparedBootFiles<'_> {
+    pub fn require_no_workload_root(&self) -> Result<()> {
+        ensure!(
+            self.workload_root.is_none(),
+            "backend does not support the original read-only workload root"
+        );
+        Ok(())
+    }
+
     /// Refuse DATA custody before an unsupported backend can dispatch or reopen.
     ///
     /// # Errors
@@ -79,24 +166,7 @@ impl LaunchWritableHandoff {
 
     #[cfg(any(target_os = "linux", test))]
     fn verify_writer_descriptors_at(&self, fd_dir: &std::path::Path) -> Result<()> {
-        let mut actual = std::collections::BTreeMap::new();
-        for entry in std::fs::read_dir(fd_dir)
-            .with_context(|| format!("reading actual writer descriptors at {}", fd_dir.display()))?
-        {
-            let entry = entry?;
-            // proc fd entries are magic symlinks. metadata follows them to the
-            // open object; a pathname match would not detect ABA substitution.
-            let metadata = std::fs::metadata(entry.path()).with_context(|| {
-                format!(
-                    "inspecting actual writer descriptor {}",
-                    entry.path().display()
-                )
-            })?;
-            *actual
-                .entry((metadata.dev(), metadata.ino()))
-                .or_insert(0usize) += 1;
-        }
-        self.verify_writer_descriptor_objects(&actual)
+        self.verify_writer_descriptor_objects(&writer_descriptor_inventory(fd_dir)?)
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -137,6 +207,30 @@ impl LaunchWritableHandoff {
     pub fn projected(&self) -> &VmmSpec {
         &self.projected
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn writer_descriptor_inventory(
+    fd_dir: &std::path::Path,
+) -> Result<std::collections::BTreeMap<(u64, u64), usize>> {
+    let mut actual = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(fd_dir)
+        .with_context(|| format!("reading actual writer descriptors at {}", fd_dir.display()))?
+    {
+        let entry = entry?;
+        // proc fd entries are magic symlinks. metadata follows them to the
+        // open object; a pathname match would not detect ABA substitution.
+        let metadata = std::fs::metadata(entry.path()).with_context(|| {
+            format!(
+                "inspecting actual writer descriptor {}",
+                entry.path().display()
+            )
+        })?;
+        *actual
+            .entry((metadata.dev(), metadata.ino()))
+            .or_insert(0usize) += 1;
+    }
+    Ok(actual)
 }
 
 impl PreparedWritableDisks {
@@ -723,6 +817,73 @@ mod tests {
     }
 
     #[test]
+    fn workload_root_requires_two_original_descriptor_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = kernel(dir.path(), b"original root");
+        let source = dir.path().join("rootfs");
+        let mut root_slot = block(&source, 0);
+        root_slot.read_only = true;
+        let root = PreparedWorkloadRoot::bind(&spec(vec![root_slot]), &source, sealed).unwrap();
+        let original = root.file().metadata().unwrap();
+        let identity = (original.dev(), original.ino());
+        let other = writable(&source).metadata().unwrap();
+        let mut observed =
+            std::collections::BTreeMap::from([(identity, 1), ((other.dev(), other.ino()), 2)]);
+        assert!(root.verify_writer_descriptor_objects(&observed).is_err());
+        observed.insert(identity, 2);
+        root.verify_writer_descriptor_objects(&observed).unwrap();
+    }
+
+    #[test]
+    fn original_workload_root_survives_path_replacement_and_refuses_changed_slot() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("rootfs");
+        let body = b"original read-only workload root";
+        std::fs::write(&path, body).unwrap();
+        let mut block = block(&path, 0);
+        block.read_only = true;
+        let original = spec(vec![block.clone()]);
+        let sealed = VerifiedRestoreFile::prepare(
+            &path,
+            dir.path(),
+            &mvm_core::plan::bundle::sha256_hex(body),
+        )
+        .unwrap();
+        let root = PreparedWorkloadRoot::bind(&original, &path, sealed).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        let mut restored = Vec::new();
+        root.file().read_to_end(&mut restored).unwrap();
+        assert_eq!(restored, body);
+        assert_eq!(root.slot(), 0);
+        root.validate_spec(&original).unwrap();
+        block.slot = 1;
+        assert!(root.validate_spec(&spec(vec![block.clone()])).is_err());
+        block.slot = 0;
+        block.read_only = false;
+        assert!(root.validate_spec(&spec(vec![block.clone()])).is_err());
+        block.read_only = true;
+        block.ephemeral = true;
+        assert!(root.validate_spec(&spec(vec![block])).is_err());
+        let driver = DispatchRecorder::default();
+        let error = driver
+            .boot_custodied(
+                &original,
+                PreparedBootFiles {
+                    kernel: None,
+                    workload_root: Some(root),
+                    writable: PreparedWritableDisks::empty(),
+                    data: None,
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("read-only workload root"));
+        assert_eq!(driver.ordinary.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn empty_resources_preserve_the_exact_kernel_dispatch() {
         let tmp = tempfile::tempdir().unwrap();
         let kernel = kernel(tmp.path(), b"dispatch fixture, not a bootable kernel");
@@ -735,6 +896,7 @@ mod tests {
                 &spec,
                 PreparedBootFiles {
                     kernel: Some(&kernel),
+                    workload_root: None,
                     writable: disks,
                     data: None,
                 },
@@ -750,6 +912,7 @@ mod tests {
                 &spec,
                 PreparedBootFiles {
                     kernel: None,
+                    workload_root: None,
                     writable: PreparedWritableDisks::empty(),
                     data: None,
                 },
@@ -782,6 +945,7 @@ mod tests {
                         &spec,
                         PreparedBootFiles {
                             kernel,
+                            workload_root: None,
                             writable: disks,
                             data: None,
                         },
@@ -832,6 +996,7 @@ mod tests {
                     &spec,
                     PreparedBootFiles {
                         kernel,
+                        workload_root: None,
                         writable: PreparedWritableDisks::empty(),
                         data: Some(data),
                     },
@@ -847,6 +1012,7 @@ mod tests {
                 &spec,
                 PreparedBootFiles {
                     kernel: None,
+                    workload_root: None,
                     writable: PreparedWritableDisks::empty(),
                     data: None,
                 },

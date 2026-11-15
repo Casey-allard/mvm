@@ -48,8 +48,29 @@ pub fn seccomp_cmdline_token(config: &mvm_core::vm_backend::VmStartConfig) -> Op
 /// Granting a mailbox widens no seccomp tier: the agent, not the workload,
 /// owns the vsock socket.
 pub fn mailbox_cmdline_token(config: &mvm_core::vm_backend::VmStartConfig) -> Option<String> {
-    let plan = mvm_core::plan::plan_from_admitted_json(config.plan_json.as_deref()?).ok()?;
-    plan.mailbox.map(|_| "mvm.mailbox=1".to_string())
+    let [presence, _] = mailbox_cmdline_tokens(config);
+    presence
+}
+
+pub(super) fn mailbox_cmdline_tokens(
+    config: &mvm_core::vm_backend::VmStartConfig,
+) -> [Option<String>; 2] {
+    use mvm_contract::protocol::mailbox::{MAILBOX_ORDINAL_CMDLINE_TOKEN, SenderSettlementProfile};
+    let grant = config
+        .plan_json
+        .as_deref()
+        .and_then(|json| mvm_core::plan::plan_from_admitted_json(json).ok())
+        .and_then(|plan| plan.mailbox);
+    let Some(grant) = grant else {
+        return [None, None];
+    };
+    let profile = grant
+        .outbound_journal_v1
+        .and_then(|direction| direction.sender_settlement);
+    let sender = profile.map(|profile| match profile {
+        SenderSettlementProfile::OrdinalV1 => MAILBOX_ORDINAL_CMDLINE_TOKEN.to_owned(),
+    });
+    [Some("mvm.mailbox=1".to_owned()), sender]
 }
 
 /// The cmdline key carrying the agent profile the guest must run under.

@@ -30,6 +30,13 @@ Host support modules prepare inherited descriptors, command lines, runtime
 metadata, brokers, consoles, audit endpoints, and workload exit observation.
 Vsock modules provide the common guest transport and the egress bridge.
 
+`host::process_limits::limit_original_address_space` installs a Linux child's
+soft and hard address-space ceilings before exec, preserving a stricter
+inherited ceiling. The installed network endpoint and tenant helper share this
+implementation. Other platforms return `Unsupported`. Callers still need an
+original parent reservation and must retain and collect the actual child;
+setting a ceiling alone supplies neither admission nor retirement evidence.
+
 ## Main modules
 
 | Module | Responsibility |

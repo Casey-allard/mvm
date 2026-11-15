@@ -21,17 +21,24 @@ use sha2::{Digest as _, Sha256};
 
 use crate::mailbox_service::durable::GuestReaderAuthority;
 
+const OBJECT_READER_FILE: &str = "mailbox-object-reader-v1.json";
 const READER_FILE: &str = "mailbox-reader-authority.json";
 const MAX_READER_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReaderRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_object_material_v1: Option<[u8; 32]>,
     version: u8,
     boot: MailboxReaderBootBinding,
     send: SignedMailboxCapability,
     receive: SignedMailboxCapability,
     enrollment: SignedMailboxGuestReaderEnrollment,
+}
+
+pub(crate) fn revocations_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("mailbox-reader-revocations.json")
 }
 
 fn invalid(reason: impl std::fmt::Display) -> io::Error {
@@ -83,12 +90,55 @@ fn read_record(path: &Path) -> io::Result<Option<ReaderRecord>> {
     serde_json::from_slice(&bytes).map(Some).map_err(invalid)
 }
 
+/// Reopen only the exact pre-existing enrollment selected by a private
+/// original worker bootstrap. No repair, new issuance or state mutation.
+pub(crate) fn check_object_worker_record(
+    state: &Path,
+    boot: &MailboxReaderBootBinding,
+    incoming: &SignedMailboxCapability,
+    receive: &SignedMailboxCapability,
+    material: [u8; 32],
+) -> io::Result<SignedMailboxGuestReaderEnrollment> {
+    let r = read_record(&state.join(OBJECT_READER_FILE))?
+        .ok_or_else(|| invalid("missing selected enrollment"))?;
+    if r.version != 2
+        || r.boot != *boot
+        || r.send != *incoming
+        || r.receive != *receive
+        || r.original_object_material_v1 != Some(material)
+    {
+        return Err(invalid(
+            "selected worker differs from retained reader enrollment",
+        ));
+    }
+    Ok(r.enrollment)
+}
+
+fn enrollment_digest(record: &ReaderRecord) -> io::Result<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(record).map_err(invalid)?).into())
+}
+pub(super) fn original_enrollment_digest(state: &Path) -> io::Result<[u8; 32]> {
+    enrollment_digest(
+        &read_record(&state.join(READER_FILE))?
+            .ok_or_else(|| invalid("original reader enrollment missing"))?,
+    )
+}
 pub(super) fn load_or_enroll(
     state_dir: &Path,
     grant: &MailboxGrant,
     binding: MailboxReaderBootBinding,
     send_grant: &MailboxCapabilityGrant,
     signer: &SigningKey,
+) -> io::Result<GuestReaderAuthority> {
+    load_reader(state_dir, grant, binding, send_grant, signer, None)
+}
+pub(super) fn load_reader(
+    state_dir: &Path,
+    grant: &MailboxGrant,
+    binding: MailboxReaderBootBinding,
+    send_grant: &MailboxCapabilityGrant,
+    signer: &SigningKey,
+    required_original: Option<[u8; 32]>,
 ) -> io::Result<GuestReaderAuthority> {
     // Re-read the host's persisted boot identity: stdin alone cannot change
     // which cold guest this per-VM helper is authorized to serve.
@@ -109,7 +159,17 @@ pub(super) fn load_or_enroll(
     let now = now_unix_ms()?;
     let path = state_dir.join(READER_FILE);
     let record = match read_record(&path)? {
-        Some(record) => record,
+        Some(record) => {
+            if let Some(digest) = required_original
+                && enrollment_digest(&record)? != digest
+            {
+                return Err(invalid("original reader enrollment changed"));
+            }
+            record
+        }
+        None if required_original.is_some() => {
+            return Err(invalid("original reader enrollment missing"));
+        }
         None => {
             let send = sign_capability(send_grant.clone(), signer).map_err(invalid)?;
             let receive =
@@ -136,6 +196,7 @@ pub(super) fn load_or_enroll(
             )
             .map_err(invalid)?;
             let record = ReaderRecord {
+                original_object_material_v1: None,
                 version: 1,
                 boot: binding.clone(),
                 send,
@@ -150,7 +211,8 @@ pub(super) fn load_or_enroll(
             record
         }
     };
-    if record.version != 1
+    if record.original_object_material_v1.is_some()
+        || record.version != 1
         || record.boot != binding
         || record.enrollment.enrollment.consumer_session != session_for(&binding)
     {
@@ -195,7 +257,122 @@ pub(super) fn load_or_enroll(
         boot: binding,
         capability: record.receive,
         enrollment: record.enrollment,
-        revocations_path: state_dir.join("mailbox-reader-revocations.json"),
+        revocations_path: revocations_path(state_dir),
+    })
+}
+
+pub(crate) struct ObjectReaderBoot<'a> {
+    pub(crate) state: &'a Path,
+    pub(crate) grant: &'a MailboxGrant,
+    pub(crate) boot: &'a MailboxReaderBootBinding,
+}
+
+/// Reader for a checked original object pair. It uses the operator's
+/// independently issued Receive credential verbatim and retains one exact
+/// destination-signed enrollment per original VM. It never mints Send.
+pub(crate) fn enroll_object_reader(
+    original: ObjectReaderBoot<'_>,
+    direction: &SignedMailboxCapability,
+    receive: &SignedMailboxCapability,
+    signer: &SigningKey,
+    material: [u8; 32],
+    revoked: &[mvm_contract::protocol::mailbox::RevocationId],
+    now: i64,
+) -> io::Result<GuestReaderAuthority> {
+    let ObjectReaderBoot { state, grant, boot } = original;
+    if grant.durable_object_pair_sha256_v1.is_none()
+        || boot.durable_object_pair_sha256_v1 != grant.durable_object_pair_sha256_v1
+        || MailboxReaderBootBinding::load(state).map_err(invalid)? != *boot
+        || signer.verifying_key().as_bytes() != &grant.authority_key
+        || revoked.contains(&direction.grant.revocation_id)
+        || revoked.contains(&receive.grant.revocation_id)
+    {
+        return Err(invalid("object reader original or authorization changed"));
+    }
+    let path = state.join(OBJECT_READER_FILE);
+    let make = || -> io::Result<ReaderRecord> {
+        let enrollment = sign_guest_reader_enrollment(
+            MailboxGuestReaderEnrollment {
+                protocol_version: ProtocolVersion::V1,
+                signature_algorithm: SignatureAlgorithm::ED25519,
+                plan_id: boot.plan_id.clone(),
+                plan_nonce: boot.plan_nonce.clone(),
+                address: receive.grant.address,
+                consumer: receive.grant.subject,
+                consumer_boot: boot.boot,
+                consumer_session: session_for(boot),
+                receive_capability_id: receive.grant.capability_id,
+                ack_public_key: boot.ack_public_key,
+                execution_epoch: grant.epoch,
+                policy_epoch: receive.grant.policy_epoch,
+                issued_at_unix_ms: now,
+                expires_at_unix_ms: receive.grant.expires_at_unix_ms,
+            },
+            signer,
+        )
+        .map_err(invalid)?;
+        Ok(ReaderRecord {
+            original_object_material_v1: Some(material),
+            version: 2,
+            boot: boot.clone(),
+            send: direction.clone(),
+            receive: receive.clone(),
+            enrollment,
+        })
+    };
+    let validate = |record: &ReaderRecord| -> io::Result<()> {
+        if record.version != 2
+            || record.original_object_material_v1 != Some(material)
+            || record.boot != *boot
+            || record.send != *direction
+            || record.receive != *receive
+            || record.enrollment.enrollment.ack_public_key != boot.ack_public_key
+        {
+            return Err(invalid("original pair reader or exact credentials changed"));
+        }
+        verify_guest_reader_enrollment(
+            &record.enrollment,
+            receive,
+            &MailboxGuestReaderScope {
+                plan: grant,
+                plan_id: &boot.plan_id,
+                plan_nonce: &boot.plan_nonce,
+                receive: &receive.grant,
+                current_boot: boot.boot,
+                current_session: session_for(boot),
+                now_unix_ms: now,
+            },
+            &signer.verifying_key(),
+            revoked,
+        )
+        .map_err(invalid)?;
+        Ok(())
+    };
+    let record = if let Some(record) = read_record(&path)? {
+        record
+    } else {
+        let fresh = make()?;
+        validate(&fresh)?;
+        let bytes = serde_json::to_vec(&fresh).map_err(invalid)?;
+        if bytes.len() as u64 > MAX_READER_FILE_BYTES {
+            return Err(invalid("reader record too large"));
+        }
+        match atomic_write_new(&path, &bytes) {
+            Ok(()) => fresh,
+            Err(e) if mvm_core::util::atomic_io::is_already_exists(&e) => {
+                read_record(&path)?.ok_or_else(|| invalid("lost winning enrollment"))?
+            }
+            Err(e) => return Err(io::Error::other(e)),
+        }
+    };
+    validate(&record)?;
+    mvm_core::util::atomic_io::sync_dir(state).map_err(io::Error::other)?;
+    Ok(GuestReaderAuthority {
+        grant: *grant,
+        boot: boot.clone(),
+        capability: record.receive,
+        enrollment: record.enrollment,
+        revocations_path: revocations_path(state),
     })
 }
 
@@ -212,6 +389,9 @@ mod tests {
         crate::audit::host_keypair::load_or_init_at(keys.path()).unwrap();
         let mailbox = MailboxId::from_bytes([42; 32]);
         let grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
             mailbox,
             authority_key: crate::mailbox_launch::authority_key_for(
                 keys.path(),
@@ -265,7 +445,44 @@ mod tests {
             first_send.capability_id
         );
 
+        let digest = original_enrollment_digest(state.path()).unwrap();
         let path = state.path().join(READER_FILE);
+        let record = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            load_reader(
+                state.path(),
+                &grant,
+                binding.clone(),
+                &second_send,
+                &second_keys.durable_material().0,
+                Some(digest)
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+        std::fs::write(&path, &record).unwrap();
+        assert!(
+            load_reader(
+                state.path(),
+                &grant,
+                binding.clone(),
+                &second_send,
+                &second_keys.durable_material().0,
+                Some([0; 32])
+            )
+            .is_err()
+        );
+        let recovered = load_reader(
+            state.path(),
+            &grant,
+            binding.clone(),
+            &second_send,
+            &second_keys.durable_material().0,
+            Some(digest),
+        )
+        .unwrap();
+        assert_eq!(recovered.capability, first.capability);
         let mut forged: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         forged["receive"]["signature"] = serde_json::json!("AAAAAAAA");

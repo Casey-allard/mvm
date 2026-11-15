@@ -8,6 +8,23 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use mvm_vmm::driver::spec::{KernelImage, VmmSpec};
 
+#[cfg(unix)]
+pub(super) fn fc_root_recipe(
+    spec: &VmmSpec,
+    root: &mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot,
+) -> Result<VmmSpec> {
+    use std::os::fd::AsRawFd;
+    root.validate_spec(spec)?;
+    let mut recipe = spec.clone();
+    let block = recipe
+        .blocks
+        .iter_mut()
+        .find(|block| block.slot == root.slot())
+        .ok_or_else(|| anyhow::anyhow!("original workload root slot absent"))?;
+    block.source = PathBuf::from(format!("/proc/self/fd/{}", root.file().as_raw_fd()));
+    Ok(recipe)
+}
+
 /// Resolve the explicit host kernel path from the spec, rejecting a bundled
 /// kernel. Firecracker has no bundled kernel, so a `Bundled` spec must not
 /// reach the API.
@@ -61,15 +78,16 @@ pub(super) fn boot_descriptor_custodied(
     spec: &VmmSpec,
     kernel: &mvm_vmm::host::restore_image::VerifiedRestoreFile,
     handoff: mvm_vmm::driver::prepared_disks::LaunchWritableHandoff,
+    root: Option<&mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot>,
 ) -> Result<Box<dyn mvm_vmm::driver::traits::RunningVm>> {
     #[cfg(any(target_os = "linux", all(test, unix)))]
     {
         let recipe = fc_descriptor_recipe(spec, kernel)?;
-        driver.boot_with_handoff(&recipe, Some(handoff))
+        driver.boot_with_handoff(&recipe, Some(handoff), root)
     }
     #[cfg(not(any(target_os = "linux", all(test, unix))))]
     {
-        let _ = (driver, spec, kernel, handoff);
+        let _ = (driver, spec, kernel, handoff, root);
         bail!("Firecracker descriptor startup requires the same Linux host")
     }
 }
@@ -80,17 +98,30 @@ pub(super) fn boot_descriptor(
     spec: &VmmSpec,
     kernel: &mvm_vmm::host::restore_image::VerifiedRestoreFile,
 ) -> Result<Box<dyn mvm_vmm::driver::traits::RunningVm>> {
+    boot_descriptor_with_root(driver, spec, kernel, None)
+}
+
+#[cfg(unix)]
+pub(super) fn boot_descriptor_with_root(
+    driver: &super::FcDriver,
+    spec: &VmmSpec,
+    kernel: &mvm_vmm::host::restore_image::VerifiedRestoreFile,
+    root: Option<&mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot>,
+) -> Result<Box<dyn mvm_vmm::driver::traits::RunningVm>> {
     #[cfg(target_os = "linux")]
     {
         // This cannot cross the macOS -> builder shell boundary: procfs
         // must name the process holding this exact descriptor. No FD
         // inheritance through sudo or filename fallback is involved.
         let recipe = fc_descriptor_recipe(spec, kernel)?;
-        mvm_vmm::driver::traits::VmmDriver::boot(driver, &recipe)
+        driver.boot_with_handoff(&recipe, None, root)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (driver, spec, kernel);
+        let _ = (driver, spec, kernel, root);
         bail!("Firecracker descriptor startup requires the same Linux host")
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;

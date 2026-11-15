@@ -18,6 +18,8 @@
 //! exists. The shred overwrites and unlinks the file; it is not a physical
 //! wipe, and a filesystem may keep the old blocks.
 
+pub mod object_pair;
+
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -175,6 +177,36 @@ pub fn authority_key_for(
         .verifying_key())
 }
 
+pub(crate) fn journal_sender_for(keys: &Path, grant: &MailboxGrant) -> Result<VerifyingKey> {
+    Ok(derived_keys(keys, &grant.mailbox, grant.epoch)?
+        .sender
+        .verifying_key())
+}
+
+/// Public identities only, derived by the original host before signing a
+/// prospective A plan. An operator template cannot replace the signing key.
+pub(crate) fn journal_scope_before_launch(
+    keys: &Path,
+    grant: &MailboxGrant,
+    now: i64,
+) -> Result<MailboxTemplate> {
+    let derived = derived_keys(keys, &grant.mailbox, grant.epoch)?;
+    let template = template_for(keys, &derived, grant, now)?;
+    let h = &template.header;
+    if derived.authority.verifying_key().to_bytes() != grant.authority_key
+        || h.sender.as_bytes() != &derived.sender.verifying_key().to_bytes()
+        || template.capability.issuer.as_bytes() != &grant.authority_key
+        || h.mailbox != grant.mailbox
+        || h.execution_epoch != grant.epoch
+    {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "original journal scope does not match local keys and grant",
+        ));
+    }
+    Ok(template)
+}
+
 /// Everything a mailbox host process needs to serve one granted guest, derived
 /// by the launcher from the host key and nothing else: the three derived keys
 /// and the identities and capability they seal under. It never carries the host
@@ -183,6 +215,9 @@ pub fn authority_key_for(
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivedMailboxKeys {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outbound_source:
+        Option<crate::mailbox_process::original_journal::relay::SourceConfiguration>,
     sender: [u8; 32],
     authority: [u8; 32],
     encryption: [u8; 32],
@@ -310,6 +345,12 @@ pub fn derive_launch_keys(
     grant: &MailboxGrant,
     secret: &Key,
 ) -> Result<DerivedMailboxKeys> {
+    if grant.durable_object_pair_sha256_v1.is_some() {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "durable object Call/Reply service is not installed",
+        ));
+    }
     let derived = derived_keys(keys_dir, &grant.mailbox, grant.epoch)?;
     // After the signing seed above, so a wrong directory never mints a root.
     let encryption_root = Key::load_or_create(&keys_dir.join(ENCRYPTION_ROOT))?;
@@ -328,6 +369,7 @@ pub fn derive_launch_keys(
     }
     let template = template_for(keys_dir, &derived, grant, now_unix_ms())?;
     Ok(DerivedMailboxKeys {
+        outbound_source: None,
         sender: derived.sender.to_bytes(),
         authority: derived.authority.to_bytes(),
         encryption: *encryption,
@@ -365,6 +407,11 @@ fn template_for(
     grant: &MailboxGrant,
     now_ms: i64,
 ) -> Result<MailboxTemplate> {
+    if let Some(digest) = grant.incoming_journal_policy_sha256_v1 {
+        return crate::mailbox_process::paired_incoming::IncomingJournalPolicy::template(
+            keys_dir, digest,
+        );
+    }
     match std::fs::read(keys_dir.join(TEMPLATE_FILE)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|e| Error::new(ErrorKind::InvalidData, format!("mailbox template: {e}"))),
@@ -581,6 +628,9 @@ mod tests {
     fn grant_at(dir: &Path, mailbox: [u8; 32], n: u64) -> MailboxGrant {
         let mailbox = MailboxId::from_bytes(mailbox);
         MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
             mailbox,
             authority_key: authority_key_for(dir, &mailbox, epoch(n))
                 .unwrap()
@@ -593,6 +643,19 @@ mod tests {
 
     fn grant(dir: &Path, mailbox: [u8; 32]) -> MailboxGrant {
         grant_at(dir, mailbox, 1)
+    }
+
+    #[test]
+    fn selected_object_pair_cannot_fall_back_to_cast_keys() {
+        let keys = keys_dir();
+        let mut selected = grant(keys.path(), [41; 32]);
+        selected.durable_object_pair_sha256_v1 = Some([42; 32]);
+        let missing = keys.path().join("absent");
+        let Err(err) = derive_launch_keys(&missing, &selected, &test_secret()) else {
+            panic!("selected object pair must refuse Cast keys");
+        };
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        assert!(!missing.exists());
     }
 
     #[test]

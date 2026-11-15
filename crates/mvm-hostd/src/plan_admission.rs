@@ -96,10 +96,16 @@ mod canonical_kernel;
 mod composition;
 mod display_grants;
 mod final_gates;
+#[cfg(unix)]
+mod installed_journal;
+#[cfg(unix)]
+pub use installed_journal::prepare_runtime as prepare_installed_journal_runtime;
 mod grant_validation;
 mod host_gates;
 mod mailbox_posture;
 mod nonce_ledger;
+#[cfg(target_os = "macos")]
+pub(crate) mod object_hvf;
 mod registry_pack;
 mod shares;
 mod verb_grant_sidecar;
@@ -165,11 +171,17 @@ pub struct AdmittedPlan {
     extensions: Vec<AdmittedExtension>,
     assurance_runtime: Option<AssuranceRuntimeBinding>,
     canonical_kernel: Option<std::sync::Arc<canonical_kernel::AdmittedKernel>>,
+    #[cfg(unix)]
+    direct_owner: Option<std::sync::Weak<mvm_core::host_lifetime::HostLifetimeAnchor>>,
     backend: Option<BackendKind>,
     /// Set once the backend has been started under this admission. An
     /// admission authorizes one launch; the plan is handed back on
     /// `StartedMachine`, and holding it again must not start a second backend.
     dispatched: bool,
+    #[cfg(target_os = "linux")]
+    object_firecracker: Option<mvm_runtime::backend::OriginalObjectFirecracker>,
+    #[cfg(target_os = "macos")]
+    object_hvf: Option<object_hvf::OriginalHvf>,
 }
 
 /// Re-verified host artifact behind one extension binding in the signed plan.
@@ -177,6 +189,15 @@ pub struct AdmittedPlan {
 pub struct AdmittedExtension {
     pub binding: mvm_contract::protocol::extension_pack::ExtensionPlanBinding,
     pub root: std::path::PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+fn object_host_backend() -> BackendKind {
+    BackendKind::Hvf
+}
+#[cfg(target_os = "linux")]
+fn object_host_backend() -> BackendKind {
+    BackendKind::Firecracker
 }
 
 impl AdmittedPlan {
@@ -187,6 +208,92 @@ impl AdmittedPlan {
         &self.plan
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn object_firecracker(
+        &self,
+    ) -> Result<&mvm_runtime::backend::OriginalObjectFirecracker> {
+        self.object_firecracker
+            .as_ref()
+            .context("no original selected Firecracker launch for this admission")
+    }
+    /// Dispatch a selected persistent SDK boot only under this original
+    /// reservation, rootfs digest and signed local plan. This consumes the
+    /// admission even if the backend subsequently reports a launch error.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn start_persistent_object_original(
+        &mut self,
+        launch: &crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<'_>,
+        backend: &AnyBackend,
+        config: VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+        bundle: Option<&PolicyBundle>,
+    ) -> Result<VmId> {
+        anyhow::ensure!(
+            !self.dispatched
+                && self.variant == Variant::Prod
+                && self.backend == Some(object_host_backend())
+                && backend.kind() == object_host_backend(),
+            "requires a fresh original object admission for this native backend"
+        );
+        launch.require_open()?;
+        launch
+            .plan()
+            .verify_selected_plan(self.plan(), SystemClock.now().timestamp_millis())?;
+        let signed: SignedExecutionPlan = serde_json::from_str(
+            config
+                .plan_json
+                .as_deref()
+                .context("missing original signed plan")?,
+        )?;
+        anyhow::ensure!(
+            signed.0.signature == self.signed.0.signature
+                && signed.0.payload == self.signed.0.payload
+                && signed.0.signer_id == self.signed.0.signer_id
+                && config.name == self.plan.image.name
+                && mvm_core::crypto::image_verify::sha256_file(std::path::Path::new(
+                    &config.rootfs_path
+                ))? == self.plan.image.sha256,
+            "different persistent boot image or original signed plan"
+        );
+        verify_selected_runtime(&config)?;
+        if self.assurance_runtime.is_some() {
+            self.verify_assurance_launch(&config)?;
+        }
+        let (config, runtime) =
+            final_gates::run_post_admission_gates(config, self, backend.kind(), bundle)
+                .map_err(|(stage, e)| e.context(stage))?;
+        registry_pack::verify_runtime_at_dispatch(runtime.as_ref(), &config, self, None)?;
+        crate::mailbox_process::require_servable(
+            &config,
+            backend,
+            self.mailbox_posture().as_ref(),
+        )?;
+        self.dispatched = true;
+        #[cfg(target_os = "linux")]
+        {
+            let (id, original) =
+                backend.start_original_object_firecracker_custodied(&config, images)?;
+            self.object_firecracker = Some(original);
+            Ok(id)
+        }
+        #[cfg(target_os = "macos")]
+        self.activate_object_hvf(launch.hvf_original(), backend, config, images)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn abort_unserved_object(&self, backend: &AnyBackend, id: &VmId) -> Result<()> {
+        let native = self.object_firecracker()?;
+        native.require_live()?;
+        native.boot()?.check_plan(self.plan())?;
+        let (pid, _) = native.original_peer()?;
+        anyhow::ensure!(
+            backend.kind() == BackendKind::Firecracker
+                && self.plan.image.name == id.0
+                && backend.host_process_id(id)? == Some(pid),
+            "original VMM changed before abort"
+        );
+        backend.abort_start(id).map(|_| ())
+    }
     /// The plan's content-address, re-derived and checked during admission.
     #[must_use]
     pub fn plan_id(&self) -> &PlanId {
@@ -211,6 +318,33 @@ impl AdmittedPlan {
     #[must_use]
     pub fn signer_id(&self) -> &str {
         &self.signer_id
+    }
+
+    /// Check the exact original parent bound into this dispatched direct Linux admission.
+    #[cfg(target_os = "linux")]
+    pub fn check_original_entrypoint(
+        &self,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<()> {
+        let same_original = self
+            .direct_owner
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|bound| std::sync::Arc::ptr_eq(&bound, owner));
+        anyhow::ensure!(
+            same_original
+                && !self.plan.stream_retention.persists()
+                && self.plan.stream_edges.is_empty()
+                && self.dispatched
+                && self.backend == Some(BackendKind::Firecracker)
+                && self
+                    .plan
+                    .agent_verbs
+                    .as_ref()
+                    .is_some_and(|verbs| verbs.iter().any(|v| v.as_str() == "run-entrypoint")),
+            "entrypoint differs from original signed direct launch"
+        );
+        Ok(())
     }
 
     /// The canonical signed envelope, for a consumer that re-verifies rather
@@ -249,8 +383,14 @@ impl AdmittedPlan {
             extensions: Vec::new(),
             assurance_runtime: None,
             canonical_kernel: None,
+            #[cfg(unix)]
+            direct_owner: None,
             backend: None,
             dispatched: false,
+            #[cfg(target_os = "linux")]
+            object_firecracker: None,
+            #[cfg(target_os = "macos")]
+            object_hvf: None,
         }
     }
 
@@ -389,8 +529,8 @@ pub fn admit_plan_for_run(
     // signed admitted one to anything downstream that only checks the
     // signature.
     admit_grants(plan, &host_grant_ceiling(), posture)?;
-    enforce_mailbox_retention(
-        plan.mailbox.as_ref(),
+    posture.enforce_journal(
+        plan,
         mvm_core::user_config::load(None).max_mailbox_retention_ms,
     )?;
 
@@ -456,6 +596,17 @@ pub fn admit_signed_plan_for_run(
     bundle_ctx: Option<&BundleAdmissionContext<'_>>,
     posture: RunPosture,
 ) -> Result<AdmittedPlan> {
+    verify_external_plan(signed)?.admit(clock, ledger, bundle_ctx, posture)
+}
+
+pub(crate) struct VerifiedExternalPlan<'a> {
+    body: ExecutionPlan,
+    signed: &'a SignedExecutionPlan,
+}
+
+pub(crate) fn verify_external_plan(
+    signed: &SignedExecutionPlan,
+) -> Result<VerifiedExternalPlan<'_>> {
     let trusted = host_trusted_plan_signers()?;
     if trusted.is_empty() {
         anyhow::bail!(
@@ -467,36 +618,56 @@ pub fn admit_signed_plan_for_run(
         trusted.iter().map(|(id, key)| (id.as_str(), key)).collect();
     let verified =
         verify_plan(signed, &trusted_refs).context("verifying externally-signed plan")?;
-    let signer_id = signed.0.signer_id.clone();
-
-    posture.verify_runtime()?;
-    let assurance_runtime = posture.assurance_runtime(&verified)?;
-    validate_extension_bindings(&verified)?;
-    // No extension verification context on this path: a plan that binds
-    // optional extensions is refused rather than admitted unchecked.
-    let extensions = verify_extension_packs(&verified, None)?;
-    verify_registry_pack_assets(&verified)?;
-    admit_grants(&verified, &host_grant_ceiling(), posture)?;
-    enforce_mailbox_retention(
-        verified.mailbox.as_ref(),
-        mvm_core::user_config::load(None).max_mailbox_retention_ms,
-    )?;
-    admit_within_host_budget(&verified)?;
-    admit_host_interface(&verified)?;
-
-    finish_admission(VerifiedAdmission {
-        verified,
-        // The caller lends the envelope; the admitted plan owns a copy so
-        // downstream consumers can re-verify without trusting this process.
-        signed: signed.clone(),
-        signer_id,
-        extensions,
-        assurance_runtime,
-        posture,
-        clock,
-        ledger,
-        bundle_ctx,
+    Ok(VerifiedExternalPlan {
+        body: verified,
+        signed,
     })
+}
+
+impl VerifiedExternalPlan<'_> {
+    pub(crate) fn plan(&self) -> &ExecutionPlan {
+        &self.body
+    }
+
+    pub(crate) fn admit(
+        self,
+        clock: &dyn Clock,
+        ledger: &InMemoryNonceLedger,
+        bundle_ctx: Option<&BundleAdmissionContext<'_>>,
+        posture: RunPosture,
+    ) -> Result<AdmittedPlan> {
+        let verified = self.body;
+        let signed = self.signed;
+        let signer_id = signed.0.signer_id.clone();
+        posture.verify_runtime()?;
+        let assurance_runtime = posture.assurance_runtime(&verified)?;
+        validate_extension_bindings(&verified)?;
+        // No extension verification context on this path: a plan that binds
+        // optional extensions is refused rather than admitted unchecked.
+        let extensions = verify_extension_packs(&verified, None)?;
+        verify_registry_pack_assets(&verified)?;
+        admit_grants(&verified, &host_grant_ceiling(), posture)?;
+        posture.enforce_journal(
+            &verified,
+            mvm_core::user_config::load(None).max_mailbox_retention_ms,
+        )?;
+        admit_within_host_budget(&verified)?;
+        admit_host_interface(&verified)?;
+
+        finish_admission(VerifiedAdmission {
+            verified,
+            // The caller lends the envelope; the admitted plan owns a copy so
+            // downstream consumers can re-verify without trusting this process.
+            signed: signed.clone(),
+            signer_id,
+            extensions,
+            assurance_runtime,
+            posture,
+            clock,
+            ledger,
+            bundle_ctx,
+        })
+    }
 }
 
 /// Everything the shared post-verification tail of admission needs.
@@ -566,6 +737,8 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         }
         other => anyhow::anyhow!("plan validity error: {other}"),
     })?;
+    #[cfg(unix)]
+    installed_journal::capture_owner(posture, &verified)?;
 
     // Bundle re-verify at admit time. Only fires
     // when the plan pinned a bundle; missing context with a pinned
@@ -649,8 +822,14 @@ fn finish_admission(parts: VerifiedAdmission<'_>) -> Result<AdmittedPlan> {
         extensions,
         assurance_runtime,
         canonical_kernel,
+        #[cfg(unix)]
+        direct_owner: posture.direct_owner.map(std::sync::Arc::downgrade),
         backend,
         dispatched: false,
+        #[cfg(target_os = "linux")]
+        object_firecracker: None,
+        #[cfg(target_os = "macos")]
+        object_hvf: None,
     })
 }
 
@@ -817,7 +996,10 @@ pub fn admit_for_run(
     // Build the unsigned plan first. Synthesis failures are caught
     // before we touch the keystore — keeps "signed bad plan" from
     // being an outcome.
-    let plan = synthesize_plan(input).context("synthesizing plan")?;
+    let mut plan = synthesize_plan(input).context("synthesizing plan")?;
+    if let Some(original) = posture.object_plan {
+        original.apply_unsigned(&mut plan, clock.now().timestamp_millis())?;
+    }
     admit_plan_for_run(
         &plan,
         clock,
@@ -844,6 +1026,16 @@ pub struct RunPosture<'a> {
     variant: Variant,
     backend: Option<BackendKind>,
     runtime_config: Option<&'a VmStartConfig>,
+    #[cfg(unix)]
+    direct_owner: Option<&'a std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    object_worker: Option<
+        &'a crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<'a>,
+    >,
+    object_plan: Option<&'a crate::mailbox_launch::object_pair::OriginalObjectPlan<'a>>,
+    incoming_journal: Option<&'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission>,
+    paired_journal:
+        Option<&'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission>,
 }
 
 impl<'a> RunPosture<'a> {
@@ -855,6 +1047,13 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: Some(backend),
             runtime_config: None,
+            #[cfg(unix)]
+            direct_owner: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            object_worker: None,
+            object_plan: None,
+            incoming_journal: None,
+            paired_journal: None,
         }
     }
 
@@ -871,6 +1070,13 @@ impl<'a> RunPosture<'a> {
             variant,
             backend: None,
             runtime_config: None,
+            #[cfg(unix)]
+            direct_owner: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            object_worker: None,
+            object_plan: None,
+            incoming_journal: None,
+            paired_journal: None,
         }
     }
 
@@ -879,6 +1085,114 @@ impl<'a> RunPosture<'a> {
     pub fn with_runtime(mut self, runtime_config: Option<&'a VmStartConfig>) -> Self {
         self.runtime_config = runtime_config;
         self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_selected_direct_owner(
+        mut self,
+        config: &'a VmStartConfig,
+        owner: &'a std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Self {
+        self.runtime_config = Some(config);
+        self.direct_owner = Some(owner);
+        self
+    }
+
+    /// Select a previously authorized original nonce and image before signing.
+    /// The installed service readiness check remains independently required.
+    pub fn with_original_object_plan(
+        mut self,
+        original: &'a crate::mailbox_launch::object_pair::OriginalObjectPlan<'a>,
+    ) -> Self {
+        self.object_plan = Some(original);
+        self
+    }
+
+    /// Supply the independent destination's original live authorization only
+    /// for this paired source admission. Ordinary admission remains unchanged.
+    pub fn with_paired_journal(
+        mut self,
+        pair: &'a crate::mailbox_process::original_journal::authorization::PairedJournalAdmission,
+    ) -> Self {
+        self.paired_journal = Some(pair);
+        self
+    }
+
+    pub fn with_incoming_journal(
+        mut self,
+        incoming: &'a crate::mailbox_process::paired_incoming::IncomingJournalAdmission,
+    ) -> Self {
+        self.incoming_journal = Some(incoming);
+        self
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn with_original_object_worker(
+        mut self,
+        launch: &'a crate::mailbox_process::original_journal::object_workers::OriginalObjectLaunch<
+            'a,
+        >,
+    ) -> Self {
+        self.object_plan = Some(launch.plan());
+        self.object_worker = Some(launch);
+        self
+    }
+
+    fn enforce_journal(&self, plan: &ExecutionPlan, max_ms: Option<u64>) -> Result<()> {
+        if let Some(original) = self.object_plan {
+            anyhow::ensure!(
+                self.variant == Variant::Prod
+                    && matches!(
+                        self.backend,
+                        Some(BackendKind::Firecracker | BackendKind::Hvf)
+                    )
+                    && self.incoming_journal.is_none()
+                    && self.paired_journal.is_none(),
+                "object selection requires a dedicated sealed native participant"
+            );
+            original.verify_selected_plan(plan, SystemClock.now().timestamp_millis())?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let Some(worker) = self.object_worker {
+                anyhow::ensure!(
+                    std::ptr::eq(original, worker.plan())
+                        && self.backend == Some(object_host_backend()),
+                    "original platform worker selection required"
+                );
+                worker.require_open()?;
+                return grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(), max_ms);
+            }
+        }
+        anyhow::ensure!(
+            plan.mailbox
+                .and_then(|g| g.durable_object_pair_sha256_v1)
+                .is_none(),
+            "durable object Call/Reply service is not installed"
+        );
+        if let Some(incoming) = self.incoming_journal {
+            anyhow::ensure!(
+                self.paired_journal.is_none()
+                    && self.variant == Variant::Prod
+                    && self.backend.is_some(),
+                "incoming journal requires an original production destination backend"
+            );
+            grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(), max_ms)?;
+            return incoming.verify(plan);
+        }
+        anyhow::ensure!(
+            plan.mailbox
+                .and_then(|g| g.incoming_journal_policy_sha256_v1)
+                .is_none(),
+            "incoming journal needs explicit original destination authorization"
+        );
+        let Some(pair) = self.paired_journal else {
+            return enforce_mailbox_retention(plan.mailbox.as_ref(), max_ms);
+        };
+        anyhow::ensure!(
+            self.variant == Variant::Prod && self.backend.is_some(),
+            "paired journal requires an original production backend"
+        );
+        grant_validation::enforce_retention_ceiling(plan.mailbox.as_ref(), max_ms)?;
+        pair.verify(plan)
     }
 
     /// The sealed-production / developer posture this run carries.
@@ -1875,6 +2189,25 @@ pub fn apply_admitted_grants_or_undo_launch(
     )
 }
 
+/// Use the caller's original VM handle for rollback. Emit terminal grant
+/// failure only after that rollback confirms the VM stopped.
+pub fn apply_grants_with_owned_rollback(
+    backend: &AnyBackend,
+    vm_id: &VmId,
+    admitted: &AdmittedPlan,
+    emitter: Option<&crate::audit::emitter::AuditEmitter>,
+    rollback: impl FnOnce() -> Result<()>,
+) -> Result<EnforcedGrants> {
+    apply_admitted_grants_with_rollback(
+        backend,
+        vm_id,
+        admitted,
+        emitter,
+        rollback,
+        FailureAuditPolicy::OwnedAfterConfirmedRollback,
+    )
+}
+
 fn apply_admitted_grants_with_rollback(
     backend: &AnyBackend,
     vm_id: &VmId,
@@ -2066,6 +2399,13 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
         "original admitted plan was already dispatched"
     );
 
+    anyhow::ensure!(
+        admitted
+            .plan()
+            .mailbox
+            .is_none_or(|g| g.durable_object_pair_sha256_v1.is_none()),
+        "selected pair must dispatch through both original worker owners"
+    );
     // A refusal in any post-admission gate must still terminate the chain:
     // `plan.admitted` already fired, so a gate refusal emits `plan.failed`
     // carrying the refusing stage rather than leaving a dangling admission.
@@ -2115,10 +2455,25 @@ pub fn start_admitted(params: StartAdmittedParams<'_>) -> Result<StartedMachine>
     // Spent before the backend starts, so an admission that reached dispatch
     // can never authorize another launch, whatever the start's outcome.
     admitted.dispatched = true;
-    match backend
-        .start(&config)
-        .context("backend start after signed-plan admission")
+    #[cfg(target_os = "linux")]
+    let started = if backend.kind() == BackendKind::Firecracker
+        && admitted
+            .plan()
+            .mailbox
+            .is_some_and(|g| g.durable_object_pair_sha256_v1.is_some())
     {
+        backend
+            .start_original_object_firecracker(&config)
+            .map(|(id, original)| {
+                admitted.object_firecracker = Some(original);
+                id
+            })
+    } else {
+        backend.start(&config)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let started = backend.start(&config);
+    match started.context("backend start after signed-plan admission") {
         Ok(vm_id) => {
             // A VM whose grants could not be applied is running without the
             // bounds it was admitted under; the helper stops it rather than
@@ -2357,6 +2712,9 @@ mod tests {
     #[test]
     fn local_retention_requires_a_configured_host_ceiling() {
         let mut grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],
             epoch: ExecutionEpoch::new(1).expect("epoch"),
@@ -2371,6 +2729,36 @@ mod tests {
         assert!(enforce_mailbox_retention(Some(&grant), Some(9_999)).is_err());
         assert!(enforce_mailbox_retention(Some(&grant), Some(10_000)).is_ok());
         assert!(enforce_mailbox_retention(Some(&grant), Some(20_000)).is_ok());
+    }
+
+    #[test]
+    fn selected_object_pair_requires_installed_endpoint_support() {
+        let mut grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
+            mailbox: MailboxId::from_bytes([1; 32]),
+            authority_key: [2; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: Some(MailboxRetentionPolicy::new(10_000).unwrap()),
+        };
+        let posture = RunPosture::without_backend(Variant::Prod);
+        let legacy = mvm_core::plan::test_support::PlanFixture::new()
+            .mailbox(grant)
+            .build();
+        assert!(posture.enforce_journal(&legacy, Some(10_000)).is_ok());
+        grant.durable_object_pair_sha256_v1 = Some([42; 32]);
+        let selected = mvm_core::plan::test_support::PlanFixture::new()
+            .mailbox(grant)
+            .build();
+        assert!(
+            posture
+                .enforce_journal(&selected, Some(10_000))
+                .unwrap_err()
+                .to_string()
+                .contains("not installed")
+        );
     }
 
     #[cfg(feature = "manifest-verify")]
@@ -3980,6 +4368,9 @@ mod tests {
         let keys = tempfile::tempdir().expect("keystore");
         let mut input = fixture_input("vm-retention");
         input.mailbox = Some(MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
             mailbox: MailboxId::from_bytes([1; 32]),
             authority_key: [2; 32],
             epoch: ExecutionEpoch::new(1).expect("epoch"),
@@ -4318,6 +4709,91 @@ mod tests {
         )
         .expect_err("memory above the ceiling must be refused");
         assert!(err.to_string().contains("memory_mib"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_entrypoint_issues_only_the_original_admitted_boot_grant() {
+        let (_env, _home) = host_with_ceiling(Default::default());
+        let keys = mvm_core::config::mvm_keys_dir();
+        let mut input = fixture_input("vm-original");
+        input.stream_retention = mvm_core::plan::StreamRetention::Ephemeral;
+        input.agent_verbs = Some(vec![
+            mvm_core::plan::VerbId::new("activate-environment").unwrap(),
+            mvm_core::plan::VerbId::new("run-entrypoint").unwrap(),
+        ]);
+        let admitted = admit_for_run(
+            &input,
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(&keys),
+            None,
+            RunPosture::on_backend(Variant::Dev, BackendKind::Firecracker),
+        )
+        .unwrap();
+        let signer = crate::audit::host_keypair::load_or_init_at(&keys).unwrap();
+        let issue = || {
+            verb_grant_sidecar::installed_issuer(&admitted, "vm-original")
+                .unwrap()
+                .unwrap()
+        };
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&signer.secret_path, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let prior = crate::host_signer::keystore::Keystore::test_signing_calls();
+        assert!(
+            issue().issue(&signer.verifying.to_bytes()).is_err(),
+            "registered issuer used a non-private original key"
+        );
+        assert_eq!(
+            crate::host_signer::keystore::Keystore::test_signing_calls(),
+            prior
+        );
+        std::fs::set_permissions(&signer.secret_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let held = issue();
+        let envelope = held.issue(&signer.verifying.to_bytes()).unwrap();
+        assert!(held.issue(&signer.verifying.to_bytes()).is_err());
+        assert!(issue().issue(&[1; 32]).is_err());
+        input.agent_verbs.as_mut().unwrap().pop();
+        let activation_only = admit_for_run(
+            &input,
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(&keys),
+            None,
+            RunPosture::on_backend(Variant::Dev, BackendKind::Firecracker),
+        )
+        .unwrap();
+        assert!(verb_grant_sidecar::installed_issuer(&activation_only, "vm-original").is_err());
+        let plan = admitted.plan();
+        envelope
+            .grant
+            .verify(
+                &signer.verifying,
+                "vm-original",
+                &plan.nonce,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(Some(&envelope.grant.verbs), plan.agent_verbs.as_ref());
+        assert_eq!(envelope.grant.not_after, plan.valid_until);
+        assert!(
+            envelope
+                .grant
+                .verify(
+                    &signer.verifying,
+                    "different",
+                    &plan.nonce,
+                    chrono::Utc::now()
+                )
+                .is_err()
+        );
+        assert!(
+            !mvm_core::config::vm_state_dir("vm-original")
+                .join("verb-grant.json")
+                .exists()
+        );
     }
 
     #[test]

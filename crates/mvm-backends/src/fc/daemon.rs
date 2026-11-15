@@ -12,15 +12,7 @@ use super::{firecracker_vsock_uds_path, resolve_running_vm_dir};
 #[cfg(any(target_os = "linux", test))]
 #[derive(serde::Deserialize)]
 struct WriterConfig {
-    drives: Vec<WriterDrive>,
-}
-
-#[cfg(any(target_os = "linux", test))]
-#[derive(serde::Deserialize)]
-struct WriterDrive {
-    drive_id: String,
-    path_on_host: std::path::PathBuf,
-    is_read_only: bool,
+    drives: Vec<super::runtime_artifacts::Drive>,
 }
 
 /// Authenticate the configured writable drives against the original objects
@@ -43,6 +35,60 @@ pub(crate) fn verify_writable_writer(
     handoff
         .verify_writer_descriptors(pid)
         .with_context(|| format!("verifying original writable custody in Firecracker pid {pid}"))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_original_writable_writer(
+    session: &mut crate::fc::fc_api::FcSession,
+    handoff: &mvm_vmm::driver::prepared_disks::LaunchWritableHandoff,
+    original: &mvm_vmm::host::fc_lifetime::OriginalProcess,
+) -> Result<()> {
+    original.authenticate_config(session.connected_stream())?;
+    let config: WriterConfig = serde_json::from_str(&session.call("GET", "/vm/config", None)?)
+        .context("parsing original Firecracker writable drive configuration")?;
+    validate_writer_config(&config, handoff.projected())?;
+    original.require_live()?;
+    handoff.verify_writer_descriptors(original.pid())?;
+    original.require_live()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_original_workload_root(
+    session: &mut crate::fc::fc_api::FcSession,
+    root: &mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot,
+    original: &mvm_vmm::host::fc_lifetime::OriginalProcess,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    original.authenticate_config(session.connected_stream())?;
+    let mut config: WriterConfig =
+        serde_json::from_str(&session.call("GET", "/vm/config", None)?)?;
+    validate_original_root_layout(
+        &mut config,
+        root.slot(),
+        std::path::Path::new(&format!("/proc/self/fd/{}", root.file().as_raw_fd())),
+    )?;
+    original.require_live()?;
+    root.verify_writer_descriptors(original.pid())?;
+    original.require_live()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_original_root_layout(
+    config: &mut WriterConfig,
+    slot: u8,
+    path: &std::path::Path,
+) -> Result<()> {
+    let drives = super::runtime_artifacts::canonical_drive_observations(&mut config.drives)?;
+    let root_id = format!("blk{slot}");
+    let root = drives
+        .iter()
+        .find(|drive| drive.drive_id == root_id)
+        .context("original workload root not configured")?;
+    anyhow::ensure!(
+        root.is_root_device && root.is_read_only && root.path == path,
+        "original workload root configuration differs"
+    );
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -143,6 +189,85 @@ pub fn start_vm_firecracker_bounded(
     secure_socket_dir(abs_dir)?;
     let prefix = spawn_scope_prefix(machine_id, std::path::Path::new(abs_dir), bounds)?;
     start_vm_firecracker_inner(abs_dir, abs_socket, &prefix, Some(guard), handoff)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct OriginalFirecrackerSpawn<'a> {
+    pub spec: &'a mvm_vmm::driver::spec::VmmSpec,
+    pub directory: &'a std::path::Path,
+    pub socket: &'a str,
+    pub handoff: Option<&'a mvm_vmm::driver::prepared_disks::LaunchWritableHandoff>,
+    pub workload_root: Option<&'a mvm_vmm::driver::prepared_disks::PreparedWorkloadRoot>,
+    pub original: &'a mut crate::driver::fc::owned::OwnedFcState,
+}
+
+/// The selected installation owns the actual unprivileged child, not a shell
+/// launcher or a PID-file recovery handle. Only original descriptors cross exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_original_firecracker(start: OriginalFirecrackerSpawn<'_>) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::process::Stdio;
+    let bounds = mvm_core::spawn_scope::SpawnBounds::for_guest_memory(start.spec.memory_mib)
+        .with_cpu_grant(start.spec.cpu_grant);
+    validate_required_scope(&start.spec.name, &bounds)?;
+    ensure_api_socket_fits(start.socket)?;
+    secure_socket_dir(&start.directory.to_string_lossy())?;
+    let firecracker = launch_binary()?;
+    let vsock = firecracker_vsock_uds_path(&start.directory.to_string_lossy());
+    for path in [
+        std::path::Path::new(start.socket),
+        std::path::Path::new(&vsock),
+    ] {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => anyhow::bail!("original Firecracker endpoint is already occupied"),
+        }
+    }
+    start.original.check_current()?;
+    let lease = start
+        .original
+        .lease
+        .as_ref()
+        .context("original Firecracker lease absent")?;
+    let holder = lease.holder().as_raw_fd();
+    let mut descriptors = vec![holder];
+    if let Some(root) = start.workload_root {
+        descriptors.push(root.file().as_raw_fd());
+    }
+    if let Some(disks) = start.handoff {
+        for descriptor in disks.first()..=disks.last() {
+            descriptors.push(i32::try_from(descriptor)?);
+        }
+    }
+    let mut command = mvm_core::env_hygiene::helper_command(firecracker);
+    command.arg("--api-sock").arg(start.socket);
+    let mut command =
+        mvm_core::spawn_scope::bind_spawn(command, &start.spec.name, start.directory, &bounds);
+    anyhow::ensure!(
+        command.unit().is_some(),
+        "original Firecracker requires an enforced scope"
+    );
+    command.stdin(Stdio::null());
+    command.stdout(mvm_vmm::host::console_capture::open_console_capture(
+        &start.directory.join("console.log"),
+    )?);
+    command.stderr(mvm_vmm::host::console_capture::open_console_capture(
+        &start.directory.join(FIRECRACKER_STDERR_LOG),
+    )?);
+    mvm_vmm::host::restore_image::inherit_descriptors(command.as_command_mut(), descriptors);
+    start.original.begin_spawn()?;
+    start.original.record_spawn(
+        command.spawn_retained(mvm_vmm::host::fc_lifetime::OriginalProcess::observe),
+    )?;
+    let original_pid = start.original.process()?.pid();
+    mvm_core::atomic_io::write_private(
+        &start.directory.join("fc.pid"),
+        format!("{original_pid}\n").as_bytes(),
+    )?;
+    wait_for_api_socket(std::path::Path::new(start.socket), API_SOCKET_TIMEOUT)?;
+    adopt_api_socket(start.socket).context("restrict original Firecracker API socket")?;
+    Ok(())
 }
 
 /// Start Firecracker for a snapshot load, inside a scope prefix the caller has
@@ -863,7 +988,7 @@ mod tests {
             plan_binding: None,
         };
         let matching: WriterConfig = serde_json::from_str(
-            r#"{"drives":[{"drive_id":"blk3","path_on_host":"/original/volume","is_read_only":false}]}"#,
+            r#"{"drives":[{"drive_id":"blk3","is_root_device":false,"path_on_host":"/original/volume","is_read_only":false}]}"#,
         )
         .unwrap();
         validate_writer_config(&matching, &spec).unwrap();
@@ -872,11 +997,35 @@ mod tests {
         assert!(validate_writer_config(&matching, &read_only_spec).is_err());
         for body in [
             r#"{"drives":[]}"#,
-            r#"{"drives":[{"drive_id":"blk3","path_on_host":"/replacement","is_read_only":false}]}"#,
-            r#"{"drives":[{"drive_id":"blk4","path_on_host":"/original/volume","is_read_only":false}]}"#,
+            r#"{"drives":[{"drive_id":"blk3","is_root_device":false,"path_on_host":"/replacement","is_read_only":false}]}"#,
+            r#"{"drives":[{"drive_id":"blk4","is_root_device":false,"path_on_host":"/original/volume","is_read_only":false}]}"#,
         ] {
             let changed: WriterConfig = serde_json::from_str(body).unwrap();
             assert!(validate_writer_config(&changed, &spec).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn original_root_readback_requires_one_readonly_root_without_path_aliases() {
+        let path = std::path::Path::new("/proc/self/fd/42");
+        let good = r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_root_device":true,"is_read_only":true}]}"#;
+        validate_original_root_layout(&mut serde_json::from_str(good).unwrap(), 0, path).unwrap();
+        for body in [
+            r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_read_only":true}]}"#,
+            r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_root_device":"true","is_read_only":true}]}"#,
+        ] {
+            assert!(serde_json::from_str::<WriterConfig>(body).is_err());
+        }
+        for body in [
+            good.replace("\"is_root_device\":true", "\"is_root_device\":false"),
+            good.replace("\"is_read_only\":true", "\"is_read_only\":false"),
+            good.replace("/proc/self/fd/42", "/other/root"),
+            good.replace("blk0", "blk1"),
+            r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_root_device":true,"is_read_only":true},{"drive_id":"blk1","path_on_host":"/another","is_root_device":true,"is_read_only":true}]}"#.into(),
+            r#"{"drives":[{"drive_id":"blk0","path_on_host":"/proc/self/fd/42","is_root_device":true,"is_read_only":true},{"drive_id":"blk1","path_on_host":"/proc/self/fd/42","is_root_device":false,"is_read_only":false}]}"#.into(),
+        ] {
+            let mut config = serde_json::from_str(&body).unwrap();
+            assert!(validate_original_root_layout(&mut config, 0, path).is_err(), "{body}");
         }
     }
 

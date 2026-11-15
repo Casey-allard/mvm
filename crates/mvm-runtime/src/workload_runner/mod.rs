@@ -7,6 +7,10 @@
 pub mod claim;
 pub mod console_stream;
 pub mod runner;
+#[cfg(unix)]
+pub use runner::InstalledSpawnedEndpoint;
+#[cfg(unix)]
+pub use runner::OwnedRetirement;
 
 pub use child_grant::ChildGrantIssuer;
 pub use console_stream::{

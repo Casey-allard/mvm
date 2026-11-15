@@ -1,0 +1,95 @@
+use super::*;
+use std::io::{Cursor, Read, Write};
+
+#[test]
+fn aborted_exchange_preserves_successful_prefix_and_never_records_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report");
+    let recorder = Recorder::create(&report).unwrap();
+    let input = Cursor::new(vec![0; 8]);
+    let result: io::Result<()> = recorder.observe(input, |io, _| {
+        let mut input = [0_u8; 10];
+        io.read_exact(&mut input)
+    });
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    let file = std::fs::read_to_string(&report).unwrap();
+    assert_eq!(file.lines().last(), Some("end 1 8 0 0 0 false"));
+    assert!(Recorder::create(&report).is_err());
+}
+
+#[test]
+fn report_marks_overflow_once_and_continues_serving_original_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("report");
+    let recorder = Recorder::create(&path).unwrap();
+    for _ in 0..(MAX_EXCHANGES + 3) {
+        recorder
+            .observe(Cursor::new(Vec::new()), |io, _| {
+                io.write_all(b"synthetic private data")
+            })
+            .unwrap();
+    }
+    let file = std::fs::read_to_string(path).unwrap();
+    assert_eq!(file.lines().count(), 1 + 2 * MAX_EXCHANGES + 1);
+    assert_eq!(file.lines().last(), Some("overflow"));
+    assert!(file.lines().any(|line| line == "end 1 0 22 0 0 false"));
+    assert!(!file.contains("synthetic"));
+}
+
+#[test]
+fn records_protocol_progress_before_an_exchange_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report");
+    let recorder = Recorder::create(&file).unwrap();
+    recorder.observe(Cursor::new(Vec::<u8>::new()), |_, mark| {
+        mark("challenge_written");
+        let recorded = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(recorded.lines().last(), Some("phase 1 challenge_written"));
+    });
+}
+
+#[test]
+fn only_clean_recorder_shutdown_closes_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report");
+    let recorder = Recorder::create(&file).unwrap();
+    recorder.observe(Cursor::new(vec![1]), |io, _| {
+        let mut byte = [0; 1];
+        io.read_exact(&mut byte).unwrap();
+    });
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("finish"));
+    drop(recorder);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap().lines().last(),
+        Some("finish 1")
+    );
+}
+
+#[test]
+fn selected_guest_records_512_exchanges_and_marks_the_next_as_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    for turns in [512, 513] {
+        let path = dir.path().join(turns.to_string());
+        let recorder = Recorder::selected_guest(&path).unwrap();
+        for _ in 0..turns {
+            recorder
+                .observe(Cursor::new(Vec::new()), |io, _| io.write_all(b"x"))
+                .unwrap();
+        }
+        drop(recorder);
+        let rows = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            rows.lines().next(),
+            Some("mvm/owned-mailbox/selected-object/guest-5257/post-mux-host-stream/v1")
+        );
+        assert!(rows.lines().any(|r| r == "end 512 0 1 0 0 false"));
+        assert_eq!(
+            rows.lines().last(),
+            Some(if turns == 512 {
+                "finish 512"
+            } else {
+                "overflow"
+            })
+        );
+    }
+}

@@ -217,11 +217,14 @@ fn failed_wait_forbids_signals_and_preserves_evidence() {
     assert!(endpoint.shutdown().is_err());
     assert_eq!(endpoint.faults.signal_attempts, 0);
     // Test owns the child and knows the injected error did not lose custody.
-    endpoint.child.kill().unwrap();
+    endpoint.child.as_mut().unwrap().kill().unwrap();
     exited(&mut endpoint);
     assert!(endpoint.shutdown().is_err());
     assert!(endpoint.exit_status().is_none());
-    assert_eq!(endpoint.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        endpoint.child.as_mut().unwrap().wait().unwrap().signal(),
+        Some(libc::SIGKILL)
+    );
     assert!(evidence.exists());
 }
 
@@ -234,6 +237,8 @@ fn failed_wait_cannot_be_reclassified_by_a_later_successful_exit() {
 
     endpoint
         .child
+        .as_mut()
+        .unwrap()
         .stdin
         .as_mut()
         .unwrap()
@@ -246,7 +251,10 @@ fn failed_wait_cannot_be_reclassified_by_a_later_successful_exit() {
     );
     assert!(endpoint.exit_status().is_none());
     assert_eq!(endpoint.faults.signal_attempts, 0);
-    assert_eq!(endpoint.child.wait().unwrap().code(), Some(0));
+    assert_eq!(
+        endpoint.child.as_mut().unwrap().wait().unwrap().code(),
+        Some(0)
+    );
 }
 
 #[test]

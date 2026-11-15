@@ -746,6 +746,45 @@ fn load_name_registry() -> Result<VmNameRegistry> {
     VmNameRegistry::load(&path).map_err(|e| backend_err(format!("loading VM name registry: {e}")))
 }
 
+/// A fresh ordinary home can hold machine definitions before its VM namespace exists.
+/// This observation authorizes no removal and supplies no installed retirement receipt.
+#[cfg(unix)]
+pub(crate) fn ordinary_runtime_root_absent(name: &str) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    mvm_core::naming::validate_vm_name(name).map_err(Error::other)?;
+    let home = mvm_core::config::mvm_home_strict()?;
+    let root = mvm_core::config::vms_dir_at(&home);
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let original = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&home)?;
+    let guard =
+        mvm_core::runtime_state_protection::RuntimeStateProtection::acquire(&home, &original)?;
+    guard.check_missing_state(&root)?;
+    let state = mvm_core::config::vm_state_dir_at(&home, name);
+    let socket = mvm_core::config::vm_socket_dir_at(&state);
+    if socket != state {
+        match std::fs::symlink_metadata(&socket) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(Error::other(
+                    "short socket namespace exists without its VM root",
+                ));
+            }
+        }
+    }
+    guard.check_missing_state(&root)?;
+    Ok(true)
+}
+
 /// Remove a stopped machine's runtime state directory.
 ///
 /// A stop that leaves it behind leaves whatever the last run put there, and a
@@ -766,6 +805,10 @@ fn load_name_registry() -> Result<VmNameRegistry> {
 /// A persistent machine — the restored-checkpoint case this exists for —
 /// reports no exit through the stop path, so it always reaps.
 pub(crate) fn remove_stopped_runtime_state(name: &str) -> Result<()> {
+    #[cfg(unix)]
+    if ordinary_runtime_root_absent(name).map_err(backend_err)? {
+        return Ok(());
+    }
     let state_dir = vm_state_dir(name);
     let transient_exit_pending = !mvm_core::config::machine_spec_path(name).exists()
         && mvm_core::exit_capture::exit_file_path(&state_dir).exists();
@@ -1251,6 +1294,7 @@ impl MvmClient for LocalBackend {
     }
 
     async fn stop_machine(&self, id: &MachineId) -> Result<()> {
+        let _reservation = crate::launch::reserve_named_lifecycle(&id.0)?;
         let vid = VmId(id.0.clone());
         // A persistent machine's session ends at its stop; a transient's ends
         // when its exit is reported, which seals it. Read before the stop: the
@@ -2771,6 +2815,37 @@ mod tests {
             .await
             .expect("stop");
         assert!(!vm_state_dir(name).exists());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-support")]
+    async fn ordinary_stop_remove_and_cleanup_cannot_clear_an_original_journal() {
+        let _home = IsolatedDataDir::new();
+        let name = "retained-mailbox";
+        let id = MachineId(name.into());
+        let owner =
+            mvm_core::config::vm_mailbox_original_owner_at(&mvm_core::config::mvm_keys_dir(), name);
+        mvm_core::private_fs::ensure_private_dir(owner.parent().unwrap()).unwrap();
+        mvm_core::private_fs::ensure_private_dir(&owner).unwrap();
+        let marker = owner.join(mvm_core::config::ORIGINAL_MAILBOX_CLAIM);
+        mvm_core::atomic_io::write_private(&marker, &[7; 32]).unwrap();
+        let state = vm_state_dir(name);
+        std::fs::create_dir_all(&state).unwrap();
+        let retained = state.join("readback");
+        std::fs::write(&retained, b"original").unwrap();
+        let client = LocalBackend::with_hypervisor("mock");
+        for result in [
+            client.stop_machine(&id).await,
+            client.remove_machine(&id).await,
+            client.cleanup_transient(name),
+        ] {
+            assert!(
+                matches!(result, Err(MvmError::Conflict { .. })),
+                "{result:?}"
+            );
+            assert_eq!(std::fs::read(&retained).unwrap(), b"original");
+            assert_eq!(std::fs::read(&marker).unwrap(), [7; 32]);
+        }
     }
 
     #[tokio::test]

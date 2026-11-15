@@ -91,6 +91,8 @@ path = "src/bin/mvm-apfs-snapshot-helper.rs"
 required-features = ["trusted-apfs"]
 
 [dependencies]
+spiralcore-mvm-flowmux = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "86497e8868146f2a21ba581dd09fcfabfca6486d" }
+spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "86497e8868146f2a21ba581dd09fcfabfca6486d" }
 # `egress-ca`: the https terminator mints per-SNI leaves
 # under the per-VM intermediate (`mvm_core::crypto::egress_ca`).
 mvm-core = { workspace = true, features = ["egress-ca", "host-state"] }
@@ -123,7 +125,7 @@ async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 # rand_core feature for the signers' Ed25519 keygen.
-ed25519-dalek = { workspace = true, features = ["rand_core"] }
+ed25519-dalek = { workspace = true, features = ["rand_core", "pkcs8", "alloc"] }
 sysinfo = { version = "0.30", default-features = false }
 ipnet.workspace = true
 # Evented readiness for FlowMux UDP relays.
@@ -157,7 +159,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-rustix = { version = "1.1", features = ["fs", "event", "process"] }
+rustix = { version = "1.1", features = ["fs", "event", "process", "net"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { version = "0.10", optional = true }
@@ -208,6 +210,10 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net"
 ctor = "0.2"
 
 [features]
+# Qualification build only. The original helper owns the numeric observation file.
+durable-guest-io-witness = []
+# Constant-space whole-session totals for an explicitly built sustained witness.
+sender-ordinal-io-witness = ["durable-guest-io-witness"]
 default = []
 # macOS-only protected caller opt-in; other platforms return Unsupported.
 native-caller-identity = ["dep:core-foundation", "dep:security-framework"]

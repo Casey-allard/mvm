@@ -48,3 +48,14 @@ pub fn create_owned_private_dir(dir: impl AsRef<Path>) -> io::Result<()> {
 pub fn sync_managed_directory_chain(root: &Path, _directory: &Path) -> io::Result<()> {
     Err(unsupported_platform_error(root))
 }
+
+pub(crate) fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
+    Err(unsupported_platform_error(path))
+}
+
+pub(crate) fn hard_link_count(_metadata: &Metadata) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure record link validation is unsupported on this host",
+    ))
+}

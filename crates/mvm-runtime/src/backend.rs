@@ -102,6 +102,29 @@ pub(crate) fn fc_runner() -> FcRunner {
     )
 }
 
+/// Public reader binding written to the original identity drive and the
+/// surviving kernel peer of the Firecracker HTTP config/InstanceStart stream.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct OriginalObjectFirecracker {
+    observation: mvm_backends::driver::fc::original::LaunchObservation,
+}
+#[cfg(target_os = "linux")]
+impl OriginalObjectFirecracker {
+    pub fn boot(&self) -> Result<&mvm_core::mailbox::reader::MailboxReaderBootBinding> {
+        self.observation
+            .reader
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("original guest reader absent"))
+    }
+    pub fn original_peer(&self) -> Result<(u32, std::os::fd::BorrowedFd<'_>)> {
+        self.observation.original_peer()
+    }
+    pub fn require_live(&self) -> Result<()> {
+        self.observation.require_live()
+    }
+}
+
 /// Compatibility wrapper for the retired raw Firecracker configuration.
 ///
 /// Normal workloads use the runner-backed [`AnyBackend::Firecracker`] variant;
@@ -819,10 +842,189 @@ impl AnyBackend {
     /// has no activation step to hold the workload behind, so it waits before
     /// it starts anything.
     pub fn start(&self, config: &VmStartConfig) -> Result<VmId> {
+        #[cfg(unix)]
+        if config.host_lifetime.is_some() {
+            anyhow::ensure!(
+                self.supports_host_lifetime(),
+                "backend has no original installed native lifetime"
+            );
+        }
         if !self.activation_waits_for_admission() {
             config.wait_for_admission_durability()?;
         }
         self.inner().start(config)
+    }
+
+    /// Run the ordinary NIC-less, signed cold workload path with two observation
+    /// slots owned by this invocation. No previously running VM can fill them.
+    #[cfg(target_os = "linux")]
+    pub fn start_original_object_firecracker(
+        &self,
+        config: &VmStartConfig,
+    ) -> Result<(VmId, OriginalObjectFirecracker)> {
+        self.start_original_object_firecracker_custodied(config, Vec::new())
+    }
+    #[cfg(target_os = "linux")]
+    pub fn start_original_object_firecracker_custodied(
+        &self,
+        config: &VmStartConfig,
+        images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+    ) -> Result<(VmId, OriginalObjectFirecracker)> {
+        let Self::Firecracker(runner) = self else {
+            anyhow::bail!("requires Linux Firecracker")
+        };
+        let plan = mvm_core::plan::plan_from_admitted_json(
+            config
+                .plan_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("original signed plan absent"))?,
+        )?;
+        anyhow::ensure!(
+            plan.image.name == config.name
+                && plan
+                    .mailbox
+                    .is_some_and(|g| g.durable_object_pair_sha256_v1.is_some()),
+            "requires original selected object plan"
+        );
+        let observation = mvm_backends::driver::fc::original::LaunchObservation::default();
+        let id = runner
+            .with_original_object_observation(observation.clone())
+            .start_custodied(config, images)?;
+        Ok((id, OriginalObjectFirecracker { observation }))
+    }
+
+    #[cfg(unix)]
+    pub fn supports_host_lifetime(&self) -> bool {
+        match self {
+            Self::Firecracker(runner) => runner.supports_host_lifetime(),
+            Self::Hvf(runner) => runner.supports_host_lifetime(),
+            _ => false,
+        }
+    }
+
+    /// No name/marker fallback can manufacture original installed ownership.
+    #[cfg(unix)]
+    pub fn install_owned_host_agent(
+        &self,
+        registrar: mvm_vmm::host::host_agent_spawn::OwnedHostAgentRegistrar,
+    ) -> Result<()> {
+        match self {
+            Self::Firecracker(runner) => runner.install_owned_host_agent(registrar),
+            Self::Hvf(runner) => runner.install_owned_host_agent(registrar),
+            _ => anyhow::bail!("installed host agent requires an original native runner"),
+        }
+    }
+
+    /// Invoke the single signed guest entrypoint through the retained direct launch owner.
+    #[cfg(target_os = "linux")]
+    pub fn run_owned_entrypoint(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: std::time::Instant,
+        event: &mut dyn FnMut(&mvm_agentd::vsock::EntrypointEvent),
+    ) -> anyhow::Result<mvm_agentd::vsock::EntrypointEvent> {
+        match self {
+            Self::Firecracker(runner) => runner.run_owned_entrypoint(id, owner, until, event),
+            _ => anyhow::bail!("original installed entrypoint unavailable"),
+        }
+    }
+
+    /// Check readiness on a fresh session authenticated to the original guest.
+    #[cfg(target_os = "linux")]
+    pub fn check_owned_journal_ready(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: std::time::Instant,
+    ) -> Result<()> {
+        match self {
+            Self::Firecracker(runner) => runner.check_owned_journal_ready(id, owner, until),
+            _ => anyhow::bail!("original journal control unavailable"),
+        }
+    }
+
+    /// Invoke one admitted journal call without replaying an uncertain result.
+    #[cfg(target_os = "linux")]
+    pub fn run_owned_journal_entrypoint(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        input: &[u8],
+        until: std::time::Instant,
+        event: &mut dyn FnMut(&mvm_agentd::vsock::EntrypointEvent),
+    ) -> Result<mvm_agentd::vsock::EntrypointEvent> {
+        match self {
+            Self::Firecracker(runner) => {
+                runner.run_owned_journal_entrypoint(id, owner, input, until, event)
+            }
+            _ => anyhow::bail!("original journal control unavailable"),
+        }
+    }
+
+    /// Wait for the original workload's bounded report using the live launch owner.
+    #[cfg(unix)]
+    pub fn wait_owned_until(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+        until: std::time::Instant,
+    ) -> Result<mvm_core::vm_backend::VmExitStatus> {
+        match self {
+            Self::Firecracker(runner) => runner.wait_owned_until(id, owner, until),
+            _ => anyhow::bail!("bounded original workload observation unavailable"),
+        }
+    }
+
+    /// No name/marker fallback can manufacture original installed ownership.
+    #[cfg(unix)]
+    pub fn stop_owned(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<()> {
+        match self {
+            Self::Firecracker(runner) => runner.stop_owned(id, owner),
+            Self::Hvf(runner) => runner.stop_owned(id, owner),
+            _ => anyhow::bail!("original installed native owner unavailable"),
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn stop_owned_pending(
+        &self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<()> {
+        match self {
+            Self::Firecracker(runner) => runner.stop_owned_pending(binding),
+            Self::Hvf(runner) => runner.stop_owned_pending(binding),
+            _ => anyhow::bail!("original installed startup unavailable"),
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn take_owned_retirement(
+        &self,
+        id: &VmId,
+        owner: &std::sync::Arc<mvm_core::host_lifetime::HostLifetimeAnchor>,
+    ) -> Result<crate::workload_runner::OwnedRetirement> {
+        match self {
+            Self::Firecracker(runner) => runner.take_owned_retirement(id, owner),
+            Self::Hvf(runner) => runner.take_owned_retirement(id, owner),
+            _ => anyhow::bail!("original installed retirement unavailable"),
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn take_owned_retirement_pending(
+        &self,
+        binding: &mvm_core::host_lifetime::HostLaunchBinding,
+    ) -> Result<crate::workload_runner::OwnedRetirement> {
+        match self {
+            Self::Firecracker(runner) => runner.take_owned_retirement_pending(binding),
+            Self::Hvf(runner) => runner.take_owned_retirement_pending(binding),
+            _ => anyhow::bail!("original pending retirement unavailable"),
+        }
     }
 
     /// Start with original writable-image custody transferred to the final writer.
@@ -864,7 +1066,7 @@ impl AnyBackend {
         images: mvm_vmm::host::boot_images::FrozenBootImageBytes,
     ) -> Result<crate::workload_runner::runner::OwnedRuntimeLaunch> {
         match self {
-            AnyBackend::Hvf(runner) => runner.prepare_cold_hvf_channel(config, images),
+            AnyBackend::Hvf(runner) => runner.prepare_owned_hvf_original(config, images),
             _ => anyhow::bail!("owned native launch requires concrete macOS HVF"),
         }
     }

@@ -72,83 +72,219 @@ pub fn verify_workload_chain_entries(
         if line.trim().is_empty() {
             continue;
         }
-        let on_disk: OnDiskEntry =
-            serde_json::from_str(line).map_err(|e| WorkloadVerifyError::Malformed {
-                line: idx,
-                reason: e.to_string(),
-            })?;
-        // Algorithm gate first — only Ed25519 ships today; ECDSA-P256
-        // (`SIG_ALG_ECDSA_P256`) verification lands with the HW-enclave key.
-        if on_disk.sig_alg != SIG_ALG_ED25519 {
-            return Err(WorkloadVerifyError::UnsupportedSigAlg {
-                line: idx,
-                sig_alg: on_disk.sig_alg,
-            });
-        }
-        let canonical_bytes = base64::engine::general_purpose::STANDARD
-            .decode(on_disk.canonical.as_bytes())
-            .map_err(|e| WorkloadVerifyError::Malformed {
-                line: idx,
-                reason: format!("canonical b64: {e}"),
-            })?;
-        let entry: CanonicalEntry = serde_json::from_slice(&canonical_bytes).map_err(|e| {
-            WorkloadVerifyError::Malformed {
-                line: idx,
-                reason: format!("canonical entry: {e}"),
-            }
-        })?;
-        // Same allow-list the writer gates on — a chain must never carry a
-        // category downstream tooling won't recognise.
-        if !category::is_allowed(&entry.category) {
-            return Err(WorkloadVerifyError::DisallowedCategory {
-                line: idx,
-                category: entry.category,
-            });
-        }
-        // The stored bytes must be exactly the JCS re-serialization of the
-        // parsed entry; a non-canonical blob can't enter through the writer.
-        let recanonical = entry
-            .jcs_bytes()
-            .map_err(|e| WorkloadVerifyError::Malformed {
-                line: idx,
-                reason: format!("re-canonicalize: {e}"),
-            })?;
-        if recanonical != canonical_bytes {
-            return Err(WorkloadVerifyError::NonCanonical { line: idx });
-        }
-        // Chain link: the entry's own prev_hash must equal the running head.
-        if entry.prev_hash != prev_hash {
-            return Err(WorkloadVerifyError::PrevHashMismatch { line: idx });
-        }
-        // Recompute the entry hash and confirm it matches the stored head.
-        let expected_hash = compute_entry_hash(&prev_hash, &canonical_bytes);
-        if expected_hash != on_disk.entry_hash {
-            return Err(WorkloadVerifyError::EntryHashMismatch { line: idx });
-        }
-        // Signature over the canonical bytes by the chain key.
-        let sig_bytes = base64::engine::general_purpose::STANDARD
-            .decode(on_disk.sig.as_bytes())
-            .map_err(|e| WorkloadVerifyError::Malformed {
-                line: idx,
-                reason: format!("sig b64: {e}"),
-            })?;
-        let sig_arr: [u8; 64] =
-            sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| WorkloadVerifyError::Malformed {
-                    line: idx,
-                    reason: format!("signature length {} != 64", sig_bytes.len()),
-                })?;
-        let signature = Signature::from_bytes(&sig_arr);
-        verifying_key
-            .verify(&canonical_bytes, &signature)
-            .map_err(|_| WorkloadVerifyError::SignatureInvalid { line: idx })?;
-
-        prev_hash = on_disk.entry_hash;
+        let (entry, head) = verify_line(line, idx, &prev_hash, verifying_key)?;
+        prev_hash = head;
         entries.push(entry);
     }
     Ok(entries)
+}
+
+/// Same canonical verifier for the CLI and for the held original archive reader.
+fn verify_line(
+    line: &str,
+    idx: usize,
+    prev_hash: &str,
+    verifying_key: &VerifyingKey,
+) -> Result<(CanonicalEntry, String), WorkloadVerifyError> {
+    let on_disk: OnDiskEntry =
+        serde_json::from_str(line).map_err(|e| WorkloadVerifyError::Malformed {
+            line: idx,
+            reason: e.to_string(),
+        })?;
+    // Algorithm gate first — only Ed25519 ships today; ECDSA-P256
+    // (`SIG_ALG_ECDSA_P256`) verification lands with the HW-enclave key.
+    if on_disk.sig_alg != SIG_ALG_ED25519 {
+        return Err(WorkloadVerifyError::UnsupportedSigAlg {
+            line: idx,
+            sig_alg: on_disk.sig_alg,
+        });
+    }
+    let canonical_bytes = base64::engine::general_purpose::STANDARD
+        .decode(on_disk.canonical.as_bytes())
+        .map_err(|e| WorkloadVerifyError::Malformed {
+            line: idx,
+            reason: format!("canonical b64: {e}"),
+        })?;
+    let entry: CanonicalEntry =
+        serde_json::from_slice(&canonical_bytes).map_err(|e| WorkloadVerifyError::Malformed {
+            line: idx,
+            reason: format!("canonical entry: {e}"),
+        })?;
+    // Same allow-list the writer gates on — a chain must never carry a
+    // category downstream tooling won't recognise.
+    if !category::is_allowed(&entry.category) {
+        return Err(WorkloadVerifyError::DisallowedCategory {
+            line: idx,
+            category: entry.category,
+        });
+    }
+    // The stored bytes must be exactly the JCS re-serialization of the
+    // parsed entry; a non-canonical blob can't enter through the writer.
+    let recanonical = entry
+        .jcs_bytes()
+        .map_err(|e| WorkloadVerifyError::Malformed {
+            line: idx,
+            reason: format!("re-canonicalize: {e}"),
+        })?;
+    if recanonical != canonical_bytes {
+        return Err(WorkloadVerifyError::NonCanonical { line: idx });
+    }
+    // Chain link: the entry's own prev_hash must equal the running head.
+    if entry.prev_hash != prev_hash {
+        return Err(WorkloadVerifyError::PrevHashMismatch { line: idx });
+    }
+    // Recompute the entry hash and confirm it matches the stored head.
+    let expected_hash = compute_entry_hash(prev_hash, &canonical_bytes);
+    if expected_hash != on_disk.entry_hash {
+        return Err(WorkloadVerifyError::EntryHashMismatch { line: idx });
+    }
+    // Signature over the canonical bytes by the chain key.
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(on_disk.sig.as_bytes())
+        .map_err(|e| WorkloadVerifyError::Malformed {
+            line: idx,
+            reason: format!("sig b64: {e}"),
+        })?;
+    let sig_arr: [u8; 64] =
+        sig_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| WorkloadVerifyError::Malformed {
+                line: idx,
+                reason: format!("signature length {} != 64", sig_bytes.len()),
+            })?;
+    let signature = Signature::from_bytes(&sig_arr);
+    verifying_key
+        .verify(&canonical_bytes, &signature)
+        .map_err(|_| WorkloadVerifyError::SignatureInvalid { line: idx })?;
+
+    Ok((entry, on_disk.entry_hash))
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub struct WorkloadChainExpectation<'a> {
+    pub tenant: &'a str,
+    pub workload: &'a str,
+    /// Authenticated final head from the original signer inventory.
+    pub head: &'a str,
+    pub length: u64,
+    pub cap: u64,
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerifiedWorkloadChain {
+    pub entries: usize,
+    pub length: u64,
+    pub sha256: [u8; 32],
+    pub head: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Error)]
+pub enum HeldWorkloadVerifyError {
+    #[error("held workload audit chain differs from its original terminal inventory")]
+    Inventory,
+    #[error(transparent)]
+    SignedEntry(#[from] WorkloadVerifyError),
+    #[error("held audit file I/O: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Verify original bytes without reopening a path or changing a shared offset.
+/// The caller authenticates the terminal inventory and original signer key
+/// before supplying these facts. This function alone cannot retire a source.
+#[cfg(unix)]
+pub fn verify_original_workload_chain(
+    file: &std::fs::File,
+    key: &VerifyingKey,
+    expected: &WorkloadChainExpectation<'_>,
+) -> Result<VerifiedWorkloadChain, HeldWorkloadVerifyError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::unix::fs::{FileExt, MetadataExt};
+
+    let check_file = || -> Result<(), HeldWorkloadVerifyError> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+            || metadata.len() != expected.length
+            || metadata.len() > expected.cap
+            || expected.cap == 0
+            || expected.head.len() != 64
+            || !expected.head.bytes().all(|c| c.is_ascii_hexdigit())
+            || expected.tenant.is_empty()
+            || expected.workload.is_empty()
+        {
+            return Err(HeldWorkloadVerifyError::Inventory);
+        }
+        Ok(())
+    };
+    check_file()?;
+    // pread preserves the caller's open-file-description cursor even when
+    // several references to the original file exist. Bound every read.
+    struct OriginalBytes<'a> {
+        file: &'a std::fs::File,
+        at: u64,
+        end: u64,
+    }
+    impl Read for OriginalBytes<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = usize::try_from(self.end - self.at).unwrap_or(usize::MAX);
+            let n = buffer.len().min(remaining);
+            let count = self.file.read_at(&mut buffer[..n], self.at)?;
+            self.at += count as u64;
+            Ok(count)
+        }
+    }
+    let mut source = BufReader::new(OriginalBytes {
+        file,
+        at: 0,
+        end: expected.length,
+    });
+    let mut bytes = Vec::new();
+    let mut digest = Sha256::new();
+    let mut head = CanonicalEntry::genesis_prev_hash();
+    let mut count = 0;
+    let mut length = 0;
+    // Matches the owned signer recovery framing, including the terminal newline.
+    const MAX_LINE: u64 = 256 * 1024;
+    loop {
+        bytes.clear();
+        let read = (&mut source)
+            .take(MAX_LINE + 1)
+            .read_until(b'\n', &mut bytes)?;
+        if read == 0 {
+            break;
+        }
+        if read as u64 > MAX_LINE || bytes.last() != Some(&b'\n') {
+            return Err(HeldWorkloadVerifyError::Inventory);
+        }
+        let line = std::str::from_utf8(&bytes[..read - 1])
+            .map_err(|_| HeldWorkloadVerifyError::Inventory)?;
+        let (entry, next) = verify_line(line, count, &head, key)?;
+        if entry.tenant_id != expected.tenant || entry.workload_id != expected.workload {
+            return Err(HeldWorkloadVerifyError::Inventory);
+        }
+        digest.update(&bytes);
+        head = next;
+        length += read as u64;
+        count += 1;
+    }
+    check_file()?;
+    if length != expected.length || head != expected.head {
+        return Err(HeldWorkloadVerifyError::Inventory);
+    }
+    Ok(VerifiedWorkloadChain {
+        entries: count,
+        length,
+        sha256: digest.finalize().into(),
+        head,
+    })
 }
 
 // ============================================================================
@@ -180,7 +316,7 @@ mod tests {
     /// Build a chain of `n` `workload_audit` entries signed by a known key.
     /// Returns the JSONL path + the signing key (so tests can craft adversarial
     /// lines and derive the verifying key).
-    fn build(dir: &tempfile::TempDir, n: usize) -> (std::path::PathBuf, SigningKey) {
+    pub(super) fn build(dir: &tempfile::TempDir, n: usize) -> (std::path::PathBuf, SigningKey) {
         let sk = {
             let mut __ed_seed = [0u8; 32];
             rand::rng().fill_bytes(&mut __ed_seed);
@@ -388,3 +524,7 @@ mod tests {
         assert_eq!(verify_workload_chain(&path, &vk(&sk)).unwrap(), 2);
     }
 }
+
+#[cfg(all(unix, test))]
+#[path = "verify/held_tests.rs"]
+mod held_tests;
