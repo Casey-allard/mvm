@@ -26,9 +26,25 @@ pub(super) fn startup_failure_record(
     record
 }
 
+pub(super) fn supervisor_unavailable_message(error: &anyhow::Error) -> String {
+    format!(
+        "HVF supervisor unavailable. Build it with `just payload::supervisors` \
+         or install mvm with `mvmctl env bootstrap`, then retry.\n\nError: {error:#}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::startup_failure_record;
+    use super::{startup_failure_record, supervisor_unavailable_message};
+
+    #[test]
+    fn supervisor_unavailable_message_names_the_remedies() {
+        let err = anyhow::anyhow!("mvm-hvf-supervisor not found in PATH or aux dirs");
+        let msg = supervisor_unavailable_message(&err);
+        assert!(msg.contains("just payload::supervisors"), "{msg}");
+        assert!(msg.contains("mvmctl env bootstrap"), "{msg}");
+        assert!(msg.contains("mvm-hvf-supervisor not found"), "{msg}");
+    }
 
     #[test]
     fn failure_record_keeps_the_stage_and_only_an_observed_exit() {

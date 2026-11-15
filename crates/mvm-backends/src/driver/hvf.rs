@@ -50,7 +50,7 @@ mod standby;
 mod stop_state;
 use cold_channel::{BootInputFiles, boot_with_custody, failed_owned_boot, require_cold_config};
 pub use cold_channel::{ColdHvfBootFailure, ColdHvfOwner, RetainedHvfLaunch};
-use failure_diagnostics::startup_failure_record;
+use failure_diagnostics::{startup_failure_record, supervisor_unavailable_message};
 #[cfg(test)]
 use handoff_client::{
     HANDOFF_RESPONSE_GRACE, LIVE_HANDOFF_ATTEMPTS, handoff_response_deadline, read_handoff_response,
@@ -405,13 +405,6 @@ fn relay_supervisor_config_with_handoff(
 /// verified at spawn time. A missing or stale helper is a build or install
 /// problem, not a run-time one: the raw resolution error alone sends users
 /// digging through console logs for what was fixable in one command.
-fn supervisor_unavailable_message(error: &anyhow::Error) -> String {
-    format!(
-        "HVF supervisor unavailable. Build it with `just payload::supervisors` \
-         or install mvm with `mvmctl env bootstrap`, then retry.\n\nError: {error:#}"
-    )
-}
-
 /// The supervisor launch, bounded by its guest's memory and task ceilings and
 /// by whatever CPU share this VM was admitted under.
 ///
@@ -1593,15 +1586,6 @@ mod tests {
     }
     use mvm_core::vm_backend::SnapshotCapability;
     use mvm_vmm::driver::spec::{ConsoleCapture, VsockDirection};
-
-    #[test]
-    fn supervisor_unavailable_message_names_the_remedies() {
-        let err = anyhow::anyhow!("mvm-hvf-supervisor not found in PATH or aux dirs");
-        let msg = supervisor_unavailable_message(&err);
-        assert!(msg.contains("just payload::supervisors"), "{msg}");
-        assert!(msg.contains("mvmctl env bootstrap"), "{msg}");
-        assert!(msg.contains("mvm-hvf-supervisor not found"), "{msg}");
-    }
 
     #[test]
     fn a_valid_capture_handoff_ack_may_arrive_after_the_old_deadline() {

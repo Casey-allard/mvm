@@ -60,7 +60,7 @@ const EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
     ),
     // A journal start requires its stopped definition and original one-start grant/helper.
     (
-        "crates/mvm-client/src/launch/mod.rs",
+        "crates/mvm-client/src/launch/stopped_machine.rs",
         "impl LocalBackend",
         "start_persistent",
         "start_persistent_with_journal",
