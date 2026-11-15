@@ -38,9 +38,9 @@ use crate::rust_source::{CommentSyntax, blank_comments};
 // Keep generated, vendored and regression source in the totals.
 // These ceilings match the measured tree without unallocated source headroom.
 /// Ceiling on total SLOC, all categories.
-const MAX_TOTAL_SLOC: usize = 1_050_375;
+const MAX_TOTAL_SLOC: usize = 1_050_570;
 /// Ceiling on total physical lines, all categories.
-const MAX_TOTAL_PHYSICAL: usize = 1_322_580;
+const MAX_TOTAL_PHYSICAL: usize = 1_322_779;
 /// How far under a ceiling the tree may sit before the ceiling must drop.
 const SLACK: usize = 10_000;
 

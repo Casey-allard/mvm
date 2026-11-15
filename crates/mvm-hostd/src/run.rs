@@ -5,8 +5,8 @@
 //! `mvm-client` local backend calls. It hashes the already-materialized
 //! `rootfs.ext4`, synthesizes an `ExecutionPlan` with the conservative facade
 //! defaults (deny-all egress, standard seccomp, no bundle, no host-fs shares),
-//! plus any metadata-only secret bindings resolved by the caller, and hands
-//! the whole thing to [`admit_and_start`]. The
+//! plus any metadata-only secret bindings resolved by the caller, then
+//! verifies the selected runtime and admits a one-use plan before dispatch. The
 //! backend never boots until the plan is signed, verified, inside its validity
 //! window, and non-replayed — the same gate `mvmctl run` and `mvmctl machine run` go through.
 //!
@@ -33,8 +33,8 @@ use mvm_runtime::runtime_evidence::{VerifiedRuntimeSet, verify_release_runtime_s
 
 use crate::audit::emitter::AuditEmitter;
 use crate::plan_admission::{
-    AdmitAndStartParams, Clock, InMemoryNonceLedger, StartedMachine,
-    admit_and_start_with_verified_release,
+    AdmitAndStartParams, AdmittedPlan, Clock, InMemoryNonceLedger, StartedMachine,
+    VerifiedExternalPlan, admit_synthesized_with_verified_release,
 };
 
 /// The tenant every locally-run machine is admitted under. Local runs are
@@ -263,153 +263,231 @@ pub fn admit_and_boot_local(
     req: &LocalRunRequest,
     ctx: LocalRunContext<'_>,
 ) -> Result<StartedMachine> {
-    anyhow::ensure!(
-        req.volumes
-            .iter()
-            .all(|volume| volume.materialized_image.is_none()),
-        "raw local admission does not accept materialized directory images; \
-         route them through instruction admission with explicit source identity"
-    );
-    let sha = mvm_core::crypto::image_verify::sha256_file_cached(&req.rootfs_path)
-        .with_context(|| format!("hashing rootfs at {}", req.rootfs_path.display()))?;
+    ResolvedLocal::new(req)?
+        .verify()?
+        .admit(backend, ctx)?
+        .dispatch()
+}
 
-    // An externally-signed plan takes the other admission door: verified
-    // against the operator-pinned signer set, never synthesized or re-signed
-    // under the host key.
-    if let Some(signed) = req.signed_plan.as_ref() {
-        return admit_signed_and_boot_local(
-            backend,
-            req,
-            signed,
-            Some(&sha),
-            ctx,
-            #[cfg(unix)]
-            None,
+struct ResolvedLocal<'a> {
+    req: &'a LocalRunRequest,
+    authority: LocalAuthority<'a>,
+    rootfs_sha: String,
+    kernel_sha: Option<String>,
+    config: VmStartConfig,
+}
+
+enum LocalAuthority<'a> {
+    Synthesized,
+    Signed(VerifiedExternalPlan<'a>),
+}
+
+struct VerifiedLocal<'a> {
+    resolved: ResolvedLocal<'a>,
+    runtime: Option<VerifiedRuntimeSet>,
+}
+
+struct AdmittedLocal<'backend, 'context> {
+    backend: &'backend AnyBackend,
+    context: LocalRunContext<'context>,
+    admitted: AdmittedPlan,
+    config: VmStartConfig,
+    runtime: Option<VerifiedRuntimeSet>,
+}
+
+impl<'a> ResolvedLocal<'a> {
+    fn new(req: &'a LocalRunRequest) -> Result<Self> {
+        anyhow::ensure!(
+            req.volumes
+                .iter()
+                .all(|volume| volume.materialized_image.is_none()),
+            "raw local admission does not accept materialized directory images; \
+         route them through instruction admission with explicit source identity"
         );
+        let sha = mvm_core::crypto::image_verify::sha256_file_cached(&req.rootfs_path)
+            .with_context(|| format!("hashing rootfs at {}", req.rootfs_path.display()))?;
+        let authority = match req.signed_plan.as_ref() {
+            Some(signed) => {
+                LocalAuthority::Signed(crate::plan_admission::verify_external_plan(signed)?)
+            }
+            None => LocalAuthority::Synthesized,
+        };
+
+        // Pin the kernel into the signed plan. Deliberately the uncached digest: a
+        // path+mtime-keyed cache can hand back a stale hash, which for an integrity
+        // pin would defeat the point of having one.
+        let kernel_sha = if matches!(authority, LocalAuthority::Synthesized) {
+            req.kernel_path
+                .as_ref()
+                .map(|k| {
+                    mvm_core::crypto::image_verify::sha256_file(k)
+                        .with_context(|| format!("hashing kernel at {}", k.display()))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        // With no egress grant the deny-all default stands; a granted allow-list
+        // is projected onto it, so the policy the gate enforces, and the seccomp
+        // tier the guest installs, derive from the grants the plan is signed for.
+        let network_policy = match req
+            .grants
+            .as_ref()
+            .filter(|_| matches!(authority, LocalAuthority::Synthesized))
+        {
+            Some(grants) if grants.egress.is_some() => {
+                mvm_contract::grants::projection::network_policy_from_grants(grants)
+            }
+            _ => mvm_core::network_policy::NetworkPolicy::deny_all(),
+        };
+
+        let path_string = |p: &Path| p.to_string_lossy().into_owned();
+        let mut config = VmStartConfig {
+            name: req.name.clone(),
+            rootfs_path: path_string(&req.rootfs_path),
+            kernel_path: req.kernel_path.as_deref().map(path_string),
+            verity_path: req.verity_path.as_deref().map(path_string),
+            roothash: req.roothash.clone(),
+            ..Default::default()
+        };
+        if matches!(authority, LocalAuthority::Synthesized) {
+            config.cpus = req.cpus;
+            config.memory_mib = req.mem_mib;
+            config.volumes = req.volumes.clone();
+            config.tenant_id = Some(LOCAL_TENANT.to_string());
+            config.network_policy = network_policy;
+        } else if let LocalAuthority::Signed(verified) = &authority {
+            config = resolve_signed_config(req, verified.plan(), Some(&sha))?;
+        }
+        Ok(Self {
+            req,
+            authority,
+            rootfs_sha: sha,
+            kernel_sha,
+            config,
+        })
     }
 
-    // Pin the kernel into the signed plan. Deliberately the uncached digest: a
-    // path+mtime-keyed cache can hand back a stale hash, which for an integrity
-    // pin would defeat the point of having one.
-    let kernel_sha = req
-        .kernel_path
-        .as_ref()
-        .map(|k| {
-            mvm_core::crypto::image_verify::sha256_file(k)
-                .with_context(|| format!("hashing kernel at {}", k.display()))
+    fn verify(mut self) -> Result<VerifiedLocal<'a>> {
+        let runtime = attach_guest_runtime(&mut self.config, &self.req.backend_name)?;
+        Ok(VerifiedLocal {
+            resolved: self,
+            runtime,
         })
-        .transpose()?;
+    }
+}
 
-    // With no egress grant the deny-all default stands; a granted allow-list
-    // is projected onto it, so the policy the gate enforces, and the seccomp
-    // tier the guest installs, derive from the grants the plan is signed for.
-    let network_policy = match req.grants.as_ref() {
-        Some(grants) if grants.egress.is_some() => {
-            mvm_contract::grants::projection::network_policy_from_grants(grants)
-        }
-        _ => mvm_core::network_policy::NetworkPolicy::deny_all(),
-    };
-
-    let synthesis = SynthesisInput {
-        mailbox: req.mailbox,
-        outputs: Vec::new(),
-        grants: req.grants.clone(),
-        stream_edges: Vec::new(),
-        kernel_sha256: kernel_sha.as_deref(),
-        network_mode: Default::default(),
-        ingress: Vec::new(),
-        vm_name: &req.name,
-        tenant: Some(LOCAL_TENANT),
-        backend_name: &req.backend_name,
-        image_name: &req.name,
-        image_sha256: &sha,
-        image_cosign_bundle: None,
-        intent: None,
-        seccomp_tier: mvm_core::plan::workload_seccomp_tier(
-            PlanSeccompTier::Standard,
-            &network_policy,
-            &[],
-            &[],
-            // The local run request carries no GPU grant.
-            false,
-        ),
-        network_policy_ref: None,
-        fs_policy_ref: None,
-        egress_policy_ref: None,
-        secret_release: req.secret_release,
-        secrets: req.secrets.clone(),
-        audit_event_prefix: None,
-        cpus: req.cpus,
-        mem_mib: u64::from(req.mem_mib),
-        disk_mib: 0,
-        boot_timeout_secs: 60,
-        // A persistent local machine outlives the admitting call; a transient
-        // run-to-completion workload records the teardown intent.
-        destroy_on_exit: req.destroy_on_exit,
-        bundle_pin: None,
-        deps_volume: None,
-        shares: shares_from_vm_volumes(&req.volumes),
-        assets: req
-            .registry_pack_image
-            .iter()
-            .map(|pin| {
-                mvm_core::plan::AssetIdentity::new(
-                    mvm_core::plan::AssetKind::RegistryPack,
-                    pin.reference().to_string(),
-                    pin.manifest_sha256().as_str(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        redaction: Default::default(),
-        reversible_replacement: Default::default(),
-        caller_commitment: None,
-        audit_labels: Default::default(),
-        agent_verbs: None,
-        services: Vec::new(),
-        extensions: Vec::new(),
-        stream_retention: Default::default(),
-        attestation_mode: mvm_contract::plan::AttestationMode::Noop,
-    };
-
-    let path_string = |p: &Path| p.to_string_lossy().into_owned();
-    let mut config = VmStartConfig {
-        name: req.name.clone(),
-        rootfs_path: path_string(&req.rootfs_path),
-        kernel_path: req.kernel_path.as_deref().map(path_string),
-        verity_path: req.verity_path.as_deref().map(path_string),
-        roothash: req.roothash.clone(),
-        cpus: req.cpus,
-        memory_mib: req.mem_mib,
-        volumes: req.volumes.clone(),
-        tenant_id: Some(LOCAL_TENANT.to_string()),
-        network_policy,
-        ..Default::default()
-    };
-    let verified_runtime = attach_guest_runtime(&mut config, &req.backend_name)?;
-
-    admit_and_start_with_verified_release(
-        backend,
-        AdmitAndStartParams {
-            synthesis: &synthesis,
+impl VerifiedLocal<'_> {
+    fn admit<'backend, 'context>(
+        self,
+        backend: &'backend AnyBackend,
+        ctx: LocalRunContext<'context>,
+    ) -> Result<AdmittedLocal<'backend, 'context>> {
+        let ResolvedLocal {
+            req,
+            authority,
+            rootfs_sha: sha,
+            kernel_sha,
             config,
-            clock: ctx.clock,
-            ledger: ctx.ledger,
-            host_signer_keys_dir: ctx.host_signer_keys_dir,
-            bundle_ctx: None,
-            extension_ctx: None,
-            variant: mvm_core::plan::Variant::Dev,
-            policy_bundle: None,
-            emitter: ctx.emitter,
-            // The local boot path launches unsealed (`sealed: false` above)
-            // and issues no attenuated verb grant, so it is not the tier whose
-            // admission has to be provable afterwards. Stated rather than
-            // defaulted: a run that silently picks its own audit durability is
-            // how this control erodes.
-            audit_durability: crate::audit::durability::AuditDurability::BestEffort,
-            assurance: ctx.assurance,
-        },
-        verified_runtime.as_ref(),
-    )
+        } = self.resolved;
+        let verified_runtime = self.runtime;
+        if let LocalAuthority::Signed(signed) = authority {
+            return admit_signed_local(backend, signed, config, verified_runtime, ctx);
+        }
+
+        let synthesis = SynthesisInput {
+            mailbox: req.mailbox,
+            outputs: Vec::new(),
+            grants: req.grants.clone(),
+            stream_edges: Vec::new(),
+            kernel_sha256: kernel_sha.as_deref(),
+            network_mode: Default::default(),
+            ingress: Vec::new(),
+            vm_name: &req.name,
+            tenant: Some(LOCAL_TENANT),
+            backend_name: &req.backend_name,
+            image_name: &req.name,
+            image_sha256: &sha,
+            image_cosign_bundle: None,
+            intent: None,
+            seccomp_tier: mvm_core::plan::workload_seccomp_tier(
+                PlanSeccompTier::Standard,
+                &config.network_policy,
+                &[],
+                &[],
+                // The local run request carries no GPU grant.
+                false,
+            ),
+            network_policy_ref: None,
+            fs_policy_ref: None,
+            egress_policy_ref: None,
+            secret_release: req.secret_release,
+            secrets: req.secrets.clone(),
+            audit_event_prefix: None,
+            cpus: req.cpus,
+            mem_mib: u64::from(req.mem_mib),
+            disk_mib: 0,
+            boot_timeout_secs: 60,
+            // A persistent local machine outlives the admitting call; a transient
+            // run-to-completion workload records the teardown intent.
+            destroy_on_exit: req.destroy_on_exit,
+            bundle_pin: None,
+            deps_volume: None,
+            shares: shares_from_vm_volumes(&req.volumes),
+            assets: req
+                .registry_pack_image
+                .iter()
+                .map(|pin| {
+                    mvm_core::plan::AssetIdentity::new(
+                        mvm_core::plan::AssetKind::RegistryPack,
+                        pin.reference().to_string(),
+                        pin.manifest_sha256().as_str(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            redaction: Default::default(),
+            reversible_replacement: Default::default(),
+            caller_commitment: None,
+            audit_labels: Default::default(),
+            agent_verbs: None,
+            services: Vec::new(),
+            extensions: Vec::new(),
+            stream_retention: Default::default(),
+            attestation_mode: mvm_contract::plan::AttestationMode::Noop,
+        };
+
+        let admitted = admit_synthesized_with_verified_release(
+            backend,
+            &AdmitAndStartParams {
+                synthesis: &synthesis,
+                config: config.clone(),
+                clock: ctx.clock,
+                ledger: ctx.ledger,
+                host_signer_keys_dir: ctx.host_signer_keys_dir,
+                bundle_ctx: None,
+                extension_ctx: None,
+                variant: mvm_core::plan::Variant::Dev,
+                policy_bundle: None,
+                emitter: ctx.emitter,
+                // The local boot path launches unsealed (`sealed: false` above)
+                // and issues no attenuated verb grant, so it is not the tier whose
+                // admission has to be provable afterwards. Stated rather than
+                // defaulted: a run that silently picks its own audit durability is
+                // how this control erodes.
+                audit_durability: crate::audit::durability::AuditDurability::BestEffort,
+                assurance: ctx.assurance,
+            },
+            verified_runtime.as_ref(),
+        )?;
+        Ok(AdmittedLocal {
+            backend,
+            context: ctx,
+            admitted,
+            config,
+            runtime: verified_runtime,
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -465,30 +543,14 @@ pub fn admit_and_boot_local_with_installed_mapping(
         .signed_plan
         .as_ref()
         .context("selected launch requires the externally signed original plan")?;
-    admit_signed_and_boot_local(backend, req, signed, None, ctx, Some(selected))
+    admit_selected_local(backend, req, signed, ctx, selected)?.dispatch()
 }
 
-/// Admit an externally-signed plan through
-/// [`crate::plan_admission::admit_signed_plan_for_run`] and boot it on
-/// `backend` — the local-run tail for the fleet-issued seam.
-///
-/// The admitted plan, not the request, decides what runs: sizing, grants, and
-/// teardown intent are read from the verified plan body, and the resolved
-/// rootfs must hash to the image digest the plan pins — otherwise the host
-/// would be booting bytes the signer never authorized. The caller's
-/// `cpus`/`mem_mib`/`grants`/`destroy_on_exit` are not consulted here;
-/// `admit_and_boot_local` only routes here when `req.signed_plan` is set.
-fn admit_signed_and_boot_local(
-    backend: &AnyBackend,
+fn resolve_signed_config(
     req: &LocalRunRequest,
-    signed: &mvm_core::plan::SignedExecutionPlan,
+    plan: &mvm_core::plan::ExecutionPlan,
     rootfs_sha: Option<&str>,
-    ctx: LocalRunContext<'_>,
-    #[cfg(unix)] selected: Option<SelectedLocalMapping<'_>>,
-) -> Result<StartedMachine> {
-    use crate::plan_admission::{RunPosture, StartAdmittedParams};
-    let verified = crate::plan_admission::verify_external_plan(signed)?;
-    let plan = verified.plan();
+) -> Result<VmStartConfig> {
     if let Some(pin) = &req.registry_pack_image {
         anyhow::ensure!(
             plan.asset_identities.iter().any(|asset| {
@@ -535,130 +597,147 @@ fn admit_signed_and_boot_local(
         }
         _ => mvm_core::network_policy::NetworkPolicy::deny_all(),
     };
-    let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind());
-    #[cfg(unix)]
-    let (admitted, verified_runtime) = if let Some(selected) = selected {
-        anyhow::ensure!(
-            cfg!(target_os = "linux")
-                && backend.kind() == mvm_core::vm_backend::BackendKind::Firecracker
-                && backend.supports_host_lifetime(),
-            "installed direct runtime is unavailable"
-        );
-        anyhow::ensure!(
-            plan.post_run.destroy_on_exit
-                && plan.network_mode == mvm_core::plan::NetworkMode::HostVsockProxy
-                && plan.mailbox.is_none()
-                && plan.ingress.is_empty()
-                && plan.secrets.is_empty(),
-            "selected direct scope requires transient vsock egress only"
-        );
-        config.network_policy = selected.mapping.project(config.network_policy)?;
-        mvm_core::policy::direct_plan::AdmittedNetworkPlan::from_plan(
-            plan,
-            &config.name,
-            &config.network_policy,
-        )?;
-        selected.owner.bind_to_config(&mut config)?;
-        let pin = plan
-            .bundle
-            .as_ref()
-            .context("signed portable bundle required")?;
-        let bytes = crate::host_lifetime_parent::check_portable_startup_workspace(
-            &config,
-            backend.kind(),
-            pin,
-        )?;
-        if let Some(kernel) = selected.owner.canonical_kernel() {
-            anyhow::ensure!(
-                kernel.pin() == pin
-                    && kernel.workload_root_declaration()?.sha256 == plan.image.sha256,
-                "canonical kernel and root must belong to the signed plan bundle"
-            );
-            kernel.bind_to_config(&mut config)?;
-        } else {
-            anyhow::ensure!(
-                mvm_core::crypto::image_verify::sha256_file(&req.rootfs_path)? == plan.image.sha256,
-                "selected root filesystem differs from the signed plan"
-            );
-        }
-        // For canonical inputs, attachment checks the installed root through one
-        // bounded file handle against the same signed declaration before admission.
-        mvm_runtime::bundle_runtime::attach_direct_runtime(
-            &mut config,
-            backend.name(),
-            pin,
-            bytes,
-        )?;
-        let resolver = mvm_core::plan::bundle::FsBundleResolver::default_path()?
-            .with_exact_archive(&pin.bundle_sha256, bytes)?;
-        let trust = mvm_core::registry_pack::application_bundle::trust_for_installed_bundle(
-            mvm_core::plan::bundle::FsTrustStore::default_path()?,
-            &pin.bundle_sha256,
-        );
-        let support = mvm_core::image_set::BackendImageSupport::for_backend(backend.kind())
-            .context("selected backend lacks image support")?;
-        let protocols = mvm_build::stage0_kernel::current_image_set_protocol_support();
-        let bundle = crate::plan_admission::BundleAdmissionContext {
-            resolver: &resolver,
-            trust: &trust,
-            image: Some(crate::plan_admission::BundleImageAdmissionContext {
-                arch: mvm_core::arch::GuestArch::host(),
-                backend: &support,
-                host_protocols: &protocols,
-            }),
-        };
-        let admitted = verified.admit(
-            ctx.clock,
-            ctx.ledger,
-            Some(&bundle),
-            posture.with_selected_direct_owner(&config, &selected.owner),
-        )?;
-        (admitted, None)
-    } else {
-        let runtime = attach_guest_runtime(&mut config, &req.backend_name)?;
-        let admitted = verified.admit(
-            ctx.clock,
-            ctx.ledger,
-            None,
-            posture
-                .with_runtime(Some(&config))
-                .with_verified_runtime(runtime.as_ref()),
-        )?;
-        (admitted, runtime)
-    };
-    #[cfg(not(unix))]
-    let (admitted, verified_runtime) = {
-        let runtime = attach_guest_runtime(&mut config, &req.backend_name)?;
-        let admitted = verified.admit(
-            ctx.clock,
-            ctx.ledger,
-            None,
-            posture
-                .with_runtime(Some(&config))
-                .with_verified_runtime(runtime.as_ref()),
-        )?;
-        (admitted, runtime)
-    };
-    let plan = admitted.plan();
+    Ok(config)
+}
 
-    crate::audit::durability::record_admission(
-        ctx.emitter,
+#[cfg(unix)]
+fn admit_selected_local<'backend, 'context>(
+    backend: &'backend AnyBackend,
+    req: &LocalRunRequest,
+    signed: &mvm_core::plan::SignedExecutionPlan,
+    ctx: LocalRunContext<'context>,
+    selected: SelectedLocalMapping<'_>,
+) -> Result<AdmittedLocal<'backend, 'context>> {
+    use crate::plan_admission::RunPosture;
+    let verified = crate::plan_admission::verify_external_plan(signed)?;
+    let plan = verified.plan();
+    let mut config = resolve_signed_config(req, plan, None)?;
+    let posture = RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind());
+    anyhow::ensure!(
+        cfg!(target_os = "linux")
+            && backend.kind() == mvm_core::vm_backend::BackendKind::Firecracker
+            && backend.supports_host_lifetime(),
+        "installed direct runtime is unavailable"
+    );
+    anyhow::ensure!(
+        plan.post_run.destroy_on_exit
+            && plan.network_mode == mvm_core::plan::NetworkMode::HostVsockProxy
+            && plan.mailbox.is_none()
+            && plan.ingress.is_empty()
+            && plan.secrets.is_empty(),
+        "selected direct scope requires transient vsock egress only"
+    );
+    config.network_policy = selected.mapping.project(config.network_policy)?;
+    mvm_core::policy::direct_plan::AdmittedNetworkPlan::from_plan(
         plan,
-        admitted.signer_id(),
-        crate::audit::durability::AuditDurability::BestEffort,
+        &config.name,
+        &config.network_policy,
+    )?;
+    selected.owner.bind_to_config(&mut config)?;
+    let pin = plan
+        .bundle
+        .as_ref()
+        .context("signed portable bundle required")?;
+    let bytes = crate::host_lifetime_parent::check_portable_startup_workspace(
+        &config,
+        backend.kind(),
+        pin,
+    )?;
+    if let Some(kernel) = selected.owner.canonical_kernel() {
+        anyhow::ensure!(
+            kernel.pin() == pin && kernel.workload_root_declaration()?.sha256 == plan.image.sha256,
+            "canonical kernel and root must belong to the signed plan bundle"
+        );
+        kernel.bind_to_config(&mut config)?;
+    } else {
+        anyhow::ensure!(
+            mvm_core::crypto::image_verify::sha256_file(&req.rootfs_path)? == plan.image.sha256,
+            "selected root filesystem differs from the signed plan"
+        );
+    }
+    // For canonical inputs, attachment checks the installed root through one
+    // bounded file handle against the same signed declaration before admission.
+    mvm_runtime::bundle_runtime::attach_direct_runtime(&mut config, backend.name(), pin, bytes)?;
+    let resolver = mvm_core::plan::bundle::FsBundleResolver::default_path()?
+        .with_exact_archive(&pin.bundle_sha256, bytes)?;
+    let trust = mvm_core::registry_pack::application_bundle::trust_for_installed_bundle(
+        mvm_core::plan::bundle::FsTrustStore::default_path()?,
+        &pin.bundle_sha256,
+    );
+    let support = mvm_core::image_set::BackendImageSupport::for_backend(backend.kind())
+        .context("selected backend lacks image support")?;
+    let protocols = mvm_build::stage0_kernel::current_image_set_protocol_support();
+    let bundle = crate::plan_admission::BundleAdmissionContext {
+        resolver: &resolver,
+        trust: &trust,
+        image: Some(crate::plan_admission::BundleImageAdmissionContext {
+            arch: mvm_core::arch::GuestArch::host(),
+            backend: &support,
+            host_protocols: &protocols,
+        }),
+    };
+    let admitted = verified.admit(
+        ctx.clock,
+        ctx.ledger,
+        Some(&bundle),
+        posture.with_selected_direct_owner(&config, &selected.owner),
     )?;
 
-    crate::plan_admission::start_admitted_with_verified_release(
-        StartAdmittedParams {
-            backend,
-            admitted,
-            config,
-            policy_bundle: None,
-            emitter: ctx.emitter,
-            assurance: ctx.assurance,
-        },
-        verified_runtime.as_ref(),
+    record_signed_admission(&admitted, &ctx)?;
+    Ok(AdmittedLocal {
+        backend,
+        context: ctx,
+        admitted,
+        config,
+        runtime: None,
+    })
+}
+
+fn admit_signed_local<'backend, 'context>(
+    backend: &'backend AnyBackend,
+    verified: VerifiedExternalPlan<'_>,
+    config: VmStartConfig,
+    runtime: Option<VerifiedRuntimeSet>,
+    ctx: LocalRunContext<'context>,
+) -> Result<AdmittedLocal<'backend, 'context>> {
+    let posture =
+        crate::plan_admission::RunPosture::on_backend(mvm_core::plan::Variant::Dev, backend.kind())
+            .with_runtime(Some(&config))
+            .with_verified_runtime(runtime.as_ref());
+    let admitted = verified.admit(ctx.clock, ctx.ledger, None, posture)?;
+    record_signed_admission(&admitted, &ctx)?;
+    Ok(AdmittedLocal {
+        backend,
+        context: ctx,
+        admitted,
+        config,
+        runtime,
+    })
+}
+
+fn record_signed_admission(admitted: &AdmittedPlan, ctx: &LocalRunContext<'_>) -> Result<()> {
+    crate::audit::durability::record_admission(
+        ctx.emitter,
+        admitted.plan(),
+        admitted.signer_id(),
+        crate::audit::durability::AuditDurability::BestEffort,
     )
+}
+
+impl AdmittedLocal<'_, '_> {
+    fn dispatch(self) -> Result<StartedMachine> {
+        crate::plan_admission::start_admitted_with_verified_release(
+            crate::plan_admission::StartAdmittedParams {
+                backend: self.backend,
+                admitted: self.admitted,
+                config: self.config,
+                policy_bundle: None,
+                emitter: self.context.emitter,
+                assurance: self.context.assurance,
+            },
+            self.runtime.as_ref(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1289,6 +1368,116 @@ mod signed_boot_tests {
         assert_eq!(started.vm_id.0, "fleet-vm");
         assert_eq!(started.admitted.signer_id(), "fleet-prod");
         assert_eq!(started.admitted.plan().tenant.0, "fleet-tenant");
+    }
+
+    #[test]
+    fn signed_local_stages_do_not_start_before_admission_or_dispatch() {
+        let (_env, home) = pinned_host();
+        let rootfs = home.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"fleet workload bytes\n").unwrap();
+        let sha = mvm_core::crypto::image_verify::sha256_file(&rootfs).unwrap();
+        let mut plan = PlanFixture::new()
+            .runtime_profile("mock")
+            .tenant("fleet-tenant")
+            .build();
+        plan.image.sha256 = sha;
+        let req = signed_request("staged-fleet-vm", &rootfs, plan);
+        let backend = AnyBackend::from_hypervisor("mock");
+        let id = mvm_core::vm_backend::VmId(req.name.clone());
+        let ledger = InMemoryNonceLedger::new();
+        let ctx = LocalRunContext {
+            clock: &SystemClock,
+            ledger: &ledger,
+            host_signer_keys_dir: None,
+            emitter: None,
+            assurance: None,
+        };
+
+        let resolved = ResolvedLocal::new(&req).expect("resolve image");
+        assert_eq!(
+            backend.status(&id).unwrap(),
+            mvm_core::vm_backend::VmStatus::Stopped
+        );
+        let verified = resolved.verify().expect("verify selected runtime");
+        assert_eq!(
+            backend.status(&id).unwrap(),
+            mvm_core::vm_backend::VmStatus::Stopped
+        );
+        let admitted = verified
+            .admit(&backend, ctx)
+            .expect("admit fleet signature");
+        assert!(std::ptr::eq(admitted.context.ledger, &ledger));
+        assert_eq!(
+            backend.status(&id).unwrap(),
+            mvm_core::vm_backend::VmStatus::Stopped
+        );
+
+        let replay = ResolvedLocal::new(&req)
+            .unwrap()
+            .verify()
+            .unwrap()
+            .admit(
+                &backend,
+                LocalRunContext {
+                    clock: &SystemClock,
+                    ledger: &ledger,
+                    host_signer_keys_dir: None,
+                    emitter: None,
+                    assurance: None,
+                },
+            )
+            .err()
+            .expect("the same signed nonce must refuse a second admission");
+        assert!(format!("{replay:#}").contains("replay"), "{replay:#}");
+        assert_eq!(
+            backend.status(&id).unwrap(),
+            mvm_core::vm_backend::VmStatus::Stopped
+        );
+
+        let started = admitted.dispatch().expect("start once");
+        assert_eq!(started.vm_id, id);
+        assert_eq!(
+            backend.status(&id).unwrap(),
+            mvm_core::vm_backend::VmStatus::Running
+        );
+    }
+
+    #[test]
+    fn synthesized_local_stages_keep_signed_authority_until_dispatch() {
+        let (_env, home) = pinned_host();
+        let rootfs = home.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"local workload bytes\n").unwrap();
+        let plan = PlanFixture::new().build();
+        let mut req = signed_request("staged-local-vm", &rootfs, plan);
+        req.signed_plan = None;
+        let backend = AnyBackend::from_hypervisor("mock");
+        let id = mvm_core::vm_backend::VmId(req.name.clone());
+        let ledger = InMemoryNonceLedger::new();
+        let ctx = LocalRunContext {
+            clock: &SystemClock,
+            ledger: &ledger,
+            host_signer_keys_dir: Some(home.path()),
+            emitter: None,
+            assurance: None,
+        };
+
+        let verified = ResolvedLocal::new(&req)
+            .expect("resolve local image")
+            .verify()
+            .expect("verify local runtime");
+        assert_eq!(
+            backend.status(&id).unwrap(),
+            mvm_core::vm_backend::VmStatus::Stopped
+        );
+        let admitted = verified.admit(&backend, ctx).expect("admit local plan");
+        assert!(!admitted.admitted.signer_id().is_empty());
+        assert_eq!(admitted.admitted.plan().image.sha256.len(), 64);
+        assert_eq!(
+            backend.status(&id).unwrap(),
+            mvm_core::vm_backend::VmStatus::Stopped
+        );
+        let started = admitted.dispatch().expect("dispatch admitted local");
+        assert_eq!(started.vm_id, id);
     }
 
     #[test]
