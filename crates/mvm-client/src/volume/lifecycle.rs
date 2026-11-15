@@ -97,11 +97,7 @@ pub(crate) fn local_master_key_dir() -> PathBuf {
 /// Holders keep it for milliseconds, so a contended caller waits briefly for its
 /// turn instead of failing; only a holder that outlasts the wait is an error.
 pub(crate) fn acquire_volume_lifecycle_lock() -> Result<mvm_core::util::atomic_io::FileLock> {
-    #[cfg(not(test))]
-    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-    #[cfg(test)]
-    const WAIT: std::time::Duration = std::time::Duration::from_millis(150);
-    let deadline = std::time::Instant::now() + WAIT;
+    let deadline = std::time::Instant::now() + VOLUME_LIFECYCLE_LOCK_WAIT;
     loop {
         if let Some(lock) =
             mvm_core::util::atomic_io::FileLock::try_acquire(&LocalVolumeCatalog::path())?
@@ -113,6 +109,29 @@ pub(crate) fn acquire_volume_lifecycle_lock() -> Result<mvm_core::util::atomic_i
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+#[cfg(not(test))]
+const VOLUME_LIFECYCLE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const VOLUME_LIFECYCLE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Volume-bearing launches retain one original, still-named regular lock file.
+/// Special files and replaced names refuse without blocking on their open.
+#[cfg(unix)]
+pub(crate) fn acquire_launch_volume_lifecycle_lock() -> Result<mvm_core::util::atomic_io::FileLock>
+{
+    mvm_core::util::atomic_io::FileLock::acquire_until(
+        &LocalVolumeCatalog::path(),
+        std::time::Instant::now() + VOLUME_LIFECYCLE_LOCK_WAIT,
+    )
+    .context("another local volume lifecycle operation is already in progress")
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_launch_volume_lifecycle_lock() -> Result<mvm_core::util::atomic_io::FileLock>
+{
+    acquire_volume_lifecycle_lock()
 }
 
 pub(crate) fn unlock_staging_path(host_path: &Path) -> PathBuf {

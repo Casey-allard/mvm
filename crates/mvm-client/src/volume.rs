@@ -105,12 +105,21 @@ mod tests {
             .build()
     }
 
+    fn register_launch_volume(home: &TestVolumeHome, owner: &str) {
+        home.create_block("work", TEST_VOLUME_MIB);
+        service().unlock_volume("work").unwrap();
+        service()
+            .prepare_attachment(&attach(owner, "work", "/data/work", AccessMode::ReadOnly))
+            .unwrap();
+    }
+
     #[test]
     fn launch_volume_contention_keeps_original_owner_at_deadline_and_propagates_io_errors() {
         use mvm_core::util::atomic_io::FileLock;
         use std::time::{Duration, Instant};
 
-        let _home = TestVolumeHome::new();
+        let home = TestVolumeHome::new();
+        register_launch_volume(&home, "vm-2");
         let path = LocalVolumeCatalog::path();
         let held = super::lifecycle::acquire_volume_lifecycle_lock().unwrap();
         let deadline = Instant::now() + Duration::from_millis(40);
@@ -140,9 +149,11 @@ mod tests {
 
     #[test]
     fn launch_volume_special_file_dangling_link_never_creates_target() {
-        let _home = TestVolumeHome::new();
+        let home = TestVolumeHome::new();
+        register_launch_volume(&home, "vm-2");
         let lock_name = LocalVolumeCatalog::path().with_extension("lock");
         fs::create_dir_all(lock_name.parent().unwrap()).unwrap();
+        fs::remove_file(&lock_name).unwrap();
         let absent = lock_name.with_extension("absent");
         std::os::unix::fs::symlink(&absent, &lock_name).unwrap();
         assert!(service().acquire_launch_lease(&jit_launch("vm-2")).is_err());
@@ -155,9 +166,11 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let _home = TestVolumeHome::new();
+        let home = TestVolumeHome::new();
+        register_launch_volume(&home, "vm-2");
         let lock_name = LocalVolumeCatalog::path().with_extension("lock");
         fs::create_dir_all(lock_name.parent().unwrap()).unwrap();
+        fs::remove_file(&lock_name).unwrap();
         assert!(
             std::process::Command::new("mkfifo")
                 .arg(&lock_name)
@@ -194,7 +207,8 @@ mod tests {
         use std::sync::mpsc::{self, RecvTimeoutError};
         use std::time::Duration;
 
-        let _home = TestVolumeHome::new();
+        let home = TestVolumeHome::new();
+        register_launch_volume(&home, "vm-2");
         for corrupt in [false, true] {
             let lock = super::lifecycle::acquire_volume_lifecycle_lock().unwrap();
             let (started, ready) = mpsc::channel();
@@ -223,7 +237,7 @@ mod tests {
                         b"invalid catalog"
                     );
                 } else {
-                    assert_eq!(outcome.unwrap(), 0);
+                    assert_eq!(outcome.unwrap(), 1);
                 }
             });
         }

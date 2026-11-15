@@ -19,6 +19,8 @@ File operations cross the host/guest boundary and need path checks. SDK examples
 
 Volumes are stateful. They need explicit lifecycle, ownership, encryption-at-rest posture, and cleanup semantics.
 
+On Unix, launches with registered or explicit volumes acquire the original regular lifecycle lock before resolving their leases. Symlinks, special files and a changed lock-file identity refuse; contention is bounded by the existing five-second launch wait. A launch with no explicit or registered volumes keeps the independent fast path and does not take that host-wide lock.
+
 ## Snapshots and cold mode
 
 Snapshots preserve machine state. They can contain sensitive data, process memory, generated files, and credentials that were present in the guest. Restore flows must name backend support and integrity evidence.

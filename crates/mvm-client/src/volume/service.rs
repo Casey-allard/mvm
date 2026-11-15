@@ -408,7 +408,7 @@ impl VolumeService for LocalVolumeService {
                 lease: LaunchLease::acquire(&request.owner, Vec::new())?,
             });
         }
-        let _lock = lifecycle::acquire_volume_lifecycle_lock()?;
+        let _lock = lifecycle::acquire_launch_volume_lifecycle_lock()?;
         self.acquire_launch_lease_locked(request)
     }
 
