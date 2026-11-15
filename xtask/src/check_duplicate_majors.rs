@@ -70,6 +70,10 @@ const ALLOWLIST: &[&str] = &[
     "cpufeatures",
     "crypto-common",
     "digest",
+    // Reviewed SpiralCore transfer/FlowMux/store pin uses sha2 0.10; MVM's
+    // ed25519-dalek 3 and sigstore stack require 0.11. Neither dependency
+    // requirement can select the other line without changing its owner.
+    "sha2",
     "ryu-js",
     // sysinfo remains on an older Windows API family than Tokio and the
     // current Windows support crates. These are host-only.

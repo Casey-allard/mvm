@@ -20,17 +20,22 @@ const APPLE_CONTAINER_RS: &str = "crates/mvm-runtime/src/apple_container_backend
 const SPAWNER_RS: &str = "crates/mvm-runtime/src/workload_runner/runner/spawner.rs";
 const SPAWN_RS: &str = "crates/mvm-vmm/src/host/network_endpoint_spawn.rs";
 const OWNED_SPAWN_RS: &str = "crates/mvm-vmm/src/host/network_endpoint_spawn/owned.rs";
+const INSTALLED_SPAWN_RS: &str = "crates/mvm-vmm/src/host/network_endpoint_spawn/installed.rs";
 
 /// Every production definition of an endpoint spawn seam, by file and name.
 ///
-/// The detached seam is the one every workload runner reaches. The owned seam
-/// keeps the endpoint a child of the process that spawned it, for a supervisor
-/// that must confirm its exit; it lives inside the same module, builds the same
-/// configuration and runs the same binary. A third definition, or either one in
-/// another file, is a second endpoint implementation.
+/// Ordinary runners use the detached seam; supervisors retain the owned child.
+/// Installed launches retain their original partition and, when selected, the
+/// registered host services. All four seams use the same endpoint configuration,
+/// command owner and binary. Any additional or relocated definition refuses.
 const SPAWN_SEAMS: &[(&str, &str)] = &[
     (SPAWN_RS, "spawn_network_endpoint"),
     (OWNED_SPAWN_RS, "spawn_network_endpoint_owned"),
+    (INSTALLED_SPAWN_RS, "spawn_network_endpoint_installed"),
+    (
+        INSTALLED_SPAWN_RS,
+        "spawn_network_endpoint_installed_registered",
+    ),
 ];
 
 /// What the owned seam must share with the detached one: the configuration it
@@ -269,14 +274,8 @@ fn check_single_endpoint_implementation(workspace: &Path) -> Result<()> {
         },
     )?;
     check_spawn_seams(&spawn_defs)?;
-    let owned = production_code(&read(workspace, OWNED_SPAWN_RS)?);
-    if let Some(missing) = OWNED_SEAM_SHARES
-        .iter()
-        .find(|shared| !owned.contains(**shared))
-    {
-        bail!(
-            "check-single-network-path: {OWNED_SPAWN_RS} must assemble the endpoint through the shared `{missing}`"
-        );
+    for owner in [OWNED_SPAWN_RS, INSTALLED_SPAWN_RS] {
+        check_shared_endpoint_owner(owner, &production_code(&read(workspace, owner)?))?;
     }
 
     let spawner = production_code(&read(workspace, SPAWNER_RS)?);
@@ -297,6 +296,18 @@ fn check_single_endpoint_implementation(workspace: &Path) -> Result<()> {
     if !endpoint.contains("FlowMuxSession::accept_with(") {
         bail!(
             "check-single-network-path: {ENDPOINT_BIN} no longer serves the authenticated FlowMux session"
+        );
+    }
+    Ok(())
+}
+
+fn check_shared_endpoint_owner(owner: &str, code: &str) -> Result<()> {
+    if let Some(missing) = OWNED_SEAM_SHARES
+        .iter()
+        .find(|shared| !code.contains(**shared))
+    {
+        bail!(
+            "check-single-network-path: {owner} must assemble the endpoint through the shared `{missing}`"
         );
     }
     Ok(())
@@ -577,6 +588,9 @@ const FLOW_AUDIT_LABEL_KEYS: &[&str] = &[
     // a fixed pair of words chosen by the host, and no byte of the flow
     // reaches it.
     "termination",
+    // ForwardPath::label chooses only direct/proxy/no_proxy from host proxy
+    // settings. It records the admitted forwarding route, never flow bytes.
+    "via",
 ];
 
 /// Where the connect paths that emit flow audit entries live. The whole
@@ -958,37 +972,52 @@ mod tests {
     }
 
     #[test]
-    fn the_detached_and_owned_seams_in_their_own_files_pass() {
+    fn the_detached_owned_and_installed_seams_in_their_own_files_pass() {
         check_spawn_seams(&[
             def(OWNED_SPAWN_RS, "spawn_network_endpoint_owned"),
             def(SPAWN_RS, "spawn_network_endpoint"),
+            def(INSTALLED_SPAWN_RS, "spawn_network_endpoint_installed"),
+            def(
+                INSTALLED_SPAWN_RS,
+                "spawn_network_endpoint_installed_registered",
+            ),
         ])
         .unwrap();
     }
 
     #[test]
-    fn a_third_spawn_seam_or_a_moved_one_is_refused() {
+    fn an_additional_spawn_seam_or_a_moved_one_is_refused() {
         let mut third = vec![
             def(SPAWN_RS, "spawn_network_endpoint"),
             def(OWNED_SPAWN_RS, "spawn_network_endpoint_owned"),
+            def(INSTALLED_SPAWN_RS, "spawn_network_endpoint_installed"),
+            def(
+                INSTALLED_SPAWN_RS,
+                "spawn_network_endpoint_installed_registered",
+            ),
         ];
         third.push(def(SPAWN_RS, "spawn_network_endpoint_fast"));
         assert!(check_spawn_seams(&third).is_err());
-        let moved = [
-            def(SPAWN_RS, "spawn_network_endpoint"),
-            def(
-                "crates/mvm-hostd/src/bin/other.rs",
-                "spawn_network_endpoint_owned",
-            ),
-        ];
+        let mut moved = third[..4].to_vec();
+        moved[1].file = "crates/mvm-hostd/src/bin/other.rs".into();
         assert!(check_spawn_seams(&moved).is_err());
-        let duplicated = [
-            def(SPAWN_RS, "spawn_network_endpoint"),
-            def(SPAWN_RS, "spawn_network_endpoint"),
-            def(OWNED_SPAWN_RS, "spawn_network_endpoint_owned"),
-        ];
+        let mut duplicated = third[..4].to_vec();
+        duplicated.push(def(SPAWN_RS, "spawn_network_endpoint"));
         assert!(check_spawn_seams(&duplicated).is_err());
         assert!(check_spawn_seams(&[def(SPAWN_RS, "spawn_network_endpoint")]).is_err());
+    }
+
+    #[test]
+    fn retained_endpoint_owners_must_share_config_binary_and_command() {
+        let complete = OWNED_SEAM_SHARES.join("\n");
+        for owner in [OWNED_SPAWN_RS, INSTALLED_SPAWN_RS] {
+            check_shared_endpoint_owner(owner, &complete).unwrap();
+            for required in OWNED_SEAM_SHARES {
+                let changed = complete.replace(required, "different_owner(");
+                let error = check_shared_endpoint_owner(owner, &changed).unwrap_err();
+                assert!(error.to_string().contains(required));
+            }
+        }
     }
 
     #[test]

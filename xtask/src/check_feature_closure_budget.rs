@@ -38,7 +38,9 @@ const BUDGET_TARGET: &str = "x86_64-unknown-linux-gnu";
 /// feature enabled, excluding dev-dependencies.
 // sigstore-crypto 0.15 + p256/p384 0.14 (the manifest-verify CryptoProvider)
 // add 6 crates to the all-features closure vs the previous aws-lc-rs path.
-const FEATURE_CLOSURE_BUDGET: usize = 538;
+// Canonical main 534 + 11 shared SpiralCore transfer/FlowMux/store packages
+// and their required transitive dependencies; measured with no headroom.
+const FEATURE_CLOSURE_BUDGET: usize = 545;
 
 /// The two gates measure nested sets — everything in the default closure is
 /// reachable with all features on — so a feature budget at or below the default

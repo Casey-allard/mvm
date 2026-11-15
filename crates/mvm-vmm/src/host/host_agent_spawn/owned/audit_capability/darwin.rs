@@ -79,6 +79,15 @@ pub(super) fn receive_now(stream: &UnixStream) -> io::Result<OwnedFd> {
     const CONTROL_BYTES: usize = 2060;
     #[repr(C, align(16))]
     struct Control([u8; CONTROL_BYTES]);
+    // Apple SDK sys/socket.h CMSG_SPACE(512 * sizeof(int)) is 2060.
+    // A C11 buffer with that extent and _Alignas(16), measured with the
+    // native arm64 Apple clang, has size 2064, alignment 16 and field offset 0.
+    // This is our aligned storage contract, not a new kernel wire structure.
+    const _: () = {
+        assert!(mem::size_of::<Control>() == 2064);
+        assert!(mem::align_of::<Control>() == 16);
+        assert!(mem::offset_of!(Control, 0) == 0);
+    };
     require_supported_platform()?;
     let base = 12usize;
     // The private canonical UDS uses default control options. Refuse options

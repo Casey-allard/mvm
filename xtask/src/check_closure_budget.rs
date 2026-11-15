@@ -45,10 +45,14 @@ const BUDGETS: &[ClosureBudget] = &[
 ];
 
 /// macOS omits the Linux-only confinement and networking dependencies.
-const MACOS_CLOSURE_BUDGET: usize = 349;
+// Shared SpiralCore transfer/FlowMux/store and native directory ownership;
+// measured against canonical main: 347 + 16 required packages, no headroom.
+const MACOS_CLOSURE_BUDGET: usize = 363;
 
 /// Maximum distinct packages in the default Linux closure.
-pub(crate) const CLOSURE_BUDGET: usize = 352;
+// Shared SpiralCore transfer/FlowMux/store, exact hashing, compression and
+// measured CPU accounting: canonical main 350 + 15 packages, no headroom.
+pub(crate) const CLOSURE_BUDGET: usize = 365;
 
 pub(crate) fn run(workspace: &Path) -> Result<()> {
     for budget in BUDGETS {
