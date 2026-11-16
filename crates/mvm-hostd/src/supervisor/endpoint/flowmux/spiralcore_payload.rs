@@ -1107,6 +1107,7 @@ impl Drop for PayloadResourcePermit {
 mod resource_pool_tests {
     use super::*;
     mod owner_mode_tests;
+    mod retirement_failure_tests;
 
     fn claimed_installed_store() -> ClaimedInstalledStore {
         use spiralcore_transfer::{resource_profile::ResourceProfile, wan};

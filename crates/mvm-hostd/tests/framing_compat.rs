@@ -49,3 +49,64 @@ async fn facade_preserves_error_identity_and_caller_cap() {
     ));
     assert_eq!(reader.position(), 4);
 }
+
+#[tokio::test]
+async fn bounded_writer_keeps_wire_and_refuses_before_any_output() {
+    let mut bytes = Vec::new();
+    hostd::write_json_frame_bounded(&mut bytes, &7u8, 1)
+        .await
+        .unwrap();
+    assert_eq!(bytes, WIRE);
+    let mut reader = std::io::Cursor::new(bytes);
+    assert_eq!(
+        core::read_json_frame_checked::<_, u8>(&mut reader, 1, |body| {
+            assert_eq!(body, b"7");
+            Ok(())
+        })
+        .await
+        .unwrap(),
+        7
+    );
+    let mut bytes = Vec::new();
+    assert!(matches!(
+        core::write_json_frame_bounded(&mut bytes, &[7u8, 8], 1).await,
+        Err(hostd::FrameError::Encode(_))
+    ));
+    assert!(bytes.is_empty());
+    assert!(matches!(
+        hostd::write_json_frame_bounded(&mut bytes, &7u8, 0).await,
+        Err(core::FrameError::LengthOverflow)
+    ));
+    assert!(bytes.is_empty());
+}
+
+#[tokio::test]
+async fn checked_reader_keeps_validation_and_cap_before_typed_parse() {
+    let mut reader = std::io::Cursor::new(WIRE);
+    let mut checked = false;
+    let error = hostd::read_json_frame_checked::<_, u8>(&mut reader, 1, |body| {
+        checked = true;
+        assert_eq!(body, b"7");
+        Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fixture validation refusal",
+        )))
+    })
+    .await
+    .unwrap_err();
+    assert!(checked);
+    assert!(matches!(error, core::FrameError::Decode(_)));
+    assert_eq!(reader.position(), WIRE.len() as u64);
+
+    let mut reader = std::io::Cursor::new(WIRE);
+    let error = core::read_json_frame_checked::<_, u8>(&mut reader, 0, |_| {
+        panic!("oversize input must not reach validation")
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        hostd::FrameError::TooLarge { size: 1, cap: 0 }
+    ));
+    assert_eq!(reader.position(), 4);
+}
