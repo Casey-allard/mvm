@@ -95,7 +95,7 @@ spiralcore-mvm-flowmux = { git = "https://github.com/R4-Laboratories/SpiralCore"
 spiralcore-transfer = { git = "https://github.com/R4-Laboratories/SpiralCore", rev = "8994951b7c13fe5acf6f5ea3060ad4e51dc473c2" }
 # `egress-ca`: the https terminator mints per-SNI leaves
 # under the per-VM intermediate (`mvm_core::crypto::egress_ca`).
-mvm-core = { workspace = true, features = ["egress-ca", "host-state"] }
+mvm-core = { workspace = true, features = ["egress-ca", "host-state", "hostd-transport"] }
 mvm-http.workspace = true
 # The EgressEnforcer seam this crate's SupervisorEgressEnforcer
 # implements. Acyclic HIGH->LOW: mvm-net deps only mvm-core + mvm-contract.
