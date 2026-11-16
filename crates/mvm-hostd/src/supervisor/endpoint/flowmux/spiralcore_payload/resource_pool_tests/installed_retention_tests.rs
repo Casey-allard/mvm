@@ -105,6 +105,7 @@ fn installed_retention_child() {
         )
     };
     if mode == "owned-attach-poison" {
+        let files = owner_mode_tests::snapshot_files(&path);
         pool.inner
             .retention
             .installed
@@ -148,6 +149,8 @@ fn installed_retention_child() {
                 .is_err()
         );
         drop(ledger);
+        assert_eq!(owner_mode_tests::snapshot_files(&path), files);
+        pool.close_admission().unwrap();
         assert!(!pool.drained().unwrap());
         // No Ready/Drained: original process exit is this fixture's only release.
         std::process::exit(0);
@@ -166,6 +169,7 @@ fn installed_retention_child() {
     lease.check_store_cleanup().unwrap();
     pool.inner.check_store_cleanup().unwrap();
     assert_eq!(pool.snapshot().unwrap(), before);
+    pool.close_admission().unwrap();
     assert!(!pool.drained().unwrap());
     drop(permit);
     assert!(!path.exists());

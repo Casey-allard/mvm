@@ -112,7 +112,7 @@ pub(super) fn seed_original_object(endpoint: &mut ObjectEndpoint<wan::BenchAutho
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct FileRecord {
+pub(super) struct FileRecord {
     relative: std::path::PathBuf,
     device: u64,
     inode: u64,
@@ -124,7 +124,7 @@ struct FileRecord {
     bytes: Vec<u8>,
 }
 
-fn snapshot_files(root: &std::path::Path) -> Vec<FileRecord> {
+pub(super) fn snapshot_files(root: &std::path::Path) -> Vec<FileRecord> {
     fn walk(
         root: &std::path::Path,
         relative: &std::path::Path,
