@@ -63,9 +63,9 @@ fn final_rmdir_refusal_retains_unlinked_owner_lease_and_original_debit() {
     let name = store.name.clone();
     let inode = store.created_inode.expect("original child inode");
     let directory = Arc::clone(store.directory.as_ref().expect("held original child"));
-    let child = directory.metadata().expect("original child metadata");
-    assert_eq!(child.ino(), inode);
-    assert_eq!(child.mode() & 0o7777, 0o700);
+    let child = rustix::fs::fstat(directory.as_ref()).expect("original child metadata");
+    assert_eq!(child.st_ino, inode);
+    assert_eq!(child.st_mode & 0o7777, 0o700);
     assert!(fixture.path.join(".owner").is_file());
     let context = spiralcore_transfer::wan::context([9; 32]);
     let namespace = fixture
@@ -145,7 +145,7 @@ fn final_rmdir_refusal_retains_unlinked_owner_lease_and_original_debit() {
     ));
     assert!(retained.lease.is_some());
     let named = retained.named().expect("same original child remains named");
-    assert_eq!((named.st_dev, named.st_ino), (child.dev(), child.ino()));
+    assert_eq!((named.st_dev, named.st_ino), (child.st_dev, child.st_ino));
     let unlinked = fixture.contender.metadata().expect("held original owner");
     assert_eq!((unlinked.dev(), unlinked.ino()), (owner.dev(), owner.ino()));
     assert_eq!(unlinked.nlink(), 0);
