@@ -229,6 +229,9 @@ fn a_terminal_archive_retry_retains_only_its_original_registration() -> Result<(
 
 #[path = "support/registered_direct_peer.rs"]
 mod peer;
+#[cfg(target_os = "linux")]
+#[path = "registered_prepare/worker_budget_tests.rs"]
+mod worker_budget_tests;
 mod registered_prepare {
     use super::peer::*;
     use super::*;

@@ -33,7 +33,10 @@ use crate::host::broker_services_spawn::{
 };
 use crate::host::process_liveness::pid_is_alive;
 
-pub const OWNED_ASYNC_WORKERS_PER_PROCESS: usize = 2;
+// Keep the multi-thread runtime so owned audit callbacks can block_in_place.
+// One scheduler plus the two blocking slots bounds each helper to three
+// runtime threads, in addition to its original foreground owner.
+pub const OWNED_ASYNC_WORKERS_PER_PROCESS: usize = 1;
 pub const OWNED_BLOCKING_WORKERS_PER_PROCESS: usize = 2;
 /// Daemon and signer each have one main and one bounded Tokio runtime.
 pub const OWNED_TENANT_MAX_THREADS: usize =
