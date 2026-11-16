@@ -1106,55 +1106,24 @@ impl Drop for PayloadResourcePermit {
 #[cfg(test)]
 mod resource_pool_tests {
     use super::*;
+    mod owner_mode_tests;
+
     fn claimed_installed_store() -> ClaimedInstalledStore {
-        use spiralcore_transfer::{
-            resource_profile::ResourceProfile,
-            v1::{OwnedLaneNamespaces, OwnedStorePolicy},
-            wan,
-        };
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::Builder::new()
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("private original parent");
-        let parent = Arc::new(std::fs::File::open(root.path()).expect("original parent FD"));
-        let name = format!("flow-{}", hex::encode([9u8; 32]));
-        let path = root.path().join(&name);
+        use spiralcore_transfer::{resource_profile::ResourceProfile, wan};
+        let owner_mode_tests::PendingInstalledStore {
+            root,
+            path,
+            pool,
+            mut permit,
+            policy,
+            charge,
+        } = owner_mode_tests::pending_installed_store();
         let profile = ResourceProfile::SmallV1;
         let limits = profile.receiver_limits();
-        let context = wan::context([9; 32]);
-        let charge = profile.operation_charge().expect("engine bytes")
-            + SpiralCorePayloadFactory::owned_store_requirements()
-                .expect("filesystem work")
-                .workspace_bytes;
-        let pool = PayloadResourcePool::new(
-            PayloadResourceLimits {
-                max_active: 1,
-                resident_bytes: charge,
-                disk_bytes: 32 << 20,
-            },
-            None,
-            1 << 20,
-        )
-        .expect("fixture ledger");
-        let mut permit = pool
-            .reserve_installed_profile(profile)
-            .expect("fixture debit");
-        let policy = OwnedStorePolicy::small_v1(
-            &limits,
-            permit.owned_store_visits().expect("booked visits"),
-            OwnedLaneNamespaces::One(context.namespace().expect("fixture scope")),
-            spiralcore_transfer::v1::OwnedWorkspaceFunding {
-                heap_bytes: permit.owned_store_heap_bytes().expect("booked heap"),
-                existing_stack_bytes: 2 << 20,
-            },
-        )
-        .expect("policy");
-        let lease = permit
-            .begin_installed_store(parent, name)
-            .expect("original directory")
-            .capture(policy)
-            .expect("retained lease");
+        let Some(OwnedPayloadStore::Installed(store)) = permit.store.as_mut() else {
+            panic!("missing original installed store");
+        };
+        let lease = store.capture(policy).expect("retained lease");
         let capabilities = Capabilities::small_v1();
         let endpoint = ObjectEndpoint::open_at_with_resource_profile(
             lease,
