@@ -187,7 +187,7 @@ fn original_guest_protocol_child() {
 fn serve_journal(listener: &UnixListener, guest: SigningKey, host: &VerifyingKey, mode: &str) {
     let count = if mode == "journal-complete" {
         3
-    } else if mode == "journal-key" || mode == "journal-no-ping" {
+    } else if mode == "journal-key" {
         1
     } else {
         2
@@ -206,14 +206,16 @@ fn serve_journal(listener: &UnixListener, guest: SigningKey, host: &VerifyingKey
             guest.clone()
         };
         let mut offer = mvm_agentd::vsock::control_offer();
-        if index == 0 && mode == "journal-no-ping" {
+        if index == 0 && mode == "journal-no-run" {
+            // Canonical Ping is a version-only baseline probe. Its optional
+            // advertisement does not gate the original readiness request.
             assert!(offer.capabilities.remove(&GuestCapability::Ping));
         }
         if index > 0 && mode == "journal-no-run" {
             assert!(offer.capabilities.remove(&GuestCapability::RunEntrypoint));
         }
         let mut session = AuthenticatedSession::guest(&mut stream, signer, host, &offer).unwrap();
-        if (index == 0 && mode == "journal-no-ping") || (index > 0 && mode == "journal-no-run") {
+        if index > 0 && mode == "journal-no-run" {
             // A missing capability must refuse before even a protected frame
             // prefix is written, then fence the original journal continuation.
             assert_eq!(stream.read(&mut [0]).unwrap(), 0);
@@ -568,44 +570,39 @@ fn missing_advertised_entrypoint_capability_writes_no_operation_or_reopen() {
 
 #[test]
 fn journal_uses_each_session_advertisement_and_fences_capability_refusal() {
-    for mode in ["journal-no-ping", "journal-no-run"] {
-        let fixture = Fixture::new(mode);
-        let mut journal = fixture
-            .activated()
-            .finish_journal_activation(until())
-            .unwrap();
-        let (error, missing) = if mode == "journal-no-ping" {
-            (journal.ready(until()).unwrap_err(), GuestCapability::Ping)
-        } else {
-            journal.ready(until()).unwrap();
-            (
-                journal
-                    .entrypoint(&run(false), until(), &mut |_| {
-                        panic!("refused capability emitted event")
-                    })
-                    .unwrap_err(),
-                GuestCapability::RunEntrypoint,
-            )
-        };
-        assert!(
-            matches!(
-                error.downcast_ref::<RpcError>(),
-                Some(RpcError::CapabilityNotAdvertised { capability, .. }) if *capability == missing
-            ),
-            "{error:#}"
-        );
-        assert!(journal.ready(until()).is_err());
-        assert!(
-            journal
-                .entrypoint(&run(false), until(), &mut |_| panic!(
-                    "fenced journal emitted event"
-                ))
-                .is_err()
-        );
-        assert!(fixture.open().is_err());
-        drop(journal);
-        fixture.finish();
-    }
+    let fixture = Fixture::new("journal-no-run");
+    let mut journal = fixture
+        .activated()
+        .finish_journal_activation(until())
+        .unwrap();
+    // Ping stays version-gated even without its baseline advertisement.
+    journal.ready(until()).unwrap();
+    let error = journal
+        .entrypoint(&run(false), until(), &mut |_| {
+            panic!("refused capability emitted event")
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<RpcError>(),
+            Some(RpcError::CapabilityNotAdvertised {
+                capability: GuestCapability::RunEntrypoint,
+                ..
+            })
+        ),
+        "{error:#}"
+    );
+    assert!(journal.ready(until()).is_err());
+    assert!(
+        journal
+            .entrypoint(&run(false), until(), &mut |_| panic!(
+                "fenced journal emitted event"
+            ))
+            .is_err()
+    );
+    assert!(fixture.open().is_err());
+    drop(journal);
+    fixture.finish();
 }
 
 #[test]
