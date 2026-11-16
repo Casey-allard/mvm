@@ -117,8 +117,8 @@ pub use mvm_core::time::{Clock, SystemClock};
 pub use nonce_ledger::InMemoryNonceLedger;
 pub use registry_pack::{BuiltPackBootCheck, PreparedBuiltPackRuntime, prepare_built_pack_start};
 pub use rollback::{
-    apply_admitted_grants_or_undo_launch, record_charge_or_undo_launch,
-    record_charge_with_owned_rollback,
+    apply_admitted_grants_or_undo_launch, apply_grants_with_owned_rollback,
+    record_charge_or_undo_launch, record_charge_with_owned_rollback,
 };
 pub use shares::enforce_admitted_shares;
 pub use start::{StartAdmittedParams, StartedMachine, admit_and_start, start_admitted};
