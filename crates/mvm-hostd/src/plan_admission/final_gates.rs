@@ -1,5 +1,7 @@
 //! Host checks and prepared attachments performed after plan admission.
 
+#[cfg(target_os = "linux")]
+use super::verb_grant_sidecar;
 use anyhow::Result;
 use mvm_core::policy::PolicyBundle;
 use mvm_core::vm_backend::{BackendKind, VmStartConfig};

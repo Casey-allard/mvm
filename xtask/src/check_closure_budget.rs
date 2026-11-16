@@ -50,9 +50,9 @@ const BUDGETS: &[ClosureBudget] = &[
 const MACOS_CLOSURE_BUDGET: usize = 363;
 
 /// Maximum distinct packages in the default Linux closure.
-// Shared SpiralCore transfer/FlowMux/store, exact hashing, compression and
-// measured CPU accounting: canonical main 350 + 15 packages, no headroom.
-pub(crate) const CLOSURE_BUDGET: usize = 365;
+// Shared crypto, transfer/FlowMux/store, exact hashing, compression and CPU
+// accounting; measured complete Linux closure with no headroom.
+pub(crate) const CLOSURE_BUDGET: usize = 366;
 
 pub(crate) fn run(workspace: &Path) -> Result<()> {
     for budget in BUDGETS {

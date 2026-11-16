@@ -57,9 +57,9 @@
 
 use anyhow::{Context, Result};
 use mvm_core::plan::{ExecutionPlan, PlanId, SignedExecutionPlan, Variant};
-use mvm_core::vm_backend::{BackendKind, VmStartConfig};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use mvm_core::{policy::PolicyBundle, vm_backend::VmId};
+use mvm_core::policy::PolicyBundle;
+use mvm_core::vm_backend::{BackendKind, VmStartConfig};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use mvm_runtime::AnyBackend;
 
@@ -203,7 +203,7 @@ impl AdmittedPlan {
         config: VmStartConfig,
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
         bundle: Option<&PolicyBundle>,
-    ) -> Result<VmId> {
+    ) -> Result<mvm_core::vm_backend::VmId> {
         self.start_persistent_object_original_with_verified_runtime(
             launch, backend, config, images, bundle, None,
         )
@@ -219,7 +219,7 @@ impl AdmittedPlan {
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
         bundle: Option<&PolicyBundle>,
         verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
-    ) -> Result<VmId> {
+    ) -> Result<mvm_core::vm_backend::VmId> {
         anyhow::ensure!(
             !self.dispatched
                 && self.variant == Variant::Prod
@@ -285,7 +285,11 @@ impl AdmittedPlan {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn abort_unserved_object(&self, backend: &AnyBackend, id: &VmId) -> Result<()> {
+    pub fn abort_unserved_object(
+        &self,
+        backend: &AnyBackend,
+        id: &mvm_core::vm_backend::VmId,
+    ) -> Result<()> {
         let native = self.object_firecracker()?;
         native.require_live()?;
         native.boot()?.check_plan(self.plan())?;
