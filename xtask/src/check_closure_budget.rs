@@ -45,9 +45,9 @@ const BUDGETS: &[ClosureBudget] = &[
 ];
 
 /// macOS omits the Linux-only confinement and networking dependencies.
-// Shared SpiralCore transfer/FlowMux/store and native directory ownership;
-// measured against canonical main: 347 + 16 required packages, no headroom.
-const MACOS_CLOSURE_BUDGET: usize = 363;
+// Shared crypto, transfer/FlowMux/store and native directory ownership;
+// measured complete macOS closure with no headroom.
+const MACOS_CLOSURE_BUDGET: usize = 362;
 
 /// Maximum distinct packages in the default Linux closure.
 // Shared crypto, transfer/FlowMux/store, exact hashing, compression and CPU

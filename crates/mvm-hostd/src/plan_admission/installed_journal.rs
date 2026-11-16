@@ -1,5 +1,6 @@
 //! Canonical dispatch for an original resource-owned persistent journal.
 use super::*;
+use mvm_core::vm_backend::VmId;
 
 pub(super) fn verify_original_owner(
     config: &VmStartConfig,

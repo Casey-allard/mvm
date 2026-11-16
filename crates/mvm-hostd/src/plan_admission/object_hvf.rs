@@ -3,6 +3,7 @@
 //! lookup can construct or replace the native stop authority.
 use super::*;
 use anyhow::{Context, ensure};
+use mvm_core::vm_backend::VmId;
 use mvm_runtime::workload_runner::runner::OwnedRuntimeLaunch;
 use std::sync::{Arc, Mutex, MutexGuard};
 

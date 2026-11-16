@@ -36,7 +36,7 @@ use crate::rust_source::{CommentSyntax, blank_comments};
 
 // Measure original-owner contribution, runtime adoption and canonical gates.
 // Keep generated, vendored and regression source in the totals.
-// These ceilings match the measured tree without unallocated source headroom.
+// Last qualified totals remain recorded while the canonical ratchet is paused.
 /// Ceiling on total SLOC, all categories.
 const MAX_TOTAL_SLOC: usize = 1_050_561;
 /// Ceiling on total physical lines, all categories.
