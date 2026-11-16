@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 #[cfg(target_os = "linux")]
 #[test]
 fn parent_fsync_refusal_after_rmdir_retains_original_lease_lock_and_debit() {
-    let pending = super::owner_mode_tests::pending_installed_store_with_parent(|path| {
+    let pending = super::owner_mode_tests::prepare_store_fixture(|path| {
         std::fs::File::from(
             rustix::fs::open(
                 path,

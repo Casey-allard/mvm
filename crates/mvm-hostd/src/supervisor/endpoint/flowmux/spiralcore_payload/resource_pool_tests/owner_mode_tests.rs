@@ -18,12 +18,12 @@ pub(super) struct PendingInstalledStore {
 }
 
 pub(super) fn pending_installed_store() -> PendingInstalledStore {
-    pending_installed_store_with_parent(|path| {
+    prepare_store_fixture(|path| {
         std::fs::File::open(path).expect("original parent FD")
     })
 }
 
-pub(super) fn pending_installed_store_with_parent(
+pub(super) fn prepare_store_fixture(
     open: impl FnOnce(&std::path::Path) -> std::fs::File,
 ) -> PendingInstalledStore {
     let root = tempfile::Builder::new()
