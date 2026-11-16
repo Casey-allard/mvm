@@ -1282,6 +1282,20 @@ mod resource_pool_tests {
         assert!(!observation.called.load(Ordering::Acquire));
     }
     #[test]
+    fn retention_slots_exist_before_first_reservation() {
+        let limits = PayloadResourceLimits {
+            max_active: 2,
+            resident_bytes: 1 << 20,
+            disk_bytes: 1 << 20,
+        };
+        let pool = PayloadResourcePool::for_qualification(limits).expect("qualification pool");
+        let ledger = pool.inner.ledger.lock().expect("new pool ledger");
+        assert_eq!(ledger.used, PayloadPoolSnapshot::default());
+        assert!(ledger.stores.is_empty());
+        assert_eq!(ledger.stores.capacity(), usize::from(limits.max_active));
+    }
+
+    #[test]
     fn installed_store_workspace_is_charged_before_visits_are_available() {
         use spiralcore_transfer::resource_profile::ResourceProfile;
         let small = ResourceProfile::SmallV1;
