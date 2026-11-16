@@ -16,6 +16,8 @@ base64.workspace = true
 # Host-only: the `did_key` module's did:key codec. Optional so guest binaries
 # never resolve it; enabled by the `host-state` feature.
 bs58 = { workspace = true, optional = true }
+# Host-only exact-byte deploy artifact identities.
+blake3 = { workspace = true, optional = true }
 serde_jcs = "0.1"
 # Host-only: `workload_address` normalization. Optional; `host-state` pulls it.
 unicode-normalization = { version = "0.1", optional = true }
@@ -142,6 +144,7 @@ os-keyring = ["dep:keyring"]
 # `unicode-normalization`, `aho-corasick`, `tar`, `toml` or `regex`; host
 # crates opt in.
 host-state = [
+    "dep:blake3",
     "dep:bs58",
     "dep:unicode-normalization",
     "dep:aho-corasick",
@@ -170,10 +173,9 @@ client-remote = ["client", "dep:mvm-http"]
 # Expose `plan::signing::test_support` (shared `ExecutionPlan` fixtures) to
 # other crates' test builds without shipping the fixtures in a release build.
 test-support = []
-# The hostd IPC async transport in `protocol` (mvmd ↔ mvm-hostd control
-# channel: read/write_frame + send/recv request/response). The only
-# async surface in mvm-core besides `manifest-verify`; gated so the
-# default closure carries no tokio. Pulls tokio's `io-util`.
+# Host control-channel transport, shared async framing and the Unix
+# signer-helper client. Gated so the default closure carries no tokio.
+# The workspace Tokio selection supplies the client's net/time support.
 hostd-transport = ["dep:tokio", "tokio/io-util"]
 # Cosign-keyless manifest verification via the modular sigstore-verify stack.
 # Verification is synchronous and offline (embedded trust root + the bundle's
@@ -242,6 +244,10 @@ required-features = ["host-state"]
 
 # Integration tests that exercise host-state-gated modules (bundle archive
 # I/O, registry packs, receipts) only build where the feature is on.
+[[test]]
+name = "deploy_record"
+required-features = ["host-state"]
+
 [[test]]
 name = "bundle_streaming_memory"
 path = "tests/bundle_streaming_memory.rs"

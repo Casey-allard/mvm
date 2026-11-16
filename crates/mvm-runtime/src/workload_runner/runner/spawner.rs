@@ -32,6 +32,7 @@ pub struct NetworkEndpointSpawnRequest<'a> {
     pub vm_name: &'a str,
     pub state_dir: &'a Path,
     pub tenant: &'a str,
+    pub audit: Option<&'a mvm_core::audit_sink::AuditContext>,
     pub secrets: &'a [SecretBinding],
     pub redaction: &'a RedactionPolicy,
     pub network_policy: &'a NetworkPolicy,
@@ -181,6 +182,19 @@ impl TelemetryStart {
 /// over the in-process-VMM UDS transport.
 pub struct RealNetworkEndpointSpawner;
 
+fn workload_audit<'a>(
+    req: &'a NetworkEndpointSpawnRequest<'_>,
+) -> Result<&'a mvm_core::audit_sink::AuditContext> {
+    let audit = req
+        .audit
+        .context("workload endpoint has no admitted audit context")?;
+    let plan = audit
+        .plan()
+        .context("workload endpoint cannot use builder audit identity")?;
+    audit.validate_for(req.tenant, &plan.workload.0)?;
+    Ok(audit)
+}
+
 pub(super) fn telemetry_for_boot(
     collection_enabled: bool,
     identity: FlowMuxIdentitySource<'_>,
@@ -233,6 +247,7 @@ pub(super) fn prepare_standby_identity(
             vm_name: &spec.id,
             state_dir: Path::new(&spec.vm_state_dir),
             tenant: "local",
+            audit: None,
             secrets: &[],
             redaction: &RedactionPolicy::default(),
             network_policy: &NetworkPolicy::deny_all(),
@@ -305,6 +320,7 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
             Some(facts)
         };
         let session = hex::encode(handoff.partition().projection().session);
+        let audit = workload_audit(req)?;
         let uds = vm_network_endpoint_socket(req.vm_name);
         let (identity, drive) = prepare_endpoint_identity(
             req,
@@ -325,6 +341,7 @@ impl NetworkEndpointSpawner for RealNetworkEndpointSpawner {
             lifetime: EndpointLifetime::Launcher,
             telemetry: true,
             tenant: req.tenant,
+            audit: audit.clone(),
             secrets: req.secrets,
             redaction: req.redaction,
             transport: EndpointTransport::Uds { path: uds.clone() },
@@ -471,6 +488,7 @@ fn spawn_local_endpoint(
     req: &NetworkEndpointSpawnRequest<'_>,
     capture: Option<&Capture>,
 ) -> Result<SpawnedEndpoint> {
+    let audit = workload_audit(req)?;
     let uds = vm_network_endpoint_socket(req.vm_name);
     let egress_ca = BootEgressCa::resolve(req)?;
     let (identity, identity_drive) =
@@ -497,6 +515,7 @@ fn spawn_local_endpoint(
         lifetime: mvm_vmm::host::network_endpoint_spawn::EndpointLifetime::Vm,
         telemetry,
         tenant: req.tenant,
+        audit: audit.clone(),
         secrets: req.secrets,
         redaction: req.redaction,
         transport: EndpointTransport::Uds { path: uds.clone() },
@@ -837,6 +856,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workload_audit_refuses_missing_or_builder_identity_but_accepts_a_warm_alias() {
+        use mvm_core::audit_sink::AuditContext;
+        let mut request = NetworkEndpointSpawnRequest {
+            vm_name: "physical-warm-alias",
+            state_dir: Path::new("/unused"),
+            tenant: "local",
+            audit: None,
+            secrets: &[],
+            redaction: &RedactionPolicy::default(),
+            network_policy: &NetworkPolicy::deny_all(),
+            network_limits: mvm_core::plan::NetworkLimits::default(),
+            ingress: &[],
+            reader_plan: None,
+            mailbox_runtime: None,
+            identity: FlowMuxIdentitySource::Mint,
+        };
+        assert!(workload_audit(&request).is_err());
+        let builder = AuditContext::Builder {
+            tenant: mvm_core::plan::TenantId("local".into()),
+            name: request.vm_name.into(),
+        };
+        request.audit = Some(&builder);
+        assert!(workload_audit(&request).is_err());
+        let workload = AuditContext::Workload {
+            plan: Box::new(
+                mvm_core::plan::test_support::PlanFixture::new()
+                    .tenant("local")
+                    .build(),
+            ),
+        };
+        request.audit = Some(&workload);
+        assert!(workload_audit(&request).is_ok());
+    }
+
+    #[test]
     fn telemetry_follows_the_boot_that_asserted_it() {
         let quiet = tempfile::tempdir().unwrap();
         let asserted = tempfile::tempdir().unwrap();
@@ -910,6 +964,7 @@ mod tests {
                 vm_name: "isolated-guest",
                 state_dir: state,
                 tenant: "tenant",
+                audit: None,
                 secrets: &[],
                 redaction: &RedactionPolicy::default(),
                 network_policy: &NetworkPolicy::deny_all(),
@@ -1011,6 +1066,7 @@ mod tests {
             vm_name: "mailbox-parent",
             state_dir: &parent,
             tenant: "tenant",
+            audit: None,
             secrets: &[],
             redaction: &redaction,
             network_policy: &policy,
@@ -1083,6 +1139,7 @@ mod tests {
             vm_name: &plan.image.name,
             state_dir: &state,
             tenant: "tenant",
+            audit: None,
             secrets: &[],
             redaction: &RedactionPolicy::default(),
             network_policy: &NetworkPolicy::deny_all(),
@@ -1157,6 +1214,7 @@ mod tests {
                 vm_name: "inherited",
                 state_dir: Path::new("/unused-child"),
                 tenant: "tenant",
+                audit: None,
                 secrets: &[],
                 redaction: &RedactionPolicy::default(),
                 network_policy: &NetworkPolicy::deny_all(),

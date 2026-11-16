@@ -155,6 +155,7 @@ pub fn factory_parent_config(
         runner_dir: _,
         tenant_id: _,
         plan_json: _,
+        audit_context: _,
         caller_registration: _,
         #[cfg(unix)]
             host_lifetime: _,
@@ -249,6 +250,7 @@ pub fn factory_parent_config(
         runner_dir: None,
         tenant_id: None,
         plan_json: None,
+        audit_context: None,
         caller_registration: None,
         #[cfg(unix)]
         host_lifetime: None,

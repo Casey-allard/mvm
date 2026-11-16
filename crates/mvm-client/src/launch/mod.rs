@@ -40,7 +40,8 @@ mod stopped_machine;
 mod tests;
 mod transient;
 use stopped_machine::{
-    discard_stopped_runtime_state, remove_dir_if_present, remove_vm_runtime_dirs,
+    discard_stopped_runtime_state, ensure_spec_bootable_in_process, remove_dir_if_present,
+    remove_vm_runtime_dirs,
 };
 mod unbooted;
 #[cfg(unix)]
@@ -422,6 +423,15 @@ impl LocalBackend {
                     None,
                 )
             }
+            LaunchSource::PreparedImage { selection } => {
+                return Err(MvmError::PreparedImage {
+                    refusal: crate::prepared_image::PreparedImageError {
+                        kind: crate::prepared_image::PreparedImageErrorKind::UnsupportedMode,
+                        reference: selection.canonical_reference.clone(),
+                        detail: "prepared OCI reuse supports persistent launches only".into(),
+                    },
+                });
+            }
             LaunchSource::RegistryPack { pin } => {
                 let image =
                     built_pack::resolve_built_pack_image(pin, backend.name(), &params.profile)
@@ -532,7 +542,7 @@ impl LocalBackend {
                 assurance: campaign.as_ref(),
             },
         )
-        .map_err(|e| crate::local::backend_err(format!("{e:#}")))
+        .map_err(prepared_client_error)
     }
 
     /// Load a declared campaign and bind it to this boot.
@@ -1061,6 +1071,22 @@ impl LocalBackend {
             persistent::journal::validate_slot(None, request.mailbox.as_ref())
                 .map_err(crate::local::backend_err)?;
         }
+        if let LaunchSource::PreparedImage { selection } = &request.source {
+            if request.mode != LifecycleMode::Persistent {
+                return Err(MvmError::PreparedImage {
+                    refusal: crate::prepared_image::PreparedImageError {
+                        kind: crate::prepared_image::PreparedImageErrorKind::UnsupportedMode,
+                        reference: selection.canonical_reference.clone(),
+                        detail: "prepared OCI reuse supports persistent launches only".into(),
+                    },
+                });
+            }
+            let backend = self.launch_backend(request.backend.as_deref())?;
+            crate::image_cache::prepared::revalidate(selection, backend.name(), &request.profile)
+                .map_err(|refusal| MvmError::PreparedImage { refusal })?;
+            crate::image_cache::prepared::cached_kernel(selection, backend.name())
+                .map_err(|refusal| MvmError::PreparedImage { refusal })?;
+        }
         if let LaunchSource::RegistryPack { pin } = &request.source {
             let backend = self.launch_backend(request.backend.as_deref())?;
             built_pack::resolve_built_pack_image(pin, backend.name(), &request.profile)
@@ -1245,7 +1271,7 @@ impl LocalBackend {
             journal,
             reservation,
         )
-        .map_err(|e| crate::local::backend_err(format!("{e:#}")))?;
+        .map_err(prepared_client_error)?;
         Ok((started, backend))
     }
 
@@ -1448,47 +1474,11 @@ impl LocalBackend {
     }
 }
 
-/// Refusals for persisted-spec shapes a library start cannot honor (fail
-/// closed, never silently ignore a persisted field): the start path boots an
-/// image, a built manifest or a deployment, and its volumes arrive as typed
-/// attachments; the CLI-only shapes stay with `mvmctl machine start`.
-fn ensure_spec_bootable_in_process(spec: &mp::MachineSpec) -> Result<()> {
-    let unsupported = |what: &str| MvmError::InvalidSpec {
-        reason: format!(
-            "machine {:?} declares {what}, which a library start cannot honor; use the CLI's \
-             `machine start`",
-            spec.name
-        ),
-    };
-    if spec.runtime_pack {
-        return Err(unsupported("a runtime-pack source"));
+fn prepared_client_error(error: anyhow::Error) -> MvmError {
+    if let Some(refusal) = error.downcast_ref::<crate::prepared_image::PreparedImageError>() {
+        return MvmError::PreparedImage {
+            refusal: refusal.clone(),
+        };
     }
-    if !spec.volumes.is_empty() {
-        return Err(unsupported(
-            "CLI-grammar volume strings (use typed attachments)",
-        ));
-    }
-    if !spec.init.is_empty() {
-        return Err(unsupported("init commands"));
-    }
-    if spec.registry_pack_image.is_some() {
-        machine_start::validate_registry_pack_source(spec).map_err(|error| {
-            MvmError::InvalidSpec {
-                reason: format!("invalid registry pack source: {error:#}"),
-            }
-        })?;
-    }
-    if spec.image.is_none()
-        && spec.manifest.is_none()
-        && spec.deployment.is_none()
-        && spec.registry_pack_image.is_none()
-    {
-        return Err(MvmError::InvalidSpec {
-            reason: format!(
-                "machine {:?} has no image, manifest or deployment source",
-                spec.name
-            ),
-        });
-    }
-    Ok(())
+    crate::local::backend_err(format!("{error:#}"))
 }

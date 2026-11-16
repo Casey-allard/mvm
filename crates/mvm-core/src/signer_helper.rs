@@ -1,0 +1,317 @@
+//! Unix client for the resident per-tenant signer helper.
+
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+
+use crate::protocol::audit_signer::{
+    SignerHelperRequest, SignerHelperResponse, SignerHelperSignHost,
+};
+use crate::protocol::host_signer::{SignRequest, SignResponse};
+use anyhow::{Context, Result, bail};
+
+/// Default cap for helper control frames.
+pub const DEFAULT_HELPER_MAX_FRAME_BYTES: usize = 64 * 1024;
+
+mod telemetry {
+    //! Deadline-bounded telemetry authentication through the resident signer.
+
+    use std::time::Duration;
+
+    use crate::{
+        net::telemetry::{TelemetryError, handshake_signing_bytes},
+        protocol::{
+            audit_signer::{SignerHelperRequest, SignerHelperResponse, SignerHelperSignHost},
+            host_signer::{SignRequest, SignResponse, TelemetryHandshake},
+        },
+        security::{SIG_ALG_ED25519, SessionHello, SessionHelloAck},
+    };
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    use super::SignerHelperClient;
+
+    impl SignerHelperClient {
+        /// Sign a validated telemetry handshake through the key-owning helper.
+        /// One deadline covers connection, write and read. The timeout must be
+        /// nonzero and at most 30 seconds. Refusals never include remote payloads.
+        ///
+        /// Cancellation drops the exclusively owned socket and leaves no task or
+        /// thread behind. Call from the collector worker, never a trace producer.
+        pub async fn sign_telemetry_handshake(
+            &self,
+            hello: &SessionHello,
+            ack: &SessionHelloAck,
+            host_key: &VerifyingKey,
+            timeout: Duration,
+        ) -> Result<Signature, TelemetryError> {
+            if timeout.is_zero() || timeout > Duration::from_secs(30) {
+                return Err(TelemetryError::Authentication);
+            }
+            tokio::time::timeout(timeout, async {
+                let transcript = handshake_signing_bytes(hello, ack, host_key)?;
+                let request_id = hello.session_id.clone();
+                let request = SignerHelperRequest::SignHost(SignerHelperSignHost {
+                    request_id: request_id.clone(),
+                    request: SignRequest::SignTelemetryHandshake {
+                        request_id: request_id.clone(),
+                        handshake: Box::new(TelemetryHandshake {
+                            hello: hello.clone(),
+                            ack: ack.clone(),
+                        }),
+                    },
+                });
+                let mut stream = tokio::net::UnixStream::connect(&self.uds_path)
+                    .await
+                    .map_err(|_| TelemetryError::Authentication)?;
+                crate::framing::write_json_frame(&mut stream, &request)
+                    .await
+                    .map_err(|_| TelemetryError::Authentication)?;
+                let response: SignerHelperResponse =
+                    crate::framing::read_json_frame(&mut stream, self.max_frame_bytes)
+                        .await
+                        .map_err(|_| TelemetryError::Authentication)?;
+                verified_signature(response, &request_id, &transcript, host_key)
+            })
+            .await
+            .map_err(|_| TelemetryError::Authentication)?
+        }
+    }
+
+    pub fn verified_signature(
+        response: SignerHelperResponse,
+        request_id: &str,
+        transcript: &[u8],
+        host_key: &VerifyingKey,
+    ) -> Result<Signature, TelemetryError> {
+        let SignerHelperResponse::HostSigned {
+            request_id: echoed,
+            response,
+        } = response
+        else {
+            return Err(TelemetryError::Authentication);
+        };
+        if echoed != request_id || response.request_id() != request_id {
+            return Err(TelemetryError::Authentication);
+        }
+        let SignResponse::Ok {
+            sig_alg,
+            signature,
+            signer_pubkey,
+            ..
+        } = response
+        else {
+            return Err(TelemetryError::Authentication);
+        };
+        if sig_alg != SIG_ALG_ED25519 || signer_pubkey != host_key.as_bytes() {
+            return Err(TelemetryError::Authentication);
+        }
+        let signature =
+            Signature::from_slice(&signature).map_err(|_| TelemetryError::Authentication)?;
+        host_key
+            .verify(transcript, &signature)
+            .map_err(|_| TelemetryError::Authentication)?;
+        Ok(signature)
+    }
+}
+/// Verify the resident signer's typed response against the canonical handshake
+/// transcript and pinned host key. This pure check grants no signing authority.
+pub use telemetry::verified_signature as verify_telemetry_signature;
+
+#[derive(Debug, Clone)]
+pub struct SignerHelperClient {
+    uds_path: PathBuf,
+    max_frame_bytes: usize,
+}
+
+impl SignerHelperClient {
+    pub fn new(uds_path: impl Into<PathBuf>) -> Self {
+        Self {
+            uds_path: uds_path.into(),
+            max_frame_bytes: DEFAULT_HELPER_MAX_FRAME_BYTES,
+        }
+    }
+
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes;
+        self
+    }
+
+    pub fn send(&self, req: &SignerHelperRequest) -> Result<SignerHelperResponse> {
+        send_helper_request(&self.uds_path, req, self.max_frame_bytes)
+    }
+
+    pub fn sign_host(&self, req: SignRequest) -> Result<SignResponse> {
+        let request_id = req.request_id().to_string();
+        let outcome: Result<SignResponse> =
+            match self.send(&SignerHelperRequest::SignHost(SignerHelperSignHost {
+                request_id: request_id.clone(),
+                request: req,
+            }))? {
+                SignerHelperResponse::HostSigned { response, .. } => Ok(response),
+                SignerHelperResponse::Err { message, .. } => {
+                    bail!("signer-helper host-sign refused: {message}")
+                }
+                other => bail!("signer-helper returned unexpected host-sign response: {other:?}"),
+            };
+        outcome.with_context(|| format!("host-sign request {request_id} via signer helper"))
+    }
+}
+
+fn send_helper_request(
+    path: &Path,
+    req: &SignerHelperRequest,
+    max_frame_bytes: usize,
+) -> Result<SignerHelperResponse> {
+    let mut stream =
+        UnixStream::connect(path).with_context(|| format!("connect {}", path.display()))?;
+    let body = serde_json::to_vec(req).context("encode signer-helper request")?;
+    let len: u32 = body
+        .len()
+        .try_into()
+        .context("signer-helper request too large")?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .with_context(|| format!("write signer-helper request len to {}", path.display()))?;
+    stream
+        .write_all(&body)
+        .with_context(|| format!("write signer-helper request body to {}", path.display()))?;
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .with_context(|| format!("read signer-helper response len from {}", path.display()))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > max_frame_bytes {
+        bail!("signer-helper response {len} bytes exceeds cap {max_frame_bytes}");
+    }
+    let mut body = vec![0u8; len];
+    stream
+        .read_exact(&mut body)
+        .with_context(|| format!("read signer-helper response body from {}", path.display()))?;
+    serde_json::from_slice(&body).context("decode signer-helper response")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::protocol::audit_signer::AuditSignerErrorCode;
+    use crate::protocol::host_signer::HostSignerErrorCode;
+    use tempfile::tempdir;
+    use tokio::net::UnixListener;
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    async fn spawn_mock(
+        path: PathBuf,
+        response: SignerHelperResponse,
+        captured: Arc<Mutex<Option<SignerHelperRequest>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req: SignerHelperRequest =
+                crate::framing::read_json_frame(&mut stream, DEFAULT_HELPER_MAX_FRAME_BYTES)
+                    .await
+                    .unwrap();
+            *captured.lock().await = Some(req);
+            crate::framing::write_json_frame(&mut stream, &response)
+                .await
+                .unwrap();
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sign_host_unwraps_nested_response() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("helper.sock");
+        let captured = Arc::new(Mutex::new(None));
+        let mock = spawn_mock(
+            path.clone(),
+            SignerHelperResponse::HostSigned {
+                request_id: "sign-1".into(),
+                response: SignResponse::Ok {
+                    request_id: "sign-1".into(),
+                    sig_alg: crate::security::SIG_ALG_ED25519,
+                    signature: vec![0u8; 64],
+                    signer_pubkey: vec![1u8; 32],
+                },
+            },
+            captured.clone(),
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        let client = SignerHelperClient::new(&path);
+        let resp = tokio::task::spawn_blocking(move || {
+            client.sign_host(SignRequest::SignPlan {
+                bytes: b"plan".to_vec(),
+                request_id: "sign-1".into(),
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.request_id(), "sign-1");
+
+        let captured_req = captured.lock().await.clone().expect("mock captured");
+        assert!(matches!(captured_req, SignerHelperRequest::SignHost(_)));
+        mock.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_response_kind_is_an_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("helper.sock");
+        let mock = spawn_mock(
+            path.clone(),
+            SignerHelperResponse::Err {
+                request_id: "sign-1".into(),
+                code: AuditSignerErrorCode::InvalidRequest,
+                message: "bad request".into(),
+            },
+            Arc::new(Mutex::new(None)),
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        let client = SignerHelperClient::new(&path);
+        let err = tokio::task::spawn_blocking(move || {
+            client.sign_host(SignRequest::SignPlan {
+                bytes: b"plan".to_vec(),
+                request_id: "sign-1".into(),
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(err.to_string().contains("host-sign refused"));
+        mock.abort();
+    }
+
+    #[test]
+    fn missing_helper_socket_errors() {
+        let dir = tempdir().unwrap();
+        let client = SignerHelperClient::new(dir.path().join("missing.sock"));
+        let err = client
+            .sign_host(SignRequest::SignPlan {
+                bytes: b"plan".to_vec(),
+                request_id: "sign-1".into(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("connect"));
+    }
+
+    #[test]
+    fn sign_response_err_is_returned_to_caller() {
+        let resp = SignerHelperResponse::HostSigned {
+            request_id: "sign-1".into(),
+            response: SignResponse::Err {
+                request_id: "sign-1".into(),
+                code: HostSignerErrorCode::NotReady,
+                message: "loading".into(),
+            },
+        };
+        assert_eq!(resp.request_id(), "sign-1");
+    }
+}

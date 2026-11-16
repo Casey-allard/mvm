@@ -184,6 +184,21 @@ guest-RPC surface, fleet-shaped workflows).
 | `mvmctl machine set-timeout <name> <seconds>` | Update the runtime idle timeout of a running machine; `<seconds>` must be greater than 0 |
 | `mvmctl machine rekernel <name> [--flake <ref>] [--kernel-pin <kernel>] [--hypervisor <backend>]` | Relaunch a VM on a chosen or updated workload kernel; `--flake` rebuilds the source for the new boot, `--kernel-pin` uses the locally built workload kernel from the mvm cache instead of the one the image ships |
 
+### Network audit failures
+
+A FlowMux endpoint must establish its plan-bound audit sink before reporting
+ready. This is required in development as well as production. If a required flow
+record cannot be written, an allow is refused and a deny remains denied with
+incomplete host evidence.
+
+The same recording rule applies in development and under `--prod`. A recovered
+journal permits later operations only after their own required writes succeed;
+successful writes reset the failure streak, not the incomplete evidence mark.
+VM lifecycle behavior is unchanged. Automatic VM termination after three
+consecutive production audit failures remains required but unimplemented; this
+audit-only change does not claim that guarantee.
+See [flow audit availability](/guides/flowmux-networking/#audit-availability-is-part-of-readiness).
+
 ### GPU device selection
 
 `mvmctl run`, `mvmctl machine run`, `mvmctl machine create`, and the
@@ -749,7 +764,11 @@ admission until their transports are wired.
 
 ## Guest Binaries
 
-The `mvm-guest-bins` archive is mvm's guest runtime as one versioned unit: every guest artifact mvm owns, built from this repository. In a source checkout, `mvmctl machine run` builds it once and assembles the runtime overlay, initramfs, and required SDK sidecar on the host from its verified contents. Each CLI release publishes the archive as a signed asset, version-locked to the CLI and listed in the release's signed checksum manifest. `install.sh` and the deb and rpm packages install it beside `mvmctl` (in the release directory's `guest-runtime/`, or `/usr/lib/mvmctl/guest-runtime/`), and `mvmctl bootstrap` on a downloaded binary otherwise fetches it, held to its digest and then its signature; `mvmctl env update` fetches the new version's archive before it replaces the binary. Installation no longer runs full bootstrap by default; set `MVM_BOOTSTRAP_ON_INSTALL=1` to prewarm everything instead. On a first `machine run --image`, the CLI downloads the workload kernel if missing, assembles the overlay, initramfs and OCI guest shims from the verified release archive (or the source checkout for a source build), reports preparation, and caches them for later runs; it does not require a separate `bootstrap` or `image pull`. A source build may take longer on this first run; `--no-build` still refuses that cold build. `mvmctl bootstrap` also prepares SDK sidecars ahead of time, and `mvmctl doctor`'s `guest runtime` line names the archive each piece came from. A launch attaches only the pieces assembled this way and never an image set's copy: the image set's contract is the Linux layer, and a set that still publishes an overlay, sidecars or initramfs is read with those members ignored. The archive is not an `mvm-images` input; that repository still publishes its own guest artifacts until its side of the image boundary lands, and nothing in `mvmctl` reads them except a portable bundle's boot assets.
+The `mvm-guest-bins` archive is mvm's guest runtime as one versioned unit: every guest artifact mvm owns, built from this repository. Each CLI release publishes it as a signed asset, version-locked to the CLI and listed in the release's signed checksum manifest. `install.sh` and the deb and rpm packages install it beside `mvmctl` (in the release directory's `guest-runtime/`, or `/usr/lib/mvmctl/guest-runtime/`). `mvmctl env update` fetches the new version's archive before it replaces the binary.
+
+`install.sh` prewarms the shared runtime and workload kernel by default. Set `MVM_SKIP_BOOTSTRAP=1` to defer that work until the first machine command. The first `machine run --image` also pulls an uncached OCI image; it does not require a separate `bootstrap` or `image pull`. First-use preparation and image acquisition take longer than a prepared launch. A source build can assemble the overlay, initramfs, SDK sidecar and OCI guest shims from its own guest runtime; `--no-build` refuses a cold source build. `mvmctl doctor` names the archive each piece came from.
+
+A launch attaches only pieces assembled from the verified guest runtime, never an image set's copy: the image set's contract is the Linux layer, and a set that still publishes an overlay, sidecars or initramfs is read with those members ignored. The archive is not an `mvm-images` input; that repository still publishes its own guest artifacts until its side of the image boundary lands, and nothing in `mvmctl` reads them except a portable bundle's boot assets.
 
 | Command | Description |
 | ------- | ----------- |
@@ -845,6 +864,16 @@ it. There is no automatic runtime-generation garbage collection.
 | `mvmctl image boot verify --manifest <f> --bundle <f> [--lock <f>] --artifacts <dir> [--artifact <name> ...] [--require-complete] [--check-revocations] [--json]` | Verify a published image set offline. Without `--artifact`, verify every member artifact. With repeatable `--artifact`, verify only the named declared artifact bytes while still checking the signed manifest against the lock, its producer, structure, and signature; output explicitly marks unselected artifacts as unverified. The omitted lock uses the pin compiled into `mvmctl`. With `--check-revocations`, also refuse a revoked set or member under the signed image-set revocation list applied with `mvmctl image revocations update`; a missing, expired, or modified list fails the command rather than being treated as empty. Without it, revocation status is not checked. No network or cache writes; a refusal names its stage and exits nonzero. |
 | `mvmctl image revocations update --document <revocations.json> --bundle <revocations.json.bundle>` | Apply the signed image-set revocation list published at `https://github.com/tinylabscom/mvm-images/releases/download/revocations/revocations.json`. The bundle must name the mvm-images `revocations.yml` workflow at a `revocation-list/v<N>` tag under the GitHub Actions issuer; any other signer, including the registry-pack revocation authority, is refused. The list must be inside its own validity window (at most 62 days), and neither the publication number `N` nor `issued_at` may go back from the last applied list. Two different lists at the same `N` or `issued_at` are refused. A refused list leaves the local copy unchanged. No network. |
 | `mvmctl image revocations status [--json]` | Re-verify the applied image-set revocation list and report its publication, validity window, digest, signer, and entry count. A missing, expired, incomplete, or modified local copy exits nonzero and names the command that fixes it. |
+
+The Rust client's explicit development-only, persistent-only prepared OCI mode reuses this
+same image-cache owner; it does not add a Studio downloader, cache reader,
+verifier, or CLI subprocess. Prepared selection and every later launch/Start
+check the current preparation and expected identity without acquisition.
+Missing or changed preparation refuses with an explicit remedy. Adoption of
+an already-built matching runtime variant may update the cache index.
+Ordinary OCI acquisition commands and production CLI trust checks are unchanged.
+Development rootfs measurements are not publisher verification or proof of
+historical OCI-to-rootfs derivation.
 
 `image boot verify` also checks compatibility with this CLI. Legacy schema 2
 sets retain their guest-protocol declaration. Linux-only schema 3 sets must

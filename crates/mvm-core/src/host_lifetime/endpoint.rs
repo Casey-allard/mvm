@@ -359,6 +359,34 @@ impl PreparedEndpointHandoff {
         Ok(())
     }
 
+    /// Match the complete audit plan to the original opaque admission.
+    /// Callers fund the bounded configuration workspace before hashing it.
+    /// This check grants no journal, network or lifecycle authority.
+    pub fn check_audit_context(&self, context: &crate::audit_sink::AuditContext) -> Result<()> {
+        self.check_current()?;
+        let plan = context
+            .plan()
+            .context("installed audit requires the original workload plan")?;
+        context.validate_for(&plan.tenant.0, &plan.workload.0)?;
+        let digest: [u8; 32] = Sha256::digest(serde_jcs::to_vec(plan)?).into();
+        let admission = self
+            .anchor
+            .admitted
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original admission poisoned"))?;
+        ensure!(
+            admission.as_ref().is_some_and(|record| {
+                record.body_sha256 == digest
+                    && record.plan_id == plan.plan_id
+                    && record.nonce == plan.nonce
+                    && record.plan_id.0 == self.partition.projection().admitted_plan_id
+            }),
+            "audit context differs from original selected admission"
+        );
+        drop(admission);
+        self.check_current()
+    }
+
     pub fn check_current(&self) -> Result<()> {
         self.anchor.verify_current()?;
         let parent = self

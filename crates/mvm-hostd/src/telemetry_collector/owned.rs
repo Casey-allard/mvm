@@ -403,7 +403,7 @@ pub(crate) fn start_owned(
                         )
                     };
                     let client =
-                        crate::audit_signer::helper_client::SignerHelperClient::new(&signer_sock)
+                        crate::audit_signer::owned_helper::OwnedSignerClient::new(&signer_sock)
                             .with_original_child(audit.signer_pid());
                     client
                         .sign_owned_telemetry_handshake(

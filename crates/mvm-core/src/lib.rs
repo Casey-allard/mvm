@@ -9,6 +9,7 @@
 pub mod action;
 pub mod admission_durability;
 pub mod arch;
+pub mod audit_sink;
 pub mod audit_verify;
 pub mod build_env;
 pub mod canonical_linux;
@@ -31,6 +32,8 @@ pub mod bounded_run;
 pub mod client;
 pub mod cold_build;
 pub mod config;
+#[cfg(feature = "host-state")]
+pub mod deploy_record;
 pub mod dev_network;
 /// did:key codec for host-side signing identity (receipts, conformance).
 /// Host-state only: guest binaries never sign or parse host identity.
@@ -85,6 +88,9 @@ pub mod mailbox;
 /// Shared backoff for polls that wait on a condition.
 pub mod poll_backoff;
 pub mod runtime_state_protection;
+/// Client for the resident host signer, available only on Unix transports.
+#[cfg(all(unix, feature = "hostd-transport"))]
+pub mod signer_helper;
 /// Per-VM host bounds on a VMM process through a transient systemd scope on
 /// the user's own manager — the one mechanism that both places an unprivileged
 /// process under cgroup v2 CPU, memory and task limits and reports back what is
@@ -176,6 +182,7 @@ pub mod mvmd_iface;
 pub mod plan;
 pub mod platform;
 pub mod policy;
+pub mod prepared_image;
 pub mod private_fs;
 pub mod protocol;
 #[cfg(feature = "provenance")]
@@ -200,8 +207,8 @@ pub mod session_transition;
 pub mod snapshot_frame;
 /// Read side of the workload stream plane: the consumer trait, its filters,
 /// and the framed transport to a VM's host-side broker. Lives here rather
-/// than in `mvm-client` so `mvm-sdk` — which sits below `mvm-hostd`, which
-/// `mvm-client` depends on — can expose the same reader without a cycle.
+/// than in `mvm-client` so `mvm-sdk` can expose the same reader without
+/// depending on the runtime client.
 /// Host-state: the console reader redacts with `pii::PiiRedactor`.
 #[cfg(feature = "host-state")]
 pub mod stream_client;

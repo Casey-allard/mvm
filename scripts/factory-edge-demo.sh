@@ -56,7 +56,8 @@ fi
 heal_helper() {
   [ "$(uname -s)" = Darwin ] || return 0
   local real helper fresh
-  real="$(python3 -c 'import os,shutil,sys; p=shutil.which(sys.argv[1]) or sys.argv[1]; print(os.path.realpath(p))' "$mvm" 2>/dev/null)" || return 0
+  # perl ships with macOS; python3 there can be a stub that opens an installer.
+  real="$(perl -MCwd=realpath -e 'print realpath(shift)' "$(command -v "$mvm" || echo "$mvm")" 2>/dev/null)" || return 0
   helper="$(dirname "$real")/mvm-hvf-supervisor"
   [ -x "$helper" ] || return 0
   probe() { bash -c 'perl -e "alarm 10; exec @ARGV" "$0" --contract-version </dev/null >/dev/null 2>&1' "$1" 2>/dev/null; }
@@ -69,7 +70,27 @@ heal_helper() {
     echo "warning: $helper does not start; the launches below will fail" >&2
   fi
 }
+command -v "$mvm" >/dev/null 2>&1 || { echo "error: $mvm is not installed. Install the release first (see scripts/factory-edge-demo.md)." >&2; exit 1; }
+
+# The macOS workload backend (Hypervisor.framework) needs Apple Silicon and
+# macOS 26 or later; say so plainly instead of failing inside the first launch.
+if [ "$(uname -s)" = Darwin ]; then
+  macos="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+  if [ "$(uname -m)" != arm64 ] || [ "${macos%%.*}" -lt 26 ]; then
+    echo "error: this demo needs an Apple Silicon Mac on macOS 26 or later (this one: $(uname -m), macOS $macos)." >&2; exit 1
+  fi
+fi
+
 heal_helper
+
+# Firecracker refuses to run as root, and the Linux host needs /dev/kvm access
+# and a systemd user session (for the CPU and memory scope around each VM).
+if [ "$(uname -s)" = Linux ]; then
+  if [ "$(id -u)" = 0 ]; then
+    echo "error: on Linux run this as a normal user in the kvm group, not as root." >&2; exit 1
+  fi
+  [ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "error: /dev/kvm is not accessible to $(id -un); add the user to the kvm group." >&2; exit 1; }
+fi
 
 id="$(date +%H%M%S)"   # names are unique per run, so `explain <name>` is never ambiguous
 a="line-a-$id"; b="line-b-$id"; m="maintenance-$id"
@@ -93,8 +114,9 @@ work() { echo "while true; do curl -sS -m 10 -o /dev/null https://$1/; sleep 2; 
 # throwaway run does. Every later run of the script skips this.
 prepare() {
   echo "Preparing this machine once (image and runtime); this takes a few minutes"
-  $mvm image pull "$image" >/dev/null
-  $mvm run --image "$image" -- true >/dev/null 2>&1 </dev/null
+  local out
+  out="$($mvm image pull "$image" 2>&1)" || { echo "could not pull $image:" >&2; echo "$out" >&2; return 1; }
+  out="$($mvm run --image "$image" -- true 2>&1 </dev/null)" || { echo "the first run on this machine failed:" >&2; echo "$out" >&2; return 1; }
 }
 
 # Start the three workloads at once. Sets `unprepared` when any was refused
@@ -114,7 +136,7 @@ start_all() {
 echo "Starting three workloads at once, each allowed one destination"
 start_all
 if [ -n "$unprepared" ]; then
-  prepare
+  prepare || exit 1
   echo "Starting three workloads at once, each allowed one destination"
   start_all
 fi

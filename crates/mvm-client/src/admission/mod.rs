@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result, bail};
 
+use mvm_core::deploy_record::{BootArtifactIdentity, read_deploy_record, verify_boot_artifact};
 use mvm_core::plan::{StreamRetention, SynthesisInput, Variant};
 use mvm_core::policy::PolicyBundle;
 pub use mvm_hostd::plan_admission::{
@@ -21,7 +22,6 @@ pub use mvm_hostd::plan_admission::{
     RunPosture, SystemClock, admit_for_run, populate_audit_substrate,
     stash_plan_and_mint_verb_grant, stash_plan_for_bridge,
 };
-use mvm_sdk::deploy::{BootArtifactIdentity, read_deploy_record, verify_boot_artifact};
 
 use crate::admission::entrypoint_resolve::ResolvedEntrypoint;
 use crate::admission::policy_resolver::{
@@ -49,7 +49,9 @@ pub mod entrypoint_resolve;
 pub mod instructions;
 pub mod mailbox_grant;
 mod outcome;
+mod params;
 mod pinned_bundle;
+pub use params::{AdmitPlanForBootParams, AssetSpec};
 pub mod policy;
 pub mod policy_resolver;
 pub mod run_grants;
@@ -72,191 +74,6 @@ pub use enforce::{enforce_kernel, enforce_shares, enforce_shares_for_claim};
 pub use instructions::InstructionSources;
 pub(crate) use outcome::record_boot;
 pub use outcome::{BootPosture, StartMode, emit_failed, emit_launched};
-
-/// A content-bound asset. Operator-declared files and internally selected
-/// signed packs are recorded in the plan without sharing them with the guest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AssetSpec {
-    /// An operator-declared host file or directory to hash.
-    File {
-        kind: mvm_contract::plan::AssetKind,
-        host_path: String,
-    },
-    /// An internally selected signed pack; never accepted from `--asset`.
-    RegistryPack(mvm_core::registry_pack::PackPin),
-}
-
-pub struct AdmitPlanForBootParams<'a> {
-    /// Mailbox this launch grants, minted into the plan before signing.
-    pub mailbox: Option<mvm_contract::protocol::mailbox::MailboxGrant>,
-    pub tenant: &'a str,
-    pub vm_name: &'a str,
-    pub backend_name: &'a str,
-    /// Local image checkout selected by the process entry point, if any.
-    ///
-    /// Admission consumes this captured value instead of rereading
-    /// `MVM_IMAGES_DIR`. Besides making the authority explicit for library
-    /// callers, that keeps one admission stable if unrelated code changes the
-    /// process environment concurrently.
-    pub configured_images_dir: Option<&'a std::path::Path>,
-    pub rootfs_path: &'a std::path::Path,
-    /// The kernel this launch will boot, pinned into the plan's
-    /// `EnvironmentRef` and re-checked by the admitted-environment gate.
-    ///
-    /// `None` only for backends that carry their own kernel (libkrun's
-    /// bundled image, the mock). For everything else this must be the same
-    /// path handed to the backend: the image digest says what the workload
-    /// *is* and says nothing about what confines it, so a plan that names the
-    /// image but not the kernel admits a workload onto whatever kernel the
-    /// host happened to have cached.
-    pub kernel_path: Option<&'a std::path::Path>,
-    /// Skip re-hashing `rootfs_path` and admit with this sha256 instead.
-    /// Only sound when a fail-closed integrity check re-hashes the same
-    /// bytes before boot (the checkpoint fork path: `verify_content`
-    /// refuses a tampered blob before any supervisor spawns) — a
-    /// mismatch then aborts the launch, never boots a mis-admitted image.
-    pub precomputed_image_sha256: Option<String>,
-    /// Optional deploy-record identity for the exact rootfs selected by this
-    /// boot. When present, both labeled digests and the byte count are
-    /// reverified before plan synthesis.
-    pub boot_artifact_identity: Option<&'a BootArtifactIdentity>,
-    /// The exact selected runtime, verified before it can contribute assurance.
-    pub runtime_config: Option<&'a mvm_core::vm_backend::VmStartConfig>,
-    pub cpus: u32,
-    pub mem_mib: u64,
-    /// The transport this launch gives the guest, recorded on the plan.
-    ///
-    /// Was hardcoded to `Default::default()` — `NetworkMode::None`, whose own
-    /// doc reads "no guest NIC, no broker, the workload cannot reach the
-    /// network" — while every ordinary launch derives `HostVsockProxy` and the
-    /// host stands a broker up for it. The signed record said the workload had
-    /// no path to the network while it was being given one.
-    pub network_mode: mvm_contract::plan::NetworkMode,
-    pub seccomp_tier: mvm_core::plan::PlanSeccompTier,
-    pub secret_release: mvm_core::plan::SecretReleasePolicy,
-    pub secrets: Vec<mvm_core::plan::SecretBinding>,
-    /// Opaque caller commitment copied into the plan and its audit entries.
-    pub caller_commitment: Option<mvm_core::plan::CallerCommitment>,
-    pub ledger: &'a InMemoryNonceLedger,
-    /// Override for the host-signer keys directory. Production callers
-    /// pass `None`, which resolves to `~/.mvm/keys/`; tests pass a
-    /// tempdir so they don't write into the real user's home.
-    pub keys_dir: Option<&'a std::path::Path>,
-    /// Override for the audit-chain directory (`~/.mvm/audit/`).
-    /// Tests inject a tempdir; production passes `None`.
-    pub audit_dir: Option<&'a std::path::Path>,
-    /// Override for the policy-bundle root (`~/.mvm/policies/`). The
-    /// resolver reads `<dir>/<tenant>/<workload>.toml` when a
-    /// plan's policy refs name a tenant-scoped bundle; tests inject a
-    /// tempdir so a bogus bundle can be staged without touching the
-    /// real user's home.
-    pub policy_dir: Option<&'a std::path::Path>,
-    /// Optional path to a `.mvmpkg` bundle archive. When set, the
-    /// archive is read + verified at admit time, the resulting
-    /// `PlanArtifact` is embedded into the plan, and the supervisor's
-    /// admit path re-verifies on every launch. Once the plan is
-    /// admitted, the boot's root filesystem and kernel must be the
-    /// ones the bundle signed, and an installed copy beside the archive
-    /// must still match it; a mismatch is refused and recorded as
-    /// `plan.failed`. Boots resolved from an installed bundle
-    /// (`--manifest <bundle-sha256>`) set it to the registry archive.
-    /// A child forked or restored from a parent whose plan pins a bundle
-    /// inherits that pin ([`InheritedBundle`]): the archive is re-verified
-    /// and must still be the bundle the parent was admitted under.
-    pub bundle_pin: Option<BundlePin<'a>>,
-    /// The signed security posture of the installed bundle this run boots,
-    /// when it boots one. The launch may only narrow it: admission refuses a
-    /// run whose network policy, host shares, or agent verbs ask for more,
-    /// and records the refusal as `plan.failed`. A pinned bundle's own
-    /// posture is checked the same way.
-    pub bundle_posture: Option<mvm_core::plan::BundleSecurityPosture>,
-    /// Optional deps-volume binding from the app-deps install pipeline.
-    /// No boot path supplies one today. When `Some`, the
-    /// synthesised `ExecutionPlan` carries `deps_volume = Some(...)`,
-    /// and the supervisor's admission gate re-verifies
-    /// the on-disk sealed volume before launch — claim 9.
-    /// `None` preserves the claim-8 baseline (no deps gate).
-    pub deps_volume: Option<mvm_core::plan::DepsVolumeBinding>,
-    /// User-supplied host-fs grants (`--volume` / `MVM_VOLUMES`) baked
-    /// into the signed plan + emitted to the chain-signed audit log
-    /// (claim 1 / claim 8). Empty for the common no-volume case.
-    pub shares: Vec<mvm_core::plan::HostShareGrant>,
-    /// Declared `--asset KIND:HOST_PATH` bindings hashed into content
-    /// identities at admission and recorded in the signed plan's
-    /// `asset_identities` (with the environment, bundle, deps volume,
-    /// digested shares, and the resolved network policy). Empty for runs
-    /// that declare no assets.
-    pub assets: Vec<AssetSpec>,
-    /// Output grants recorded in the signed plan: which guest directories the
-    /// workload may hand back, where they land on the host, and the bounds the
-    /// collection enforces. Each must be backed by a writable disk in `shares`.
-    pub outputs: Vec<mvm_core::plan::OutputGrant>,
-    /// Per-destination egress redaction authored by `--redact HOST[=audit]`.
-    /// Default (all-off) preserves the curated-only baseline.
-    pub redaction: mvm_core::policy::RedactionPolicy,
-    /// The resolved runtime egress policy (`--allow-host`,
-    /// template default, or deny-all default). Non-deny
-    /// policies are lowered into a generated PolicyBundle and referenced by the
-    /// signed plan so the bridge never relies on an unsigned bare carrier to
-
-    /// authorize outbound traffic.
-    pub network_policy: mvm_core::network_policy::NetworkPolicy,
-    /// Raw `--agent-verb` strings from the CLI. Empty ⇒ use the computed
-    /// default. Validated inside `admit_plan_for_boot` via
-    /// `parse_agent_verb_override`; any unknown/DevOnly verb is an error.
-    pub agent_verb_override: Vec<String>,
-    /// Host services this workload is authorized to call over the broker
-    /// channel, baked into the signed plan. The broker's dispatch gate refuses
-    /// anything absent from this set, and the launch path reads the same set to
-    /// decide whether the optional glibc SDK sidecar must be attached. Empty
-    /// (the common case) means the workload calls no host service.
-    pub services: Vec<mvm_contract::protocol::broker::ServiceId>,
-    /// Whether this launch arms the GPU remoting plane. Its shims dial the
-    /// host GPU endpoint over vsock from inside the workload, so admission
-    /// raises the seccomp tier to one that opens `AF_VSOCK` sockets.
-    pub gpu: bool,
-    /// True iff this run should receive an attenuated (ProdSafe-only) agent-verb
-    /// grant. Set this with `grant_eligible(pty, has_ad_hoc_argv, is_dev_profile)`.
-    /// Interactive / ad-hoc / dev runs must pass `false`: they issue DevOnly verbs
-    /// (ConsoleOpen, Exec) that a ProdSafe grant would refuse.
-    pub restrict_agent_verbs: bool,
-    /// What the caller worked out this image will run.
-    ///
-    /// Feeds [`entrypoint_is_shell_shaped`], which refuses the workload input
-    /// grant under a sealed production posture (`restrict_agent_verbs`) when
-    /// the entrypoint looks like a shell.
-    /// [`Unresolved`](ResolvedEntrypoint::Unresolved) refuses that grant too:
-    /// a launch that cannot say what it runs has not established that what it
-    /// runs is not a shell, and admitting on that basis would leave a control
-    /// that reports present and never fires. Callers that never request the
-    /// input grant may pass `Unresolved` freely — the check is reached only
-    /// through the grant.
-    pub entrypoint: ResolvedEntrypoint,
-    /// What this workload is permitted to consume or reach, as resolved from
-    /// the surfaces that may author one (CLI flags, a JSON grants file, the
-    /// project manifest, the operator's host config). Baked into the signed
-    /// plan and checked against the host's ceiling inside `admit_for_run`. Its
-    /// egress dimension is already reflected in
-    /// [`network_policy`](Self::network_policy), which the caller derived from
-    /// the same resolution.
-    ///
-    /// `None` means no surface authored anything, which is the pre-grant
-    /// baseline: no CPU cap, no wall-clock bound, deny-all egress.
-    pub grants: Option<mvm_contract::grants::Grants>,
-    /// The backend this run will actually boot on, when the caller has one in
-    /// hand. Admission measures a declared grant against the mechanisms that
-    /// tier really has; without it a sealed run refuses a grant whose
-    /// enforceability nothing can confirm, and a dev run is warned. Taken from
-    /// the backend object, never parsed from
-    /// [`backend_name`](Self::backend_name) — a name is a label, and a grant
-    /// checked against a label is checked against whatever the caller typed.
-    pub backend_kind: Option<mvm_contract::protocol::vm_backend::BackendKind>,
-    /// Where instruction-file provenance looks beyond `shares` and `assets`:
-    /// the workload's own source directory, and an override for the user
-    /// policy. Every instruction file the boot copies into the guest is
-    /// verified against that policy before the boot is admitted.
-    pub instructions: InstructionSources<'a>,
-}
 
 /// Shell basenames [`entrypoint_is_shell_shaped`] refuses on direct match.
 /// A superset of `mvm_contract::entrypoint`'s own shell set: that helper
@@ -321,6 +138,125 @@ pub struct AdmissionContext {
     /// per-tenant L4 egress against; `None` for a local-default plan.
     pub policy_bundle: Option<PolicyBundle>,
     pub host_signer_public_path: std::path::PathBuf,
+}
+
+/// The admitted CLI run before it chooses warm claim or cold boot.
+///
+/// The authority cannot be cloned or built from signed-plan JSON. The legacy
+/// warm and cold paths only borrow it; dispatch will consume it when migrated.
+pub struct CliAdmission {
+    authority: AdmittedPlan,
+    policy_bundle: Option<PolicyBundle>,
+    audit: AuditContinuation,
+}
+
+/// Read-only admitted plan and its original signer for post-run accounting.
+pub struct AuditContinuation {
+    plan: mvm_core::plan::ExecutionPlan,
+    emitter: AuditEmitter,
+}
+
+// allow(secret-debug): only the plan id is shown; signing material is redacted.
+impl std::fmt::Debug for AuditContinuation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditContinuation")
+            .field("plan_id", &self.plan.plan_id)
+            .field("emitter", &"<redacted: FileAuditSigner>")
+            .finish()
+    }
+}
+
+impl CliAdmission {
+    /// Retain the actual admission and audit owner, never a decoded plan JSON.
+    #[must_use]
+    pub fn new(context: AdmissionContext) -> Self {
+        let audit = AuditContinuation {
+            plan: context.admitted.plan().clone(),
+            emitter: context.emitter,
+        };
+        Self {
+            authority: context.admitted,
+            policy_bundle: context.policy_bundle,
+            audit,
+        }
+    }
+
+    /// The signed plan that owns this run's single admission.
+    #[must_use]
+    pub fn plan(&self) -> &mvm_core::plan::ExecutionPlan {
+        self.authority.plan()
+    }
+
+    /// Compare the legacy VM name, signed-plan JSON and policy-bundle JSON.
+    ///
+    /// Kernel, rootfs, volume and network enforcement remain in their existing
+    /// admission and runner gates; this comparison does not replace them.
+    ///
+    /// # Errors
+    /// Refuses a changed name or different signed-plan or policy-bundle JSON.
+    /// The JSON is compared with the typed owner, never used as authority.
+    pub fn check_legacy_projection(
+        &self,
+        config: &mvm_core::vm_backend::VmStartConfig,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            config.name == self.authority.plan().image.name,
+            "launch identity differs from admitted plan"
+        );
+        let expected = serde_json::to_string(self.authority.signed())?;
+        anyhow::ensure!(
+            config.plan_json.as_deref() == Some(expected.as_str()),
+            "legacy launch plan projection differs from admitted authority"
+        );
+        let policy = self
+            .policy_bundle
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        anyhow::ensure!(
+            config.bundle_json == policy,
+            "legacy launch policy projection differs from admitted authority"
+        );
+        Ok(())
+    }
+
+    /// Retire the one-use authority after the unmigrated warm or cold path.
+    #[must_use]
+    pub fn finish_legacy(self) -> AuditContinuation {
+        let Self {
+            authority: _,
+            policy_bundle: _,
+            audit,
+        } = self;
+        audit
+    }
+}
+
+impl AuditContinuation {
+    /// The exact plan admitted for this run, not one decoded from boot JSON.
+    #[must_use]
+    pub fn plan(&self) -> &mvm_core::plan::ExecutionPlan {
+        &self.plan
+    }
+
+    /// Record an output against an actual signed grant.
+    ///
+    /// # Errors
+    /// Refuses an ungranted output or an audit-write failure.
+    pub fn record_output(
+        &self,
+        record: &mvm_hostd::audit::output_audit::OutputRecord<'_>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.plan
+                .outputs
+                .iter()
+                .any(|grant| grant.guest_path == record.guest_path),
+            "the admitted plan carries no output grant for {}",
+            record.guest_path
+        );
+        self.emitter.emit_outputs(&self.plan, record)
+    }
 }
 
 // allow(secret-debug): hand-written Debug elides the AuditEmitter's
@@ -422,8 +358,10 @@ pub fn admit_plan_for_boot_with_verified_retained(
         durability::AdmissionSync::Inline,
         None,
         StreamRetention::Persist,
-        None,
-        Some(retained),
+        RuntimeEvidence {
+            retained: Some(retained),
+            ..Default::default()
+        },
     )?;
     debug_assert!(
         durability.is_settled(),
@@ -454,7 +392,7 @@ fn admit_persistent_ingress_with_retention(
     journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
     retention: StreamRetention,
 ) -> Result<AdmissionContext> {
-    admit_persistent_ingress_with_runtime(p, ingress, journal, retention, None)
+    admit_persistent_ingress_with_runtime(p, ingress, journal, retention, None, None)
 }
 
 pub(crate) fn admit_persistent_ingress_with_runtime(
@@ -463,15 +401,25 @@ pub(crate) fn admit_persistent_ingress_with_runtime(
     journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
     retention: StreamRetention,
     runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+    prepared: Option<&crate::image_cache::prepared::ValidatedPrepared>,
 ) -> Result<AdmissionContext> {
+    if journal.is_none()
+        && retention == StreamRetention::Persist
+        && let Some(prepared) = prepared
+    {
+        return admit_prepared_plan_for_boot(p, ingress, prepared, runtime);
+    }
     let (context, durability) = admit_with_runtime_evidence(
         p,
         ingress,
         durability::AdmissionSync::Inline,
         journal,
         retention,
-        runtime,
-        None,
+        RuntimeEvidence {
+            runtime,
+            prepared,
+            ..Default::default()
+        },
     )?;
     debug_assert!(
         durability.is_settled(),
@@ -492,8 +440,10 @@ pub fn admit_plan_for_boot_configured_ingress_with_verified_runtime(
         durability::AdmissionSync::Inline,
         None,
         StreamRetention::Persist,
-        Some(runtime),
-        None,
+        RuntimeEvidence {
+            runtime: Some(runtime),
+            ..Default::default()
+        },
     )?;
     debug_assert!(
         durability.is_settled(),
@@ -524,7 +474,43 @@ fn admit_with_stream_retention(
     AdmissionContext,
     mvm_core::admission_durability::AdmissionDurability,
 )> {
-    admit_with_runtime_evidence(p, ingress, sync, journal, retention, None, None)
+    admit_with_runtime_evidence(
+        p,
+        ingress,
+        sync,
+        journal,
+        retention,
+        RuntimeEvidence::default(),
+    )
+}
+
+pub(crate) fn admit_prepared_plan_for_boot(
+    p: AdmitPlanForBootParams<'_>,
+    ingress: Vec<mvm_core::plan::IngressMapping>,
+    prepared: &crate::image_cache::prepared::ValidatedPrepared,
+    runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+) -> Result<AdmissionContext> {
+    let (context, durability) = admit_with_runtime_evidence(
+        p,
+        ingress,
+        durability::AdmissionSync::Inline,
+        None,
+        StreamRetention::Persist,
+        RuntimeEvidence {
+            runtime,
+            prepared: Some(prepared),
+            ..Default::default()
+        },
+    )?;
+    debug_assert!(durability.is_settled());
+    Ok(context)
+}
+
+#[derive(Default)]
+struct RuntimeEvidence<'a> {
+    runtime: Option<&'a mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+    retained: Option<&'a mvm_runtime::checkpoint::VerifiedRetainedRuntime>,
+    prepared: Option<&'a crate::image_cache::prepared::ValidatedPrepared>,
 }
 
 fn admit_with_runtime_evidence(
@@ -533,12 +519,17 @@ fn admit_with_runtime_evidence(
     sync: durability::AdmissionSync,
     journal: Option<&crate::launch::persistent::journal::InstalledJournal<'_>>,
     retention: StreamRetention,
-    runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
-    retained: Option<&mvm_runtime::checkpoint::VerifiedRetainedRuntime>,
+    evidence: RuntimeEvidence<'_>,
 ) -> Result<(
     AdmissionContext,
     mvm_core::admission_durability::AdmissionDurability,
 )> {
+    let RuntimeEvidence {
+        runtime,
+        retained,
+        prepared,
+    } = evidence;
+    let prepared = prepared.map(|validated| &validated.selection);
     // A production boot runs only verified released images, for every
     // managed artifact it resolves. The tiers recorded with those images
     // decide (below): a local-dev managed image is refused however it was
@@ -609,7 +600,20 @@ fn admit_with_runtime_evidence(
         .transpose()?;
     let t_admit_start = std::time::Instant::now();
     mvm_core::launch_trace::lap("admit_plan.setup_and_boot_artifact_identity");
-    let sha = resolve_image_sha256(p.rootfs_path, p.precomputed_image_sha256.or(attested_sha))?;
+    let sha = if let Some(expected) = prepared {
+        let actual = mvm_core::crypto::image_verify::sha256_file(p.rootfs_path)?;
+        if actual != expected.rootfs_sha256 || p.backend_name != expected.backend {
+            return Err(mvm_core::prepared_image::PreparedImageError {
+                kind: mvm_core::prepared_image::PreparedImageErrorKind::SelectionChanged,
+                reference: expected.canonical_reference.clone(),
+                detail: "prepared bytes or backend changed before admission".into(),
+            }
+            .into());
+        }
+        actual
+    } else {
+        resolve_image_sha256(p.rootfs_path, p.precomputed_image_sha256.or(attested_sha))?
+    };
     mvm_core::launch_trace::lap("admit_plan.image_sha256");
     let t_sha = std::time::Instant::now();
     tracing::debug!(
@@ -807,6 +811,9 @@ fn admit_with_runtime_evidence(
         p.gpu,
     );
     let mut bundle_audit_labels = std::collections::BTreeMap::new();
+    if let Some(prepared) = prepared {
+        bundle_audit_labels.extend(prepared.audit_labels());
+    }
     if pinned_bundle_origin == Some(mvm_core::plan::bundle::BundleOrigin::LocalBuild) {
         bundle_audit_labels.insert("origin".to_string(), "local-build".to_string());
         bundle_audit_labels.insert(
@@ -1348,12 +1355,12 @@ pub(crate) mod admit_plan_tests {
     fn sibling_deploy_record_is_only_used_for_its_rootfs_directory() {
         let dir = tempfile::tempdir().unwrap();
         let rootfs = write_rootfs(dir.path(), b"recorded rootfs");
-        let boot_artifact = mvm_sdk::deploy::digest_boot_artifact(&rootfs).unwrap();
-        let record = mvm_sdk::deploy::DeployRecord {
-            schema_version: mvm_sdk::deploy::DEPLOY_RECORD_SCHEMA_VERSION,
+        let boot_artifact = mvm_core::deploy_record::digest_boot_artifact(&rootfs).unwrap();
+        let record = mvm_core::deploy_record::DeployRecord {
+            schema_version: mvm_core::deploy_record::DEPLOY_RECORD_SCHEMA_VERSION,
             workload_id: "vm-test".to_string(),
             ir_hash: "ir-hash".to_string(),
-            image: mvm_sdk::deploy::ArtifactDigests {
+            image: mvm_core::deploy_record::ArtifactDigests {
                 blake3: "b".repeat(64),
                 sha256: "a".repeat(64),
                 size_bytes: 1,
@@ -1362,7 +1369,8 @@ pub(crate) mod admit_plan_tests {
             environment: None,
             dependency_volume: None,
         };
-        mvm_sdk::deploy::write_deploy_record(&record, &dir.path().join("deploy.json")).unwrap();
+        mvm_core::deploy_record::write_deploy_record(&record, &dir.path().join("deploy.json"))
+            .unwrap();
 
         assert_eq!(
             sibling_deploy_boot_artifact(&rootfs).unwrap(),
@@ -1843,7 +1851,7 @@ pub(crate) mod admit_plan_tests {
         let audit_dir = tempfile::tempdir().unwrap();
         let rootfs_dir = tempfile::tempdir().unwrap();
         let rootfs = write_rootfs(rootfs_dir.path(), b"hello rootfs");
-        let boot_artifact = mvm_sdk::deploy::digest_boot_artifact(&rootfs).unwrap();
+        let boot_artifact = mvm_core::deploy_record::digest_boot_artifact(&rootfs).unwrap();
         let ledger = InMemoryNonceLedger::new();
         let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
             mailbox: None,
@@ -2034,6 +2042,77 @@ pub(crate) mod admit_plan_tests {
             ..pinning_params(&rootfs, &ledger)
         })
         .expect("admission")
+    }
+
+    #[test]
+    fn cli_owner_retains_exact_admission_until_legacy_selection_finishes() {
+        let _home = isolated_home();
+        let keys_dir = tempfile::tempdir().expect("keys dir");
+        let audit_dir = tempfile::tempdir().expect("audit dir");
+        let context = admitted_into(keys_dir.path(), audit_dir.path(), "vm-cli-owner");
+        let original_id = context.admitted.plan_id().clone();
+        let original_nonce = context.admitted.plan().nonce.clone();
+        let signed = serde_json::to_string(context.admitted.signed()).expect("signed envelope");
+        let bundle = context
+            .policy_bundle
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .expect("admitted policy serializes");
+        let owner = CliAdmission::new(context);
+        let config = mvm_core::vm_backend::VmStartConfig {
+            name: "vm-cli-owner".into(),
+            plan_json: Some(signed),
+            bundle_json: bundle,
+            ..Default::default()
+        };
+        owner
+            .check_legacy_projection(&config)
+            .expect("the three projected fields match the admitted owner");
+        assert_eq!(owner.plan().plan_id, original_id);
+        assert_eq!(owner.plan().nonce, original_nonce);
+        let changed_name = mvm_core::vm_backend::VmStartConfig {
+            name: "other-vm".into(),
+            ..config.clone()
+        };
+        let identity_error = owner
+            .check_legacy_projection(&changed_name)
+            .expect_err("the admitted VM name cannot drift");
+        assert!(
+            identity_error.to_string().contains("identity differs"),
+            "{identity_error:#}"
+        );
+        let changed_policy = mvm_core::vm_backend::VmStartConfig {
+            bundle_json: Some("{}".into()),
+            ..config.clone()
+        };
+        let policy_error = owner
+            .check_legacy_projection(&changed_policy)
+            .expect_err("caller policy JSON cannot replace admitted policy");
+        assert!(
+            policy_error
+                .to_string()
+                .contains("policy projection differs"),
+            "{policy_error:#}"
+        );
+        let changed = mvm_core::vm_backend::VmStartConfig {
+            plan_json: Some("{}".into()),
+            ..config
+        };
+        let error = owner
+            .check_legacy_projection(&changed)
+            .expect_err("JSON cannot replace the admitted authority");
+        assert!(
+            error.to_string().contains("projection differs"),
+            "{error:#}"
+        );
+        let continuation = owner.finish_legacy();
+        assert_eq!(continuation.plan().plan_id, original_id);
+        assert_eq!(continuation.plan().nonce, original_nonce);
+        let chain = std::fs::read_to_string(audit_dir.path().join("local.jsonl"))
+            .expect("admission was recorded");
+        assert_eq!(chain.matches("plan.admitted").count(), 1, "{chain}");
+        assert!(!chain.contains("plan.launched"), "{chain}");
     }
 
     #[test]

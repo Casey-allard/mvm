@@ -1,7 +1,7 @@
 //! Canonical Recorder -> original installed signer, without a key-file fallback.
 use super::*;
 use crate::{
-    audit_signer::{category, helper_client::SignerHelperClient},
+    audit_signer::{category, owned_helper::OwnedSignerClient},
     owned_resources::{
         FRAME_BYTES, WORKSPACE_BYTES, WorkspacePermit, WorkspacePool, encoded_len, validate_value,
     },
@@ -84,12 +84,15 @@ impl InstalledAuditOrigin {
         })();
         result.map_err(|_| self.fenced_error())
     }
+    pub(crate) fn write_deadline(&self) -> std::result::Result<Instant, AuditError> {
+        append_deadline(None).map_err(|_| self.fenced_error())
+    }
     pub(crate) fn preflight(&self, entry: &PlanAuditEntry) -> std::result::Result<(), AuditError> {
         let result = (|| {
             self.signer.permit.check_current()?;
             self.signer.audit.check_current()?;
-            // Maximum serial width covers the later actual request without
-            // consuming a serial or sending any audit record before connect.
+            // Maximum serial width bounds the subsequent append without
+            // consuming a serial or sending a record during preparation.
             project_entry(
                 entry,
                 self.signer.audit.vm(),
@@ -119,6 +122,15 @@ impl InstalledAuditOrigin {
     }
 }
 
+fn append_deadline(original: Option<Instant>) -> Result<Instant> {
+    let cap = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .context("audit deadline overflow")?;
+    let deadline =
+        crate::broker::registry::owned_call_deadline().map_or(cap, |outer| cap.min(outer));
+    Ok(original.map_or(deadline, |outer| deadline.min(outer)))
+}
+
 struct InstalledSigner {
     audit: InstalledEndpointAudit,
     workspaces: WorkspacePool,
@@ -132,12 +144,7 @@ impl InstalledSigner {
         self.append_held(entry, None)
     }
     fn append_held(&self, entry: &PlanAuditEntry, original: Option<Instant>) -> Result<()> {
-        let cap = Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .context("audit deadline overflow")?;
-        let deadline = crate::broker::registry::owned_call_deadline()
-            .map_or(cap, |original| cap.min(original));
-        let deadline = original.map_or(deadline, |original| deadline.min(original));
+        let deadline = append_deadline(original)?;
         self.permit.check_current()?;
         self.audit.check_current()?;
         ensure!(Instant::now() < deadline, "installed audit deadline");
@@ -155,7 +162,7 @@ impl InstalledSigner {
             serial,
         )?;
         self.permit.check_current()?;
-        let response = SignerHelperClient::new(self.audit.socket())
+        let response = OwnedSignerClient::new(self.audit.socket())
             .with_original_child(self.audit.signer_pid())
             .send_until_endpoint(&request, deadline, &self.audit)?;
         let SignerHelperResponse::Ok {

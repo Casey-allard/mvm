@@ -35,6 +35,13 @@ pub(crate) fn owned_call_deadline() -> Option<Instant> {
     OWNED_CALL_DEADLINE.try_with(|deadline| *deadline).ok()
 }
 
+/// Carry an existing server-owned restriction through synchronous recorder
+/// calls. Nesting can only narrow it; scope exit and unwind restore the caller.
+pub(crate) fn with_owned_call_deadline<R>(deadline: Instant, call: impl FnOnce() -> R) -> R {
+    let deadline = owned_call_deadline().map_or(deadline, |outer| outer.min(deadline));
+    OWNED_CALL_DEADLINE.sync_scope(deadline, call)
+}
+
 fn original_owned_deadline(timeout: Duration) -> Option<Instant> {
     let deadline = Instant::now().checked_add(timeout)?;
     Some(owned_call_deadline().map_or(deadline, |outer| outer.min(deadline)))

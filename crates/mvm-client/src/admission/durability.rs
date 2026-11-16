@@ -55,8 +55,10 @@ pub fn admit_plan_for_boot_with_verified_runtime_syncing_beside_boot(
         AdmissionSync::BesideBoot,
         None,
         super::StreamRetention::Persist,
-        Some(runtime),
-        None,
+        super::RuntimeEvidence {
+            runtime: Some(runtime),
+            ..Default::default()
+        },
     )?;
     phase.finish();
     Ok(admitted)

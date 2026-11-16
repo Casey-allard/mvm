@@ -133,6 +133,7 @@ impl JournalStartContext {
         params: super::super::PersistentImageStartParams<'_>,
         journal: Option<&mut InstalledJournal<'_>>,
         fresh: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
+        prepared: Option<&crate::image_cache::prepared::ValidatedPrepared>,
     ) -> Result<AdmittedPlan> {
         let journal = journal.context("original installed journal missing")?;
         ensure!(
@@ -143,6 +144,7 @@ impl JournalStartContext {
         self.boot = Some(Box::new(super::super::prepare_persistent_boot_with_owner(
             params,
             Some(journal),
+            prepared,
             |config| {
                 anchor.bind_to_config(config)?;
                 let kernel = anchor

@@ -70,6 +70,74 @@ fn oversized_or_confused_canonical_entry_refuses_before_request_projection() {
 }
 
 #[test]
+fn canonical_bound_records_keep_the_admitted_identity_through_helper_projection() {
+    use crate::supervisor::audit::{bound_sink::BoundRecorder, signer::CapturingAuditSigner};
+    use mvm_core::audit_sink::{AuditContext, AuditSink};
+
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let signer = Arc::new(CapturingAuditSigner::new());
+    let mut plan = mvm_core::plan::test_support::PlanFixture::new()
+        .tenant("local")
+        .workload("logical-workload")
+        .build();
+    plan.execution_epoch = 19;
+    let recorder =
+        Arc::new(Recorder::new(signer.clone(), TenantId("local".into())).with_vm_name("vm-1"));
+    let sink = BoundRecorder::builder(
+        recorder,
+        runtime.handle().clone(),
+        AuditContext::Workload {
+            plan: Box::new(plan.clone()),
+        },
+    )
+    .health_file(home.path().join("health.json"))
+    .build()
+    .unwrap();
+    sink.record(
+        "host.flow.allowed",
+        BTreeMap::from([
+            ("workload".into(), "forged-workload".into()),
+            ("execution_epoch".into(), "1".into()),
+            ("vm_name".into(), "forged-instance".into()),
+            ("tenant".into(), "forged-tenant".into()),
+        ]),
+    )
+    .unwrap();
+    let entries = signer.entries();
+    assert_eq!(
+        entries.len(),
+        2,
+        "actual readiness append precedes the allow"
+    );
+    assert_eq!(entries[0].event, "host.audit.ready");
+    assert_eq!(entries[1].event, "host.flow.allowed");
+    for (serial, entry) in entries.iter().enumerate() {
+        assert_eq!(entry.plan_id, plan.plan_id);
+        assert_eq!(entry.plan_version, plan.plan_version);
+        assert_eq!(entry.tenant, plan.tenant);
+        assert_eq!(entry.labels["workload"], "logical-workload");
+        assert_eq!(entry.labels["execution_epoch"], "19");
+        assert_eq!(entry.labels["vm_name"], "vm-1");
+        assert_eq!(entry.labels["audit_scope"], "workload");
+        assert!(!entry.labels.contains_key("tenant"));
+        let SignerHelperRequest::AppendEntry(request) =
+            project_entry(entry, "vm-1", "local", "original-session", serial as u64).unwrap()
+        else {
+            panic!("canonical append required")
+        };
+        assert_eq!(request.fields, serde_json::to_value(entry).unwrap());
+        assert_eq!(request.vm_id, "vm-1");
+        assert_eq!(request.workload_id, "vm-1");
+        assert_eq!(request.tenant_id, "local");
+        assert_eq!(request.session_id, "original-session");
+    }
+    assert_eq!(sink.health().write_failures, 0);
+}
+
+#[test]
 fn projected_records_use_real_canonical_helper_chain_signatures_and_order() {
     use crate::audit_signer::{
         canonical::CanonicalEntry,

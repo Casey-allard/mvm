@@ -782,10 +782,12 @@ impl HostAgentDaemon {
         });
         let client = SignerHelperClient::new(path.clone());
         let response = if let Some(child) = self.owned_signer {
-            client.with_original_child(child).send_until(
-                &req,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )?
+            crate::audit_signer::owned_helper::OwnedSignerClient::new(path.clone())
+                .with_original_child(child)
+                .send_until(
+                    &req,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )?
         } else {
             client.send(&req)?
         };
@@ -827,10 +829,12 @@ impl HostAgentDaemon {
         });
         let client = SignerHelperClient::new(path.clone());
         let response = if let Some(child) = self.owned_signer {
-            client.with_original_child(child).send_until(
-                &req,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )?
+            crate::audit_signer::owned_helper::OwnedSignerClient::new(path.clone())
+                .with_original_child(child)
+                .send_until(
+                    &req,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )?
         } else {
             client.send(&req)?
         };

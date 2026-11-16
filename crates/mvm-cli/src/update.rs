@@ -2491,6 +2491,7 @@ mod tests {
     /// PATH. The environment guard keeps the host tar invocations independent.
     #[test]
     fn a_release_that_fails_its_post_install_smoke_test_is_rolled_back() {
+        // The fixture resolves dirname through the process-global PATH.
         let _env = TestEnv::new();
         let tmp = tempfile::tempdir().unwrap();
         let work = tmp.path().join("work");

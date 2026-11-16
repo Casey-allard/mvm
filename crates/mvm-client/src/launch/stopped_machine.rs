@@ -1,6 +1,56 @@
 //! Stopped-machine restart/removal using the original lifecycle reservations.
 use super::*;
 
+/// Refusals for persisted-spec shapes a library start cannot honor (fail
+/// closed, never silently ignore a persisted field): the start path boots an
+/// image, a built manifest or a deployment, and its volumes arrive as typed
+/// attachments; the CLI-only shapes stay with `mvmctl machine start`.
+pub(super) fn ensure_spec_bootable_in_process(spec: &mp::MachineSpec) -> Result<()> {
+    spec.validate_prepared_source()
+        .map_err(|error| MvmError::InvalidSpec {
+            reason: error.to_string(),
+        })?;
+    let unsupported = |what: &str| MvmError::InvalidSpec {
+        reason: format!(
+            "machine {:?} declares {what}, which a library start cannot honor; use the CLI's \
+             `machine start`",
+            spec.name
+        ),
+    };
+    if spec.runtime_pack {
+        return Err(unsupported("a runtime-pack source"));
+    }
+    if !spec.volumes.is_empty() {
+        return Err(unsupported(
+            "CLI-grammar volume strings (use typed attachments)",
+        ));
+    }
+    if !spec.init.is_empty() {
+        return Err(unsupported("init commands"));
+    }
+    if spec.registry_pack_image.is_some() {
+        machine_start::validate_registry_pack_source(spec).map_err(|error| {
+            MvmError::InvalidSpec {
+                reason: format!("invalid registry pack source: {error:#}"),
+            }
+        })?;
+    }
+    if spec.image.is_none()
+        && spec.prepared_image.is_none()
+        && spec.manifest.is_none()
+        && spec.deployment.is_none()
+        && spec.registry_pack_image.is_none()
+    {
+        return Err(MvmError::InvalidSpec {
+            reason: format!(
+                "machine {:?} has no image, manifest or deployment source",
+                spec.name
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl LocalBackend {
     /// Boot a stopped, previously defined machine under a one-start journal
     /// grant. The original helper is returned in the caller's owner slot.

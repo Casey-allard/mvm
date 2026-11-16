@@ -60,16 +60,16 @@ has been used before.
 From a checkout of this repository:
 
 ```sh
-MVM_VERSION=v0.28.0-rc.2 MVM_SKIP_BOOTSTRAP=1 sh install.sh
-export MVMCTL="${MVMCTL:-mvmctl}"
 export MVM_HOME="$HOME/.mvm-demo"
+MVM_VERSION=v0.28.0-rc.2 sh install.sh
+export MVMCTL="${MVMCTL:-mvmctl}"
 "$MVMCTL" --version
 ```
 
-Only the install is required. Do not run `mvmctl bootstrap`: it prepares a lot
-the demo never uses and is slow. The script prepares a new home itself on its
-first run, pulling the image and building only the workload runtime, which took
-about half a minute in testing.
+Only the install is required; no separate `mvmctl bootstrap` command.
+`install.sh` prewarms shared artifacts in the demo home, and the script pulls
+its image on first use. That first image acquisition may still be slower than
+a prepared launch.
 
 The demo needs an Apple Silicon Mac on macOS 26 or later, and working
 internet and DNS, because each allowed destination is looked up when its
@@ -83,6 +83,18 @@ commands too, so preparation and launches use the same binary and cache.
 To use an already-built binary from this checkout instead of the installed
 release, set `export MVMCTL="$PWD/target/release/mvmctl"` before the preparation
 commands above, and skip the installer command.
+
+## Other machines
+
+Tested end to end, from an empty home, on:
+
+- an Apple Silicon Mac on macOS 26 (HVF): about 6 s once prepared;
+- an x86_64 Linux host with KVM (Firecracker), as a normal user in the `kvm`
+  group with a systemd user session: 19 s including first-time preparation,
+  9 s after.
+
+Not tested: Intel Macs, macOS 13 to 25 (libkrun), Linux on aarch64. On Linux the
+script refuses to run as root, because Firecracker does.
 
 ## Known limits
 

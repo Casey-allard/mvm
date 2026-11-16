@@ -122,6 +122,7 @@ pub struct RuntimeOverlayGuestBinaries {
     pub egress_client: PathBuf,
     pub addon_dns: PathBuf,
     pub exit_report: PathBuf,
+    pub mailbox_client: PathBuf,
     pub ping: PathBuf,
 }
 
@@ -131,7 +132,7 @@ impl RuntimeOverlayGuestBinaries {
     /// The overlay itself stages these under short names (`agent`,
     /// `netinit`, …); a consumer that builds images from the binaries knows
     /// them by their Cargo names, so that is the name an exported set uses.
-    pub fn artifacts(&self) -> [(&'static str, &Path); 9] {
+    pub fn artifacts(&self) -> [(&'static str, &Path); 10] {
         [
             ("mvm-guest-agent", self.agent.as_path()),
             ("mvm-guest-netinit", self.netinit.as_path()),
@@ -141,6 +142,7 @@ impl RuntimeOverlayGuestBinaries {
             ("mvm-egress-client", self.egress_client.as_path()),
             ("mvm-addon-dns", self.addon_dns.as_path()),
             ("mvm-exit-report", self.exit_report.as_path()),
+            ("mvm-mailbox-client", self.mailbox_client.as_path()),
             ("mvm-ping", self.ping.as_path()),
         ]
     }
@@ -157,6 +159,7 @@ pub struct RuntimeOverlayGuestLayout {
     pub egress_client: PathBuf,
     pub addon_dns: PathBuf,
     pub exit_report: PathBuf,
+    pub mailbox_client: PathBuf,
     pub ping: PathBuf,
 }
 
@@ -176,6 +179,7 @@ impl RuntimeOverlayGuestLayout {
             egress_client: dir.join("egress-client"),
             addon_dns: dir.join("addon-dns"),
             exit_report: dir.join("exit-report"),
+            mailbox_client: dir.join("mailbox-client"),
             ping: dir.join("ping"),
             dir,
         }
@@ -190,6 +194,7 @@ impl RuntimeOverlayGuestLayout {
             && self.egress_client.is_file()
             && self.addon_dns.is_file()
             && self.exit_report.is_file()
+            && self.mailbox_client.is_file()
             && self.ping.is_file()
     }
 
@@ -203,6 +208,7 @@ impl RuntimeOverlayGuestLayout {
             egress_client: self.egress_client.clone(),
             addon_dns: self.addon_dns.clone(),
             exit_report: self.exit_report.clone(),
+            mailbox_client: self.mailbox_client.clone(),
             ping: self.ping.clone(),
         }
     }
@@ -307,12 +313,46 @@ impl GuestAgentBuildSpec {
     }
 }
 
-/// The worktree-isolated Cargo target dir for guest cross-compiles.
+/// Directory, inside a source checkout's own `target/`, where the guest
+/// cross-compiles keep their Cargo output.
+const CHECKOUT_GUEST_TARGET_DIR: &str = "mvm-guest-build";
+
+/// Whether the checkout's `target/` is, or can become, a writable directory.
+/// Looks only; resolving a path creates nothing, Cargo makes the directory when
+/// the build runs.
+fn checkout_can_hold_a_target_dir(workspace_root: &Path) -> bool {
+    let target = workspace_root.join("target");
+    let probe = if target.exists() {
+        target
+    } else {
+        workspace_root.to_path_buf()
+    };
+    probe.is_dir()
+        && probe
+            .metadata()
+            .is_ok_and(|meta| !meta.permissions().readonly())
+}
+
+/// The Cargo target dir for guest cross-compiles.
 ///
-/// One checkout reuses dependency output across source edits; different
-/// worktrees hash to different target dirs and cannot serve each other stale
-/// workspace artifacts. Final guest binaries remain content-keyed separately.
+/// The compiled dependency output (hundreds of crates, an hour on a busy
+/// host) belongs to the checkout, not to the `MVM_HOME` that happened to ask
+/// for it, so it lives in the checkout's own `target/`: a new home, a temp home
+/// from a script or a test, or a second `mvmctl` against the same tree reuses it
+/// instead of compiling everything again. Different worktrees have different
+/// `target/` directories, so they cannot serve each other stale workspace
+/// artifacts, and `cargo clean` removes it. Final guest binaries stay keyed by
+/// their content in each home's cache.
+///
+/// A checkout whose `target/` cannot be written (read-only, or not a
+/// directory) falls back to the per-home location keyed by the workspace path,
+/// which is where this output lived before.
 pub fn guest_build_target_dir(cache_root: &Path, workspace_root: &Path) -> PathBuf {
+    if checkout_can_hold_a_target_dir(workspace_root) {
+        return workspace_root
+            .join("target")
+            .join(CHECKOUT_GUEST_TARGET_DIR);
+    }
     let stable_root =
         std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     let digest = Sha256::digest(stable_root.to_string_lossy().as_bytes());
@@ -739,7 +779,7 @@ pub fn runtime_overlay_source_checkout_fingerprint(
 
 /// Runtime-overlay binaries built without `mvm-agentd/addons`: the sealed
 /// agent and the helpers it launches, none of which may link an async runtime.
-pub const RUNTIME_OVERLAY_SEALED_BINS: [&str; 7] = [
+pub const RUNTIME_OVERLAY_SEALED_BINS: [&str; 8] = [
     "mvm-guest-agent",
     "mvm-guest-netinit",
     "mvm-seccomp-apply",
@@ -747,6 +787,7 @@ pub const RUNTIME_OVERLAY_SEALED_BINS: [&str; 7] = [
     "mvm-ping",
     "mvm-runner",
     "mvm-exit-report",
+    "mvm-mailbox-client",
 ];
 
 /// Runtime-overlay binaries that need `mvm-agentd/addons`: the async loopback
@@ -823,6 +864,10 @@ fn build_runtime_overlay_guest_binaries_into_cache(
     install_one(&output_dir.join("mvm-egress-client"), &layout.egress_client)?;
     install_one(&output_dir.join("mvm-addon-dns"), &layout.addon_dns)?;
     install_one(&output_dir.join("mvm-exit-report"), &layout.exit_report)?;
+    install_one(
+        &output_dir.join("mvm-mailbox-client"),
+        &layout.mailbox_client,
+    )?;
 
     Ok(layout.binaries())
 }
@@ -1441,6 +1486,7 @@ mod tests {
                 "mvm-ping",
                 "mvm-runner",
                 "mvm-exit-report",
+                "mvm-mailbox-client",
             ]
         );
         assert!(features_of(&sealed).is_empty(), "{sealed:?}");
@@ -1489,18 +1535,50 @@ mod tests {
     }
 
     #[test]
-    fn guest_build_target_dir_reuses_dependencies_across_edits_in_one_checkout() {
-        let first = guest_build_target_dir(Path::new("/c"), Path::new("/ws"));
-        assert!(first.starts_with("/c/guest-agent-build/targets"));
+    fn guest_build_output_belongs_to_the_checkout_not_the_home() {
+        let checkout = tempfile::tempdir().unwrap();
+        let first = guest_build_target_dir(Path::new("/home-a/cache"), checkout.path());
         assert_eq!(
             first,
-            guest_build_target_dir(Path::new("/c"), Path::new("/ws")),
-            "source edits in one checkout must reuse Cargo dependency output"
+            checkout.path().join("target").join("mvm-guest-build"),
+            "the output lives in the checkout's own target directory"
+        );
+        assert_eq!(
+            first,
+            guest_build_target_dir(Path::new("/home-b/cache"), checkout.path()),
+            "a second home reuses the same dependency output"
+        );
+    }
+
+    #[test]
+    fn different_worktrees_keep_their_guest_build_output_apart() {
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        assert_ne!(
+            guest_build_target_dir(Path::new("/c"), one.path()),
+            guest_build_target_dir(Path::new("/c"), two.path())
+        );
+    }
+
+    #[test]
+    fn a_checkout_that_cannot_hold_a_target_dir_falls_back_to_the_per_home_location() {
+        let checkout = tempfile::tempdir().unwrap();
+        // `target` is a file, so a directory cannot be created beneath it.
+        std::fs::write(checkout.path().join("target"), b"not a directory").unwrap();
+        let fallback = guest_build_target_dir(Path::new("/c"), checkout.path());
+        assert!(
+            fallback.starts_with("/c/guest-agent-build/targets"),
+            "{fallback:?}"
+        );
+        assert_eq!(
+            fallback,
+            guest_build_target_dir(Path::new("/c"), checkout.path()),
+            "the fallback is stable across calls"
         );
         assert_ne!(
-            first,
-            guest_build_target_dir(Path::new("/c"), Path::new("/other-ws")),
-            "different worktrees must keep Cargo outputs isolated"
+            fallback,
+            guest_build_target_dir(Path::new("/other-home"), checkout.path()),
+            "the fallback is per home"
         );
     }
 
@@ -1987,6 +2065,7 @@ rust = "1.91.1"
         assert_eq!(layout.egress_client, layout.dir.join("egress-client"));
         assert_eq!(layout.addon_dns, layout.dir.join("addon-dns"));
         assert_eq!(layout.exit_report, layout.dir.join("exit-report"));
+        assert_eq!(layout.mailbox_client, layout.dir.join("mailbox-client"));
     }
 
     #[test]

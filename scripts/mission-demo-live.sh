@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Live runbook for the mission demo on ONE real machine: a granted guest
-# delivers a message, a planted compromise is denied, the workload is
+# delivers a message, stages a planted compromise, the workload is
 # quarantined and terminated, replaced under a new epoch with new keys, the old
-# state is refused, and the audit chain verifies without any message body.
+# state is not observed, and the audit chain verifies without any message body.
+# Empty reads do not prove host refusal or acceptance/purge of unread frames.
+# Those unsupported checks leave DEMO_RESULT=partial; exit 0 means the observed
+# checks completed, not that the full mission security claim was demonstrated.
 #
 # What it shows: the contain, terminate and replace sequence on a real VM, on
 # the host it runs on. What it does NOT show: delivery into a second guest or
@@ -14,10 +17,17 @@
 # image and does one throwaway run) and launches again. It never runs
 # `mvmctl bootstrap`.
 #
-#   MVMCTL             the mvmctl to drive (default: mvmctl on PATH)
+#   MVMCTL             the mvmctl to drive. Default: this checkout's
+#                      target/release/mvmctl when `cargo build --release --locked`
+#                      has produced one, otherwise mvmctl on PATH. Build, then run
+#                      this script: nothing else is needed.
 #   HYPERVISOR         hvf (default on macOS) or firecracker (default on Linux)
 #   BUILDER            passed as --builder when set
-#   MVM_HOME           default: a new empty directory, removed on exit
+#   MVM_HOME           default: a new empty directory, removed on exit; with this
+#                      checkout's own build, target/mission-demo-home instead,
+#                      kept between runs. A build from source compiles its guest
+#                      runtime the first time it launches (tens of minutes, one
+#                      line of progress every 15 s); a kept home pays that once.
 #   IMAGE              OCI image to boot (default: alpine)
 #   WAIT_SECS          how long to wait for a guest or a stop (default: 120)
 #   QUARANTINE_DEADLINE  seconds before a quarantine that has not finished is
@@ -26,6 +36,13 @@
 #                      the source: sets MVM_RUNTIME_OVERLAY_ACQUIRE_MODE=build
 #   EXPECT_SCRUB_AUDIT=1   (hvf only) also require the signed
 #                      plan.guest_memory_scrubbed audit entry
+#   ALLOW_HOST         the one host the workload is granted (default example.com).
+#                      The guest has no network interface: every request leaves it
+#                      over the vsock egress channel to the host's per-VM endpoint,
+#                      and a workload with no grant has no endpoint behind that
+#                      channel, so a refusal would be invisible to the host. With a
+#                      grant, the planted request for blocked.example crosses the
+#                      channel and the endpoint's refusal is audited.
 #   EXPECT_EGRESS_DENIAL_AUDIT=1   also require that the guest's refused outbound
 #                      attempt left a flow.egress.denied or host.flow.denied
 #                      entry naming the destination. Without it a missing
@@ -41,7 +58,9 @@
 #                      two short transient guests and changes nothing before it.
 #   DRIVER=entrypoint  the workload leaves its own frames and attempts its own
 #                      outbound connection from its command, and the host only
-#                      observes (`machine mailbox recv`, the audit chain). The
+#                      observes (`machine logs --stream stdout`, mailbox recv,
+#                      the audit chain). Guest markers attest staging/actions,
+#                      not host acceptance or refusal. The
 #                      default, `exec`, injects frames and the connection
 #                      attempt with `machine exec`, a dev-profile verb a
 #                      production workload does not have. This is the shape a
@@ -62,9 +81,15 @@
 # not finish.
 set -uo pipefail
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+from_checkout=0
+if [ -z "${MVMCTL:-}" ] && [ -x "$here/target/release/mvmctl" ]; then
+  MVMCTL="$here/target/release/mvmctl"; from_checkout=1
+fi
 MVMCTL="${MVMCTL:-mvmctl}"
 IMAGE="${IMAGE:-alpine}"
 WAIT_SECS="${WAIT_SECS:-120}"
+ALLOW_HOST="${ALLOW_HOST:-example.com}"
 if [ -z "${HYPERVISOR:-}" ]; then
   if [ "$(uname -s)" = Darwin ]; then HYPERVISOR=hvf; else HYPERVISOR=firecracker; fi
 fi
@@ -83,7 +108,11 @@ ID="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
 
 own_home=""
 if [ -z "${MVM_HOME:-}" ]; then
-  own_home="$(mktemp -d)"; export MVM_HOME="$own_home"
+  if [ "$from_checkout" = 1 ]; then
+    export MVM_HOME="$here/target/mission-demo-home"; mkdir -p "$MVM_HOME"
+  else
+    own_home="$(mktemp -d)"; export MVM_HOME="$own_home"
+  fi
 fi
 mvm() { "$MVMCTL" ${bld[@]+"${bld[@]}"} "$@"; }
 say() { echo "PASS $*"; }
@@ -115,7 +144,41 @@ wait_for() { # <what> <cmd...>
 OWN=000     # the guest's own mailbox
 OTHER=377   # anyone else: must be refused
 recv() { mvm machine mailbox recv "$NAME"; }
-got() { [ "$(recv)" = "$1" ]; }
+read_mailbox() {
+  message="$(recv)" || fail "mailbox read failed"
+}
+empty_mailbox() {
+  read_mailbox
+  [ -z "$message" ] || fail "$1"
+}
+# Recv is destructive: never discard an unexpected message to find a later one.
+wait_message() {
+  local expected="$1" end=$((SECONDS + WAIT_SECS)) delay=$(((WAIT_SECS + 14) / 15)) attempt remaining
+  for attempt in 1 2 3 4 5; do
+    read_mailbox
+    [ "$message" != "$expected" ] || return 0
+    [ -z "$message" ] || fail "unexpected mailbox message while waiting for $expected"
+    [ "$attempt" -lt 5 ] && [ "$SECONDS" -lt "$end" ] || break
+    remaining=$((end - SECONDS))
+    [ "$delay" -le "$remaining" ] || delay="$remaining"
+    sleep "$delay"; delay=$((delay * 2))
+  done
+  fail "timed out waiting for $expected"
+}
+# Captured stdout is externally owned; reconcile at most five times. A future
+# action-event API could replace this bounded snapshot polling.
+wait_action() {
+  local action="$1" logs end=$((SECONDS + WAIT_SECS)) delay=$(((WAIT_SECS + 14) / 15)) attempt remaining
+  for attempt in 1 2 3 4 5; do
+    logs="$(mvm machine logs "$NAME" --stream stdout -n 1000)" || fail "guest logs read failed"
+    grep -qxF "MISSION_ACTION=$NAME:$action" <<<"$logs" && return 0
+    [ "$attempt" -lt 5 ] && [ "$SECONDS" -lt "$end" ] || break
+    remaining=$((end - SECONDS))
+    [ "$delay" -le "$remaining" ] || delay="$remaining"
+    sleep "$delay"; delay=$((delay * 2))
+  done
+  fail "timed out waiting for guest action $action"
+}
 # First use of a home: pull the image and build the workload runtime, which one
 # throwaway run does.
 prepare() {
@@ -127,80 +190,92 @@ prepare() {
 # the launch says it is not prepared.
 start_granted() {
   local out
-  out="$(mvm machine run -d --image "$IMAGE" --mailbox "$ID" --hypervisor "$HYPERVISOR" --name "$NAME" -- "$@" 2>&1)" && return 0
+  out="$(mvm machine run -d --image "$IMAGE" --mailbox "$ID" --hypervisor "$HYPERVISOR" --allow-host "$ALLOW_HOST" --name "$NAME" -- "$@" 2>&1)" && return 0
   case "$out" in
     *"is not prepared"*)
       prepare
-      out="$(mvm machine run -d --image "$IMAGE" --mailbox "$ID" --hypervisor "$HYPERVISOR" --name "$NAME" -- "$@" 2>&1)" && return 0 ;;
+      out="$(mvm machine run -d --image "$IMAGE" --mailbox "$ID" --hypervisor "$HYPERVISOR" --allow-host "$ALLOW_HOST" --name "$NAME" -- "$@" 2>&1)" && return 0 ;;
   esac
   echo "$out" >&2; return 1
 }
 launch() { start_granted sleep 900; }
-# The entrypoint driver's workloads. Timings are from the guest's first frame:
-# own mailbox at 0, another mailbox at 10, an outbound attempt at 15, an own
-# frame left unread at 30; the host reads the first and leaves the last.
+# Guest delays pace the demo, but the host requires observed actions, not time.
 workload_first() {
   mailbox_guest_writer
   cat <<EOS
 n=\$(grep -o mvm.mailbox=1 /proc/cmdline | wc -l)
 if [ "\$n" = 1 ]; then b=$FIRST; else b=bad-cmdline-\$n; fi
-mbx_write 000 "\$b"
-sleep 10; mbx_write 377 $CONTAINED
-sleep 5; wget -T 4 -q -O- http://example.com >/dev/null 2>&1 || true
-sleep 15; mbx_write 000 $UNREAD
+mbx_write 000 "\$b" || exit 1
+sleep 10; mbx_write 377 $CONTAINED || exit 1
+echo 'MISSION_ACTION=$NAME:other-staged'
+sleep 5
+command -v wget >/dev/null 2>&1 || exit 1
+if wget -T 4 -q -O- http://blocked.example >/dev/null 2>&1; then
+  echo 'MISSION_ACTION=$NAME:outbound-succeeded'; exit 1
+fi
+echo 'MISSION_ACTION=$NAME:outbound-failed'
+sleep 15; mbx_write 000 $UNREAD || exit 1
+echo 'MISSION_ACTION=$NAME:unread-staged'
 sleep 900
 EOS
 }
 workload_replacement() {
   mailbox_guest_writer
-  printf 'sleep 12; mbx_write 000 %s; sleep 900\n' "$SECOND"
+  printf 'mbx_write 000 %s || exit 1; sleep 900\n' "$SECOND"
 }
 launch_entrypoint() { start_granted sh -c "$1"; }
 audit_dir="$MVM_HOME/audit"
 count() { grep -rhoF "$1" "$audit_dir" 2>/dev/null | wc -l | tr -d ' '; }
 
 echo "== 1. a granted guest boots (mvmctl: $(mvm --version), $HYPERVISOR)"
-mvm image pull "$IMAGE" >/dev/null
-denials() { grep -rhE 'flow\.egress\.denied|host\.flow\.denied' "$audit_dir" 2>/dev/null | grep -cF example.com || true; }
+mvm image pull "$IMAGE" >/dev/null || fail "could not pull $IMAGE"
+# A refused name lookup (dns.refused) is how the endpoint records a request for a
+# host the workload was not granted; a refused connection is a flow denial.
+denials() { grep -rhE 'flow\.egress\.denied|host\.flow\.denied|dns\.refused' "$audit_dir" 2>/dev/null | grep -cF blocked.example || true; }
 denied_before="$(denials)"
 if [ "$DRIVER" = entrypoint ]; then
-  launch_entrypoint "$(workload_first)"
+  launch_entrypoint "$(workload_first)" || fail "entrypoint launch failed"
   say "granted guest launched with its own command; it checks its command line itself"
 else
-  launch
+  launch || fail "launch failed"
   wait_for "the guest to take commands" mvm machine exec "$NAME" -- true
   [ "$(mvm machine exec "$NAME" -- cat /proc/cmdline | grep -o 'mvm.mailbox=1' | wc -l)" -eq 1 ] || fail "not exactly one mvm.mailbox=1"
   say "granted guest booted with exactly one mvm.mailbox=1"
 fi
 
 echo "== 2. the guest delivers a message to its host mailbox"
-[ "$DRIVER" = entrypoint ] || mailbox_write_frame "$NAME" "$OWN" "$FIRST"
-wait_for "the message" got "$FIRST"; say "message read back exactly"
-[ "$DRIVER" != entrypoint ] || { t_first=$SECONDS; say "the entrypoint saw exactly one mvm.mailbox=1 (otherwise its frame would differ)"; }
-[ -z "$(recv)" ] || fail "mailbox not empty after reading"; say "mailbox empty after reading"
+[ "$DRIVER" = entrypoint ] || mailbox_write_frame "$NAME" "$OWN" "$FIRST" || fail "first frame staging failed"
+wait_message "$FIRST"; say "message read back exactly"
+[ "$DRIVER" != entrypoint ] || say "the entrypoint saw exactly one mvm.mailbox=1 (otherwise its frame would differ)"
+empty_mailbox "mailbox not empty after reading"; say "mailbox empty after reading"
 
-echo "== 3. a planted compromise is denied"
+echo "== 3. observe a planted compromise attempt"
 if [ "$DRIVER" = entrypoint ]; then
-  while [ $((SECONDS - t_first)) -lt 18 ]; do sleep 1; done
+  wait_action other-staged
+  say "guest reported staging a frame for another mailbox (not host acceptance)"
 else
-  mailbox_write_frame "$NAME" "$OTHER" "$CONTAINED"; sleep 8
+  mailbox_write_frame "$NAME" "$OTHER" "$CONTAINED" || fail "other frame staging failed"
+  sleep 8
 fi
-[ -z "$(recv)" ] || fail "a message to another recipient was queued"; say "a message to another mailbox was refused"
+empty_mailbox "a message to another recipient was queued"
+say "host mailbox read returned empty after the other-recipient staging"
+echo "FINDING: host refusal is unproven; an empty read is not a host decision or proof the staged frame was processed."
 if [ "$DRIVER" = entrypoint ]; then
-  say "the entrypoint attempted an outbound connection (its result is not visible to the host; the host's decision is checked below)"
+  wait_action outbound-failed
+  say "guest reported a failed outbound attempt; the host's decision is checked separately"
 else
-  if mvm machine exec "$NAME" -- sh -c 'wget -T 4 -q -O- http://example.com >/dev/null 2>&1'; then fail "the guest reached the network"; fi
+  if mvm machine exec "$NAME" -- sh -c 'wget -T 4 -q -O- http://blocked.example >/dev/null 2>&1'; then fail "the guest reached the network"; fi
   say "an outbound connection from the guest failed (this shows it fails, not why)"
 fi
 # Whether the host audited the refusal is a separate question from the attempt
 # failing; give the entry a few seconds to be written before judging.
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(denials)" -gt "$denied_before" ] && break; sleep 1; done
 if [ "$(denials)" -gt "$denied_before" ]; then
-  say "the refused outbound attempt left an audited egress denial naming example.com"
+  say "the refused outbound attempt left an audited egress denial naming blocked.example"
 elif [ "${EXPECT_EGRESS_DENIAL_AUDIT:-0}" = 1 ]; then
-  fail "the refused outbound attempt left no flow.egress.denied or host.flow.denied entry naming example.com"
+  fail "the refused outbound attempt left no flow.egress.denied, host.flow.denied or dns.refused entry naming blocked.example"
 else
-  echo "FINDING: the refused outbound attempt left no flow.egress.denied or host.flow.denied entry naming example.com; the failure is observed but the host's decision is not audited here."
+  echo "FINDING: the refused outbound attempt left no flow.egress.denied, host.flow.denied or dns.refused entry naming blocked.example; the failure is observed but the host's decision is not audited here."
 fi
 
 echo "== 4. a running workload cannot be replaced"
@@ -209,13 +284,14 @@ grep -q "machine stop $NAME" <<<"$out" || fail "replace did not name machine sto
 say "replace refused while running, naming \`machine stop $NAME\`"
 
 echo "== 5. contain: quarantine and terminate"
-# A frame left unread in the workload being contained: step 8 proves its
-# replacement cannot read it.
+# A staged frame is not evidence that the host accepted it before containment.
 if [ "$DRIVER" = entrypoint ]; then
-  while [ $((SECONDS - t_first)) -lt 34 ]; do sleep 1; done
+  wait_action unread-staged
 else
-  mailbox_write_frame "$NAME" "$OWN" "$UNREAD"; sleep 3
+  mailbox_write_frame "$NAME" "$OWN" "$UNREAD" || fail "unread frame staging failed"
+  sleep 3
 fi
+echo "FINDING: unread frame host acceptance is unproven; no non-destructive queue evidence is exposed here, so replacement cannot prove its purge."
 secret="$(state_dir)/mailbox-epoch.secret"
 [ -s "$secret" ] || fail "no per-launch secret at $secret"
 old_secret="$(sha12 "$secret")"
@@ -259,20 +335,25 @@ say "$out"
 grep -q "\"epoch\": *2" "$MVM_HOME/host-interface/workloads.json" || fail "the ledger is not at epoch 2"
 say "the ledger is at epoch 2"
 
-echo "== 8. the replacement runs under new keys; the old state is refused"
+echo "== 8. the replacement runs under new keys; check exact message order"
 if [ "$DRIVER" = entrypoint ]; then
-  launch_entrypoint "$(workload_replacement)"; sleep 4
+  launch_entrypoint "$(workload_replacement)" || fail "replacement entrypoint launch failed"
 else
-  launch; wait_for "the replacement to take commands" mvm machine exec "$NAME" -- true
+  launch || fail "replacement launch failed"
+  wait_for "the replacement to take commands" mvm machine exec "$NAME" -- true
 fi
+[ -s "$secret" ] || fail "no replacement per-launch secret"
 new_secret="$(sha12 "$secret")"
 [ "$new_secret" != "$old_secret" ] || fail "the replacement has the old per-launch secret"
 say "per-launch secret changed ($old_secret... -> $new_secret...)"
-[ -z "$(recv)" ] || fail "the replacement could read a message from the old workload"
-say "the frame left unread in the old workload is not readable by its replacement"
-[ "$DRIVER" = entrypoint ] || mailbox_write_frame "$NAME" "$OWN" "$SECOND"
-wait_for "a fresh message under the new epoch" got "$SECOND"
+if [ "$DRIVER" = exec ]; then
+  empty_mailbox "the replacement could read a message from the old workload"
+  mailbox_write_frame "$NAME" "$OWN" "$SECOND" || fail "replacement frame staging failed"
+fi
+wait_message "$SECOND"
 say "a fresh message under the new epoch is read exactly"
+empty_mailbox "unexpected message after the replacement's fresh message"
+say "no old message observed in the replacement reads (not proof of unread acceptance or erasure)"
 
 echo "== 9. the evidence"
 vout="$(mvm trust audit verify 2>&1)" || fail "audit chain does not verify: $vout"
@@ -340,4 +421,4 @@ if [ "${NETWORK_SEGMENT:-0}" = 1 ]; then
     rm -rf "$net_root" "$net_log"
   fi
 fi
-echo "DEMO_RESULT=pass"
+echo "DEMO_RESULT=partial"

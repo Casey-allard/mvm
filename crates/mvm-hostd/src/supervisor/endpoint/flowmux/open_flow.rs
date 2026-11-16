@@ -19,7 +19,6 @@ use super::socket::FlowSocket;
 use super::tcp_relay::connect_first_admitted;
 use super::wire::{lock_registry, parse_host_port};
 use super::{FlowMuxError, FlowMuxSession, registry};
-use crate::supervisor::audit::audit_recorder::EventCategory;
 use crate::supervisor::endpoint::network_endpoint_proxy::TerminationMode;
 use crate::supervisor::endpoint::terminator;
 use mvm_contract::protocol::network_flow::open_tcp::{OpenTcpPayloadError, decode_open_tcp};
@@ -123,8 +122,8 @@ impl FlowMuxSession {
             Ok(reservation) => Ok(RelayAdmission::Proceed(reservation)),
             Err(_) => {
                 let _ = lock_registry(&self.registry).retire(stream_id);
-                self.send_refused(stream_id, "owned relay capacity unavailable")?;
                 self.deny_flow(stream_id, flow, "relay_capacity_unavailable");
+                self.send_refused(stream_id, "owned relay capacity unavailable")?;
                 Ok(RelayAdmission::Refused)
             }
         }
@@ -162,11 +161,11 @@ impl FlowMuxSession {
                 .as_ref()
                 .and_then(|service| service.route_refusal(&flow.host, flow.port))
             {
+                self.deny_route_flow(stream_id, &flow, &refusal.route_id, refusal.reason);
                 self.send_refused(
                     stream_id,
                     "destination has endpoint rules; the plan must grant interception to enforce them",
                 )?;
-                self.deny_route_flow(stream_id, &flow, &refusal.route_id, refusal.reason);
                 return Ok(());
             }
             if let Some(reason) = self
@@ -174,8 +173,8 @@ impl FlowMuxSession {
                 .as_ref()
                 .and_then(|service| service.opaque_refusal_reason(&flow.host))
             {
-                self.send_refused(stream_id, reason)?;
                 self.deny_flow(stream_id, &flow, "typed_transform_required");
+                self.send_refused(stream_id, reason)?;
                 return Ok(());
             }
             return self.open_opaque_flow(stream_id, &flow);
@@ -185,11 +184,11 @@ impl FlowMuxSession {
             .as_ref()
             .is_some_and(|mapping| mapping.selects(&flow.host, flow.requested_port))
         {
+            self.deny_flow(stream_id, &flow, "payload_transform_unsupported");
             self.send_refused(
                 stream_id,
                 "selected payload profile does not support this terminated transform path",
             )?;
-            self.deny_flow(stream_id, &flow, "payload_transform_unsupported");
             return Ok(());
         }
         self.open_terminated_flow(stream_id, &flow, mode)
@@ -207,16 +206,17 @@ impl FlowMuxSession {
         let target = match decode_open_tcp(self.frame_payload(payload_len)) {
             Ok(target) => target.to_string(),
             Err(OpenTcpPayloadError::LegacyBinding) => {
-                self.send_refused(stream_id, "tool invocation bindings are not supported")?;
                 self.deny_unrouted_flow(
                     stream_id,
                     registry::FlowClass::Tcp,
                     "legacy-binding",
                     "tool_binding_unsupported",
                 );
+                self.send_refused(stream_id, "tool invocation bindings are not supported")?;
                 return Ok(None);
             }
             Err(error) => {
+                self.deny_unrouted_flow(stream_id, registry::FlowClass::Tcp, "", "malformed");
                 self.send_refused(stream_id, &error.to_string())?;
                 return Ok(None);
             }
@@ -225,18 +225,37 @@ impl FlowMuxSession {
         let (host, requested_port) = match parse_host_port(&target) {
             Ok((host, port)) => (host.to_string(), port),
             Err(e) => {
+                self.deny_unrouted_flow(stream_id, registry::FlowClass::Tcp, "", "malformed");
                 self.send_refused(stream_id, &format!("invalid OpenTcp target: {e}"))?;
                 return Ok(None);
             }
         };
 
         if !self.check_connection_rate(registry::FlowClass::Tcp) {
-            self.send_refused(stream_id, "rate limited")?;
             self.deny_unrouted_flow(stream_id, registry::FlowClass::Tcp, &target, "rate_limited");
+            self.send_refused(stream_id, "rate limited")?;
             return Ok(None);
         }
 
-        let decision = self.gate.decide_target(&host, requested_port);
+        let decision = match super::dns_decision::decide_target(
+            &self.gate,
+            self.audit_sink.as_ref(),
+            stream_id,
+            &host,
+            requested_port,
+            |name| {
+                crate::supervisor::datapath::dns_resolver::resolve_hostname_ips(
+                    name,
+                    self.connect_timeout,
+                )
+            },
+        ) {
+            Ok(decision) => decision,
+            Err(_) => {
+                self.send_refused(stream_id, "audit unavailable")?;
+                return Ok(None);
+            }
+        };
         // Recorded on every audit entry this connect emits, so the chain says
         // which namespace authorized (or refused) the flow rather than leaving
         // a reader to infer it from the target's shape.
@@ -255,13 +274,13 @@ impl FlowMuxSession {
                 Ok(Some(flow))
             }
             EgressVerdict::Deny(reason) => {
-                self.send_refused(stream_id, &reason.to_string())?;
                 self.deny_flow(stream_id, &flow, reason.audit_label());
+                self.send_refused(stream_id, &reason.to_string())?;
                 Ok(None)
             }
             EgressVerdict::Malformed => {
-                self.send_refused(stream_id, "malformed destination")?;
                 self.deny_flow(stream_id, &flow, "malformed");
+                self.send_refused(stream_id, "malformed destination")?;
                 Ok(None)
             }
         }
@@ -282,8 +301,8 @@ impl FlowMuxSession {
                 .as_ref()
                 .is_some_and(|mapping| mapping.selects(&flow.host, flow.requested_port))
         {
-            self.send_refused(stream_id, "selected installed payload mapping required")?;
             self.deny_flow(stream_id, flow, "installed_payload_unmapped");
+            self.send_refused(stream_id, "selected installed payload mapping required")?;
             return Ok(());
         }
         if !self.reserve_stream(stream_id, flow)? {
@@ -313,29 +332,20 @@ impl FlowMuxSession {
             None
         };
 
-        let prepared_audit = if self.installed_audit.is_some() {
-            self.check_installed_audit()?;
-            let recorder = self.recorder.as_ref().ok_or_else(|| {
-                FlowMuxError::FrameRefused("original installed recorder missing".into())
-            })?;
-            let deadline = owned_deadline.ok_or_else(|| {
-                FlowMuxError::FrameRefused("original installed flow deadline missing".into())
-            })?;
-            Some(
-                recorder
-                    .preflight_installed_unbound(
-                        EventCategory::Host,
-                        "host.flow.allowed",
-                        deadline,
-                        || flow.allowed_tcp_labels(stream_id),
-                    )
-                    .map_err(|_| {
-                        FlowMuxError::FrameRefused("installed flow audit preflight refused".into())
-                    })?,
-            )
-        } else {
-            None
+        let recorded = match owned_deadline {
+            Some(deadline) => super::decision_audit::record_before(
+                self.audit_sink.as_ref(),
+                "host.flow.allowed",
+                deadline,
+                || flow.allowed_tcp_labels(stream_id),
+            ),
+            None => self.record_allow("host.flow.allowed", flow.allowed_tcp_labels(stream_id)),
         };
+        if recorded.is_err() {
+            let _ = lock_registry(&self.registry).retire(stream_id);
+            return self.send_refused(stream_id, "audit unavailable");
+        }
+        self.check_installed_audit()?;
         let timeout = owned_deadline
             .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
             .unwrap_or_else(|| {
@@ -350,35 +360,11 @@ impl FlowMuxSession {
             None => {
                 warn!(stream_id, target = %flow.target, "FlowMux TCP connect failed");
                 let _ = lock_registry(&self.registry).retire(stream_id);
-                self.send_connect_failed(stream_id, "connection failed")?;
                 self.deny_flow(stream_id, flow, "connect_failed");
+                self.send_connect_failed(stream_id, "connection failed")?;
                 return Ok(());
             }
         };
-        if let Some(prepared) = prepared_audit {
-            let appended = (|| {
-                self.check_installed_audit()?;
-                let recorder = self.recorder.as_ref().ok_or_else(|| {
-                    FlowMuxError::FrameRefused("original installed recorder missing".into())
-                })?;
-                let runtime = self.runtime_handle.as_ref().ok_or_else(|| {
-                    FlowMuxError::FrameRefused("installed audit runtime missing".into())
-                })?;
-                runtime
-                    .block_on(recorder.record_installed_prepared(prepared))
-                    .map_err(|_| {
-                        FlowMuxError::FrameRefused("installed flow audit append refused".into())
-                    })?;
-                self.check_installed_audit()
-            })();
-            if let Err(error) = appended {
-                let _ = upstream.shutdown(std::net::Shutdown::Both);
-                if let Some(audit) = &self.installed_audit {
-                    audit.fence();
-                }
-                return Err(error);
-            }
-        }
         if let Some(reservation) = &reservation {
             let guest = self
                 .owned_guest_control
@@ -423,11 +409,11 @@ impl FlowMuxSession {
                     }
                     warn!(stream_id,error=%error,"required payload mapping refused");
                     let _ = lock_registry(&self.registry).retire(stream_id);
+                    self.deny_flow(stream_id, flow, "payload_mapping_unavailable");
                     self.send_refused(
                         stream_id,
                         "required authenticated payload mapping unavailable",
                     )?;
-                    self.deny_flow(stream_id, flow, "payload_mapping_unavailable");
                     return Ok(());
                 }
             }
@@ -437,8 +423,8 @@ impl FlowMuxSession {
         if owned_deadline.is_some_and(|until| std::time::Instant::now() >= until) {
             let _ = upstream.shutdown(std::net::Shutdown::Both);
             let _ = lock_registry(&self.registry).retire(stream_id);
-            self.send_refused(stream_id, "owned flow setup deadline")?;
             self.deny_flow(stream_id, flow, "owned_setup_deadline");
+            self.send_refused(stream_id, "owned flow setup deadline")?;
             return Ok(());
         }
         if !self.confirm_stream(stream_id)? {
@@ -446,13 +432,6 @@ impl FlowMuxSession {
         }
         self.send_opened(stream_id)?;
         self.spawn_tcp_relay(stream_id, upstream, reservation)?;
-        if self.installed_audit.is_none() {
-            self.emit_audit(
-                EventCategory::Host,
-                "host.flow.allowed",
-                flow.allowed_tcp_labels(stream_id),
-            );
-        }
         Ok(())
     }
 
@@ -473,8 +452,8 @@ impl FlowMuxSession {
         let (Some(service), Some(runtime)) =
             (self.substitution.clone(), self.runtime_handle.clone())
         else {
-            self.send_refused(stream_id, "termination unavailable on this endpoint")?;
             self.deny_flow(stream_id, flow, "termination_unavailable");
+            self.send_refused(stream_id, "termination unavailable on this endpoint")?;
             return Ok(());
         };
         let reservation = match self.reserve_owned_tcp_relay(stream_id, flow)? {
@@ -487,8 +466,8 @@ impl FlowMuxSession {
         // opaque one, so it gets its own ceiling rather than sharing the
         // registry's.
         let Some(slot) = terminator::flow::FlowSlot::claim(&self.terminated_flows) else {
-            self.send_refused(stream_id, "too many terminated flows")?;
             self.deny_flow(stream_id, flow, "termination_exhausted");
+            self.send_refused(stream_id, "too many terminated flows")?;
             return Ok(());
         };
 
@@ -503,8 +482,8 @@ impl FlowMuxSession {
             Ok(terminated) => terminated,
             Err(reason) => {
                 warn!(stream_id, %reason, "FlowMux terminated flow is incomplete");
-                self.send_refused(stream_id, reason)?;
                 self.deny_flow(stream_id, flow, "termination_unavailable");
+                self.send_refused(stream_id, reason)?;
                 return Ok(());
             }
         };
@@ -518,26 +497,12 @@ impl FlowMuxSession {
             Err(error) => {
                 warn!(stream_id, %error, "FlowMux terminated flow has no transport");
                 let _ = lock_registry(&self.registry).retire(stream_id);
-                self.send_connect_failed(stream_id, "termination setup failed")?;
                 self.deny_flow(stream_id, flow, "termination_failed");
+                self.send_connect_failed(stream_id, "termination setup failed")?;
                 return Ok(());
             }
         };
 
-        if let Err(error) = terminator::flow::spawn(terminated, terminator_side, slot) {
-            warn!(stream_id, %error, "FlowMux terminated flow could not start");
-            let _ = lock_registry(&self.registry).retire(stream_id);
-            self.send_connect_failed(stream_id, "termination setup failed")?;
-            self.deny_flow(stream_id, flow, "termination_failed");
-            return Ok(());
-        }
-
-        if !self.confirm_stream(stream_id)? {
-            return Ok(());
-        }
-
-        self.send_opened(stream_id)?;
-        self.spawn_tcp_relay(stream_id, FlowSocket::from(endpoint_side), reservation)?;
         let mut labels = BTreeMap::from([
             ("stream_id".to_string(), stream_id.to_string()),
             ("class".to_string(), "tcp".to_string()),
@@ -559,7 +524,25 @@ impl FlowMuxSession {
         {
             labels.insert("via".to_string(), path.label().to_string());
         }
-        self.emit_audit(EventCategory::Host, "host.flow.allowed", labels);
+        if self.record_allow("host.flow.allowed", labels).is_err() {
+            let _ = lock_registry(&self.registry).retire(stream_id);
+            drop(endpoint_side);
+            drop(terminator_side);
+            drop(terminated);
+            drop(slot);
+            return self.send_refused(stream_id, "audit unavailable");
+        }
+        if !self.confirm_stream(stream_id)? {
+            return Ok(());
+        }
+        if let Err(error) = terminator::flow::spawn(terminated, terminator_side, slot) {
+            warn!(stream_id, %error, "FlowMux terminated flow could not start");
+            let _ = lock_registry(&self.registry).retire(stream_id);
+            self.deny_flow(stream_id, flow, "termination_failed");
+            return self.send_connect_failed(stream_id, "termination setup failed");
+        }
+        self.send_opened(stream_id)?;
+        self.spawn_tcp_relay(stream_id, FlowSocket::from(endpoint_side), reservation)?;
         Ok(())
     }
 
@@ -574,8 +557,8 @@ impl FlowMuxSession {
             .open_guest(stream_id, registry::FlowClass::Tcp)
             .err();
         if let Some(e) = open_err {
-            self.send_refused(stream_id, &e.to_string())?;
             self.deny_flow(stream_id, flow, "resource_exhausted");
+            self.send_refused(stream_id, &e.to_string())?;
             return Ok(false);
         }
         Ok(true)
@@ -587,6 +570,12 @@ impl FlowMuxSession {
         let confirm_err = lock_registry(&self.registry).confirm(stream_id).err();
         if let Some(e) = confirm_err {
             let _ = lock_registry(&self.registry).retire(stream_id);
+            self.deny_unrouted_flow(
+                stream_id,
+                registry::FlowClass::Tcp,
+                "",
+                "resource_exhausted",
+            );
             self.send_refused(stream_id, &e.to_string())?;
             return Ok(false);
         }
@@ -595,8 +584,7 @@ impl FlowMuxSession {
 
     /// Audit a refusal of a flow the gate had already routed.
     fn deny_flow(&self, stream_id: u32, flow: &AdmittedFlow, reason: &str) {
-        self.emit_audit(
-            EventCategory::Host,
+        self.record_denial(
             "host.flow.denied",
             Self::flow_denial_labels(stream_id, flow, reason),
         );
@@ -606,7 +594,7 @@ impl FlowMuxSession {
         let mut labels = Self::flow_denial_labels(stream_id, flow, reason);
         labels.insert("endpoint_route".into(), route_id.into());
         labels.insert("rule".into(), "not_evaluated".into());
-        self.emit_audit(EventCategory::Host, "host.flow.denied", labels);
+        self.record_denial("host.flow.denied", labels);
     }
 
     fn flow_denial_labels(
@@ -633,8 +621,7 @@ impl FlowMuxSession {
         target: &str,
         reason: &str,
     ) {
-        self.emit_audit(
-            EventCategory::Host,
+        self.record_denial(
             "host.flow.denied",
             BTreeMap::from([
                 ("stream_id".to_string(), stream_id.to_string()),
@@ -648,6 +635,7 @@ impl FlowMuxSession {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{audit_tests::capturing_sink, test_sink::RecorderSink};
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::thread;
@@ -984,6 +972,7 @@ mod tests {
                 let (mut guest, mut session, host) =
                     run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
                         FlowMuxAccept::new(id, key, anchor, limits, gate)
+                            .with_audit_sink(capturing_sink())
                             .with_payload_mapping(Some(mapping))
                     });
                 guest
@@ -1167,6 +1156,7 @@ mod tests {
             let (mut guest, mut session, host) =
                 run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
                     FlowMuxAccept::new(id, key, anchor, limits, gate)
+                        .with_audit_sink(capturing_sink())
                         .with_payload_mapping(Some(mapping))
                 });
             guest
@@ -1223,6 +1213,85 @@ mod tests {
         )
     }
     #[test]
+    fn selected_payload_transform_denial_survives_a_broken_response_transport() {
+        use super::super::audit_tests::CapturingSink;
+
+        for broken_response in [false, true] {
+            let sink = Arc::new(CapturingSink::default());
+            let supplied = Arc::clone(&sink);
+            let (host_key, host_verify) = fresh_keys();
+            let (guest_key, guest_verify) = fresh_keys();
+            let (host_stream, mut guest) = UnixStream::pair().unwrap();
+            let (service, _secrets) = substitution_binding("bound.example", true);
+            let mapping = selected_mapping("bound.example");
+            let host = thread::spawn(move || {
+                let mut host = FlowMuxSession::accept_with(
+                    host_stream,
+                    FlowMuxAccept::new(
+                        "denial-response-failure",
+                        host_key,
+                        guest_verify,
+                        RegistryLimits::default(),
+                        gate_pinning_name("bound.example", local_test_ip(), 443),
+                    )
+                    .with_audit_sink(supplied)
+                    .with_substitution(Some(service))
+                    .with_payload_mapping(Some(mapping)),
+                )
+                .unwrap();
+                // Exercise the open handler after authenticating and reading
+                // the original request; no relay or installed role is created.
+                let (opcode, stream_id, payload_len) = host.read_frame().unwrap().unwrap();
+                assert_eq!(opcode, Opcode::OpenTcp);
+                if broken_response {
+                    host.reader
+                        .stream()
+                        .shutdown(std::net::Shutdown::Write)
+                        .unwrap();
+                }
+                host.handle_open_tcp(stream_id, payload_len)
+            });
+            guest
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let (mut session, _) = Session::guest(&mut guest, guest_key, &host_verify).unwrap();
+            write_frame(
+                &mut guest,
+                &mut session,
+                Opcode::OpenTcp,
+                1,
+                b"bound.example:443",
+            );
+            if !broken_response {
+                assert_eq!(
+                    read_flowmux_frame(&mut guest, &mut session).0,
+                    Opcode::Refused
+                );
+            }
+            let result = host.join().unwrap();
+            if broken_response {
+                assert!(matches!(result, Err(FlowMuxError::Transport(_))));
+            } else {
+                result.unwrap();
+            }
+            let records = sink.records.lock().unwrap();
+            let denials: Vec<_> = records
+                .iter()
+                .filter(|(event, _)| event == "host.flow.denied")
+                .collect();
+            assert_eq!(
+                denials.len(),
+                1,
+                "response failure must not lose the denial"
+            );
+            let (_, labels) = denials[0];
+            assert_eq!(labels["reason"], "payload_transform_unsupported");
+            assert_eq!(labels["target"], "bound.example:443");
+            assert_eq!(labels["stream_id"], "1");
+        }
+    }
+
+    #[test]
     fn selected_payload_mapping_never_bypasses_required_tcp_termination() {
         let target = "bound.example";
         let (service, _secrets) = substitution_binding(target, true);
@@ -1231,6 +1300,7 @@ mod tests {
         let (mut guest, mut session, host) =
             run_session_on_runtime(move |id, key, anchor, limits| {
                 FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_audit_sink(capturing_sink())
                     .with_substitution(Some(service))
                     .with_payload_mapping(Some(mapping))
             });
@@ -1262,6 +1332,7 @@ mod tests {
         let (mut guest, mut session, host) =
             run_session_on_runtime(move |id, key, anchor, limits| {
                 FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_audit_sink(capturing_sink())
                     .with_substitution(Some(service))
                     .with_payload_mapping(Some(mapping))
             });
@@ -1370,6 +1441,7 @@ mod tests {
             let (mut guest, mut session, host) =
                 run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
                     FlowMuxAccept::new(id, key, anchor, limits, gate)
+                        .with_audit_sink(capturing_sink())
                         .with_payload_mapping(Some(mapping))
                 });
             guest
@@ -1408,6 +1480,7 @@ mod tests {
                 &guest_verify,
                 RegistryLimits::default(),
                 gate,
+                capturing_sink(),
             )
             .unwrap();
             session.serve()
@@ -1534,7 +1607,8 @@ mod tests {
         );
         let (mut guest, mut guest_session, host) =
             run_session_on_runtime(move |id, key, anchor, limits| {
-                FlowMuxAccept::new(id, key, anchor, limits, gate).with_recorder(Some(recorder))
+                FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_audit_sink(RecorderSink::wrap(recorder))
             });
 
         for (stream, target) in [(1_u32, PRIVATE), (3, METADATA)] {
@@ -1591,7 +1665,8 @@ mod tests {
         );
         let (mut guest, mut guest_session, host) =
             run_session_on_runtime(move |id, key, anchor, limits| {
-                FlowMuxAccept::new(id, key, anchor, limits, gate).with_recorder(Some(recorder))
+                FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_audit_sink(RecorderSink::wrap(recorder))
             });
 
         write_frame(
@@ -1755,7 +1830,9 @@ mod tests {
         let gate = gate_allowing_addr(ip, 443, None);
         let (mut guest, mut guest_session, host) =
             run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
-                FlowMuxAccept::new(id, key, anchor, limits, gate).with_substitution(Some(service))
+                FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_audit_sink(capturing_sink())
+                    .with_substitution(Some(service))
             });
 
         write_frame(
@@ -1820,7 +1897,7 @@ mod tests {
             run_session_on_runtime(move |id, key, anchor, limits| {
                 FlowMuxAccept::new(id, key, anchor, limits, gate)
                     .with_substitution(Some(service))
-                    .with_recorder(Some(recorder))
+                    .with_audit_sink(RecorderSink::wrap(recorder))
             });
 
         write_frame(
@@ -1897,7 +1974,7 @@ mod tests {
             run_session_on_runtime(move |id, key, anchor, limits| {
                 FlowMuxAccept::new(id, key, anchor, limits, gate)
                     .with_substitution(Some(service))
-                    .with_recorder(Some(recorder))
+                    .with_audit_sink(RecorderSink::wrap(recorder))
             });
 
         write_frame(
@@ -2002,7 +2079,7 @@ mod tests {
             run_session_on_runtime(move |id, key, anchor, limits| {
                 FlowMuxAccept::new(id, key, anchor, limits, gate)
                     .with_substitution(Some(service))
-                    .with_recorder(Some(recorder))
+                    .with_audit_sink(RecorderSink::wrap(recorder))
             });
 
         write_frame(
@@ -2052,6 +2129,7 @@ mod tests {
                         RegistryLimits::default(),
                         EgressGate::default_deny(),
                     )
+                    .with_audit_sink(capturing_sink())
                     .with_vm_resources(resources),
                 )
                 .unwrap()
@@ -2119,7 +2197,9 @@ mod tests {
 
         let (mut guest, mut guest_session, host) =
             run_session_on_runtime(move |id, key, anchor, limits| {
-                FlowMuxAccept::new(id, key, anchor, limits, gate).with_substitution(Some(service))
+                FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_audit_sink(capturing_sink())
+                    .with_substitution(Some(service))
             });
 
         write_frame(
@@ -2167,7 +2247,9 @@ mod tests {
         let gate = gate_allowing_addr(addr.ip(), addr.port(), None);
         let (mut guest, mut guest_session, host) =
             run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
-                FlowMuxAccept::new(id, key, anchor, limits, gate).with_substitution(Some(service))
+                FlowMuxAccept::new(id, key, anchor, limits, gate)
+                    .with_audit_sink(capturing_sink())
+                    .with_substitution(Some(service))
             });
 
         write_frame(
@@ -2232,7 +2314,7 @@ mod tests {
             run_session_on_runtime(move |id, key, anchor, limits| {
                 FlowMuxAccept::new(id, key, anchor, limits, gate)
                     .with_substitution(Some(service))
-                    .with_recorder(Some(recorder))
+                    .with_audit_sink(RecorderSink::wrap(recorder))
             });
 
         write_frame(

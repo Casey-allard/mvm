@@ -16,7 +16,11 @@ fn telemetry_handoff(
     state: &Path,
     credit: bool,
     case: Case,
-) -> Result<(PreparedEndpointHandoff, Arc<Guard>)> {
+) -> Result<(
+    PreparedEndpointHandoff,
+    Arc<Guard>,
+    mvm_core::audit_sink::AuditContext,
+)> {
     let policy = NetworkPolicy::deny_all();
     let mut plan = PlanFixture::new().workload("vm-1").build();
     plan.network_mode = mvm_core::plan::NetworkMode::HostVsockProxy;
@@ -92,6 +96,9 @@ fn telemetry_handoff(
     Ok((
         anchor.prepare_endpoint_handoff(&config, BackendKind::Firecracker)?,
         guard,
+        mvm_core::audit_sink::AuditContext::Workload {
+            plan: Box::new(plan),
+        },
     ))
 }
 
@@ -138,7 +145,7 @@ fn run_case(case: Case) -> Result<()> {
             service_proxies: &[],
         },
     )?;
-    let (handoff, guard) = telemetry_handoff(
+    let (handoff, guard, audit) = telemetry_handoff(
         &holder,
         &state,
         !matches!(case, Case::MissingRetainedCredit),
@@ -159,6 +166,7 @@ fn run_case(case: Case) -> Result<()> {
             lifetime: EndpointLifetime::Launcher,
             telemetry: true,
             tenant: "local",
+            audit,
             secrets: &[],
             redaction: &redaction,
             transport: EndpointTransport::Uds {

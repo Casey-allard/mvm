@@ -110,10 +110,10 @@ pub fn resolve_local_deployment(path: &Path) -> Result<LocalDeployment> {
     }
     let record_path = directory.join("deploy.json");
     let rootfs = directory.join("rootfs.ext4");
-    let record = mvm_sdk::deploy::read_deploy_record(&record_path)
+    let record = mvm_core::deploy_record::read_deploy_record(&record_path)
         .map_err(anyhow::Error::from)
         .with_context(|| format!("reading deployment record {}", record_path.display()))?;
-    mvm_sdk::deploy::verify_boot_artifact(&rootfs, &record.boot_artifact)
+    mvm_core::deploy_record::verify_boot_artifact(&rootfs, &record.boot_artifact)
         .map_err(anyhow::Error::from)
         .with_context(|| format!("verifying deployment boot artifact {}", rootfs.display()))?;
     Ok(LocalDeployment {
@@ -268,11 +268,39 @@ pub(super) fn start_machine_spec_with_journal_context(
         super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
         None
     };
+    spec.validate_prepared_source()?;
+    let prepared_backend = spec
+        .prepared_image
+        .as_ref()
+        .map(|selection| {
+            let backend = host.backend(params.hypervisor);
+            crate::image_cache::prepared::require_backend(
+                selection,
+                params.hypervisor,
+                backend.name(),
+            )?;
+            Ok::<_, crate::prepared_image::PreparedImageError>(backend)
+        })
+        .transpose()?;
+    let prepared = spec
+        .prepared_image
+        .as_ref()
+        .map(|selection| {
+            crate::image_cache::prepared::revalidate(selection, params.hypervisor, &spec.profile)
+        })
+        .transpose()?;
     validate_registry_pack_source(spec)?;
     let network_policy = persisted_network_policy(spec)?;
     let (memory_mib, mem_initial_mib) =
         mp::validate_machine_memory(&spec.memory, spec.mem_initial.as_deref())?;
-    let boot = if let Some(pin) = spec
+    let boot = if let Some(prepared) = &prepared {
+        BootSource {
+            kernel: None,
+            label: prepared.image.reference.clone(),
+            rootfs: prepared.image.rootfs_path.clone(),
+            digest: prepared.selection.manifest_digest.clone(),
+        }
+    } else if let Some(pin) = spec
         .registry_pack_image
         .as_ref()
         .filter(|_| spec.manifest.is_none())
@@ -288,9 +316,14 @@ pub(super) fn start_machine_spec_with_journal_context(
     } else {
         resolve_boot_source(spec, host)?
     };
-    let kernel_path = match boot.kernel {
-        Some(kernel) => Some(kernel),
-        None => host.workload_kernel(params.hypervisor)?,
+    let kernel_path = match &prepared {
+        Some(prepared) => {
+            crate::image_cache::prepared::cached_kernel(&prepared.selection, params.hypervisor)?
+        }
+        None => match boot.kernel {
+            Some(kernel) => Some(kernel),
+            None => host.workload_kernel(params.hypervisor)?,
+        },
     };
     // Validated before any volume is leased, so a missing secret refuses the
     // start without leaving a lease behind.
@@ -324,7 +357,7 @@ pub(super) fn start_machine_spec_with_journal_context(
         gpu_device: spec.gpu_device,
         workload_dir: workload_dir.as_deref(),
         secrets,
-        backend: host.backend(params.hypervisor),
+        backend: prepared_backend.unwrap_or_else(|| host.backend(params.hypervisor)),
     };
     #[cfg(unix)]
     let admitted = if let Some(installed) = installed {
@@ -332,12 +365,13 @@ pub(super) fn start_machine_spec_with_journal_context(
             agent_verb: installed.agent_verbs(&spec.agent_verb)?,
             ..boot_params
         };
-        installed.start(boot_params, journal, fresh_state)?
+        installed.start(boot_params, journal, fresh_state, prepared.as_ref())?
     } else {
-        persistent::start_persistent(boot_params, journal, fresh_state)?
+        persistent::start_persistent(boot_params, journal, fresh_state, prepared.as_ref())?
     };
     #[cfg(not(unix))]
-    let admitted = persistent::start_persistent(boot_params, journal, fresh_state)?;
+    let admitted =
+        persistent::start_persistent(boot_params, journal, fresh_state, prepared.as_ref())?;
     Ok(MachineStart {
         resolved_digest: boot.digest,
         admitted,
@@ -519,6 +553,7 @@ mod tests {
 
     fn spec(name: &str) -> mp::MachineSpec {
         mp::MachineSpec {
+            prepared_image: None,
             schema_version: mp::MACHINE_SPEC_SCHEMA_VERSION,
             name: name.to_string(),
             image: None,

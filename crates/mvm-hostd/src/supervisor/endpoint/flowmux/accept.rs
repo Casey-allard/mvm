@@ -1,11 +1,10 @@
 //! Authenticated session construction and original audit/cancellation custody.
 use super::*;
+use crate::supervisor::audit::audit_recorder::Recorder;
 
 /// What one accepted FlowMux session needs to serve.
 ///
-/// A struct with a builder rather than a longer argument list: the optional
-/// halves — the audit recorder and the substitution service — are exactly the
-/// ones a caller is most likely to pass in the wrong order.
+/// Construction refuses a missing bound sink before authenticating a session.
 pub struct FlowMuxAccept {
     pub(super) session_id: String,
     pub(super) host_key: SigningKey,
@@ -13,6 +12,7 @@ pub struct FlowMuxAccept {
     pub(super) limits: RegistryLimits,
     pub(super) gate: Arc<EgressGate>,
     pub(super) recorder: Option<Arc<Recorder>>,
+    pub(super) audit_sink: Option<Arc<dyn AuditSink>>,
     pub(super) substitution:
         Option<Arc<crate::supervisor::endpoint::network_endpoint_proxy::SubstitutionService>>,
     pub(super) vm_resources: Option<Arc<FlowMuxVmResources>>,
@@ -73,6 +73,7 @@ impl FlowMuxAccept {
             limits,
             gate,
             recorder: None,
+            audit_sink: None,
             substitution: None,
             vm_resources: None,
             ingress_mappings: Vec::new(),
@@ -81,6 +82,22 @@ impl FlowMuxAccept {
             installed_audit: None,
             installed_session_control: None,
         }
+    }
+
+    /// Attach the required host-bound sink shared across this endpoint's sessions.
+    #[must_use]
+    pub fn with_audit_sink(mut self, audit_sink: Arc<dyn AuditSink>) -> Self {
+        self.audit_sink = Some(audit_sink);
+        self
+    }
+
+    /// Check presence of the same required sink before publishing readiness.
+    /// The caller must still perform canonical binding and health preflight.
+    pub(crate) fn required_audit_sink(&self) -> Result<Arc<dyn AuditSink>, FlowMuxError> {
+        self.audit_sink
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(FlowMuxError::MissingAuditSink)
     }
 
     /// Attach the chain-signed audit recorder.
@@ -176,15 +193,16 @@ impl FlowMuxSession {
         guest_anchor: &VerifyingKey,
         limits: RegistryLimits,
         gate: EgressGate,
+        audit_sink: Arc<dyn AuditSink>,
     ) -> Result<Self, FlowMuxError> {
         Self::accept_with(
             stream,
-            FlowMuxAccept::new(session_id, host_key, guest_anchor.to_owned(), limits, gate),
+            FlowMuxAccept::new(session_id, host_key, guest_anchor.to_owned(), limits, gate)
+                .with_audit_sink(audit_sink),
         )
     }
 
-    /// Accept one authenticated FlowMux session with an optional audit
-    /// recorder attached.
+    /// Accept one authenticated FlowMux session with a required bound audit sink.
     ///
     /// `session_id` must be unique per VM boot. `host_key` signs the
     /// handshake; `guest_anchor` is the only guest identity this endpoint
@@ -193,6 +211,7 @@ impl FlowMuxSession {
         mut stream: UnixStream,
         params: FlowMuxAccept,
     ) -> Result<Self, FlowMuxError> {
+        let audit_sink = params.required_audit_sink()?;
         let FlowMuxAccept {
             session_id,
             host_key,
@@ -200,6 +219,7 @@ impl FlowMuxSession {
             limits,
             gate,
             recorder,
+            audit_sink: _,
             substitution,
             vm_resources,
             ingress_mappings,
@@ -283,6 +303,8 @@ impl FlowMuxSession {
         // main thread can block on guest frames while relay threads emit
         // upstream data back to the guest.
         let writer = stream.try_clone()?;
+        wire::write_deadline(limits.credit_wait)?;
+        writer.set_write_timeout(Some(limits.credit_wait))?;
         let (session, _peer_key) =
             Session::host(&mut stream, session_id, host_key).map_err(|error| {
                 if let Some(control) = &installed_session_control {
@@ -319,12 +341,13 @@ impl FlowMuxSession {
             None => None,
         };
 
+        let reader = transport::BlockingReader::new(stream)?;
         info!(session_id, "FlowMux handshake complete");
 
         let resources = vm_resources
             .unwrap_or_else(|| Arc::new(FlowMuxVmResources::from_registry_limits(limits)));
         Ok(Self {
-            reader: stream,
+            reader,
             writer: Arc::new(SharedWriter::new(writer, pending_audit.0.clone())),
             session: Arc::new(Mutex::new(session)),
             validator: Arc::new(Mutex::new(SessionValidator::new(ingress_mappings))),
@@ -334,6 +357,8 @@ impl FlowMuxSession {
             ))),
             streams: Arc::new(Mutex::new(BTreeMap::new())),
             pending_ingress: Arc::new(Mutex::new(BTreeMap::new())),
+            ingress_activity: Arc::new(Mutex::new(())),
+            session_closed: Arc::new(AtomicBool::new(false)),
             icmp_rate: Arc::clone(&resources.icmp_rate),
             http_flows: BTreeMap::new(),
             http_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
@@ -343,7 +368,7 @@ impl FlowMuxSession {
             read_buf: Vec::with_capacity(4096),
             limits,
             connect_timeout: Duration::from_secs(30),
-            recorder,
+            audit_sink,
             runtime_handle,
             rate_limiter: Arc::clone(&resources.rate_limiter),
             terminated_flows: Arc::clone(&resources.terminated_flows),

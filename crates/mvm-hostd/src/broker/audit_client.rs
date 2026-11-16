@@ -242,7 +242,7 @@ impl AuditClient {
         crate::owned_resources::encoded_len(req, DEFAULT_MAX_FRAME_BYTES)
             .map_err(|source| AuditClientError::Encode { source })?;
         let helper_req = helper_request_from_append(req, vm_id);
-        let client = crate::audit_signer::helper_client::SignerHelperClient::new(uds_path)
+        let client = crate::audit_signer::owned_helper::OwnedSignerClient::new(uds_path)
             .with_max_frame_bytes(self.max_frame_bytes)
             .with_original_child(*original_child);
         let response = client

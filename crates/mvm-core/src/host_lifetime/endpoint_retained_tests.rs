@@ -207,6 +207,63 @@ fn selected_store_fixture() -> Fixture {
     f
 }
 
+fn retain_fixture_admission(handoff: &PreparedEndpointHandoff, plan: &ExecutionPlan) {
+    *handoff.anchor.admitted.lock().unwrap() = Some(AdmissionBinding {
+        plan_id: plan.plan_id.clone(),
+        nonce: plan.nonce.clone(),
+        body_sha256: Sha256::digest(serde_jcs::to_vec(plan).unwrap()).into(),
+        direct: None,
+        collector_redaction: None,
+        legacy_portable: false,
+    });
+}
+
+#[test]
+fn audit_context_requires_the_original_complete_admission_including_epoch() {
+    let fixture = Fixture::new();
+    let handoff = fixture.handoff(Arc::new(DefaultGuard));
+    let mut plan = crate::plan::test_support::PlanFixture::new()
+        .plan_id("fixture-only")
+        .build();
+    plan.execution_epoch = 17;
+    let context = crate::audit_sink::AuditContext::Workload {
+        plan: Box::new(plan.clone()),
+    };
+    assert!(handoff.check_audit_context(&context).is_err());
+    retain_fixture_admission(&handoff, &plan);
+    handoff.check_audit_context(&context).unwrap();
+
+    let mut changed_epoch = plan.clone();
+    changed_epoch.execution_epoch += 1;
+    assert!(
+        handoff
+            .check_audit_context(&crate::audit_sink::AuditContext::Workload {
+                plan: Box::new(changed_epoch),
+            })
+            .is_err()
+    );
+    let mut changed_body = plan.clone();
+    changed_body.resources.mem_mib += 1;
+    assert!(
+        handoff
+            .check_audit_context(&crate::audit_sink::AuditContext::Workload {
+                plan: Box::new(changed_body),
+            })
+            .is_err()
+    );
+    assert!(
+        handoff
+            .check_audit_context(&crate::audit_sink::AuditContext::Builder {
+                tenant: plan.tenant.clone(),
+                name: plan.workload.0.clone(),
+            })
+            .is_err()
+    );
+    handoff.check_audit_context(&context).unwrap();
+    fixture.parent.store(false, Ordering::Release);
+    assert!(handoff.check_audit_context(&context).is_err());
+}
+
 #[test]
 fn collector_selection_poison_keeps_original_registration_required() {
     let fixture = Fixture::new();

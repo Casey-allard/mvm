@@ -106,6 +106,61 @@ The first merged candidate stopped in strict Clippy on an oversized private
 authority enum. Its replacement uses the existing two-way optional verified
 plan carrier without an extra heap allocation or lint suppression; that failure
 remains recorded separately from qualification of the corrected source.
+## Flow-audit lifecycle boundary
+
+The focused review for [#5538](https://github.com/tinylabscom/mvm/issues/5538)
+covers the changed FlowMux decision and session-cleanup paths, the bound-recorder
+adapter and shared asynchronous-recorder bridge, and endpoint readiness.
+It is not a new review of every file in the earlier census below.
+
+The transition owners are:
+
+- The admitting host supplies the workload plan and execution epoch; a builder
+  supplies an explicit non-workload identity.
+- Endpoint startup requires a successful write through the actual bound sink.
+  The sink carries no lifecycle control capability and adds no post-boot
+  registration handoff.
+- One endpoint-owned state serializes write outcomes across all its sessions.
+  Missing records remain marked incomplete after recovery of the journal;
+  suppressed UDP repeats do not reset the failure streak.
+- An operation whose required audit write fails is refused. After journal
+  recovery, later recorded operations may proceed, but the missing evidence
+  remains recorded as incomplete.
+- Session completion cancels its forwarding work and flushes accumulated health.
+  The health file begins `active`, never `complete`; an unclean exit or failed
+  health-file write cannot establish a complete epoch. Signed epoch sealing and
+  crash-recovery integration remain separate contracts.
+
+Health creation exclusively reserves an owner-only path before publishing its
+first snapshot. An interrupted, even empty, reservation refuses reuse. Updates
+use the shared atomic durable writer: sync a private temporary, rename it into
+place, then sync the parent directory. Failed rename retains temporary cleanup;
+successful rename disarms old-name cleanup. This path uses creation-time modes
+and libc rename without extending the endpoint's seccomp allowlist.
+
+UDP closure retains the relay and its capacity charge until the worker exits;
+the session thread never joins a live relay while handling CloseUdp or Reset.
+Nonblocking transport I/O and readiness preserve blocking read behavior while
+bounding a whole frame write by one credit-wait deadline. Session locking ends
+before the write can wait, so incoming cancellation can still be authenticated.
+Final cleanup closes the transport, cancels and joins relay owners, releases
+their charges, then flushes suppression counts. Native socket tests cover a
+non-reading guest, slow draining, partial-frame failure, and continuous denied
+datagrams; ordinary association closure leaves unrelated TCP flows intact.
+
+The endpoint-process witnesses verify missing-sink refusal and signed,
+plan-bound denial records; they do not establish live HVF/Firecracker behavior.
+Backend-specific verification is recorded in the implementing issue and PR,
+not inferred here.
+
+VM lifetime remains with the existing runner/backend owners. Automatic
+termination after three production audit-write failures remains unimplemented
+under #5538; this audit-only slice adds no stop control, post-boot target
+acquisition, or backend-based startup refusal. Completing that requirement needs
+qualified lifecycle ownership and confirmed rollback, not a new lookup by name
+or PID. Original-owner persistent Firecracker work remains subject to the
+deferral and process-model decision in
+[#5522](https://github.com/tinylabscom/mvm/issues/5522).
 
 ## Files NOT read
 

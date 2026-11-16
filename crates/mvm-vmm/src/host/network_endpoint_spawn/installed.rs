@@ -362,6 +362,7 @@ fn spawn_registered(
     // The full bounded instance quote precedes canonical policy hashing and
     // proxy parsing; the bootstrap floor alone does not fund those operations.
     if program == RegisteredProgram::Network {
+        handoff.check_audit_context(&params.audit)?;
         let policy = params
             .network_policy
             .context("installed endpoint policy missing")?;

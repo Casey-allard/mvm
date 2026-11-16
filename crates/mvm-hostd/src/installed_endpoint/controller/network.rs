@@ -264,6 +264,9 @@ pub(super) fn run(
     .with_installed_audit(audit.clone())
     .with_installed_session_control(session_control.clone())
     .with_recorder(Some(recorder));
+    // Missing required audit configuration must refuse before listeners,
+    // collector startup or Ready; this is not the canonical health preflight.
+    let _ = params.required_audit_sink()?;
     // No enable_all, tokio::spawn or spawn_blocking. Actual audit futures use
     // bounded synchronous original std sockets; Handle::block_on needs no driver.
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;

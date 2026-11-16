@@ -479,7 +479,12 @@ mod registered_prepare {
         store: &Path,
         state: &Path,
         policy: &NetworkPolicy,
-    ) -> Result<(PreparedEndpointHandoff, AdmittedNetworkPlan, Arc<Guard>)> {
+    ) -> Result<(
+        PreparedEndpointHandoff,
+        AdmittedNetworkPlan,
+        Arc<Guard>,
+        mvm_core::audit_sink::AuditContext,
+    )> {
         let mut plan = PlanFixture::new().workload("vm-1").build();
         plan.network_mode = mvm_core::plan::NetworkMode::HostVsockProxy;
         plan.asset_identities
@@ -540,6 +545,9 @@ mod registered_prepare {
             anchor.prepare_endpoint_handoff(&config, BackendKind::Firecracker)?,
             projection,
             guard,
+            mvm_core::audit_sink::AuditContext::Workload {
+                plan: Box::new(plan),
+            },
         ))
     }
 
@@ -669,13 +677,14 @@ mod registered_prepare {
                     profile: PayloadMappingProfile::SpiralCoreObjectStreamSmallV1,
                 },
             ])?));
-        let (handoff, plan, guard) = handoff(&holder, &store, &state, &policy)?;
+        let (handoff, plan, guard, audit) = handoff(&holder, &store, &state, &policy)?;
         let redaction = Default::default();
         let params = SubstitutionSpawnParams::builder()
             .vm_name("vm-1")
             .state_dir(&state)
             .lifetime(EndpointLifetime::Launcher)
             .tenant("local")
+            .audit(audit)
             .secrets(&[])
             .redaction(&redaction)
             .transport(EndpointTransport::Uds {
@@ -749,7 +758,8 @@ mod registered_prepare {
             &mut guest,
             SigningKey::from_bytes(&[7; 32]),
             &fixture.host_signer.verifying_key(),
-        )?;
+        )
+        .with_context(endpoint_diagnostic)?;
 
         // The canonical launcher waits for post-handshake session publication.
         let readiness_path = config::vm_socket_dir_at(&state)

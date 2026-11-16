@@ -46,9 +46,11 @@
 //! categories use [`Recorder::record_unbound`] which constructs
 //! an envelope with sentinel plan-id values.
 
+mod bound;
+
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock, Weak};
 
 use mvm_core::observability::metrics::Metrics;
 use mvm_core::plan::{ExecutionPlan, PlanId, TenantId};
@@ -165,6 +167,9 @@ pub enum RecorderError {
 
     #[error(transparent)]
     Signer(#[from] AuditError),
+
+    #[error("bound audit sink failed: {0}")]
+    Bound(#[from] std::io::Error),
 }
 
 /// Unified audit-event recorder. Owns an `Arc<dyn AuditSigner>`
@@ -189,15 +194,15 @@ pub struct Recorder {
     /// carries sentinel plan and image fields and would otherwise say nothing
     /// about which workload it describes.
     vm_name: Option<String>,
+    bound_sink: Arc<OnceLock<Weak<dyn mvm_core::audit_sink::AuditSink>>>,
 }
 
-/// Private linear preflight: the original canonical entry and actual
-/// workspace remain together through connection and final append.
+/// Private linear preflight: one canonical bound entry and original workspace
+/// remain together until the required append, before any authorized effect.
 pub(crate) struct PreparedInstalledAudit {
     entry: PlanAuditEntry,
     origin: crate::installed_endpoint::InstalledAuditOrigin,
     workspace: crate::owned_resources::WorkspacePermit,
-    category: EventCategory,
     deadline: std::time::Instant,
 }
 
@@ -213,6 +218,7 @@ impl Recorder {
             default_tenant,
             metrics: None,
             vm_name: None,
+            bound_sink: Arc::new(OnceLock::new()),
         }
     }
 
@@ -233,44 +239,44 @@ impl Recorder {
             .is_some_and(|origin| origin.matches(audit))
     }
 
-    pub(crate) fn preflight_installed_unbound(
+    pub(crate) fn prepare_installed_bound(
         &self,
+        context: &mvm_core::audit_sink::AuditContext,
         category: EventCategory,
         event_name: &str,
-        deadline: std::time::Instant,
         extras: impl FnOnce() -> std::collections::BTreeMap<String, String>,
     ) -> Result<PreparedInstalledAudit, RecorderError> {
-        if category.requires_plan_context() {
-            return Err(RecorderError::MissingPlanContext { category });
-        }
         let origin = self
             .installed_origin
             .as_ref()
             .ok_or_else(|| AuditError::Io("original installed audit origin required".into()))?;
-        // The SAME actual workspace precedes entry/label copies and remains
-        // held through the authorized connection attempt and final append.
+        let plan = context.plan().ok_or_else(|| {
+            AuditError::Io("original installed workload audit context required".into())
+        })?;
+        context.validate_for(&plan.tenant.0, &plan.workload.0)?;
+        // Cover recorder-created entry and label copies with the SAME actual
+        // one-slot workspace. Caller-owned labels precede this API boundary.
         let workspace = origin.acquire()?;
+        let deadline = origin.write_deadline()?;
         if std::time::Instant::now() >= deadline {
             return Err(AuditError::Io("installed audit deadline expired".into()).into());
         }
         validate_event_prefix(category, event_name)?;
-        let mut entry = self.unbound_entry(category, event_name.to_owned(), extras());
-        // A private size template, never emitted: the largest supported UTC
-        // year/fraction widths bound the actual post-connect canonical time.
-        entry.timestamp = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+        let entry = self.audit_context_entry(context, category, event_name, extras());
         origin.preflight(&entry)?;
         Ok(PreparedInstalledAudit {
             entry,
             origin: origin.clone(),
             workspace,
-            category,
             deadline,
         })
     }
 
-    pub(crate) async fn record_installed_prepared(
+    pub(crate) fn record_installed_prepared(
         &self,
-        mut prepared: PreparedInstalledAudit,
+        prepared: PreparedInstalledAudit,
+        context: &mvm_core::audit_sink::AuditContext,
+        category: EventCategory,
     ) -> Result<(), RecorderError> {
         let origin = self
             .installed_origin
@@ -279,19 +285,21 @@ impl Recorder {
         if !origin.same_signer(&prepared.origin) {
             return Err(AuditError::Io("original installed audit signer differs".into()).into());
         }
-        prepared.entry.timestamp = unbound_timestamp();
+        // emit_held uses the retained slot, rather than acquiring it again
+        // through InstalledSigner's ordinary append method.
         origin.emit_held(&prepared.entry, &prepared.workspace, prepared.deadline)?;
-        self.bump_metric(prepared.category);
+        self.complete_audit_context(context, category, &prepared.entry);
+        // Prepared's entry is destroyed before its workspace field. No funded
+        // entry escapes while the one-slot pool becomes available again.
         Ok(())
     }
 
     /// Attribute every unbound entry to one machine by stamping it with a
     /// `vm_name` label. An empty name attributes nothing.
     ///
-    /// The per-VM network endpoint records its egress decisions unbound — it
-    /// holds no plan — and several machines share one tenant chain, so without
-    /// this a reader cannot tell whose refusal a `host.flow.denied` was. A label
-    /// the caller passes explicitly wins over this one.
+    /// The physical instance can differ from the admitted logical workload.
+    /// Bound network entries stamp both identities; an explicit unbound label
+    /// retains its historical caller precedence.
     #[must_use]
     pub fn with_vm_name(mut self, vm_name: &str) -> Self {
         self.vm_name = (!vm_name.is_empty()).then(|| vm_name.to_string());
@@ -363,10 +371,15 @@ impl Recorder {
         event_name: impl Into<String>,
         extras: impl IntoIterator<Item = (String, String)>,
     ) -> Result<(), RecorderError> {
+        let event_name = event_name.into();
+        if self.bound_sink.get().is_some() {
+            return self
+                .record_through_bound_sink(category, event_name, extras)
+                .await;
+        }
         if category.requires_plan_context() {
             return Err(RecorderError::MissingPlanContext { category });
         }
-        let event_name = event_name.into();
         validate_event_prefix(category, &event_name)?;
         let entry = self.unbound_entry(category, event_name, extras);
         self.signer.sign_and_emit(&entry).await?;
@@ -691,13 +704,21 @@ pub(crate) mod tests {
     #[test]
     fn legacy_recorder_cannot_prepare_an_installed_flow_entry() {
         let (recorder, signer) = fixture_recorder();
-        let result = recorder.preflight_installed_unbound(
+        let context = mvm_core::audit_sink::AuditContext::Workload {
+            plan: Box::new(fixture_plan()),
+        };
+        let copied = std::sync::atomic::AtomicBool::new(false);
+        let result = recorder.prepare_installed_bound(
+            &context,
             EventCategory::Host,
             "host.flow.allowed",
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-            std::collections::BTreeMap::new,
+            || {
+                copied.store(true, std::sync::atomic::Ordering::Release);
+                std::collections::BTreeMap::new()
+            },
         );
         assert!(result.is_err());
+        assert!(!copied.load(std::sync::atomic::Ordering::Acquire));
         assert!(signer.entries().is_empty(), "preflight performs no append");
     }
 
