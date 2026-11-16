@@ -1179,6 +1179,12 @@ mod resource_pool_tests {
     mod retirement_failure_tests;
 
     fn claimed_installed_store() -> ClaimedInstalledStore {
+        claim_installed_store(owner_mode_tests::pending_installed_store())
+    }
+
+    fn claim_installed_store(
+        pending: owner_mode_tests::PendingInstalledStore,
+    ) -> ClaimedInstalledStore {
         use spiralcore_transfer::{resource_profile::ResourceProfile, wan};
         let owner_mode_tests::PendingInstalledStore {
             root,
@@ -1187,7 +1193,7 @@ mod resource_pool_tests {
             mut permit,
             policy,
             charge,
-        } = owner_mode_tests::pending_installed_store();
+        } = pending;
         let profile = ResourceProfile::SmallV1;
         let limits = profile.receiver_limits();
         let Some(OwnedPayloadStore::Installed(store)) = permit.store.as_mut() else {

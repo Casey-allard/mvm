@@ -18,11 +18,19 @@ pub(super) struct PendingInstalledStore {
 }
 
 pub(super) fn pending_installed_store() -> PendingInstalledStore {
+    pending_installed_store_with_parent(|path| {
+        std::fs::File::open(path).expect("original parent FD")
+    })
+}
+
+pub(super) fn pending_installed_store_with_parent(
+    open: impl FnOnce(&std::path::Path) -> std::fs::File,
+) -> PendingInstalledStore {
     let root = tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .expect("private original parent");
-    let parent = Arc::new(std::fs::File::open(root.path()).expect("original parent FD"));
+    let parent = Arc::new(open(root.path()));
     let name = format!("flow-{}", hex::encode([9u8; 32]));
     let path = root.path().join(&name);
     let profile = ResourceProfile::SmallV1;
