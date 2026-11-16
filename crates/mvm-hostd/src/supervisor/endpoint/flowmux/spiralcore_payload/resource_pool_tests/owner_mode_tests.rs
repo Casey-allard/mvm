@@ -18,9 +18,7 @@ pub(super) struct PendingInstalledStore {
 }
 
 pub(super) fn pending_installed_store() -> PendingInstalledStore {
-    prepare_store_fixture(|path| {
-        std::fs::File::open(path).expect("original parent FD")
-    })
+    prepare_store_fixture(|path| std::fs::File::open(path).expect("original parent FD"))
 }
 
 pub(super) fn prepare_store_fixture(
