@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 #[path = "owned_relays_tests.rs"]
-mod custody_tests;
+pub(super) mod custody_tests;
 
 use super::socket::FlowSocket;
 use crate::installed_endpoint::{InstalledEndpointComponentPermit, InstalledEndpointResources};

@@ -187,6 +187,20 @@ impl InstalledEndpointComponentPermit {
         self.lease.check_store_cleanup().map_err(io::Error::other)?;
         self.auxiliary.open()
     }
+    #[cfg(test)]
+    pub(crate) fn poison_auxiliary_for_test(&self) {
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _held = self
+                    .auxiliary
+                    .remaining
+                    .lock()
+                    .expect("original auxiliary ledger");
+                panic!("controlled retained store metadata poison");
+            })
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1174,6 +1174,7 @@ impl Drop for PayloadResourcePermit {
 #[cfg(test)]
 mod resource_pool_tests {
     use super::*;
+    mod installed_retention_tests;
     mod owner_mode_tests;
     mod retirement_failure_tests;
 

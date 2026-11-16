@@ -26,7 +26,7 @@ mod installed_factory {
 }
 
 #[allow(dead_code, unreachable_pub)]
-mod installed_resource_fixture {
+pub(in crate::supervisor::endpoint::flowmux) mod installed_resource_fixture {
     use crate as mvm_hostd;
     include!("../../../../tests/support/installed_factory_fixture.rs");
 }
