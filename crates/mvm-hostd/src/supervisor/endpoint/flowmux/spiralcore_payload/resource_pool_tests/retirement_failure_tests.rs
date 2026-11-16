@@ -119,12 +119,16 @@ fn final_rmdir_refusal_retains_unlinked_owner_lease_and_original_debit() {
         fixture.pool.snapshot().expect("quarantined debit"),
         expected
     );
+    assert!(fixture.pool.inner.fenced.load(Ordering::Acquire));
     match fixture
         .pool
         .reserve_installed_profile(spiralcore_transfer::resource_profile::ResourceProfile::SmallV1)
     {
         Ok(_) => panic!("quarantined credit was reused"),
-        Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+        Err(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "payload pool fenced");
+        }
     }
     let ledger = fixture.pool.inner.ledger.lock().expect("quarantine ledger");
     assert_eq!(ledger.used, expected);

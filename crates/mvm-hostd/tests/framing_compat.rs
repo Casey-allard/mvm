@@ -84,7 +84,7 @@ async fn bounded_writer_keeps_wire_and_refuses_before_any_output() {
 async fn checked_reader_keeps_validation_and_cap_before_typed_parse() {
     let mut reader = std::io::Cursor::new(WIRE);
     let mut checked = false;
-    let error = hostd::read_json_frame_checked::<_, u8>(&mut reader, 1, |body| {
+    let error = hostd::read_json_frame_checked::<_, bool>(&mut reader, 1, |body| {
         checked = true;
         assert_eq!(body, b"7");
         Err(serde_json::Error::io(std::io::Error::new(
@@ -95,7 +95,12 @@ async fn checked_reader_keeps_validation_and_cap_before_typed_parse() {
     .await
     .unwrap_err();
     assert!(checked);
-    assert!(matches!(error, core::FrameError::Decode(_)));
+    match error {
+        core::FrameError::Decode(error) => {
+            assert_eq!(error.to_string(), "fixture validation refusal");
+        }
+        error => panic!("validation failure changed: {error}"),
+    }
     assert_eq!(reader.position(), WIRE.len() as u64);
 
     let mut reader = std::io::Cursor::new(WIRE);
