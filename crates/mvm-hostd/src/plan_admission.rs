@@ -302,6 +302,16 @@ impl AdmittedPlan {
         );
         backend.abort_start(id).map(|_| ())
     }
+
+    /// The audit identity the host endpoint records this admitted workload's
+    /// flows under: the admitted plan itself, never a builder identity.
+    #[must_use]
+    pub fn workload_audit_context(&self) -> mvm_core::audit_sink::AuditContext {
+        mvm_core::audit_sink::AuditContext::Workload {
+            plan: Box::new(self.plan.clone()),
+        }
+    }
+
     /// The plan's content-address, re-derived and checked during admission.
     #[must_use]
     pub fn plan_id(&self) -> &PlanId {

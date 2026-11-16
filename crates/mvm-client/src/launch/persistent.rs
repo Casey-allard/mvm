@@ -195,6 +195,7 @@ pub(super) fn start_persistent(
     fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
     prepared: Option<&crate::image_cache::prepared::ValidatedPrepared>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    let _runtime_proofs = mvm_build::guest_runtime::evidence::LaunchProofScope::begin();
     journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     let boot = prepare_persistent_boot(params, journal.as_deref(), prepared)?;
     finish_legacy_persistent(boot, journal, fresh_state)

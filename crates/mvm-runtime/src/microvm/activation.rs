@@ -1090,9 +1090,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let guest_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
             let host_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
-            let mut session =
-                mvm_agentd::vsock::AuthenticatedSession::guest(&mut guest, guest_key, &host_key)
-                    .unwrap();
+            let mut session = mvm_agentd::vsock::AuthenticatedSession::guest(
+                &mut guest,
+                guest_key,
+                &host_key,
+                &mvm_agentd::vsock::control_offer(),
+            )
+            .unwrap();
             let req: GuestRequest = session.read(&mut guest).unwrap();
             assert!(matches!(req, GuestRequest::ActivateEnvironment(_)));
             session
@@ -1127,9 +1131,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let guest_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
             let host_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
-            let mut session =
-                mvm_agentd::vsock::AuthenticatedSession::guest(&mut guest, guest_key, &host_key)
-                    .unwrap();
+            let mut session = mvm_agentd::vsock::AuthenticatedSession::guest(
+                &mut guest,
+                guest_key,
+                &host_key,
+                &mvm_agentd::vsock::control_offer(),
+            )
+            .unwrap();
             let req: GuestRequest = session.read(&mut guest).unwrap();
             assert!(matches!(req, GuestRequest::ActivateEnvironment(_)));
             session

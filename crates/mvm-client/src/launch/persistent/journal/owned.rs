@@ -135,6 +135,7 @@ impl JournalStartContext {
         fresh: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
         prepared: Option<&crate::image_cache::prepared::ValidatedPrepared>,
     ) -> Result<AdmittedPlan> {
+        let _runtime_proofs = mvm_build::guest_runtime::evidence::LaunchProofScope::begin();
         let journal = journal.context("original installed journal missing")?;
         ensure!(
             self.boot.is_none(),

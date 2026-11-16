@@ -59,3 +59,8 @@ pub(crate) fn hard_link_count(_metadata: &Metadata) -> io::Result<u64> {
         "secure record link validation is unsupported on this host",
     ))
 }
+
+/// Refuse managed-directory sync on hosts without Unix permission bits.
+pub fn submit_managed_directory_chain(root: &Path, _directory: &Path) -> io::Result<()> {
+    Err(unsupported_platform_error(root))
+}

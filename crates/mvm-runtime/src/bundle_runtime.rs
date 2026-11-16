@@ -42,6 +42,22 @@ pub fn attach_if_installed_bundle(
     backend: &str,
     host_key: impl FnOnce() -> Result<Option<ed25519_dalek::VerifyingKey>>,
 ) -> Result<bool> {
+    Ok(attach_installed_bundle_with_release(config, backend, host_key)?.is_some())
+}
+
+/// The authenticated release selected by this installed-bundle launch, when
+/// its config carries a release proof. Legacy boot assets have no such release.
+pub struct InstalledBundleAttachment {
+    pub release: Option<std::sync::Arc<mvm_build::guest_runtime::evidence::VerifiedReleaseRuntime>>,
+}
+
+/// Return the same launch-owned release snapshot that authenticated selection.
+/// Config changes commit only after the complete attachment succeeds.
+pub fn attach_installed_bundle_with_release(
+    config: &mut VmStartConfig,
+    backend: &str,
+    host_key: impl FnOnce() -> Result<Option<ed25519_dalek::VerifyingKey>>,
+) -> Result<Option<InstalledBundleAttachment>> {
     let mut selected = config.clone();
     let attached = attach_installed_bundle(&mut selected, backend, None, host_key)?;
     *config = selected;
@@ -57,7 +73,7 @@ pub fn attach_direct_runtime(
 ) -> Result<()> {
     let mut selected = config.clone();
     ensure!(
-        attach_installed_bundle(&mut selected, backend, Some((pin, bytes)), || Ok(None))?
+        attach_installed_bundle(&mut selected, backend, Some((pin, bytes)), || Ok(None))?.is_some()
             && (selected
                 .legacy_portable_runtime
                 .as_ref()
@@ -76,9 +92,9 @@ fn attach_installed_bundle(
     backend: &str,
     quote: Option<(&mvm_core::plan::PlanArtifact, std::num::NonZeroU64)>,
     host_key: impl FnOnce() -> Result<Option<ed25519_dalek::VerifyingKey>>,
-) -> Result<bool> {
+) -> Result<Option<InstalledBundleAttachment>> {
     let Some(archive) = installed_archive_for_rootfs(Path::new(&config.rootfs_path))? else {
-        return Ok(false);
+        return Ok(None);
     };
     let registry = BundleRegistry::default_path()?;
     let release = match quote {
@@ -207,7 +223,7 @@ fn attach_installed_bundle(
     }
     attach_workload_verity(config, &installed)?;
     let Some(boot) = &verified.boot_assets else {
-        return Ok(false);
+        return Ok(None);
     };
     if let Some(runtime) = &boot.cli_runtime {
         ensure!(
@@ -238,7 +254,7 @@ fn attach_installed_bundle(
             &support,
             &mvm_build::stage0_kernel::current_image_set_protocol_support(),
         )?;
-        attach_cli_runtime(config, &installed, runtime)?;
+        let release = attach_cli_runtime(config, &installed, runtime)?;
         if needs_owner {
             let owner = std::sync::Arc::new(mvm_core::canonical_linux::prepare_canonical_linux(
                 &archive,
@@ -249,7 +265,9 @@ fn attach_installed_bundle(
             )?);
             owner.bind_to_config(config)?;
         }
-        return Ok(true);
+        return Ok(Some(InstalledBundleAttachment {
+            release: Some(release),
+        }));
     }
     ensure!(
         config.legacy_bundle_runtime.is_none()
@@ -360,7 +378,7 @@ fn attach_installed_bundle(
         config,
         crate::runtime_evidence::MIN_GUEST_RPC_PROTOCOL_VERSION,
     )?;
-    Ok(true)
+    Ok(Some(InstalledBundleAttachment { release: None }))
 }
 
 /// Reuse the canonical release verifier; a bundle publisher cannot authorize
@@ -370,10 +388,8 @@ fn attach_cli_runtime(
     config: &mut VmStartConfig,
     installed: &mvm_core::plan::bundle::InstalledBundle,
     runtime: &mvm_core::plan::bundle::EmbeddedCliBootAssets,
-) -> Result<()> {
-    use mvm_build::guest_runtime::evidence::{
-        RuntimeArtifactSelection, verify_runtime_release_proof,
-    };
+) -> Result<std::sync::Arc<mvm_build::guest_runtime::evidence::VerifiedReleaseRuntime>> {
+    use mvm_build::guest_runtime::evidence::{RuntimeArtifactSelection, verify_release_runtime};
     use mvm_core::protocol::runtime_release::{
         CliRuntimeLaunchBinding, RuntimeBindingProvenance, RuntimeLaunchBinding,
         RuntimeReleaseProof,
@@ -419,8 +435,11 @@ fn attach_cli_runtime(
     let overlay_path = artifact(&runtime.overlay_artifact)?;
     let overlay_verity_path = artifact(&runtime.overlay_verity_artifact)?;
     let initramfs_path = artifact(&runtime.initramfs_artifact)?;
-    let verified = verify_runtime_release_proof(&proof, &runtime.version, proof.arch)
-        .context("verifying retained portable CLI runtime release proof")?;
+    let release = std::sync::Arc::new(
+        verify_release_runtime(proof.clone(), &runtime.version, proof.arch)
+            .context("verifying retained portable CLI runtime release proof")?,
+    );
+    let verified = release.manifest();
     let declaration = verified.declaration(proof.arch)?;
     ensure!(
         declaration.protocol_version == runtime.protocol_version
@@ -450,7 +469,7 @@ fn attach_cli_runtime(
     // The portable closure is selected for this cold launch, not a substitute
     // for the runtime of an independently prepared standby parent.
     config.warm_pool_size = 0;
-    Ok(())
+    Ok(release)
 }
 
 fn attach_workload_verity(
@@ -574,8 +593,8 @@ mod tests {
             overlay_verity_artifact: "overlay.verity".into(),
             initramfs_artifact: "initrd".into(),
             overlay_roothash: "a".repeat(64),
-            protocol_version: 2,
-            min_supported_protocol_version: 2,
+            protocol_version: crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION,
+            min_supported_protocol_version: crate::runtime_evidence::MIN_GUEST_RPC_PROTOCOL_VERSION,
         };
         let artifacts = [
             "runtime.tar.gz",

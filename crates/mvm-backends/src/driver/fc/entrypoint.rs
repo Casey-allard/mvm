@@ -3,7 +3,7 @@ use super::owned::OwnedFcState;
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use mvm_agentd::vsock::{
-    AuthenticatedSession, EntrypointEvent, GUEST_AGENT_PORT, GuestRequest, GuestResponse,
+    EntrypointEvent, GUEST_AGENT_PORT, GuestRequest, GuestResponse, HostControlSession,
     check_response, complete_connect_handshake, connect_unix_before,
     send_entrypoint_on_authenticated_session,
 };
@@ -30,7 +30,7 @@ struct Channel {
     original: Arc<Mutex<OwnedFcState>>,
     anchor: Arc<HostLifetimeAnchor>,
     stream: Option<UnixStream>,
-    session: AuthenticatedSession,
+    session: HostControlSession,
     first_guest: VerifyingKey,
     path: PathBuf,
     host: [u8; 32],
@@ -90,7 +90,7 @@ fn connect(
     host: &[u8; 32],
     path: &Path,
     until: Instant,
-) -> Result<(UnixStream, AuthenticatedSession, VerifyingKey)> {
+) -> Result<(UnixStream, HostControlSession, VerifyingKey)> {
     {
         let held = original
             .try_lock()
@@ -119,7 +119,7 @@ fn connect(
     .context("original control CONNECT handshake")?;
     check(original, anchor, &stream, until).context("original control post-CONNECT custody")?;
     let session_id = mvm_core::domain::session::SessionId::new();
-    let (session, peer) = AuthenticatedSession::host_retaining_peer(
+    let (session, peer) = HostControlSession::host_retaining_peer(
         &mut DeadlineIo {
             stream: &mut stream,
             until,
@@ -172,7 +172,7 @@ impl Channel {
         until: Instant,
     ) -> Result<GuestResponse> {
         let mut io = DeadlineIo { stream, until };
-        self.session.write(&mut io, request)?;
+        self.session.send(&mut io, request)?;
         Ok(check_response(request, self.session.read(&mut io)?)?)
     }
 }
