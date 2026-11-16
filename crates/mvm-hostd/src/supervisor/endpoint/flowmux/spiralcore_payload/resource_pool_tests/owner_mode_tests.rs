@@ -68,6 +68,130 @@ pub(super) fn pending_installed_store() -> PendingInstalledStore {
     }
 }
 
+pub(super) fn seed_original_object(endpoint: &mut ObjectEndpoint<wan::BenchAuthority>) {
+    use spiralcore_transfer::{protocol::Frame, v1::ObjectMode};
+    let context = wan::context([9; 32]);
+    let bytes = b"original installed custody: exact retained object".to_vec();
+    let mut sender = ObjectSender::new_with_resource_profile(
+        ObjectMode::Raw,
+        &context,
+        None,
+        endpoint.profile(),
+        ResourceProfile::SmallV1,
+    )
+    .expect("canonical fixture sender");
+    let clock = Instant::now();
+    let (mut requests, mut replies) = (0usize, 0usize);
+    let receipt = sender
+        .send(&context, bytes.clone(), [31; 32], false, |frames| {
+            frames
+                .iter()
+                .map(|frame| {
+                    let encoded = frame.encode()?;
+                    requests += encoded.len();
+                    let reply = endpoint.handle(&context, &Frame::decode(&encoded)?, 0)?;
+                    let encoded = reply.encode()?;
+                    replies += encoded.len();
+                    Frame::decode(&encoded)
+                })
+                .collect()
+        })
+        .expect("publish original object");
+    assert_eq!(receipt.object, spiralcore_transfer::object_id(&bytes));
+    assert_eq!(
+        endpoint
+            .read_object(&context, receipt.object)
+            .expect("exact readback"),
+        bytes
+    );
+    eprintln!(
+        "STORE_FIXTURE_OBJECT exact_bytes={} serialized_in_memory_request_bytes={requests} serialized_in_memory_reply_bytes={replies} verified_wall_ns={} network_bytes=0",
+        bytes.len(),
+        clock.elapsed().as_nanos()
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileRecord {
+    relative: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    links: u64,
+    directory: bool,
+    bytes: Vec<u8>,
+}
+
+fn snapshot_files(root: &std::path::Path) -> Vec<FileRecord> {
+    fn walk(
+        root: &std::path::Path,
+        relative: &std::path::Path,
+        depth: u8,
+        rows: &mut Vec<FileRecord>,
+    ) {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        assert!(depth <= 2, "fixture directory depth");
+        let mut entries: Vec<_> = std::fs::read_dir(root.join(relative))
+            .expect("fixture entries")
+            .take(9)
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect();
+        assert!(entries.len() <= 8, "fixture entry bound");
+        entries.sort();
+        for name in entries {
+            let relative = relative.join(name);
+            let named = std::fs::symlink_metadata(root.join(&relative)).expect("named fixture");
+            assert!(
+                named.is_dir() || named.is_file(),
+                "no fixture symlinks/special files"
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(root.join(&relative))
+                .expect("original fixture file");
+            let meta = file.metadata().expect("held fixture metadata");
+            assert_eq!((meta.dev(), meta.ino()), (named.dev(), named.ino()));
+            let mut bytes = Vec::new();
+            if meta.is_file() {
+                assert!(meta.len() <= 4096, "fixture file byte bound");
+                std::io::Read::by_ref(&mut file)
+                    .take(4097)
+                    .read_to_end(&mut bytes)
+                    .expect("original bytes");
+                assert_eq!(
+                    u64::try_from(bytes.len()).expect("fixture length"),
+                    meta.len()
+                );
+                assert!(bytes.len() <= 4096);
+            }
+            rows.push(FileRecord {
+                relative: relative.clone(),
+                device: meta.dev(),
+                inode: meta.ino(),
+                uid: meta.uid(),
+                gid: meta.gid(),
+                mode: meta.mode(),
+                links: meta.nlink(),
+                directory: meta.is_dir(),
+                bytes,
+            });
+            assert!(rows.len() <= 8, "fixture total entry bound");
+            if meta.is_dir() {
+                walk(root, &relative, depth + 1, rows);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    walk(root, std::path::Path::new(""), 0, &mut rows);
+    assert!(rows.iter().any(
+        |row| row.relative.extension().is_some_and(|ext| ext == "object") && !row.bytes.is_empty()
+    ));
+    rows
+}
+
 struct OriginalMetadata {
     directory: std::fs::File,
     before: rustix::fs::Stat,
@@ -127,6 +251,21 @@ impl OriginalMetadata {
             rustix::fs::FileType::from_raw_mode(held.st_mode),
             rustix::fs::FileType::Directory
         );
+    }
+
+    fn broaden_mode(&self) {
+        self.directory
+            .set_permissions(std::fs::Permissions::from_mode(0o750))
+            .expect("broaden only the original fixture mode");
+        self.assert_metadata(rustix::process::geteuid().as_raw(), 0o750);
+    }
+
+    fn change_owner(&mut self) {
+        self.restore_owner = true;
+        let foreign = rustix::process::Uid::from_raw(65534);
+        rustix::fs::fchown(&self.directory, Some(foreign), None)
+            .expect("change only the original fixture UID");
+        self.assert_metadata(foreign.as_raw(), 0o700);
     }
 }
 
@@ -227,11 +366,7 @@ fn broad_mode_capture_refuses_and_retains_original_store_and_debit() {
     super::installed_store_destruction_precedes_returned_credit();
     let fixture = pending_installed_store();
     let original = OriginalMetadata::hold(&fixture.permit);
-    original
-        .directory
-        .set_permissions(std::fs::Permissions::from_mode(0o750))
-        .expect("broaden only the original fixture mode");
-    original.assert_metadata(rustix::process::geteuid().as_raw(), 0o750);
+    original.broaden_mode();
     capture_refusal_retains_original(fixture, original);
 }
 
@@ -245,10 +380,108 @@ fn foreign_uid_capture_refuses_and_retains_original_store_and_debit() {
     super::installed_store_destruction_precedes_returned_credit();
     let fixture = pending_installed_store();
     let mut original = OriginalMetadata::hold(&fixture.permit);
-    original.restore_owner = true;
-    let foreign = rustix::process::Uid::from_raw(65534);
-    rustix::fs::fchown(&original.directory, Some(foreign), None)
-        .expect("change only the original fixture UID");
-    original.assert_metadata(foreign.as_raw(), 0o700);
+    original.change_owner();
     capture_refusal_retains_original(fixture, original);
+}
+
+fn retirement_refusal_retains_original(
+    mut fixture: ClaimedInstalledStore,
+    original: OriginalMetadata,
+    contents: Vec<FileRecord>,
+) {
+    use std::sync::atomic::Ordering;
+    let before = fixture.pool.snapshot().expect("original debit");
+    let carrier_before = fixture
+        .pool
+        .inner
+        .ledger
+        .lock()
+        .expect("ledger")
+        .carrier_used;
+    assert_eq!(snapshot_files(&fixture.path), contents);
+    let Some(OwnedPayloadStore::Installed(store)) = fixture.permit.store.as_mut() else {
+        panic!("missing claimed store");
+    };
+    let parent = Arc::clone(&store.parent);
+    let name = store.name.clone();
+    let error = store
+        .cleanup(&fixture.pool.inner)
+        .expect_err("identity refusal");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        error.to_string(),
+        "original installed store identity differs"
+    );
+    assert_eq!(fixture.pool.snapshot().expect("debit before drop"), before);
+    assert_eq!(snapshot_files(&fixture.path), contents);
+    drop(fixture.permit);
+    let ledger = fixture.pool.inner.ledger.lock().expect("quarantine ledger");
+    assert_eq!(
+        ledger.used,
+        PayloadPoolSnapshot {
+            quarantined: before.quarantined + 1,
+            ..before
+        }
+    );
+    assert_eq!(ledger.carrier_used, carrier_before);
+    let [OwnedPayloadStore::Installed(store)] = ledger.stores.as_slice() else {
+        panic!("original claimed store not retained");
+    };
+    assert!(Arc::ptr_eq(&parent, &store.parent));
+    assert_eq!(store.name, name);
+    assert_eq!(store.created_inode, Some(original.before.st_ino));
+    assert!(store.directory.is_some() && store.lease.is_some());
+    let held = rustix::fs::fstat(
+        store
+            .directory
+            .as_ref()
+            .expect("retained directory")
+            .as_ref(),
+    )
+    .expect("held original identity");
+    let named = store.named().expect("original name retained");
+    assert_eq!(
+        (held.st_dev, held.st_ino, named.st_dev, named.st_ino),
+        (
+            original.before.st_dev,
+            original.before.st_ino,
+            original.before.st_dev,
+            original.before.st_ino
+        )
+    );
+    store.check_child().expect_err("metadata still refuses");
+    assert_eq!(snapshot_files(&fixture.path), contents);
+    assert!(matches!(
+        fixture.contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    assert!(!fixture.observation.called.load(Ordering::Acquire));
+    assert!(fixture.root.path().is_dir());
+    drop(ledger);
+    drop(original);
+}
+
+#[test]
+fn broad_mode_retirement_refuses_and_retains_original_lease_lock_and_debit() {
+    super::installed_store_destruction_precedes_returned_credit();
+    let fixture = super::claimed_installed_store();
+    let contents = snapshot_files(&fixture.path);
+    let original = OriginalMetadata::hold(&fixture.permit);
+    original.broaden_mode();
+    retirement_refusal_retains_original(fixture, original, contents);
+}
+
+#[test]
+#[ignore = "requires explicit native root execution to mutate the fixture UID"]
+fn foreign_uid_retirement_refuses_and_retains_original_lease_lock_and_debit() {
+    assert!(
+        rustix::process::geteuid().is_root(),
+        "explicit root actor required"
+    );
+    super::installed_store_destruction_precedes_returned_credit();
+    let fixture = super::claimed_installed_store();
+    let contents = snapshot_files(&fixture.path);
+    let mut original = OriginalMetadata::hold(&fixture.permit);
+    original.change_owner();
+    retirement_refusal_retains_original(fixture, original, contents);
 }

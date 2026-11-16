@@ -1125,7 +1125,7 @@ mod resource_pool_tests {
         };
         let lease = store.capture(policy).expect("retained lease");
         let capabilities = Capabilities::small_v1();
-        let endpoint = ObjectEndpoint::open_at_with_resource_profile(
+        let mut endpoint = ObjectEndpoint::open_at_with_resource_profile(
             lease,
             limits,
             wan::BenchAuthority,
@@ -1135,6 +1135,7 @@ mod resource_pool_tests {
             profile,
         )
         .expect("original claim");
+        owner_mode_tests::seed_original_object(&mut endpoint);
         let contender = std::fs::File::open(path.join(".owner")).expect("same lock inode");
         drop(endpoint);
         assert!(matches!(
