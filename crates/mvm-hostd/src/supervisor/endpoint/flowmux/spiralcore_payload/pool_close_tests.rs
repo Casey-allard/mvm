@@ -21,6 +21,99 @@ fn charge() -> PayloadResourceCharge {
     }
 }
 
+struct RetentionParent {
+    limits: PayloadResourceLimits,
+    released: Arc<AtomicBool>,
+}
+impl ParentPayloadReservation for RetentionParent {
+    fn limits(&self) -> PayloadResourceLimits {
+        self.limits
+    }
+    fn authorize(
+        &self,
+        _: &mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan,
+        _: &str,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+    fn check_current(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl Drop for RetentionParent {
+    fn drop(&mut self) {
+        self.released.store(true, Ordering::Release);
+    }
+}
+
+#[test]
+fn generic_parent_retention_is_funded_before_operations_and_survives_drain() {
+    let quote = PayloadResourcePool::retention_metadata_bytes(limits()).unwrap();
+    let released = Arc::new(AtomicBool::new(false));
+    let parent = |resident_bytes| {
+        Arc::new(RetentionParent {
+            limits: PayloadResourceLimits {
+                resident_bytes,
+                ..limits()
+            },
+            released: released.clone(),
+        })
+    };
+    // Private construction isolates funding arithmetic; it is not admission
+    // evidence and does not manufacture an installed component permit.
+    assert!(matches!(
+        PayloadResourcePool::new(parent(quote - 1).limits(), Some(parent(quote - 1)), 0),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    released.store(false, Ordering::Release);
+    let limits = PayloadResourceLimits {
+        resident_bytes: quote + charge().resident_bytes,
+        ..limits()
+    };
+    let pool = PayloadResourcePool::new(limits, Some(parent(limits.resident_bytes)), 0).unwrap();
+    assert!(pool.inner.retention.installed.is_none());
+    let (slots, capacity) = {
+        let ledger = pool.inner.ledger.lock().unwrap();
+        (ledger.stores.as_ptr(), ledger.stores.capacity())
+    };
+    let operation = pool.reserve_charge(charge()).unwrap();
+    assert_eq!(
+        pool.snapshot().unwrap().resident_charge,
+        charge().resident_bytes
+    );
+    assert!(
+        matches!(pool.reserve_charge(PayloadResourceCharge { resident_bytes: 1, disk_bytes: 1 }), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+    );
+    drop(operation);
+    assert_eq!(pool.snapshot().unwrap(), PayloadPoolSnapshot::default());
+    assert_eq!(
+        pool.inner.retention.operational_resident_limit,
+        charge().resident_bytes
+    );
+    assert!(matches!(
+        pool.reserve_charge(PayloadResourceCharge {
+            resident_bytes: charge().resident_bytes + 1,
+            disk_bytes: 1,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    drop(pool.reserve_charge(charge()).unwrap());
+    pool.close_admission().unwrap();
+    assert!(pool.drained().unwrap());
+    let ledger = pool.inner.ledger.lock().unwrap();
+    assert_eq!(
+        (ledger.stores.as_ptr(), ledger.stores.capacity()),
+        (slots, capacity)
+    );
+    drop(ledger);
+    assert!(!released.load(Ordering::Acquire));
+    let retained = pool.clone();
+    drop(pool);
+    assert!(!released.load(Ordering::Acquire));
+    drop(retained);
+    assert!(released.load(Ordering::Acquire));
+}
+
 #[derive(Debug)]
 struct GatedParent {
     gate: AtomicBool,

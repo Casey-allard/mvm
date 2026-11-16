@@ -28,6 +28,55 @@ fn credits(stack: u64, metadata: u64) -> Arc<AuxiliaryLedger> {
 }
 
 #[test]
+fn store_retention_precedes_other_metadata_spending_and_cannot_be_reclaimed() {
+    use crate::supervisor::endpoint::flowmux::{PayloadResourceLimits, PayloadResourcePool};
+    let quote = PayloadResourcePool::retention_metadata_bytes(PayloadResourceLimits {
+        max_active: 32,
+        resident_bytes: 64 << 20,
+        disk_bytes: 64 << 20,
+    })
+    .unwrap();
+    assert!(quote > 0);
+    let refused = credits(0, quote - 1);
+    assert_eq!(
+        refused
+            .reserve(Component::StoreRetention, 0, quote, || Ok(()))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        refused
+            .reserve(Component::StoreRetention, 0, 0, || Ok(()))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    // A failed reservation spends no metadata, but cannot retry its role.
+    refused
+        .reserve(Component::Relay, 0, quote - 1, || Ok(()))
+        .unwrap();
+    let funded = credits(0, quote);
+    funded
+        .reserve(Component::StoreRetention, 0, quote, || Ok(()))
+        .unwrap();
+    assert_eq!(
+        funded
+            .reserve(Component::Relay, 0, 1, || Ok(()))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        funded
+            .reserve(Component::StoreRetention, 0, 0, || Ok(()))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+}
+
+#[test]
 fn relay_and_readers_draw_one_stack_and_metadata_remainder() {
     let ledger = credits(10, 100);
     ledger.reserve(Component::Relay, 4, 60, || Ok(())).unwrap();

@@ -16,6 +16,7 @@ pub(super) enum Component {
     Collector,
     Controller,
     Audit,
+    StoreRetention,
 }
 impl Component {
     fn bit(self) -> u8 {
@@ -25,6 +26,7 @@ impl Component {
             Self::Collector => 4,
             Self::Controller => 8,
             Self::Audit => 16,
+            Self::StoreRetention => 32,
         }
     }
 }
@@ -178,6 +180,11 @@ impl InstalledEndpointComponentPermit {
                 error.to_string(),
             ));
         }
+        self.auxiliary.open()
+    }
+    pub(crate) fn check_store_cleanup(&self) -> io::Result<()> {
+        self.auxiliary.open()?;
+        self.lease.check_store_cleanup().map_err(io::Error::other)?;
         self.auxiliary.open()
     }
 }

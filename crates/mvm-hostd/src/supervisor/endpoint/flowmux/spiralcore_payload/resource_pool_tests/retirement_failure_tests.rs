@@ -46,6 +46,17 @@ fn final_rmdir_refusal_retains_unlinked_owner_lease_and_original_debit() {
     super::installed_store_destruction_precedes_returned_credit();
     let mut fixture = super::claimed_installed_store();
     let before = fixture.pool.snapshot().expect("original debit");
+    let (slots, capacity) = {
+        let ledger = fixture
+            .pool
+            .inner
+            .ledger
+            .lock()
+            .expect("prepared retention");
+        assert!(ledger.stores.is_empty());
+        (ledger.stores.as_ptr(), ledger.stores.capacity())
+    };
+    assert_eq!(capacity, 1);
     assert_eq!((before.active, before.resident_charge), (1, fixture.charge));
     let carrier = fixture
         .pool
@@ -131,6 +142,8 @@ fn final_rmdir_refusal_retains_unlinked_owner_lease_and_original_debit() {
         }
     }
     let ledger = fixture.pool.inner.ledger.lock().expect("quarantine ledger");
+    assert_eq!(ledger.stores.as_ptr(), slots);
+    assert_eq!(ledger.stores.capacity(), capacity);
     assert_eq!(ledger.used, expected);
     assert_eq!(ledger.carrier_used, carrier);
     let [OwnedPayloadStore::Installed(retained)] = ledger.stores.as_slice() else {

@@ -506,13 +506,20 @@ struct PoolLedger {
 #[cfg(test)]
 #[path = "spiralcore_payload/pool_close_tests.rs"]
 mod pool_close_tests;
+struct RetentionFunding {
+    operational_resident_limit: u64,
+    installed: Option<crate::installed_endpoint::InstalledEndpointComponentPermit>,
+}
 struct PoolInner {
     limits: PayloadResourceLimits,
     carrier_limit: u64,
-    parent: Option<Arc<dyn ParentPayloadReservation>>,
+    // Rust drops fields in declaration order: destroy the backing storage
+    // before releasing the original reservation and its retained subdivision.
     ledger: std::sync::Mutex<PoolLedger>,
     retained_uncertain: std::sync::atomic::AtomicBool,
     fenced: std::sync::atomic::AtomicBool,
+    retention: RetentionFunding,
+    parent: Option<Arc<dyn ParentPayloadReservation>>,
 }
 #[derive(Clone)]
 pub struct PayloadResourcePool {
@@ -535,37 +542,89 @@ impl PayloadResourcePool {
         plan: &mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan,
         session: &str,
     ) -> io::Result<Self> {
-        Self::from_installed_parent(parent, plan, session, 0)
+        parent.authorize(plan, session)?;
+        parent.check_current()?;
+        Self::new(parent.limits(), Some(parent), 0)
     }
     pub(crate) fn from_installed_parent(
         parent: Arc<dyn ParentPayloadReservation>,
         plan: &mvm_vmm::host::network_endpoint_spawn::AdmittedNetworkPlan,
         session: &str,
         carrier_limit: u64,
+        retention: crate::installed_endpoint::InstalledEndpointComponentPermit,
     ) -> io::Result<Self> {
         parent.authorize(plan, session)?;
         parent.check_current()?;
-        Self::new(parent.limits(), Some(parent), carrier_limit)
+        retention.check_current()?;
+        Self::new_with_retention(
+            parent.limits(),
+            Some(parent),
+            carrier_limit,
+            Some(retention),
+        )
     }
     fn new(
         limits: PayloadResourceLimits,
         parent: Option<Arc<dyn ParentPayloadReservation>>,
         carrier_limit: u64,
     ) -> io::Result<Self> {
+        Self::new_with_retention(limits, parent, carrier_limit, None)
+    }
+    /// Backing slots and new funding bookkeeping, held until pool destruction.
+    pub(crate) fn retention_metadata_bytes(limits: PayloadResourceLimits) -> io::Result<u64> {
         limits.validate().map_err(invalid)?;
+        let slots = std::alloc::Layout::array::<OwnedPayloadStore>(usize::from(limits.max_active))
+            .map_err(invalid)?;
+        let bytes = slots
+            .size()
+            .checked_add(std::mem::size_of::<RetentionFunding>())
+            .ok_or_else(|| invalid("payload retention metadata overflow"))?;
+        u64::try_from(bytes).map_err(invalid)
+    }
+    fn new_with_retention(
+        limits: PayloadResourceLimits,
+        parent: Option<Arc<dyn ParentPayloadReservation>>,
+        carrier_limit: u64,
+        installed: Option<crate::installed_endpoint::InstalledEndpointComponentPermit>,
+    ) -> io::Result<Self> {
+        let metadata = Self::retention_metadata_bytes(limits)?;
+        // Generic parent callers fund permanent bookkeeping from their original
+        // resident ceiling. Installed endpoints already booked the same bytes
+        // from the original auxiliary metadata partition, not codec credit.
+        let operational_resident_limit = if parent.is_some() && installed.is_none() {
+            limits.resident_bytes.checked_sub(metadata).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "payload retention credit exhausted",
+                )
+            })?
+        } else {
+            limits.resident_bytes
+        };
+        let mut stores = Vec::new();
+        stores
+            .try_reserve_exact(usize::from(limits.max_active))
+            .map_err(invalid)?;
+        if stores.capacity() != usize::from(limits.max_active) {
+            return Err(invalid("payload retention allocation exceeds quote"));
+        }
         Ok(Self {
             inner: Arc::new(PoolInner {
                 limits,
                 carrier_limit,
-                parent,
                 ledger: std::sync::Mutex::new(PoolLedger {
                     closed: false,
                     used: PayloadPoolSnapshot::default(),
                     carrier_used: 0,
-                    stores: Vec::new(),
+                    stores,
                 }),
                 retained_uncertain: std::sync::atomic::AtomicBool::new(false),
                 fenced: std::sync::atomic::AtomicBool::new(false),
+                retention: RetentionFunding {
+                    operational_resident_limit,
+                    installed,
+                },
+                parent,
             }),
         })
     }
@@ -702,7 +761,7 @@ impl PayloadResourcePool {
             .checked_add(carrier_bytes)
             .ok_or_else(|| invalid("payload carrier overflow"))?;
         if active > self.inner.limits.max_active
-            || resident > self.inner.limits.resident_bytes
+            || resident > self.inner.retention.operational_resident_limit
             || disk > self.inner.limits.disk_bytes
             || carrier > self.inner.carrier_limit
         {
@@ -735,6 +794,9 @@ impl PoolInner {
         if let Some(parent) = &self.parent {
             parent.check_current()?;
         }
+        if let Some(retention) = &self.retention.installed {
+            retention.check_current()?;
+        }
         Ok(())
     }
     fn check_store_cleanup(&self) -> io::Result<()> {
@@ -743,6 +805,9 @@ impl PoolInner {
         }
         if let Some(parent) = &self.parent {
             parent.check_store_cleanup()?;
+        }
+        if let Some(retention) = &self.retention.installed {
+            retention.check_store_cleanup()?;
         }
         Ok(())
     }
@@ -1064,6 +1129,9 @@ impl Drop for PayloadResourcePermit {
         };
         if uncertain {
             if let Some(store) = self.store.take() {
+                // Every store belongs to one still-charged active permit;
+                // quarantine never returns that slot. Capacity was prepared
+                // for max_active before any permit or store effect existed.
                 ledger.stores.push(store);
             }
             ledger.used.quarantined = ledger.used.quarantined.saturating_add(1);

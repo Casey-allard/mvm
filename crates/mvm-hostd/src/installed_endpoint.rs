@@ -183,6 +183,13 @@ impl InstalledEndpointResources {
                 .context("installed payload disk limit overflow")?,
         }
         .validate()?;
+        auxiliary.reserve(
+            Component::StoreRetention,
+            0,
+            PayloadResourcePool::retention_metadata_bytes(limits)?,
+            || lease.check_current().map_err(invalid),
+        )?;
+        let retention = InstalledEndpointComponentPermit::new(lease.clone(), auxiliary.clone());
         let locator = projection
             .store
             .as_ref()
@@ -200,6 +207,7 @@ impl InstalledEndpointResources {
             plan,
             &session,
             projection.limits.host_carrier_bytes,
+            retention,
         )?;
         Ok(Self {
             startup_deadline: child.startup_deadline(),
