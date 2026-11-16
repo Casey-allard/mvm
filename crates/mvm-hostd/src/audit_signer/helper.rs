@@ -43,6 +43,8 @@ pub struct SignerHelper {
     chains: HashMap<String, VmChain>,
     owned: bool,
     chain_bytes: Option<std::num::NonZeroU64>,
+    #[cfg(test)]
+    owned_dispatch_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SignerHelper {
@@ -55,6 +57,8 @@ impl SignerHelper {
             chains: HashMap::new(),
             owned: false,
             chain_bytes: None,
+            #[cfg(test)]
+            owned_dispatch_hook: None,
         }
     }
 
@@ -401,6 +405,11 @@ pub async fn serve_owned_on_listener(
         "owned signer frame limit"
     );
     anyhow::ensure!(
+        tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread,
+        "owned signer requires a multithread runtime"
+    );
+    anyhow::ensure!(
         helper.lock().await.owned,
         "owned signer resource profile absent"
     );
@@ -464,7 +473,19 @@ async fn handle_owned_connection(
         request.request_id().len() <= 256,
         "owned signer request identity limit"
     );
-    let response = helper.lock().await.dispatch(request);
+    let response = {
+        let mut helper = helper.lock().await;
+        // Dispatch retains this original key/file owner and can block in fsync.
+        // Hand the scheduler core off within the existing bounded pool so the
+        // other connection's original parse timer and I/O can keep progressing.
+        tokio::task::block_in_place(|| {
+            #[cfg(test)]
+            if let Some(hook) = &helper.owned_dispatch_hook {
+                hook();
+            }
+            helper.dispatch(request)
+        })
+    };
     crate::framing::write_json_frame_bounded(&mut stream, &response, max_frame_bytes).await?;
     stream.shutdown().await?;
     Ok(())
@@ -522,6 +543,10 @@ fn ensure_parent(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "helper/owned_dispatch_tests.rs"]
+mod owned_dispatch_tests;
 
 #[cfg(test)]
 mod tests {
