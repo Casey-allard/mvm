@@ -21,6 +21,7 @@ fn charge() -> PayloadResourceCharge {
     }
 }
 
+#[derive(Debug)]
 struct RetentionParent {
     limits: PayloadResourceLimits,
     released: Arc<AtomicBool>,
