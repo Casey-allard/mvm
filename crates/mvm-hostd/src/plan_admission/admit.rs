@@ -3,8 +3,10 @@
 
 use super::assurance_runtime::AssuranceRuntimeBinding;
 use super::extension_packs::{validate_extension_bindings, verify_extension_packs};
-use super::grant_validation::{admit_grants, enforce_mailbox_retention};
+use super::grant_validation::admit_grants;
 use super::host_gates::{admit_host_interface, admit_within_host_budget};
+#[cfg(unix)]
+use super::installed_journal;
 use super::registry_pack::verify_registry_pack_assets;
 use super::{
     AdmittedExtension, AdmittedPlan, Clock, ExtensionAdmissionContext, InMemoryNonceLedger,

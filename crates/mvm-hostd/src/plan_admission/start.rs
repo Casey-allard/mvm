@@ -2,7 +2,6 @@
 //! admit-and-boot entry point.
 
 use super::admit::admit_plan_for_run;
-use super::assurance_runtime::verify_selected_runtime;
 use super::rollback::{
     UndoLaunch, apply_admitted_grants_or_undo_launch, record_charge_or_undo_launch, undo_launch,
 };
@@ -16,6 +15,8 @@ use mvm_contract::provenance::{
 };
 use mvm_core::plan::{ExecutionPlan, synthesize_plan};
 use mvm_core::policy::PolicyBundle;
+#[cfg(target_os = "linux")]
+use mvm_core::vm_backend::BackendKind;
 use mvm_core::vm_backend::{VmId, VmStartConfig};
 use mvm_runtime::AnyBackend;
 

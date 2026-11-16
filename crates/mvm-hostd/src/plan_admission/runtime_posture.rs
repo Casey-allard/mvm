@@ -1,5 +1,4 @@
 //! Selected backend and original verified runtime facts for admission.
-use super::assurance_runtime::verify_selected_runtime;
 use super::grant_validation::enforce_mailbox_retention;
 use super::*;
 
