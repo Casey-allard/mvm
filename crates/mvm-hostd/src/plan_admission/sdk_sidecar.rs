@@ -1,5 +1,6 @@
 //! Canonical native SDK attachment and backend/libc compatibility checks.
 use super::*;
+use mvm_build::guest_libc::GuestLibc;
 
 /// Typed reasons the selected backend cannot carry the native SDK sidecar.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

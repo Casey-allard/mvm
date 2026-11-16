@@ -1,4 +1,5 @@
-//! Original admitted warm-child claim sequence and retained launch ownership.
+//! Warm claim: fork a clean standby parent into a fresh, admitted child.
+
 use super::*;
 
 impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner<D, S, B> {
@@ -464,4 +465,106 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         }
         Ok(child)
     }
+
+    /// Deliver `token` to the forked child's guest agent and judge what it
+    /// reports. The driver owns the transport; the verdict is the claim's.
+    fn take_fresh_child_identity(
+        &self,
+        child_vm_name: &str,
+        identity: ChildIdentity,
+    ) -> std::result::Result<(), StandbyError> {
+        let requested_tier = identity.seccomp_tier;
+        let requested_volumes = identity.volumes.len();
+        let outcome = self
+            .driver
+            .deliver_child_identity(child_vm_name, identity)
+            .map_err(|e| {
+                StandbyError::ClaimFailed(format!(
+                    "forked child '{child_vm_name}' never answered the post-restore identity \
+                     handshake: {e:#}; a guest agent too old to take the claim's seccomp tier \
+                     refuses this handshake, and the claim is refused rather than run \
+                     unfiltered — `mvmctl bootstrap` refreshes the guest runtime"
+                ))
+            })?;
+        require_fresh_child_identity(child_vm_name, &outcome)?;
+        require_admitted_seccomp_tier(child_vm_name, requested_tier, &outcome)?;
+        require_late_volumes_mounted(child_vm_name, requested_volumes, &outcome)
+    }
+}
+
+/// The admitted plan from the claim.
+/// The runner does not re-verify the signature — the host admitted the plan and
+/// the supervisor re-verifies at attach. The runner reads the image binding and
+/// child-grant fields it must enforce. A claim carrying no parseable plan fails
+/// closed.
+fn claim_plan(claim: &StandbyClaim) -> std::result::Result<ExecutionPlan, StandbyError> {
+    mvm_core::plan::plan_from_admitted_json(&claim.plan_json)
+        .map_err(|_| refuse(ClaimRefusal::PlanMissing))
+}
+
+/// How many times to redraw a fresh child name before giving up. A collision is
+/// astronomically unlikely (random suffix), so a small bound is a fail-closed
+/// backstop, never a hot loop.
+pub(super) const MAX_CHILD_NAME_ATTEMPTS: usize = 8;
+
+/// Mint a fresh child [`VmId`] that collides with no existing VM registration.
+/// The name is a fresh random id (never the parent's), which — with the fresh
+/// VMGenID and per-child endpoint — is the identity scrub that stops a fork from
+/// inheriting the parent's identity. Uniqueness comes from the random suffix
+/// checked against the registry, not from mutual exclusion: the registry lock
+/// only serializes the read (nothing is persisted under it here — the boot path
+/// registers the name), so two truly-concurrent claims rely on the ~2^64 suffix
+/// space to not collide, which is what makes a re-check-and-redraw a backstop
+/// rather than a race.
+fn fresh_child_id(ctx: &ClaimContext<'_>) -> std::result::Result<VmId, StandbyError> {
+    let _lock = acquire_registry_lock(ctx.registry_path)
+        .map_err(|e| StandbyError::ClaimFailed(format!("acquire registry lock: {e:#}")))?;
+    let registry = VmNameRegistry::load(ctx.registry_path)
+        .map_err(|e| StandbyError::ClaimFailed(format!("load vm registry: {e:#}")))?;
+    for _ in 0..MAX_CHILD_NAME_ATTEMPTS {
+        let name = generate_vm_name();
+        if registry.lookup(&name).is_none() {
+            return Ok(VmId(name));
+        }
+    }
+    Err(StandbyError::ClaimFailed(
+        "could not mint a registry-unique child name".into(),
+    ))
+}
+
+/// Recheck a preloaded child's registry identity immediately before claim-side
+/// authority is created. The preload name was collision-checked when the pool
+/// record was written, but another VM may have registered the same random name
+/// before a later process claimed the persisted record.
+fn verify_preloaded_child_name_is_available(
+    ctx: &ClaimContext<'_>,
+    child_name: &str,
+) -> std::result::Result<(), StandbyError> {
+    let _lock = acquire_registry_lock(ctx.registry_path)
+        .map_err(|e| StandbyError::ClaimFailed(format!("acquire registry lock: {e:#}")))?;
+    let registry = VmNameRegistry::load(ctx.registry_path)
+        .map_err(|e| StandbyError::ClaimFailed(format!("load vm registry: {e:#}")))?;
+    if registry.lookup(child_name).is_some() {
+        return Err(StandbyError::ClaimFailed(format!(
+            "preloaded child name '{child_name}' is already registered"
+        )));
+    }
+    Ok(())
+}
+/// The child's launch config: the CLI-populated claim config (carrying the
+/// verity fields the CLI already resolved on the cloned rootfs) rekeyed onto the
+/// fresh child identity and its materialized rootfs. The runner consumes verity;
+/// it never derives it.
+fn child_start_config(claim: &StandbyClaim, child: &VmId, rootfs_dir: &Path) -> VmStartConfig {
+    let mut cfg = claim.start_config.clone().unwrap_or_default();
+    cfg.name = child.0.clone();
+    cfg.rootfs_path = rootfs_dir
+        .join("rootfs.ext4")
+        .to_string_lossy()
+        .into_owned();
+    cfg.tenant_id = Some(claim.tenant_id.clone());
+    cfg.network_policy = claim.network_policy.clone();
+    cfg.plan_json = Some(claim.plan_json.clone());
+    cfg.bundle_json = claim.bundle_json.clone();
+    cfg
 }
