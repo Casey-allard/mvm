@@ -135,4 +135,3 @@ at the cited site, then the fix.
 | Item | Site | Fixed in | Files read and found sound or fixed |
 | --- | --- | --- | --- |
 | FlowMux registry kept `Closed` entries for the session lifetime; retired entries are now dropped, with reuse refused by the allocator's high-water mark | `crates/mvm-hostd/src/supervisor/endpoint/flowmux/registry.rs` (`StreamRegistry::retire`, `open_guest`/`open_host` watermark) | #5493 | `registry.rs`; removal is safe because every retire path has already had its final frame admitted by the session validator, relay threads gate on the per-stream `retired` flag, and ID ordering survives in the allocator counters. Verified by `open_close_cycles_do_not_accumulate_registry_entries` and `a_retired_stream_id_cannot_be_reopened_by_the_peer` |
->>>>>>> eec70abbca (fix(hostd): drop retired flowmux entries instead of accumulating them)
