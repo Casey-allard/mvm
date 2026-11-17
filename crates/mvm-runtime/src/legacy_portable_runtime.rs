@@ -646,34 +646,16 @@ mod tests {
                     Err(mvm_core::plan::BundleVerifyError::UnsupportedSchema {
                         found: 6, ..
                     }) => {}
-                    Ok(config) => assert!(
-                        verify_runtime_for_launch(
-                            &config,
-                            crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION
-                        )
-                        .is_err()
-                    ),
+                    Ok(config) => assert!(verify_runtime_for_launch(&config, 2).is_err()),
                     Err(error) => panic!("unexpected future-envelope refusal: {error}"),
                 }
                 continue;
             }
             let config = prepared.unwrap();
-            assert!(
-                verify_runtime_for_launch(
-                    &config,
-                    crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION
-                )
-                .is_ok()
-            );
+            assert!(verify_runtime_for_launch(&config, 2).is_ok());
             let mut mixed = config.clone();
             mixed.source_runtime_archive_sha256 = Some("a".repeat(64));
-            assert!(
-                verify_runtime_for_launch(
-                    &mixed,
-                    crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION
-                )
-                .is_err()
-            );
+            assert!(verify_runtime_for_launch(&mixed, 2).is_err());
             let archive = &config.legacy_portable_runtime.as_ref().unwrap().archive;
             let mut bytes = std::fs::read(archive).unwrap();
             let needle = format!("\"schema_version\":{schema}");
@@ -683,13 +665,7 @@ mod tests {
                 .unwrap();
             bytes[offset + needle.len() - 1] = b'3';
             std::fs::write(archive, bytes).unwrap();
-            assert!(
-                verify_runtime_for_launch(
-                    &config,
-                    crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION
-                )
-                .is_err()
-            );
+            assert!(verify_runtime_for_launch(&config, 2).is_err());
         }
     }
 
@@ -707,8 +683,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            verify_runtime_for_launch(&config, crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION)
-                .unwrap(),
+            verify_runtime_for_launch(&config, 2).unwrap(),
             Some(crate::runtime_evidence::VerifiedLaunchRuntime::LegacyPortable(_))
         ));
         assert!(VmStartConfig::default().legacy_portable_runtime.is_none());
@@ -774,14 +749,7 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert!(
-                verify_runtime_for_launch(
-                    &changed,
-                    crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION
-                )
-                .is_err(),
-                "{field}"
-            );
+            assert!(verify_runtime_for_launch(&changed, 2).is_err(), "{field}");
         }
         let lease = RuntimeLifecycleLease::acquire(&config.name).unwrap();
         let bound = lease.bind(&config).unwrap();
@@ -921,19 +889,12 @@ mod tests {
             (None, false),
             (Some(1), false),
             (Some(999), false),
-            (
-                Some(crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION),
-                true,
-            ),
+            (Some(2), true),
         ] {
             let source = tempfile::tempdir().unwrap();
             let config = fixture(source.path(), protocol, wrong_role, 4, false).unwrap();
             assert!(
-                verify_runtime_for_launch(
-                    &config,
-                    crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION
-                )
-                .is_err(),
+                verify_runtime_for_launch(&config, 2).is_err(),
                 "{protocol:?} {wrong_role}"
             );
             let proof = config.legacy_portable_runtime.as_ref().unwrap();
@@ -947,13 +908,10 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                verify_runtime_for_launch(
-                    &downgraded,
-                    crate::runtime_evidence::GUEST_RPC_PROTOCOL_VERSION
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("portable bundle")
+                verify_runtime_for_launch(&downgraded, 2)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("portable bundle")
             );
         }
     }

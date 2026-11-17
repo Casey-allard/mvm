@@ -60,7 +60,7 @@ pub(super) fn finish_activation(
 }
 
 impl Journal {
-    fn session(&mut self, until: Instant) -> Result<(UnixStream, HostControlSession)> {
+    fn session(&mut self, until: Instant) -> Result<(UnixStream, AuthenticatedSession)> {
         ensure!(!self.fenced, "original journal control fenced");
         self.fenced = true;
         let (stream, session, guest) =
@@ -88,7 +88,7 @@ impl OriginalJournalControl for Journal {
             until,
         };
         session
-            .send(&mut io, &GuestRequest::Ping)
+            .write(&mut io, &GuestRequest::Ping)
             .context("original journal protected Ping write")?;
         let response = session
             .read(&mut io)

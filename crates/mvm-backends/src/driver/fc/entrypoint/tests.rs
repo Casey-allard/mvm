@@ -6,8 +6,8 @@ use crate::driver::fc::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use mvm_agentd::vsock::{
-    ActivateEnvironment, AuthenticatedSession, EntrypointEvent, GuestCapability, GuestRequest,
-    GuestResponse, RootfsConfig, RpcError,
+    ActivateEnvironment, AuthenticatedSession, EntrypointEvent, GuestRequest, GuestResponse,
+    RootfsConfig,
 };
 use mvm_core::{host_lifetime::HostLifetimeAnchor, util::test_env::TestEnv};
 use mvm_vmm::{
@@ -100,15 +100,10 @@ fn original_guest_protocol_child() {
             .unwrap()
             .read_exact(&mut seed)
             .unwrap();
-        let mut offer = mvm_agentd::vsock::control_offer();
-        if mode == "no-run" {
-            assert!(offer.capabilities.remove(&GuestCapability::RunEntrypoint));
-        }
         let mut session = AuthenticatedSession::guest(
             &mut stream,
             SigningKey::from_bytes(&seed),
             &VerifyingKey::from_bytes(&public).unwrap(),
-            &offer,
         )
         .unwrap();
         if mode != "expired" {
@@ -205,22 +200,7 @@ fn serve_journal(listener: &UnixListener, guest: SigningKey, host: &VerifyingKey
         } else {
             guest.clone()
         };
-        let mut offer = mvm_agentd::vsock::control_offer();
-        if index == 0 && mode == "journal-no-run" {
-            // Canonical Ping is a version-only baseline probe. Its optional
-            // advertisement does not gate the original readiness request.
-            assert!(offer.capabilities.remove(&GuestCapability::Ping));
-        }
-        if index > 0 && mode == "journal-no-run" {
-            assert!(offer.capabilities.remove(&GuestCapability::RunEntrypoint));
-        }
-        let mut session = AuthenticatedSession::guest(&mut stream, signer, host, &offer).unwrap();
-        if index > 0 && mode == "journal-no-run" {
-            // A missing capability must refuse before even a protected frame
-            // prefix is written, then fence the original journal continuation.
-            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
-            continue;
-        }
+        let mut session = AuthenticatedSession::guest(&mut stream, signer, host).unwrap();
         if mode == "journal-key" || (index > 0 && mode == "journal-input") {
             assert!(session.read::<GuestRequest>(&mut stream).is_err());
             continue;
@@ -540,68 +520,6 @@ fn original_control_runs_once_with_exact_events_and_terminal_sync() {
     channel.sync_filesystems(until()).unwrap();
     assert!(channel.sync_filesystems(until()).is_err());
     drop(channel);
-    fixture.finish();
-}
-
-#[test]
-fn missing_advertised_entrypoint_capability_writes_no_operation_or_reopen() {
-    let fixture = Fixture::new("no-run");
-    let mut channel = fixture.activated();
-    let error = channel
-        .entrypoint(&run(false), until(), &mut |_| {
-            panic!("refused capability emitted event")
-        })
-        .unwrap_err();
-    assert!(
-        matches!(
-            error.downcast_ref::<RpcError>(),
-            Some(RpcError::CapabilityNotAdvertised {
-                capability: GuestCapability::RunEntrypoint,
-                ..
-            })
-        ),
-        "{error:#}"
-    );
-    assert!(channel.sync_filesystems(until()).is_err());
-    assert!(fixture.open().is_err());
-    drop(channel);
-    fixture.finish();
-}
-
-#[test]
-fn journal_uses_each_session_advertisement_and_fences_capability_refusal() {
-    let fixture = Fixture::new("journal-no-run");
-    let mut journal = fixture
-        .activated()
-        .finish_journal_activation(until())
-        .unwrap();
-    // Ping stays version-gated even without its baseline advertisement.
-    journal.ready(until()).unwrap();
-    let error = journal
-        .entrypoint(&run(false), until(), &mut |_| {
-            panic!("refused capability emitted event")
-        })
-        .unwrap_err();
-    assert!(
-        matches!(
-            error.downcast_ref::<RpcError>(),
-            Some(RpcError::CapabilityNotAdvertised {
-                capability: GuestCapability::RunEntrypoint,
-                ..
-            })
-        ),
-        "{error:#}"
-    );
-    assert!(journal.ready(until()).is_err());
-    assert!(
-        journal
-            .entrypoint(&run(false), until(), &mut |_| panic!(
-                "fenced journal emitted event"
-            ))
-            .is_err()
-    );
-    assert!(fixture.open().is_err());
-    drop(journal);
     fixture.finish();
 }
 
