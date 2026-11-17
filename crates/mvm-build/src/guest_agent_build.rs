@@ -1001,12 +1001,17 @@ fn zigbuild_args_for_output(args: &[String]) -> Vec<String> {
     quiet
 }
 
-/// The only compiler flags these builds carry. rustc asks the linker for
-/// `-Wl,-O1` on an optimized build, and zig's linker answers every link with
-/// "ignoring deprecated linker optimization setting '1'", which rustc's
-/// `linker_messages` lint reprints as a warning under each of the dozens of
-/// guest binaries. That message is zig's, not a problem in the code, so it is
-/// allowed here; the workspace's own builds keep the lint on.
+/// The flags every guest build carries unless a target sets its own. rustc asks
+/// the linker for `-Wl,-O1` on an optimized build, and zig's linker answers
+/// every link with "ignoring deprecated linker optimization setting '1'", which
+/// rustc's `linker_messages` lint reprints as a warning under each of the
+/// dozens of guest binaries. That message is zig's, not a problem in the code,
+/// so it is allowed here; the workspace's own builds keep the lint on.
+///
+/// Passed as `CARGO_BUILD_RUSTFLAGS`, never as `RUSTFLAGS` or
+/// `CARGO_ENCODED_RUSTFLAGS`: cargo lets either of those override the
+/// per-target `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` that a musl shared object sets
+/// to turn static linking off, and with it back on the `cdylib` is not built.
 const ZIGBUILD_RUSTFLAGS: &str = "-Alinker-messages";
 
 fn apply_zigbuild_env(
@@ -1025,10 +1030,10 @@ fn apply_zigbuild_env(
         .env("RUSTC_WORKSPACE_WRAPPER", "")
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTFLAGS")
-        // Scrub the outer session's encoded flags before setting our own, so
-        // no inherited flag can ride along even if the set below is dropped.
+        // Scrub the outer session's overriding flags, so none can ride along or
+        // mask a target's own, then set the lowest-precedence default.
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env("CARGO_ENCODED_RUSTFLAGS", ZIGBUILD_RUSTFLAGS);
+        .env("CARGO_BUILD_RUSTFLAGS", ZIGBUILD_RUSTFLAGS);
 
     // Keep cargo-zigbuild's own cache under the mvm cache root instead of
     // whatever platform-global default the host picks (for example
@@ -1620,6 +1625,58 @@ mod tests {
         );
     }
 
+    /// Cargo reads one rustflags source and never merges them, so a global
+    /// override would hide the `-crt-static` a musl shared object sets for
+    /// itself and cargo would drop the cdylib.
+    #[test]
+    fn a_musl_cdylib_keeps_its_target_flags_under_the_zigbuild_env() {
+        for (arch, so) in [
+            (GuestArch::X86_64, "x86_64/lib/musl/libmvm_host_services.so"),
+            (
+                GuestArch::Aarch64,
+                "aarch64/lib/musl/libmvm_host_services.so",
+            ),
+        ] {
+            let build = crate::guest_bins::extras::extra_builds(arch)
+                .unwrap()
+                .into_iter()
+                .find(|b| b.member.path() == so)
+                .unwrap_or_else(|| panic!("no build produces {so}"));
+            let spec = GuestAgentBuildSpec::new(
+                PathBuf::from("/ws"),
+                arch,
+                std::env::temp_dir().join("mvm-rustflags-precedence-target"),
+            );
+            let mut cmd = std::process::Command::new("cargo");
+            cmd.env("RUSTFLAGS", "-Zthreads=8")
+                .env("CARGO_ENCODED_RUSTFLAGS", "-Zthreads=8");
+            apply_zigbuild_env(&mut cmd, &spec, None).expect("configure zigbuild env");
+            cmd.envs(build.env.iter().map(|(k, v)| (k, v)));
+
+            let value = |name: &str| {
+                cmd.get_envs()
+                    .find(|(k, _)| *k == std::ffi::OsStr::new(name))
+                    .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+            };
+            let target_var = format!(
+                "CARGO_TARGET_{}_RUSTFLAGS",
+                build.target.to_uppercase().replace('-', "_")
+            );
+            assert!(
+                value(&target_var).is_some_and(|f| f.contains("-C target-feature=-crt-static")),
+                "{so}: {target_var} must carry -crt-static"
+            );
+            for global in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
+                assert_eq!(value(global), None, "{so}: {global} would shadow it");
+            }
+            assert_eq!(
+                value("CARGO_BUILD_RUSTFLAGS").as_deref(),
+                Some(ZIGBUILD_RUSTFLAGS),
+                "{so}: the lint allowance must stay, at the lowest precedence"
+            );
+        }
+    }
+
     #[test]
     fn apply_zigbuild_env_exports_explicit_cache_dir() {
         let spec = GuestAgentBuildSpec::new(
@@ -1674,11 +1731,13 @@ mod tests {
             Some(&Some(std::ffi::OsString::new()))
         );
         assert_eq!(
-            envs.get(std::ffi::OsStr::new("CARGO_ENCODED_RUSTFLAGS")),
+            envs.get(std::ffi::OsStr::new("CARGO_BUILD_RUSTFLAGS")),
             Some(&Some(std::ffi::OsString::from("-Alinker-messages"))),
             "the guest build carries only the flag that silences zig's linker notice, not the outer session's"
         );
-        for removed in ["RUSTUP_TOOLCHAIN", "RUSTFLAGS"] {
+        // An overriding flag set would replace a target's own flags, such as the
+        // `-crt-static` a musl shared object needs.
+        for removed in ["RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
             assert_eq!(
                 envs.get(std::ffi::OsStr::new(removed)),
                 Some(&None),

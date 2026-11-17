@@ -11,8 +11,9 @@ use super::{FlowMuxError, FlowMuxSession, registry::FlowClass};
 pub(super) fn record(
     sink: &dyn AuditSink,
     event: &str,
-    labels: BTreeMap<String, String>,
+    mut labels: BTreeMap<String, String>,
 ) -> std::io::Result<()> {
+    crate::supervisor::audit::denial_stage::stamp(event, &mut labels);
     sink.record(event, labels).inspect_err(|error| {
         tracing::warn!(%error, event, "FlowMux audit write failed; epoch marked incomplete");
     })
@@ -147,15 +148,19 @@ mod deadline_tests {
     };
 
     #[derive(Default)]
-    struct DeadlineProbe(Mutex<Vec<Option<Instant>>>);
+    struct DeadlineProbe(
+        Mutex<Vec<Option<Instant>>>,
+        Mutex<Vec<BTreeMap<String, String>>>,
+    );
 
     #[async_trait::async_trait]
     impl AuditSigner for DeadlineProbe {
-        async fn sign_and_emit(&self, _: &PlanAuditEntry) -> Result<(), AuditError> {
+        async fn sign_and_emit(&self, entry: &PlanAuditEntry) -> Result<(), AuditError> {
             self.0
                 .lock()
                 .unwrap()
                 .push(crate::broker::registry::owned_call_deadline());
+            self.1.lock().unwrap().push(entry.labels.clone());
             Ok(())
         }
     }
@@ -309,5 +314,91 @@ mod deadline_tests {
         });
         assert_eq!(crate::broker::registry::owned_call_deadline(), None);
         assert_eq!(signer.0.lock().unwrap().as_slice(), [None]);
+    }
+
+    #[test]
+    fn denial_stage_stamp_preserves_the_original_deadline_and_expired_refusal() {
+        let home = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let signer = Arc::new(DeadlineProbe::default());
+        let (_, sink) = bound_sink(&runtime, home.path(), signer.clone());
+        let labels_built = AtomicBool::new(false);
+        let expired = record_before(
+            &sink,
+            "host.flow.denied",
+            Instant::now() - Duration::from_secs(1),
+            || {
+                labels_built.store(true, Ordering::Release);
+                BTreeMap::new()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(expired.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!labels_built.load(Ordering::Acquire));
+        assert_eq!(signer.0.lock().unwrap().as_slice(), [None]);
+        assert_eq!(signer.1.lock().unwrap().len(), 1);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        record_before(&sink, "host.flow.denied", deadline, || {
+            BTreeMap::from([
+                ("class".into(), "udp".into()),
+                ("target".into(), "192.0.2.1:53".into()),
+                ("stage".into(), "lookup".into()),
+            ])
+        })
+        .unwrap();
+        assert_eq!(signer.0.lock().unwrap().as_slice(), [None, Some(deadline)]);
+        assert_eq!(
+            signer
+                .1
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .get("stage")
+                .map(String::as_str),
+            Some("datagram")
+        );
+        assert_eq!(crate::broker::registry::owned_call_deadline(), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::audit_tests::CapturingSink;
+    use super::*;
+
+    fn stage_recorded(event: &str, class: Option<&str>) -> Option<String> {
+        let sink = CapturingSink::default();
+        let labels = class
+            .map(|c| BTreeMap::from([("class".to_string(), c.to_string())]))
+            .unwrap_or_default();
+        record(&sink, event, labels).unwrap();
+        let records = sink.records.lock().unwrap();
+        records[0].1.get("stage").cloned()
+    }
+
+    #[test]
+    fn a_connect_a_datagram_and_a_lookup_refusal_each_record_their_stage() {
+        assert_eq!(
+            stage_recorded("host.flow.denied", Some("tcp")).as_deref(),
+            Some("connect")
+        );
+        assert_eq!(
+            stage_recorded("host.flow.denied", Some("udp")).as_deref(),
+            Some("datagram")
+        );
+        assert_eq!(
+            stage_recorded("dns.refused", None).as_deref(),
+            Some("lookup")
+        );
+    }
+
+    #[test]
+    fn an_admitted_flow_records_no_stage() {
+        assert_eq!(stage_recorded("host.flow.allowed", Some("tcp")), None);
+        assert_eq!(stage_recorded("dns.resolved", None), None);
     }
 }
