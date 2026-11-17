@@ -42,12 +42,7 @@ fn preopen_console_for_profile(profile: &str) -> bool {
 ///
 /// QEMU is excluded: it reads the in-memory config and must not overwrite the
 /// persisted plan.
-pub fn persists_plan_before_start(hypervisor: &str) -> bool {
-    matches!(
-        hypervisor,
-        "firecracker" | "libkrun" | "hvf" | "apple-container"
-    )
-}
+pub use mvm_hostd::plan_admission::persists_plan_before_start;
 
 pub use crate::admission::secrets::load_workload_ir;
 
@@ -198,7 +193,7 @@ pub(super) fn start_persistent(
     let _runtime_proofs = mvm_build::guest_runtime::evidence::LaunchProofScope::begin();
     journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     let boot = prepare_persistent_boot(params, journal.as_deref(), prepared)?;
-    finish_legacy_persistent(boot, journal, fresh_state)
+    finish_admitted_persistent(boot, journal, fresh_state)
 }
 
 struct PreparedPersistentBoot {
@@ -457,52 +452,57 @@ fn prepare_persistent_boot_with_owner(
         }
     }
     emit_runtime_source_status(&start_config);
-    thread_tenant_id(&mut start_config, &admission.admitted);
-    populate_audit_substrate(
-        &mut start_config,
-        &admission.admitted,
-        admission.policy_bundle.as_ref(),
-    )?;
     let guest_profile = guest_profile_for_boot(profile == "dev", rootfs_path);
     attach_guest_boot_config(&mut start_config, &admission, guest_profile)?;
-    if persists_plan_before_start(backend_name) {
-        stash_plan_for_bridge(&start_config)?;
-    }
-    enforce_shares(&admission, &start_config.volumes)?;
-    // Against the config the backend is about to be handed, not the local the
-    // plan was synthesized from — that is what makes this a check rather than a
-    // restatement of what admission already believed.
-    enforce_kernel(
-        &admission,
-        start_config
-            .kernel_path
-            .as_deref()
-            .map(std::path::Path::new),
-    )?;
-    let _built_runtime = mvm_hostd::plan_admission::prepare_built_pack_start(
-        &admission.admitted,
-        &mut start_config,
-        crate::backend_kind_for(backend_name),
-    )
-    .inspect_err(|error| {
-        emit_failed(&admission, "registry-pack-boot", error);
-    })?;
-    if let Some(runtime) = &_built_runtime {
-        runtime.verify_config(&start_config).inspect_err(|error| {
-            emit_failed(&admission, "registry-pack-runtime", error);
+    let built_runtime = if journal.is_some() {
+        thread_tenant_id(&mut start_config, &admission.admitted);
+        populate_audit_substrate(
+            &mut start_config,
+            &admission.admitted,
+            admission.policy_bundle.as_ref(),
+        )?;
+        if persists_plan_before_start(backend_name) {
+            stash_plan_for_bridge(&start_config)?;
+        }
+        enforce_shares(&admission, &start_config.volumes)?;
+        // Against the config the backend is about to be handed, not the local the
+        // plan was synthesized from — that is what makes this a check rather than a
+        // restatement of what admission already believed.
+        enforce_kernel(
+            &admission,
+            start_config
+                .kernel_path
+                .as_deref()
+                .map(std::path::Path::new),
+        )?;
+        let runtime = mvm_hostd::plan_admission::prepare_built_pack_start(
+            &admission.admitted,
+            &mut start_config,
+            crate::backend_kind_for(backend_name),
+        )
+        .inspect_err(|error| {
+            emit_failed(&admission, "registry-pack-boot", error);
         })?;
-    }
-    if let Some(runtime) = &verified_runtime {
-        runtime.verify_config(&start_config).inspect_err(|error| {
-            emit_failed(&admission, "release-runtime", error);
-        })?;
-    }
+        if let Some(runtime) = &runtime {
+            runtime.verify_config(&start_config).inspect_err(|error| {
+                emit_failed(&admission, "registry-pack-runtime", error);
+            })?;
+        }
+        if let Some(runtime) = &verified_runtime {
+            runtime.verify_config(&start_config).inspect_err(|error| {
+                emit_failed(&admission, "release-runtime", error);
+            })?;
+        }
+        runtime
+    } else {
+        None
+    };
     Ok(PreparedPersistentBoot {
         backend,
         start_config,
         admission,
         prepared_volumes,
-        built_runtime: _built_runtime,
+        built_runtime,
         verified_runtime,
     })
 }
@@ -533,7 +533,7 @@ fn complete_writable_images(
     Ok(())
 }
 
-fn finish_legacy_persistent(
+fn finish_admitted_persistent(
     boot: PreparedPersistentBoot,
     mut journal: Option<&mut journal::InstalledJournal<'_>>,
     fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
@@ -552,23 +552,40 @@ fn finish_legacy_persistent(
     let name = name_label.as_str();
     let backend_label = backend.name().to_string();
     let backend_name = backend_label.as_str();
-    let mailbox_posture = admission.admitted.mailbox_posture();
-    // VMM selection + workload-support check + start move behind the facade; the
-    // admission gate (above) and the launched/failed emits stay here.
     #[cfg(unix)]
-    let started = match (|| -> Result<_> {
+    let images = match (|| -> Result<_> {
         let mut images = prepared_volumes.take_writable_images();
         complete_writable_images(&start_config, &mut images)?;
+        Ok(images)
+    })() {
+        Ok(images) => images,
+        Err(err) => {
+            emit_failed(&admission, "backend-start", &err);
+            return Err(err);
+        }
+    };
+    #[cfg(not(unix))]
+    let images = Vec::new();
+    if journal.is_some() {
         mvm_hostd::mailbox_process::require_servable(
             &start_config,
             &backend,
-            mailbox_posture.as_ref(),
+            admission.admitted.mailbox_posture().as_ref(),
         )?;
-        if let Some(state) = fresh_state {
-            state.commit();
-        }
+    }
+    if let Some(state) = fresh_state {
+        state.commit();
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let object_launch = match journal.as_deref() {
+        Some(journal::InstalledJournal::Object { launch, .. }) => Some(*launch),
+        _ => None,
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let object_launch: Option<()> = None;
+    let (started, mut admission, dispatched_config) = if let Some(launch) = object_launch {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(journal::InstalledJournal::Object { launch, .. }) = journal.as_deref() {
+        {
             let id = admission
                 .admitted
                 .start_persistent_object_original_with_verified_runtime(
@@ -578,32 +595,29 @@ fn finish_legacy_persistent(
                     images,
                     admission.policy_bundle.as_ref(),
                     verified_runtime.as_ref(),
-                )?;
-            return Ok(crate::StartedVm::from_started(backend, id));
+                )
+                .inspect_err(|error| emit_failed(&admission, "backend-start", error))?;
+            (
+                crate::StartedVm::from_started(backend, id),
+                admission,
+                start_config,
+            )
         }
-        Ok(crate::boot::start_prepared_custodied_with_verified_runtime(
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = launch;
+            anyhow::bail!("original object dispatch unavailable on this host")
+        }
+    } else {
+        crate::boot::start_admitted_persistent(
             backend,
-            &start_config,
+            start_config,
+            admission,
             images,
             verified_runtime.as_ref(),
-        )?)
-    })() {
-        Ok(started) => started,
-        Err(err) => {
-            let err = anyhow::anyhow!("{err}");
-            emit_failed(&admission, "backend-start", &err);
-            return Err(err);
-        }
+        )?
     };
-    #[cfg(not(unix))]
-    let started = match crate::start_prepared(backend, &start_config) {
-        Ok(started) => started,
-        Err(err) => {
-            let err = anyhow::anyhow!("{err}");
-            emit_failed(&admission, "backend-start", &err);
-            return Err(err);
-        }
-    };
+    let mailbox_posture = admission.admitted.mailbox_posture();
     // The guest asserts a mailbox exactly when the plan grants one, so the
     // host side starts here or the launch is rolled back.
     let paired = journal.is_some();
@@ -645,7 +659,7 @@ fn finish_legacy_persistent(
     } else if let Err(error) = mvm_hostd::mailbox_process::serve_started(
         started.backend(),
         started.vm_id(),
-        &start_config,
+        &dispatched_config,
         mailbox_posture.as_ref(),
     ) {
         emit_failed(&admission, "mailbox-process", &error);

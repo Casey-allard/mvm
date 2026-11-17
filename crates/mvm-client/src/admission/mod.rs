@@ -74,8 +74,8 @@ pub use durability::{
 };
 pub use enforce::{enforce_kernel, enforce_shares, enforce_shares_for_claim};
 pub use instructions::InstructionSources;
-pub(crate) use outcome::record_boot;
 pub use outcome::{BootPosture, StartMode, emit_failed, emit_launched};
+pub(crate) use outcome::{record_boot, seal_recorded_failure};
 
 /// Shell basenames [`entrypoint_is_shell_shaped`] refuses on direct match.
 /// A superset of `mvm_contract::entrypoint`'s own shell set: that helper

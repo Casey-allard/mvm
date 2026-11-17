@@ -27,6 +27,10 @@ enum StartFinalization {
     CliTransient {
         writable_images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
     },
+    /// Defer acceptance until the persistent guest proves authenticated readiness.
+    Persistent {
+        writable_images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+    },
 }
 
 /// Distinguish an already-audited pack refusal, a CLI-owned failure, and an uncertain stop.
@@ -52,6 +56,7 @@ struct StartTailResult {
     vm_id: VmId,
     admitted: AdmittedPlan,
     enforced_grants: Option<EnforcedGrants>,
+    config: VmStartConfig,
 }
 
 /// Outcome of a successful admitted boot: the backend's VM id plus the
@@ -67,6 +72,33 @@ pub struct StartedMachine {
     /// plan. A caller building a receipt gets the tier that fired, so it cannot
     /// report a bound that was only asked for.
     pub enforced_grants: EnforcedGrants,
+}
+
+/// A persistent VM dispatched under its one-use plan but not yet accepted.
+pub struct DispatchedPersistent {
+    pub vm_id: VmId,
+    pub admitted: AdmittedPlan,
+    /// The exact admitted configuration handed to the backend, for post-start
+    /// mailbox setup; the caller's pre-gate config is not authoritative.
+    pub config: VmStartConfig,
+}
+
+/// Dispatch a persistent guest while its caller retains readiness-dependent finalization.
+pub fn start_persistent(
+    params: StartAdmittedParams<'_>,
+    verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
+    writable_images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
+) -> Result<DispatchedPersistent> {
+    let started = start_admitted_with_finalization(
+        params,
+        verified_runtime,
+        StartFinalization::Persistent { writable_images },
+    )?;
+    Ok(DispatchedPersistent {
+        vm_id: started.vm_id,
+        admitted: started.admitted,
+        config: started.config,
+    })
 }
 
 pub(super) fn launch_decision_record(plan: &ExecutionPlan, backend_name: &str) -> DecisionRecord {
@@ -196,6 +228,7 @@ fn start_admitted_with_finalization(
     finalization: StartFinalization,
 ) -> Result<StartTailResult> {
     let cli_transient = matches!(finalization, StartFinalization::CliTransient { .. });
+    let persistent = matches!(finalization, StartFinalization::Persistent { .. });
     let backend = params.backend;
     let mut admitted = params.admitted;
     anyhow::ensure!(
@@ -228,17 +261,43 @@ fn start_admitted_with_finalization(
                 .verify_assurance_launch(&params.config, verified_runtime)
                 .map_err(|error| ("assurance-runtime", error))?;
         }
-        RunPosture::on_backend(admitted.variant, backend.kind())
-            .with_runtime(Some(&params.config))
-            .with_verified_runtime(verified_runtime)
-            .verify_launch_runtime(admitted.plan())
-            .map_err(|error| ("guest-runtime", error))?;
-        final_gates::run_post_admission_gates(
+        if !persistent {
+            RunPosture::on_backend(admitted.variant, backend.kind())
+                .with_runtime(Some(&params.config))
+                .with_verified_runtime(verified_runtime)
+                .verify_launch_runtime(admitted.plan())
+                .map_err(|error| ("guest-runtime", error))?;
+        }
+        let (config, built_runtime) = final_gates::run_post_admission_gates(
             params.config,
             &admitted,
             backend.kind(),
             params.policy_bundle,
-        )
+        )?;
+        if persistent {
+            if verified_runtime.is_none()
+                && built_runtime.is_none()
+                && admitted.plan().runtime_identity.is_some()
+            {
+                return Err((
+                    "release-runtime",
+                    anyhow::anyhow!("admitted runtime identity has no retained verification"),
+                ));
+            }
+            if verified_runtime.is_some() || built_runtime.is_none() {
+                RunPosture::on_backend(admitted.variant, backend.kind())
+                    .with_runtime(Some(&config))
+                    .with_verified_runtime(verified_runtime)
+                    .verify_launch_runtime(admitted.plan())
+                    .map_err(|error| ("release-runtime", error))?;
+            }
+            if let Some(runtime) = &built_runtime {
+                runtime
+                    .verify_config(&config)
+                    .map_err(|error| ("registry-pack-runtime", error))?;
+            }
+        }
+        Ok((config, built_runtime))
     })();
     let (mut config, _built_runtime) = match gated {
         Ok(prepared) => prepared,
@@ -281,7 +340,38 @@ fn start_admitted_with_finalization(
     })?;
     // Before the boot, so a grant this backend cannot serve never reaches a
     // guest that would assert it.
-    crate::mailbox_process::require_servable(&config, backend, mailbox_posture.as_ref())?;
+    if let Err(err) =
+        crate::mailbox_process::require_servable(&config, backend, mailbox_posture.as_ref())
+    {
+        if persistent
+            && let Some(emitter) = params.emitter
+            && let Err(e) =
+                emitter.emit_failed(admitted.plan(), "backend-start", &format!("{err:#}"))
+        {
+            tracing::warn!(error = %e, "audit emit_failed failed (non-fatal)");
+        }
+        return Err(err);
+    }
+    if persistent && super::persists_plan_before_start(backend.name()) {
+        super::stash_plan_for_bridge(&config).inspect_err(|err| {
+            if let Some(emitter) = params.emitter
+                && let Err(e) =
+                    emitter.emit_failed(admitted.plan(), "bridge-plan", &format!("{err:#}"))
+            {
+                tracing::warn!(error = %e, "audit emit_failed failed (non-fatal)");
+            }
+        })?;
+    }
+    if persistent && let Err(err) = mvm_runtime::workload_backend::require_workload_backend(backend)
+    {
+        if let Some(emitter) = params.emitter
+            && let Err(e) =
+                emitter.emit_failed(admitted.plan(), "backend-start", &format!("{err:#}"))
+        {
+            tracing::warn!(error = %e, "audit emit_failed failed (non-fatal)");
+        }
+        return Err(err);
+    }
     // Spent before the backend starts, so an admission that reached dispatch
     // can never authorize another launch, whatever the start's outcome.
     admitted.dispatched = true;
@@ -294,7 +384,11 @@ fn start_admitted_with_finalization(
     {
         return Err(CliStartFailure::Unrecorded(err).into());
     }
-    let start = if let StartFinalization::CliTransient { writable_images } = finalization {
+    let start = if let StartFinalization::CliTransient { writable_images }
+    | StartFinalization::Persistent {
+        writable_images, ..
+    } = finalization
+    {
         #[cfg(unix)]
         {
             verified_runtime
@@ -310,23 +404,27 @@ fn start_admitted_with_finalization(
         #[cfg(not(unix))]
         {
             let _ = writable_images;
-            Err(anyhow::anyhow!(
-                "CLI transient custody is unavailable on this host"
-            ))
+            if persistent && verified_runtime.is_none() {
+                backend.start(&config)
+            } else {
+                Err(anyhow::anyhow!(
+                    "verified runtime custody is unavailable on this host"
+                ))
+            }
         }
     } else {
         backend.start_with_verified_runtime(&config, verified_runtime)
     };
-    let start = if cli_transient {
+    let start = if cli_transient || persistent {
         start
     } else {
         start.context("backend start after signed-plan admission")
     };
     match start {
         Ok(vm_id) => {
-            let enforced_grants = if cli_transient {
-                // The CLI's existing start never applied or charged these
-                // hostd post-start controls. Do not add new refusals here.
+            let enforced_grants = if cli_transient || persistent {
+                // The CLI finalizes on teardown; persistent starts finalize
+                // after authenticated readiness. Neither accepts here.
                 None
             } else {
                 Some(apply_admitted_grants_or_undo_launch(
@@ -342,10 +440,13 @@ fn start_admitted_with_finalization(
             // budget, and an undercounted host is precisely the state the
             // budget exists to prevent — so this is fatal, and rolls the
             // launch back the same way an unapplied grant does.
-            if !cli_transient {
+            if !cli_transient && !persistent {
                 record_charge_or_undo_launch(backend, &vm_id, &vm_name, &admitted, params.emitter)?;
             }
-            if !cli_transient && let Some(emitter) = params.emitter {
+            if !cli_transient
+                && !persistent
+                && let Some(emitter) = params.emitter
+            {
                 if let Err(e) = emitter.emit_launched(admitted.plan(), &backend_name) {
                     tracing::warn!(error = %e, "audit emit_launched failed (non-fatal)");
                 }
@@ -391,12 +492,14 @@ fn start_admitted_with_finalization(
             // Last, so no earlier rollback leaves a mailbox process behind.
             // A grant that cannot be served is refused rather than booting a
             // guest whose mailbox port nobody answers.
-            if let Err(err) = crate::mailbox_process::spawn_for_launch(
-                admitted.plan(),
-                backend,
-                &vm_name,
-                mailbox_posture.as_ref(),
-            ) {
+            if !persistent
+                && let Err(err) = crate::mailbox_process::spawn_for_launch(
+                    admitted.plan(),
+                    backend,
+                    &vm_name,
+                    mailbox_posture.as_ref(),
+                )
+            {
                 let undo = UndoLaunch {
                     backend,
                     vm_id: &vm_id,
@@ -416,6 +519,7 @@ fn start_admitted_with_finalization(
                 vm_id,
                 admitted,
                 enforced_grants,
+                config,
             })
         }
         Err(err) => {
