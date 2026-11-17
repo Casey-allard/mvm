@@ -533,6 +533,19 @@ fn complete_writable_images(
     Ok(())
 }
 
+#[cfg(unix)]
+fn require_journal_servable(
+    config: &mvm_core::vm_backend::VmStartConfig,
+    backend: &mvm_runtime::AnyBackend,
+    admission: &crate::admission::AdmissionContext,
+) -> Result<()> {
+    mvm_hostd::mailbox_process::require_servable(
+        config,
+        backend,
+        admission.admitted.mailbox_posture().as_ref(),
+    )
+}
+
 fn finish_admitted_persistent(
     boot: PreparedPersistentBoot,
     mut journal: Option<&mut journal::InstalledJournal<'_>>,
@@ -566,12 +579,9 @@ fn finish_admitted_persistent(
     };
     #[cfg(not(unix))]
     let images = Vec::new();
+    #[cfg(unix)]
     if journal.is_some() {
-        mvm_hostd::mailbox_process::require_servable(
-            &start_config,
-            &backend,
-            admission.admitted.mailbox_posture().as_ref(),
-        )?;
+        require_journal_servable(&start_config, &backend, &admission)?;
     }
     if let Some(state) = fresh_state {
         state.commit();
@@ -745,6 +755,59 @@ mod persistent_oci_boot_tests {
 
     use crate::admission::admit_plan_tests::admitted_libkrun;
     use mvm_core::util::test_env::TestEnv;
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_preflight_refusal_seals_exactly_one_failed_session_before_dispatch() {
+        let _env_lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let mut env = TestEnv::new();
+        env.isolate_mvm_home(home.path());
+        for unadmitted_mailbox in [false, true] {
+            let name = format!("journal-preflight-{unadmitted_mailbox}");
+            let (admission, _keys, audit) = admitted_libkrun(&name, None);
+            let backend = mvm_runtime::AnyBackend::from_hypervisor("mock");
+            let mut config = mvm_core::vm_backend::VmStartConfig {
+                name: name.clone(),
+                ..Default::default()
+            };
+            if unadmitted_mailbox {
+                // A config projection cannot add mailbox authority to the
+                // original no-mailbox admission supplied by this fixture.
+                let mut plan = admission.admitted.plan().clone();
+                plan.mailbox = Some(mvm_contract::protocol::mailbox::MailboxGrant {
+                    mailbox: mvm_contract::protocol::mailbox::MailboxId::from_bytes([1; 32]),
+                    authority_key: [2; 32],
+                    epoch: mvm_contract::protocol::mailbox::ExecutionEpoch::new(1).unwrap(),
+                    report: None,
+                    retention: None,
+                    durable_object_pair_sha256_v1: None,
+                    incoming_journal_policy_sha256_v1: None,
+                    outbound_journal_v1: None,
+                });
+                config.plan_json = Some(serde_json::to_string(&plan).unwrap());
+            }
+            let result = super::require_journal_servable(&config, &backend, &admission);
+            let chain = std::fs::read_to_string(audit.path().join("local.jsonl")).unwrap();
+            if unadmitted_mailbox {
+                let error = result.expect_err("a mailbox without admitted posture must refuse");
+                assert!(
+                    error.to_string().contains("no admitted posture"),
+                    "{error:#}"
+                );
+                assert_eq!(chain.matches("plan.failed").count(), 1, "{chain}");
+                assert!(chain.contains("backend-start"), "{chain}");
+                assert_eq!(chain.matches("session.sealed").count(), 1, "{chain}");
+            } else {
+                result.expect("the original no-mailbox preflight remains valid");
+                assert!(!chain.contains("plan.failed"), "{chain}");
+                assert!(!chain.contains("session.sealed"), "{chain}");
+            }
+            assert!(!chain.contains("plan.launched"), "{chain}");
+            assert!(backend.list().unwrap().is_empty());
+            assert!(!mvm_core::config::vm_state_dir(&name).exists());
+        }
+    }
 
     #[test]
     fn readiness_audit_seals_completed_abort_but_leaves_unresolved_abort_unsealed() {
