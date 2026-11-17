@@ -99,6 +99,7 @@ pub mod reconcile;
 pub mod registration;
 pub mod registry_application;
 pub mod registry_pack_local;
+pub mod release;
 pub mod replay;
 pub mod secret;
 pub mod session_store;
@@ -106,6 +107,7 @@ pub mod snapshot;
 pub mod standby;
 pub mod storage;
 pub mod stream;
+mod stream_binding;
 #[cfg(feature = "tracing-bridge")]
 pub mod stream_tracing;
 pub mod telemetry;
