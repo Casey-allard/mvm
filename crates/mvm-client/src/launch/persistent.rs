@@ -544,6 +544,7 @@ fn require_journal_servable(
         backend,
         admission.admitted.mailbox_posture().as_ref(),
     )
+    .inspect_err(|error| emit_failed(admission, "backend-start", error))
 }
 
 fn finish_admitted_persistent(
