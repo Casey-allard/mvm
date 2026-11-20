@@ -1082,6 +1082,8 @@ impl LocalBackend {
         }
         let _barrier = mvm_core::host_interface::activation_barrier::ActivationBarrier::shared()
             .map_err(crate::local::backend_err)?;
+        crate::policy_profiles::coordinator::recover_workload_ledger()
+            .map_err(crate::local::backend_err)?;
         if cfg!(target_os = "linux")
             && self.backend.kind() != mvm_core::vm_backend::BackendKind::Mock
         {
