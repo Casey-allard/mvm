@@ -201,7 +201,7 @@ impl WorkloadStore {
                     known || canonical.workloads.len() < MAX_WORKLOADS - QUARANTINE_RESERVE,
                     "workload ledger has no room for another replacement"
                 );
-                canonical.workloads.replace(workload);
+                canonical.workloads.replace(workload)?;
             }
         }
         canonical.sequence = canonical

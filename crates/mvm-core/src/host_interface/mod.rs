@@ -8,6 +8,7 @@
 //! starts. It does not own the full launch or a running workload's lifecycle.
 
 pub mod activation_barrier;
+pub mod epoch_gate;
 pub mod error;
 pub mod lease;
 pub mod local;
