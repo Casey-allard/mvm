@@ -413,7 +413,7 @@ fn run_command() -> Result<()> {
     };
     // Offline proof tooling bypasses telemetry and interactive update checks,
     // not just the command recorder and signer initialization.
-    if cli.command.is_offline_audit_command() {
+    if cli.command.skips_startup() {
         return cli
             .command
             .try_run_early()

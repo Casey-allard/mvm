@@ -30,8 +30,10 @@ const MAX_REQUEST_BYTES: usize = 16 * 1024;
 /// to know a request answers `Refused` with this in the message.
 const FRAME_DECODE_CONTEXT: &str = "decoding policy coordinator frame";
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 const MAX_STATUS_BYTES: usize = 4 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+pub(super) const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Handler threads alive at once; a connection past this is refused. An
 /// activation can hold its thread for as long as a launch holds the shared
 /// barrier, so the count needs a ceiling, and it stays well under the default
@@ -147,6 +149,9 @@ mod unix {
         time::Duration,
     };
 
+    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
+    use std::time::Instant;
+
     use super::*;
 
     static ACTIVATIONS: Mutex<()> = Mutex::new(());
@@ -171,11 +176,9 @@ mod unix {
             WAITING_ACTIVATIONS.fetch_sub(1, Ordering::SeqCst);
         }
     }
-    #[cfg(any(test, target_os = "linux"))]
-    const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn read_frame<T: serde::de::DeserializeOwned>(
-        stream: &mut UnixStream,
+        stream: &mut impl Read,
         max: usize,
     ) -> Result<T> {
         let mut length = [0u8; 4];
@@ -187,7 +190,7 @@ mod unix {
         serde_json::from_slice(&bytes).context(FRAME_DECODE_CONTEXT)
     }
 
-    fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T, max: usize) -> Result<()> {
+    fn write_frame<T: Serialize>(stream: &mut impl Write, value: &T, max: usize) -> Result<()> {
         let bytes = serde_json::to_vec(value).context("encoding policy coordinator frame")?;
         ensure!(
             bytes.len() <= max,
@@ -216,14 +219,15 @@ mod unix {
 
     /// Ask the process on this connection who it is, within a short deadline
     /// and a small reply. The caller decides whether to believe it.
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
     pub(in crate::policy_generation) fn exchange_status(
-        stream: &mut UnixStream,
+        stream: UnixStream,
+        deadline: Instant,
     ) -> Result<CoordinatorStatus> {
-        stream.set_read_timeout(Some(STATUS_TIMEOUT))?;
-        stream.set_write_timeout(Some(STATUS_TIMEOUT))?;
-        write_frame(stream, &Request::Status, MAX_REQUEST_BYTES)?;
-        match read_frame(stream, MAX_STATUS_BYTES)? {
+        // The shared I/O wrapper keeps partial reads and writes on one budget.
+        let mut stream = crate::mailbox_service::durable::GuestDeadline::new(stream, deadline)?;
+        write_frame(&mut stream, &Request::Status, MAX_REQUEST_BYTES)?;
+        match read_frame(&mut stream, MAX_STATUS_BYTES)? {
             Response::Status { status } => Ok(status),
             Response::Refused { message } => {
                 anyhow::bail!("policy coordinator refused a status request: {message}")
@@ -408,6 +412,24 @@ mod unix {
         )
     }
 
+    /// A coordinator on a thread of this process, for tests that need a real
+    /// socket for the ledger's owner. It serves until the process exits.
+    #[cfg(test)]
+    pub(crate) fn serve_in_process(home: &Path) -> Result<PathBuf> {
+        let status = CoordinatorStatus::of_this_process(home, Lifetime::Detached);
+        let bound = bind(home)?;
+        std::thread::spawn(move || {
+            let _owner = bound.owner;
+            serve_on(
+                &bound.listener,
+                &bound.generations,
+                &bound.workloads,
+                &status,
+            )
+        });
+        Ok(socket_path(home))
+    }
+
     pub(in crate::policy_generation) fn bind(home: &Path) -> Result<Bound> {
         ensure!(
             home.is_absolute(),
@@ -572,8 +594,8 @@ mod unix {
             });
 
             let socket = socket_path(&home);
-            let mut stream = UnixStream::connect(&socket).unwrap();
-            assert_eq!(exchange_status(&mut stream).unwrap(), status);
+            let stream = UnixStream::connect(&socket).unwrap();
+            assert_eq!(exchange_status(stream, Instant::now() + STATUS_TIMEOUT).unwrap(), status);
             assert!(matches!(
                 call(&socket, &Request::Ping).unwrap(),
                 Response::Ready
@@ -845,21 +867,35 @@ mod unix {
                     message: "unknown variant `status`".into(),
                 },
             ] {
-                let (mut client, mut server) = UnixStream::pair().unwrap();
+                let (client, mut server) = UnixStream::pair().unwrap();
                 let answering = std::thread::spawn(move || {
                     let request = read_frame::<Request>(&mut server, MAX_REQUEST_BYTES).unwrap();
                     assert!(matches!(request, Request::Status));
                     write_frame(&mut server, &reply, MAX_RESPONSE_BYTES).unwrap();
                 });
-                assert!(exchange_status(&mut client).is_err());
+                assert!(exchange_status(client, Instant::now() + STATUS_TIMEOUT).is_err());
                 answering.join().unwrap();
             }
-            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let (client, mut server) = UnixStream::pair().unwrap();
             server
                 .write_all(&u32::try_from(MAX_STATUS_BYTES + 1).unwrap().to_be_bytes())
                 .unwrap();
-            let error = exchange_status(&mut client).unwrap_err();
+            let error = exchange_status(client, Instant::now() + STATUS_TIMEOUT).unwrap_err();
             assert!(error.to_string().contains("exceeds its limit"), "{error}");
+        }
+
+        #[test]
+        fn malformed_and_truncated_status_replies_are_refused() {
+            for bytes in [b"\0\0\0\x01{".as_slice(), b"\0\0", b""] {
+                let (client, mut server) = UnixStream::pair().unwrap();
+                let answering = std::thread::spawn(move || {
+                    let request = read_frame::<Request>(&mut server, MAX_REQUEST_BYTES).unwrap();
+                    assert!(matches!(request, Request::Status));
+                    server.write_all(bytes).unwrap();
+                });
+                assert!(exchange_status(client, Instant::now() + STATUS_TIMEOUT).is_err());
+                answering.join().unwrap();
+            }
         }
 
         #[test]
@@ -937,11 +973,10 @@ pub fn serve() -> Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) use unix::exchange_status;
-#[cfg(all(test, target_os = "linux"))]
-pub(super) use unix::{bind, serve_on};
-
+#[cfg(all(test, unix))]
+pub(crate) use unix::serve_in_process;
 /// Send a bounded request to the local coordinator.
 ///
 /// # Errors
