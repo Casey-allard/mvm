@@ -80,6 +80,48 @@ impl Write for MeteredCarrier<'_> {
     }
 }
 
+pub(super) struct VerifiedExchange {
+    pub(super) payload_out: usize,
+    pub(super) payload_in: usize,
+    pub(super) carrier_out: usize,
+    pub(super) carrier_in: usize,
+}
+
+pub(super) fn verify_tcp_exchange(
+    guest: &mut UnixStream,
+    session: &mut Session,
+    upstream: &mut std::net::TcpStream,
+) -> VerifiedExchange {
+    const REQUEST: &[u8] = b"close-check\0\0";
+    let reply = b"reply\0\0";
+    let mut carrier = MeteredCarrier {
+        stream: guest,
+        written: 0,
+        read: 0,
+    };
+    write_frame(&mut carrier, session, Opcode::Data, 1, REQUEST);
+    let mut received = [0; REQUEST.len()];
+    upstream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, REQUEST);
+    let (opcode, stream, _) = read_flowmux_frame(&mut carrier, session);
+    assert_eq!((opcode, stream), (Opcode::WindowUpdate, 1));
+    upstream.write_all(reply).unwrap();
+    let mut returned = Vec::with_capacity(reply.len());
+    while returned.len() < reply.len() {
+        let (opcode, stream, data) = read_flowmux_frame(&mut carrier, session);
+        assert_eq!((opcode, stream), (Opcode::Data, 1));
+        assert!(!data.is_empty());
+        returned.extend_from_slice(&data);
+    }
+    assert_eq!(&returned, reply);
+    VerifiedExchange {
+        payload_out: received.len(),
+        payload_in: returned.len(),
+        carrier_out: carrier.written,
+        carrier_in: carrier.read,
+    }
+}
+
 #[test]
 fn session_completion_closes_tcp_before_flushing_health() {
     let setup_start = Instant::now();
@@ -119,31 +161,9 @@ fn session_completion_closes_tcp_before_flushing_health() {
     upstream.set_write_timeout(io_timeout).unwrap();
     let setup_time = setup_start.elapsed();
 
-    const REQUEST: &[u8] = b"close-check\0\0";
-    let reply = b"reply\0\0";
-    let mut carrier = MeteredCarrier {
-        stream: &mut guest,
-        written: 0,
-        read: 0,
-    };
     let transfer_start = Instant::now();
-    write_frame(&mut carrier, &mut session, Opcode::Data, 1, REQUEST);
-    let mut received = [0; REQUEST.len()];
-    upstream.read_exact(&mut received).unwrap();
-    assert_eq!(&received, REQUEST);
-    let (opcode, stream, _) = read_flowmux_frame(&mut carrier, &mut session);
-    assert_eq!((opcode, stream), (Opcode::WindowUpdate, 1));
-    upstream.write_all(reply).unwrap();
-    let mut returned = Vec::with_capacity(reply.len());
-    while returned.len() < reply.len() {
-        let (opcode, stream, data) = read_flowmux_frame(&mut carrier, &mut session);
-        assert_eq!((opcode, stream), (Opcode::Data, 1));
-        assert!(!data.is_empty());
-        returned.extend_from_slice(&data);
-    }
-    assert_eq!(&returned, reply);
+    let traffic = verify_tcp_exchange(&mut guest, &mut session, &mut upstream);
     let transfer_time = transfer_start.elapsed();
-    let (carrier_written, carrier_read) = (carrier.written, carrier.read);
 
     // Trigger normal session completion while retaining the guest's read half.
     // The same deadline covers both EOFs and entry into the held flush.
@@ -170,9 +190,11 @@ fn session_completion_closes_tcp_before_flushing_health() {
     release.send(()).unwrap();
     host.join().unwrap().unwrap();
     eprintln!(
-        "payload_out={} payload_in={} carrier_out={carrier_written} carrier_in={carrier_read} setup_us={} transfer_us={} closure_us={} lifecycle_us={}",
-        received.len(),
-        returned.len(),
+        "payload_out={} payload_in={} carrier_out={} carrier_in={} setup_us={} transfer_us={} closure_us={} lifecycle_us={}",
+        traffic.payload_out,
+        traffic.payload_in,
+        traffic.carrier_out,
+        traffic.carrier_in,
         setup_time.as_micros(),
         transfer_time.as_micros(),
         closure_time.as_micros(),

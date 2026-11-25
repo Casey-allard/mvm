@@ -16,6 +16,8 @@ mod audit_tests;
 mod decision_audit;
 mod dns_decision;
 #[cfg(test)]
+mod epoch_closure_tests;
+#[cfg(test)]
 mod http_audit_tests;
 mod http_flow;
 mod icmp_decision;
