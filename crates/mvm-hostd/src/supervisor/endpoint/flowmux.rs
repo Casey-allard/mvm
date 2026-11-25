@@ -1401,7 +1401,7 @@ mod tests {
     }
 
     pub(super) fn read_flowmux_frame(
-        stream: &mut UnixStream,
+        stream: &mut impl Read,
         session: &mut Session,
     ) -> (Opcode, u32, Vec<u8>) {
         let sealed = mvm_core::net::session::read_sealed_frame(stream, 1 << 20).unwrap();
@@ -2227,7 +2227,7 @@ mod tests {
     }
 
     pub(super) fn write_frame(
-        stream: &mut UnixStream,
+        stream: &mut impl Write,
         session: &mut Session,
         opcode: Opcode,
         stream_id: u32,

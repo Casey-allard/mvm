@@ -1,5 +1,10 @@
 //! Additional refusal and cleanup witnesses through authenticated sessions.
 
+use std::io::Write;
+use std::net::Shutdown;
+use std::sync::mpsc;
+use std::time::Instant;
+
 use super::audit_tests::CapturingSink;
 use super::tests::{
     build_dns_query, fresh_keys, gate_allowing_addr, gate_pinning_name, local_test_ip,
@@ -25,7 +30,8 @@ impl AuditSink for FailedFlush {
 
 struct CleanupWitness {
     sink: CapturingSink,
-    upstream: Mutex<Option<std::net::TcpStream>>,
+    entered: mpsc::SyncSender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
 }
 
 impl AuditSink for CleanupWitness {
@@ -38,34 +44,64 @@ impl AuditSink for CleanupWitness {
     }
 
     fn flush_health(&self) -> std::io::Result<()> {
-        let mut guard = self.upstream.lock().unwrap();
-        let upstream = guard
-            .as_mut()
-            .expect("the flow was opened before completion");
-        upstream.set_read_timeout(Some(Duration::from_secs(1)))?;
-        assert_eq!(
-            upstream.read(&mut [0; 1])?,
-            0,
-            "upstream must close before health flush"
-        );
-        Ok(())
+        self.entered.send(()).map_err(std::io::Error::other)?;
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(std::io::Error::other)?;
+        self.sink.flush_health()
+    }
+}
+
+struct MeteredCarrier<'a> {
+    stream: &'a mut UnixStream,
+    written: usize,
+    read: usize,
+}
+
+impl Read for MeteredCarrier<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let received = self.stream.read(bytes)?;
+        self.read += received;
+        Ok(received)
+    }
+}
+
+impl Write for MeteredCarrier<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.stream.write(bytes)?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
     }
 }
 
 #[test]
 fn session_completion_closes_tcp_before_flushing_health() {
+    let setup_start = Instant::now();
     let listener = std::net::TcpListener::bind((local_test_ip(), 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let target = listener.local_addr().unwrap();
     let gate = gate_allowing_addr(target.ip(), target.port(), None);
-    let sink = Arc::new(CleanupWitness {
-        sink: CapturingSink::default(),
-        upstream: Mutex::new(None),
-    });
-    let supplied = Arc::clone(&sink);
+    let (entered, flushing) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
     let (mut guest, mut session, host) =
         run_session_from(RegistryLimits::default(), move |id, key, anchor, limits| {
-            FlowMuxAccept::new(id, key, anchor, limits, gate).with_audit_sink(supplied)
+            FlowMuxAccept::new(id, key, anchor, limits, gate).with_audit_sink(Arc::new(
+                CleanupWitness {
+                    sink: CapturingSink::default(),
+                    entered,
+                    release: Mutex::new(resume),
+                },
+            ))
         });
+    let io_timeout = Some(Duration::from_secs(2));
+    guest.set_read_timeout(io_timeout).unwrap();
+    guest.set_write_timeout(io_timeout).unwrap();
     write_frame(
         &mut guest,
         &mut session,
@@ -77,9 +113,71 @@ fn session_completion_closes_tcp_before_flushing_health() {
         read_flowmux_frame(&mut guest, &mut session).0,
         Opcode::Opened
     );
-    *sink.upstream.lock().unwrap() = Some(listener.accept().unwrap().0);
-    drop(guest);
+    let (mut upstream, _) = listener.accept().unwrap();
+    upstream.set_nonblocking(false).unwrap();
+    upstream.set_read_timeout(io_timeout).unwrap();
+    upstream.set_write_timeout(io_timeout).unwrap();
+    let setup_time = setup_start.elapsed();
+
+    const REQUEST: &[u8] = b"close-check\0\0";
+    let reply = b"reply\0\0";
+    let mut carrier = MeteredCarrier {
+        stream: &mut guest,
+        written: 0,
+        read: 0,
+    };
+    let transfer_start = Instant::now();
+    write_frame(&mut carrier, &mut session, Opcode::Data, 1, REQUEST);
+    let mut received = [0; REQUEST.len()];
+    upstream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, REQUEST);
+    let (opcode, stream, _) = read_flowmux_frame(&mut carrier, &mut session);
+    assert_eq!((opcode, stream), (Opcode::WindowUpdate, 1));
+    upstream.write_all(reply).unwrap();
+    let mut returned = Vec::with_capacity(reply.len());
+    while returned.len() < reply.len() {
+        let (opcode, stream, data) = read_flowmux_frame(&mut carrier, &mut session);
+        assert_eq!((opcode, stream), (Opcode::Data, 1));
+        assert!(!data.is_empty());
+        returned.extend_from_slice(&data);
+    }
+    assert_eq!(&returned, reply);
+    let transfer_time = transfer_start.elapsed();
+    let (carrier_written, carrier_read) = (carrier.written, carrier.read);
+
+    // Trigger normal session completion while retaining the guest's read half.
+    // The same deadline covers both EOFs and entry into the held flush.
+    let stop_start = Instant::now();
+    let deadline = stop_start + Duration::from_secs(1);
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .expect("session closure deadline expired")
+    };
+    guest.shutdown(Shutdown::Write).unwrap();
+    flushing.recv_timeout(remaining()).unwrap();
+    upstream.set_read_timeout(Some(remaining())).unwrap();
+    assert_eq!(
+        upstream.read(&mut [0; 1]).unwrap(),
+        0,
+        "upstream must close before health flush completes"
+    );
+    guest.set_read_timeout(Some(remaining())).unwrap();
+    assert_eq!(guest.read(&mut [0; 1]).unwrap(), 0, "carrier must close");
+    let closure_time = stop_start.elapsed();
+    assert!(Instant::now() <= deadline);
+    assert!(!host.is_finished(), "audit flush must still be held");
+    release.send(()).unwrap();
     host.join().unwrap().unwrap();
+    eprintln!(
+        "payload_out={} payload_in={} carrier_out={carrier_written} carrier_in={carrier_read} setup_us={} transfer_us={} closure_us={} lifecycle_us={}",
+        received.len(),
+        returned.len(),
+        setup_time.as_micros(),
+        transfer_time.as_micros(),
+        closure_time.as_micros(),
+        setup_start.elapsed().as_micros(),
+    );
 }
 
 #[test]
