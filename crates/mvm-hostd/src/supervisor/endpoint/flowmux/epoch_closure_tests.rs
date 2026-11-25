@@ -29,19 +29,20 @@ use crate::supervisor::endpoint::epoch_admission::{
 const WORKLOAD: &str = "epoch-closure-unit";
 const FIXTURE_POLL: Duration = Duration::from_millis(5);
 const CLOSURE_BOUND: Duration = Duration::from_secs(1);
+const EARLIER_AUDIT_EVENT: &str = "host.flow.fixture_pending";
 
-struct HeldRevocationSigner {
+struct HeldAuditSigner {
     file: FileAuditSigner,
-    entered: mpsc::SyncSender<()>,
+    entered: mpsc::SyncSender<String>,
     release: Mutex<mpsc::Receiver<()>>,
 }
 
 #[async_trait::async_trait]
-impl AuditSigner for HeldRevocationSigner {
+impl AuditSigner for HeldAuditSigner {
     async fn sign_and_emit(&self, entry: &PlanAuditEntry) -> Result<(), AuditError> {
-        if entry.event == REVOKED_EVENT {
+        if matches!(entry.event.as_str(), EARLIER_AUDIT_EVENT | REVOKED_EVENT) {
             self.entered
-                .try_send(())
+                .try_send(entry.event.clone())
                 .map_err(|error| AuditError::Io(error.to_string()))?;
             // Test-only fault injection before the existing signer appends.
             // BoundRecorder still owns the original plan and this call.
@@ -149,7 +150,7 @@ fn ledger_closes_flow_and_preserves_audit(change: WorkloadChange, expected: Deni
     let (entered, pending) = mpsc::sync_channel(1);
     let (release, resume) = mpsc::sync_channel(1);
     let recorder = Arc::new(Recorder::new(
-        Arc::new(HeldRevocationSigner {
+        Arc::new(HeldAuditSigner {
             file: FileAuditSigner::open_file(audit_key, &path).unwrap(),
             entered,
             release: Mutex::new(resume),
@@ -181,10 +182,23 @@ fn ledger_closes_flow_and_preserves_audit(change: WorkloadChange, expected: Deni
     );
     assert!(before.iter().all(|entry| entry.event != REVOKED_EVENT));
 
+    // Hold another plan-bound audit call before committing the ledger change.
+    // This occupies the real BoundRecorder, as well as the underlying signer.
+    let busy_sink = Arc::clone(&sink);
+    let earlier_write =
+        std::thread::spawn(move || busy_sink.record(EARLIER_AUDIT_EVENT, BTreeMap::new()));
+    assert_eq!(
+        pending.recv_timeout(Duration::from_secs(2)).unwrap(),
+        EARLIER_AUDIT_EVENT
+    );
+    let stop = flow.stop;
     let (detected, refusal) = mpsc::sync_channel(1);
     let watch = gate
         .watch(FIXTURE_POLL, UNREADABLE_LEDGER_GRACE, move |gate, error| {
-            detected.send(error.to_string()).unwrap();
+            // The watcher holds the original carrier and stops it before
+            // entering the audit path. The test thread only observes closure.
+            let stopped = stop.shutdown(Shutdown::Both);
+            let _ = detected.send((error.to_string(), stopped));
             gate.record_revocation(Some(&recorder), &handle, &error);
         })
         .unwrap();
@@ -199,12 +213,9 @@ fn ledger_closes_flow_and_preserves_audit(change: WorkloadChange, expected: Deni
     };
     owner.commit(&change).unwrap();
     let expected = HostInterfaceError::Denied(expected).to_string();
-    assert_eq!(refusal.recv_timeout(remaining()).unwrap(), expected);
-    pending.recv_timeout(remaining()).unwrap();
-
-    // The fixture owns this original carrier. Neither its stop nor the TCP
-    // cleanup needs the in-progress bound audit append to return.
-    flow.stop.shutdown(Shutdown::Both).unwrap();
+    let (received, stopped) = refusal.recv_timeout(remaining()).unwrap();
+    assert_eq!(received, expected);
+    stopped.unwrap();
     flow.guest.set_read_timeout(Some(remaining())).unwrap();
     assert_eq!(flow.guest.read(&mut [0]).unwrap(), 0);
     flow.upstream.set_read_timeout(Some(remaining())).unwrap();
@@ -212,14 +223,32 @@ fn ledger_closes_flow_and_preserves_audit(change: WorkloadChange, expected: Deni
     let closure_time = change_start.elapsed();
     assert!(Instant::now() <= deadline);
     assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+    assert!(!earlier_write.is_finished());
     assert!(!flow.host.is_finished());
+
+    // Complete the already-held record, then observe the watcher handing its
+    // revocation to the same signer. Its record remains held at this stage.
+    release.send(()).unwrap();
+    earlier_write.join().unwrap().unwrap();
+    assert_eq!(
+        pending.recv_timeout(Duration::from_secs(2)).unwrap(),
+        REVOKED_EVENT
+    );
+    let prior_bytes = std::fs::read(&path).unwrap();
+    assert!(prior_bytes.starts_with(&before_bytes));
+    let prior = verify_audit_chain_entries(&path, &audit_verify).unwrap();
+    let (earlier, history) = prior.split_last().unwrap();
+    assert_eq!(history, before);
+    assert_eq!(earlier.event, EARLIER_AUDIT_EVENT);
+    assert_eq!(earlier.plan_id, plan.plan_id);
+    assert_eq!(earlier.tenant, plan.tenant);
     release.send(()).unwrap();
     drop(watch);
     flow.host.join().unwrap().unwrap();
 
     let after = verify_audit_chain_entries(&path, &audit_verify).unwrap();
     let (revocation, history) = after.split_last().unwrap();
-    assert_eq!(history, before);
+    assert_eq!(history, prior);
     assert_eq!(revocation.event, REVOKED_EVENT);
     assert_eq!(revocation.plan_id, plan.plan_id);
     assert_eq!(revocation.tenant, plan.tenant);
@@ -230,9 +259,12 @@ fn ledger_closes_flow_and_preserves_audit(change: WorkloadChange, expected: Deni
     );
     assert_eq!(revocation.labels["reason"], "execution_not_admitted");
     assert_eq!(revocation.labels["detail"], expected);
-    let signed_bytes = std::fs::read(&path).unwrap().len() - before_bytes.len();
+    let final_bytes = std::fs::read(&path).unwrap();
+    assert!(final_bytes.starts_with(&prior_bytes));
+    let earlier_signed_bytes = prior_bytes.len() - before_bytes.len();
+    let signed_bytes = final_bytes.len() - prior_bytes.len();
     eprintln!(
-        "payload_out={} payload_in={} carrier_out={} carrier_in={} setup_us={} transfer_us={} closure_us={} lifecycle_us={} signed_bytes={signed_bytes}",
+        "payload_out={} payload_in={} carrier_out={} carrier_in={} setup_us={} transfer_us={} closure_us={} lifecycle_us={} earlier_signed_bytes={earlier_signed_bytes} signed_bytes={signed_bytes}",
         traffic.payload_out,
         traffic.payload_in,
         traffic.carrier_out,
@@ -245,7 +277,7 @@ fn ledger_closes_flow_and_preserves_audit(change: WorkloadChange, expected: Deni
 }
 
 #[test]
-fn replacement_closes_tcp_while_the_signed_revocation_is_pending() {
+fn replacement_watcher_closes_tcp_while_signed_audit_is_stalled() {
     ledger_closes_flow_and_preserves_audit(
         WorkloadChange::Replace {
             workload: WORKLOAD.into(),
@@ -256,7 +288,7 @@ fn replacement_closes_tcp_while_the_signed_revocation_is_pending() {
 }
 
 #[test]
-fn quarantine_closes_tcp_while_the_signed_revocation_is_pending() {
+fn quarantine_watcher_closes_tcp_while_signed_audit_is_stalled() {
     ledger_closes_flow_and_preserves_audit(
         WorkloadChange::Quarantine {
             workload: WORKLOAD.into(),
