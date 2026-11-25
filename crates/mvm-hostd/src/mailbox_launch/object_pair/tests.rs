@@ -11,6 +11,7 @@ fn public_grant(dir: &Path, mail: u8) -> MailboxGrant {
     let mailbox = MailboxId::from_bytes([mail; 32]);
     let epoch = ExecutionEpoch::new(1).unwrap();
     MailboxGrant {
+        service_blind: None,
         mailbox,
         epoch,
         authority_key: super::super::authority_key_for(dir, &mailbox, epoch)

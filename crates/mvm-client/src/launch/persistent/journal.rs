@@ -68,6 +68,7 @@ pub(crate) fn validate_slot(
     endpoint: Option<&InstalledJournal<'_>>,
     grant: Option<&MailboxGrant>,
 ) -> Result<()> {
+    mvm_hostd::mailbox_launch::require_legacy_launch(grant)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(InstalledJournal::Object { launch, owner }) = endpoint {
         ensure!(
@@ -336,6 +337,32 @@ impl crate::LocalBackend {
 #[cfg(test)]
 mod tests {
     use super::JournalRole::{Destination, Ordinary, Source};
+
+    #[test]
+    fn a_signed_v3_selector_cannot_fall_back_to_an_ordinary_journal() {
+        use mvm_contract::protocol::mailbox::{
+            ExecutionEpoch, MailboxGrant, MailboxId, service_blind::LaunchProfile,
+        };
+
+        let mut grant = MailboxGrant {
+            durable_object_pair_sha256_v1: None,
+            incoming_journal_policy_sha256_v1: None,
+            outbound_journal_v1: None,
+            mailbox: MailboxId::from_bytes([1; 32]),
+            authority_key: [2; 32],
+            epoch: ExecutionEpoch::new(1).unwrap(),
+            report: None,
+            retention: None,
+            service_blind: None,
+        };
+        super::validate_slot(None, Some(&grant)).unwrap();
+        grant.service_blind = Some(LaunchProfile::new([3; 32], [4; 32]).unwrap());
+        let refusal = super::validate_slot(None, Some(&grant)).unwrap_err();
+        assert_eq!(
+            refusal.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
 
     #[cfg(feature = "test-support")]
     #[test]

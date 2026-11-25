@@ -22,6 +22,8 @@ pub enum AssetSpec {
 }
 
 pub struct AdmitPlanForBootParams<'a> {
+    /// Bundle sizing decisions recorded on the admitted plan.
+    pub bundle_sizing: super::bundle_resources::AppliedSizing,
     /// Mailbox this launch grants, minted into the plan before signing.
     pub mailbox: Option<mvm_contract::protocol::mailbox::MailboxGrant>,
     pub tenant: &'a str,

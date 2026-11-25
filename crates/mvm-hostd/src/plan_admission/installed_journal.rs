@@ -147,6 +147,7 @@ impl AdmittedPlan {
         bundle: Option<&PolicyBundle>,
         verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
     ) -> Result<VmId> {
+        crate::mailbox_launch::require_legacy_launch(self.plan().mailbox.as_ref())?;
         anyhow::ensure!(
             !self.dispatched
                 && cfg!(target_os = "linux")

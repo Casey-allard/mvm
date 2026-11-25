@@ -686,6 +686,7 @@ mod tests {
         use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            service_blind: None,
             mailbox: MailboxId::from_bytes([4; 32]),
             authority_key: [5; 32],
             epoch: ExecutionEpoch::new(1).unwrap(),

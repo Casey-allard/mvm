@@ -21,6 +21,7 @@ fn fixture() -> (
     let mut plan = PlanFixture::new().build();
     plan.image.name = "attempt-test".into();
     plan.mailbox = Some(MailboxGrant {
+        service_blind: None,
         durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,

@@ -10,6 +10,7 @@ fn context(
 
 fn grant() -> MailboxGrant {
     MailboxGrant {
+        service_blind: None,
         mailbox: MailboxId::from_bytes([3; 32]),
         authority_key: ed25519_dalek::SigningKey::from_bytes(&[4; 32])
             .verifying_key()

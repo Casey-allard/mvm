@@ -1057,6 +1057,7 @@ mod tests {
             epoch: ExecutionEpoch::new(3).unwrap(),
             report: None,
             retention: None,
+            service_blind: None,
         });
         plan.plan_id = mvm_core::plan::compute_plan_id(&plan);
         let redaction = RedactionPolicy::default();
@@ -1124,6 +1125,7 @@ mod tests {
         std::fs::write(&anchor, host.verifying_key().as_bytes()).unwrap();
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            service_blind: None,
             durable_object_pair_sha256_v1: Some([4; 32]),
             mailbox: MailboxId::from_bytes([5; 32]),
             authority_key: host.verifying_key().to_bytes(),
@@ -1200,6 +1202,7 @@ mod tests {
         use mvm_contract::protocol::mailbox::{ExecutionEpoch, MailboxGrant, MailboxId};
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         plan.mailbox = Some(MailboxGrant {
+            service_blind: None,
             mailbox: MailboxId::from_bytes([5; 32]),
             authority_key: [6; 32],
             epoch: ExecutionEpoch::new(1).unwrap(),

@@ -239,6 +239,7 @@ fn selected_object_pair_requires_installed_endpoint_support() {
         ExecutionEpoch, MailboxGrant, MailboxId, MailboxRetentionPolicy,
     };
     let mut grant = MailboxGrant {
+        service_blind: None,
         durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: None,
         outbound_journal_v1: None,

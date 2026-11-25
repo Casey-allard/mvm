@@ -223,6 +223,7 @@ impl AdmittedPlan {
         bundle: Option<&PolicyBundle>,
         verified_runtime: Option<&mvm_runtime::runtime_evidence::VerifiedRuntimeSet>,
     ) -> Result<mvm_core::vm_backend::VmId> {
+        crate::mailbox_launch::require_legacy_launch(self.plan().mailbox.as_ref())?;
         anyhow::ensure!(
             !self.dispatched
                 && self.variant == Variant::Prod

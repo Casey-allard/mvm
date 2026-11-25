@@ -78,6 +78,7 @@ fn fixture(
         ExecutionEpoch, MailboxGrant, MailboxId, MailboxRetentionPolicy,
     };
     plan.mailbox = Some(MailboxGrant {
+        service_blind: None,
         durable_object_pair_sha256_v1: None,
         incoming_journal_policy_sha256_v1: Some([3; 32]),
         outbound_journal_v1: None,

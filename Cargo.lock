@@ -3473,7 +3473,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libkrun-sys"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "libc",
  "mvm-agentd",
@@ -3670,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-agentd"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3701,7 +3701,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-backends"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -3722,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-build"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3761,7 +3761,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-builder-guest"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "hex",
@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-bundler"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-capture"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "chrono",
  "hex",
@@ -3813,7 +3813,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-cli"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3867,7 +3867,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-client"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3912,7 +3912,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-compiler"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "flate2",
  "globset",
@@ -3933,7 +3933,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-conformance"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3967,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-contract"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3987,7 +3987,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-core"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -4044,14 +4044,14 @@ dependencies = [
 
 [[package]]
 name = "mvm-crypto"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "aes-gcm",
 ]
 
 [[package]]
 name = "mvm-fs"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "am-fs-ext4",
  "async-trait",
@@ -4081,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-gpu"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "libc",
  "mvm-contract",
@@ -4091,7 +4091,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-host-services"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "mvm-agentd",
  "mvm-core",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-hostd"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4161,7 +4161,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-hostlib"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4181,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-http"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-macho-sign"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "plist",
  "sha1",
@@ -4211,7 +4211,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-net"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "mvm-contract",
  "mvm-core",
@@ -4220,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-policy"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "libc",
@@ -4237,7 +4237,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-runtime"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "mvm-sdk"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -4307,14 +4307,14 @@ dependencies = [
 
 [[package]]
 name = "mvm-setpriv"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "mvm-vmm"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4349,7 +4349,7 @@ dependencies = [
 
 [[package]]
 name = "mvmctl"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -5434,7 +5434,7 @@ checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
 
 [[package]]
 name = "runmvm-client"
-version = "0.28.0-rc.9"
+version = "0.28.0-rc.10"
 dependencies = [
  "libloading",
  "serde_json",

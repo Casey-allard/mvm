@@ -210,6 +210,21 @@ impl GuestSealer {
         Ok((capability, envelope))
     }
 
+    pub(super) fn retained_intent(
+        &self,
+        message: &OutboxMessage,
+    ) -> Result<Option<(SignedMailboxCapability, MailboxEnvelope)>, Refusal> {
+        let Some(dir) = &self.intent_dir else {
+            return Ok(None);
+        };
+        let path = dir.join(hex::encode(message.message_id.as_bytes()));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => self.read_intent(&path, message, None).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(Refusal::Unavailable),
+        }
+    }
+
     fn read_intent(
         &self,
         path: &Path,
@@ -969,6 +984,7 @@ mod accept_loop_tests {
             epoch: ExecutionEpoch::new(1).unwrap(),
             report: None,
             retention: None,
+            service_blind: None,
         };
         let (trust, _) = crate::mailbox_launch::host_trust(dir, &grant, &test_secret()).unwrap();
         let limits = MailboxLimits {
@@ -1151,6 +1167,7 @@ mod tests {
             epoch,
             report: None,
             retention: None,
+            service_blind: None,
         }
     }
 

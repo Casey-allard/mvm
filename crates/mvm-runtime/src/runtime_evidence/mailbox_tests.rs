@@ -8,6 +8,7 @@ use mvm_core::mailbox::reader::{
 fn plan() -> mvm_core::plan::ExecutionPlan {
     let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
     plan.mailbox = Some(MailboxGrant {
+        service_blind: None,
         mailbox: MailboxId::from_bytes([4; 32]),
         authority_key: ed25519_dalek::SigningKey::from_bytes(&[5; 32])
             .verifying_key()

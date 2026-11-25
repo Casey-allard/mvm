@@ -37,6 +37,7 @@ pub fn grant_for(
         epoch,
         report: None,
         retention: None,
+        service_blind: None,
     }
 }
 
@@ -60,6 +61,7 @@ pub fn at_workload_epoch(grant: MailboxGrant, workload: &str) -> Result<MailboxG
     current.durable_object_pair_sha256_v1 = grant.durable_object_pair_sha256_v1;
     current.outbound_journal_v1 = grant.outbound_journal_v1;
     current.incoming_journal_policy_sha256_v1 = grant.incoming_journal_policy_sha256_v1;
+    current.service_blind = grant.service_blind;
     Ok(current)
 }
 

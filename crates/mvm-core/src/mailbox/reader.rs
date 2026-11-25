@@ -470,6 +470,7 @@ impl<'a> ObjectCallAuthority<'a> {
             "unexpected original Call authority"
         );
         let grant = MailboxGrant {
+            service_blind: None,
             durable_object_pair_sha256_v1: Some(*pair),
             outbound_journal_v1: None,
             incoming_journal_policy_sha256_v1: None,

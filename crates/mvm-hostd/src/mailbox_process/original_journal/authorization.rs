@@ -303,6 +303,7 @@ mod tests {
             let mailbox = MailboxId::from_bytes([id; 32]);
             let epoch = ExecutionEpoch::new(2).unwrap();
             let grant = MailboxGrant {
+                service_blind: None,
                 mailbox,
                 epoch,
                 authority_key: crate::mailbox_launch::authority_key_for(

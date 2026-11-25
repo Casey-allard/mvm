@@ -117,6 +117,7 @@ impl IncomingJournalPolicy {
         let a = journal_scope_before_launch(
             keys,
             &MailboxGrant {
+                service_blind: None,
                 mailbox: self.source_mailbox,
                 epoch: self.source_epoch,
                 authority_key: auth_a.to_bytes(),
@@ -426,6 +427,7 @@ pub(super) mod tests {
             let mailbox = MailboxId::from_bytes([id; 32]);
             let epoch = ExecutionEpoch::new(1).unwrap();
             MailboxGrant {
+                service_blind: None,
                 mailbox,
                 epoch,
                 authority_key: authority_key_for(dir, &mailbox, epoch).unwrap().to_bytes(),

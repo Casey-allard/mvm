@@ -382,6 +382,7 @@ fn prepare_persistent_boot_with_owner(
                 .collect::<Vec<_>>();
             let configured_images_dir = mvm_build::image_source::configured_images_dir();
             let admission_params = AdmitPlanForBootParams {
+                bundle_sizing: Default::default(),
                 mailbox,
                 // What the backend will arm, so the admitted tier opens
                 // the GPU endpoint's vsock socket exactly when there is one.
@@ -818,6 +819,7 @@ mod persistent_oci_boot_tests {
                 // original no-mailbox admission supplied by this fixture.
                 let mut plan = admission.admitted.plan().clone();
                 plan.mailbox = Some(mvm_contract::protocol::mailbox::MailboxGrant {
+                    service_blind: None,
                     mailbox: mvm_contract::protocol::mailbox::MailboxId::from_bytes([1; 32]),
                     authority_key: [2; 32],
                     epoch: mvm_contract::protocol::mailbox::ExecutionEpoch::new(1).unwrap(),

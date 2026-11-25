@@ -1,4 +1,5 @@
 //! Original A-side dispatch for the opt-in local-durable direction.
+use super::durable::AdmissionReceipt;
 use super::sender_window::{Original, SenderWindow};
 use super::{GuestSealer, Refusal};
 use crate::mailbox_launch::MailboxTemplate;
@@ -393,13 +394,15 @@ impl<'a> SourceTurn<'a> {
         &mut self,
         message: OutboxMessage,
         deadline: Instant,
-        local: impl FnOnce(OutboxMessage) -> Result<SignedDestinationReceipt, Refusal>,
-    ) -> Result<SignedDestinationReceipt, Refusal> {
+        local: impl FnOnce(OutboxMessage) -> Result<AdmissionReceipt, Refusal>,
+    ) -> Result<AdmissionReceipt, Refusal> {
         if Some(message.recipient) != self.original_recipient {
             return local(message);
         }
         let (endpoint, connect) = self.transport.as_mut().ok_or(Refusal::Unavailable)?;
-        endpoint.forward(message, deadline, connect)
+        endpoint
+            .forward(message, deadline, connect)
+            .map(AdmissionReceipt::Legacy)
     }
 }
 

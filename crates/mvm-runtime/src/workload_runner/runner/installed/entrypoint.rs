@@ -254,6 +254,7 @@ mod tests {
         let mut plan = mvm_core::plan::test_support::PlanFixture::new().build();
         assert!(!selects_journal(&plan));
         let mut grant = MailboxGrant {
+            service_blind: None,
             durable_object_pair_sha256_v1: None,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,

@@ -353,6 +353,7 @@ fn run(ordinal: bool, reconnect: bool) -> Result<()> {
         max_payload_bytes: 313,
     };
     let a_grant = MailboxGrant {
+        service_blind: None,
         mailbox: incoming.source_mailbox,
         epoch: incoming.source_epoch,
         authority_key: crate::mailbox_launch::authority_key_for(

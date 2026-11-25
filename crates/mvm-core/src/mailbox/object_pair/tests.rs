@@ -91,6 +91,7 @@ fn original(
             chrono::DateTime::from_timestamp_millis(NOW + 20_000).unwrap(),
         )
         .mailbox(MailboxGrant {
+            service_blind: None,
             durable_object_pair_sha256_v1: selection,
             incoming_journal_policy_sha256_v1: None,
             outbound_journal_v1: None,
