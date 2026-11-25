@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 pub mod journal;
 
+use mvm_core::client::MvmError;
 use mvm_core::domain::instance::InstanceReadiness;
 use mvm_core::naming::validate_vm_name;
 use mvm_hostd::plan_admission::{
@@ -180,8 +181,9 @@ fn register_vm_name(vm_name: &str, network_name: &str) {
 pub fn start_persistent_oci_machine(
     params: PersistentImageStartParams<'_>,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    let lifecycle = mvm_runtime::vm::instance_snapshot::MachineLifecycleLock::acquire(params.name)?;
     let _reservation = super::PairedBootReservation::for_lifecycle_mutation(params.name)?;
-    start_persistent(params, None, None, None)
+    start_persistent(params, None, None, None, &lifecycle)
 }
 
 pub(super) fn start_persistent(
@@ -189,11 +191,13 @@ pub(super) fn start_persistent(
     journal: Option<&mut journal::InstalledJournal<'_>>,
     fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
     prepared: Option<&crate::image_cache::prepared::ValidatedPrepared>,
+    lifecycle: &mvm_runtime::vm::instance_snapshot::MachineLifecycleLock,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
+    lifecycle.require_name(params.name)?;
     let _runtime_proofs = mvm_build::guest_runtime::evidence::LaunchProofScope::begin();
     journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
     let boot = prepare_persistent_boot(params, journal.as_deref(), prepared)?;
-    finish_admitted_persistent(boot, journal, fresh_state)
+    finish_admitted_persistent(boot, journal, fresh_state, lifecycle)
 }
 
 struct PreparedPersistentBoot {
@@ -551,6 +555,7 @@ fn finish_admitted_persistent(
     boot: PreparedPersistentBoot,
     mut journal: Option<&mut journal::InstalledJournal<'_>>,
     fresh_state: Option<mvm_hostd::mailbox_process::original_journal::FreshState>,
+    lifecycle: &mvm_runtime::vm::instance_snapshot::MachineLifecycleLock,
 ) -> Result<mvm_hostd::plan_admission::AdmittedPlan> {
     // Keep the verified runtime pack held through startup and any rollback.
     let _built_runtime = boot.built_runtime;
@@ -673,8 +678,26 @@ fn finish_admitted_persistent(
         &dispatched_config,
         mailbox_posture.as_ref(),
     ) {
+        if let Some(stop) = error
+            .downcast_ref::<mvm_hostd::mailbox_process::MailboxStartFailure>()
+            .and_then(mvm_hostd::mailbox_process::MailboxStartFailure::stop_error)
+        {
+            prepared_volumes.commit();
+            let reason = format!("VM launch rollback unresolved: {stop:#}");
+            crate::launch::record_unsealed_end(
+                Some((&admission.emitter, admission.admitted.plan())),
+                crate::launch::UnsealedEnd::new(name, crate::launch::UnsealedReason::StopFailed)
+                    .error(format!("{error:#}; {reason}")),
+            );
+            return Err(MvmError::RecoveryRequired {
+                machine_id: name.into(),
+                plan_id: admission.admitted.plan_id().0.clone(),
+                reason: format!("{error:#}; {reason}"),
+            }
+            .into());
+        }
         emit_failed(&admission, "mailbox-process", &error);
-        if let Err(cleanup_error) = crate::local::remove_stopped_runtime_state(name) {
+        if let Err(cleanup_error) = crate::local::remove_stopped_runtime_state(name, lifecycle) {
             tracing::warn!(error = %cleanup_error, machine = name, "removing runtime state after a refused mailbox failed");
         }
         return Err(error);
@@ -693,25 +716,29 @@ fn finish_admitted_persistent(
         None => super::detached::require_serving_guest(name, &started, timeout),
     };
     if let Err(error) = ready {
-        let abort_is_unresolved = error.abort_is_unresolved();
-        if abort_is_unresolved {
+        audit_detached_readiness_failure(&admission, name, &error);
+        if error.abort_is_unresolved() {
             // The VMM may still hold block-device file descriptors. Preserve
             // the owner leases and registry for recovery; releasing or
             // re-sealing here could admit a second attachment while it lives.
             prepared_volumes.commit();
-            audit_detached_readiness_failure(&admission, name, &error);
-        } else {
-            audit_detached_readiness_failure(&admission, name, &error);
-            // The failure record and session seal live under the runtime
-            // state directory, so cleanup must follow audit finalization.
-            if !paired && let Err(cleanup_error) = crate::local::remove_stopped_runtime_state(name)
-            {
-                tracing::warn!(
-                    error = %cleanup_error,
-                    machine = name,
-                    "removing runtime state after completed launch abort failed"
-                );
+            return Err(MvmError::RecoveryRequired {
+                machine_id: name.into(),
+                plan_id: admission.admitted.plan_id().0.clone(),
+                reason: format!("{error:#}"),
             }
+            .into());
+        }
+        // The failure record and session seal live under the runtime state
+        // directory, so cleanup must follow audit finalization.
+        if !paired
+            && let Err(cleanup_error) = crate::local::remove_stopped_runtime_state(name, lifecycle)
+        {
+            tracing::warn!(
+                error = %cleanup_error,
+                machine = name,
+                "removing runtime state after completed launch abort failed"
+            );
         }
         return Err(anyhow::Error::new(error));
     }

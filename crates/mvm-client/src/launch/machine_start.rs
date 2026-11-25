@@ -239,6 +239,17 @@ pub fn start_machine_spec(
     host: &dyn StartHost,
     params: MachineStartParams<'_>,
 ) -> Result<MachineStart> {
+    let lifecycle = mvm_runtime::vm::instance_snapshot::MachineLifecycleLock::acquire(&spec.name)?;
+    start_machine_spec_in_lifecycle(spec, host, params, &lifecycle)
+}
+
+/// Start under the same transition that checked and stopped a predecessor.
+pub fn start_machine_spec_in_lifecycle(
+    spec: &mp::MachineSpec,
+    host: &dyn StartHost,
+    params: MachineStartParams<'_>,
+    lifecycle: &mvm_runtime::vm::instance_snapshot::MachineLifecycleLock,
+) -> Result<MachineStart> {
     let reservation = super::PairedBootReservation::for_lifecycle_mutation(&spec.name)?;
     start_machine_spec_with_journal_context(
         spec,
@@ -246,6 +257,7 @@ pub fn start_machine_spec(
         params,
         None,
         &reservation,
+        lifecycle,
         #[cfg(unix)]
         None,
     )
@@ -257,18 +269,23 @@ pub(super) fn start_machine_spec_with_journal_context(
     params: MachineStartParams<'_>,
     journal: Option<&mut InstalledJournal<'_>>,
     reservation: &super::PairedBootReservation,
+    lifecycle: &mvm_runtime::vm::instance_snapshot::MachineLifecycleLock,
     #[cfg(unix)] installed: Option<&mut persistent::journal::JournalStartContext>,
 ) -> Result<MachineStart> {
     reservation.require_name(&spec.name)?;
+    lifecycle.require_name(&spec.name)?;
     persistent::journal::validate_slot(journal.as_deref(), params.mailbox.as_ref())?;
-    AnyBackend::require_hypervisor_selectable(params.hypervisor)?;
-    let fresh_state = if journal.is_some() {
-        Some(reservation.prepare_journal_runtime(&spec.name)?)
-    } else {
-        super::discard_stopped_runtime_state(params.hypervisor, &spec.name)?;
-        None
-    };
     spec.validate_prepared_source()?;
+    AnyBackend::require_hypervisor_selectable(params.hypervisor)?;
+    anyhow::ensure!(
+        !matches!(
+            host.backend(params.hypervisor)
+                .status(&mvm_core::vm_backend::VmId(spec.name.clone())),
+            Ok(mvm_core::vm_backend::VmStatus::Running | mvm_core::vm_backend::VmStatus::Paused)
+        ),
+        "machine {:?} is already running",
+        spec.name
+    );
     let prepared_backend = spec
         .prepared_image
         .as_ref()
@@ -289,6 +306,12 @@ pub(super) fn start_machine_spec_with_journal_context(
             crate::image_cache::prepared::revalidate(selection, params.hypervisor, &spec.profile)
         })
         .transpose()?;
+    let fresh_state = if journal.is_some() {
+        Some(reservation.prepare_journal_runtime_in_lifecycle(&spec.name, lifecycle)?)
+    } else {
+        super::reap_stopped_runtime_state(&spec.name, lifecycle)?;
+        None
+    };
     validate_registry_pack_source(spec)?;
     let network_policy = persisted_network_policy(spec)?;
     let (memory_mib, mem_initial_mib) =
@@ -367,11 +390,22 @@ pub(super) fn start_machine_spec_with_journal_context(
         };
         installed.start(boot_params, journal, fresh_state, prepared.as_ref())?
     } else {
-        persistent::start_persistent(boot_params, journal, fresh_state, prepared.as_ref())?
+        persistent::start_persistent(
+            boot_params,
+            journal,
+            fresh_state,
+            prepared.as_ref(),
+            lifecycle,
+        )?
     };
     #[cfg(not(unix))]
-    let admitted =
-        persistent::start_persistent(boot_params, journal, fresh_state, prepared.as_ref())?;
+    let admitted = persistent::start_persistent(
+        boot_params,
+        journal,
+        fresh_state,
+        prepared.as_ref(),
+        lifecycle,
+    )?;
     Ok(MachineStart {
         resolved_digest: boot.digest,
         admitted,
@@ -613,7 +647,9 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("hvf-instance.json"), "{}").unwrap();
 
-        super::super::discard_stopped_runtime_state("firecracker", "restarted").unwrap();
+        let lifecycle =
+            mvm_runtime::vm::instance_snapshot::MachineLifecycleLock::acquire("restarted").unwrap();
+        assert!(lifecycle.reap_unowned_state().unwrap());
 
         assert!(!state.exists());
     }

@@ -443,21 +443,20 @@ impl PairedBootReservation {
         Ok(())
     }
 
-    pub fn prepare_journal_runtime(&self, name: &str) -> Result<FreshState> {
+    /// Prepare the journal runtime while the caller holds the canonical machine lock.
+    pub fn prepare_journal_runtime_in_lifecycle(
+        &self,
+        name: &str,
+        lifecycle: &mvm_runtime::vm::instance_snapshot::MachineLifecycleLock,
+    ) -> Result<FreshState> {
+        lifecycle.require_name(name)?;
         self.require_name(name)?;
         let home = mvm_core::config::mvm_home_strict()?;
         let state = mvm_core::config::vm_state_dir_at(&home, name);
         let original = owner_dir(&mvm_core::config::mvm_keys_dir(), name)?;
         let _claim = claim_launch(&state, &original, true)?;
         runtime_state::prepare(&home, name, || {
-            ensure!(
-                mvm_runtime::vm::reconcile::reap_unowned_state_dir(
-                    &state,
-                    &mvm_core::config::instance_dir(name)
-                )
-                .map_err(anyhow::Error::msg)?,
-                "VM runtime is still owned"
-            );
+            ensure!(lifecycle.reap_unowned_state()?, "VM runtime is still owned");
             Ok(())
         })
     }
@@ -650,10 +649,19 @@ mod tests {
         let live = mvm_runtime::vm::instance_snapshot::try_lock_resume_in(&instance)
             .unwrap()
             .unwrap();
-        assert!(first.prepare_journal_runtime(name).is_err());
+        assert!(
+            mvm_runtime::vm::instance_snapshot::try_lock_resume_in(&instance)
+                .unwrap()
+                .is_none()
+        );
         assert!(sample.exists());
         drop(live);
-        first.prepare_journal_runtime(name).unwrap().commit();
+        let lifecycle =
+            mvm_runtime::vm::instance_snapshot::MachineLifecycleLock::acquire(name).unwrap();
+        first
+            .prepare_journal_runtime_in_lifecycle(name, &lifecycle)
+            .unwrap()
+            .commit();
         assert!(!sample.exists());
         assert!(PairedBootReservation::for_lifecycle_mutation(name).is_err());
         drop(first);

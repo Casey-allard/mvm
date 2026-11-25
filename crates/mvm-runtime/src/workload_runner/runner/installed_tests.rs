@@ -497,6 +497,21 @@ fn owned_native_handle_survives_canonical_runner_start_return() {
         runner.start(&config).is_err(),
         "same identity cannot reserve another slot"
     );
+    let automatic = runner
+        .stop_hvf_instance(&mvm_core::protocol::hvf_control::HvfInstance {
+            vm_id: id.0.clone(),
+            boot_nonce: [1; 32],
+        })
+        .expect_err("automatic recovery cannot stop an installed owner by name");
+    assert!(
+        automatic
+            .to_string()
+            .contains("installed VM must stop through its original runner custody"),
+        "{automatic:#}"
+    );
+    assert_eq!(attached.load(Ordering::SeqCst), 0);
+    assert!(runner.installed.find(&id).unwrap().is_some());
+    assert_eq!(runner.status(&id).unwrap(), VmStatus::Running);
     assert!(
         runner.stop_owned(&id, &anchor).is_err(),
         "MockDriver cannot fabricate native exit proof"

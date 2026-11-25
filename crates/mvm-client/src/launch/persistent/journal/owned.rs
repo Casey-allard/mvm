@@ -694,6 +694,7 @@ impl crate::LocalBackend {
         context: &mut JournalStartContext,
     ) -> Result<crate::launch::machine_start::MachineStart> {
         use crate::launch::machine_start;
+        let lifecycle = crate::local::machine_lifecycle(name).await?;
         let reservation = crate::launch::reserve_named_lifecycle(name)?;
         let mut spec = mvm_runtime::machine::persist::load_machine_spec(name)?;
         ensure!(
@@ -719,6 +720,7 @@ impl crate::LocalBackend {
             },
             journal,
             &reservation,
+            &lifecycle,
             Some(context),
         )?;
         machine_start::record_machine_started(&mut spec, started.resolved_digest.clone());

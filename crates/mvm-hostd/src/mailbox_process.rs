@@ -624,6 +624,22 @@ pub fn require_servable(
     }
 }
 
+/// Mailbox launch refusal together with any original VM stop failure.
+#[derive(Debug, thiserror::Error)]
+#[error("the granted guest mailbox could not be served")]
+pub struct MailboxStartFailure {
+    #[source]
+    error: anyhow::Error,
+    stop: Option<anyhow::Error>,
+}
+
+impl MailboxStartFailure {
+    /// Failed termination leaves the original VM and its resources in custody.
+    pub fn stop_error(&self) -> Option<&anyhow::Error> {
+        self.stop.as_ref()
+    }
+}
+
 /// Serve the mailbox `config` grants, now that its VM `id` is up on `backend`.
 /// The cmdline token and this process come from the same plan, so a guest
 /// asserts a mailbox exactly when one is served. A grant that cannot be served
@@ -634,7 +650,7 @@ pub fn serve_started(
     config: &VmStartConfig,
     posture: Option<&MailboxLaunchPosture>,
 ) -> anyhow::Result<()> {
-    serve_started_with(backend, id, config, posture, spawn_for_launch)
+    serve_started_with(backend, id, config, posture, spawn_for_launch).map_err(Into::into)
 }
 
 fn serve_started_with(
@@ -648,7 +664,7 @@ fn serve_started_with(
         &str,
         Option<&MailboxLaunchPosture>,
     ) -> Result<Option<u32>>,
-) -> anyhow::Result<()> {
+) -> std::result::Result<(), MailboxStartFailure> {
     let Some(plan) = granted_plan(config) else {
         return Ok(());
     };
@@ -658,10 +674,11 @@ fn serve_started_with(
         Ok(())
     })();
     if let Err(error) = outcome {
-        if let Err(stop) = backend.stop(id) {
+        let stop = backend.stop(id).err();
+        if let Some(stop) = &stop {
             tracing::warn!(vm = %id.0, error = %stop, "stopping a VM whose mailbox could not be served failed");
         }
-        return Err(error.context("the granted guest mailbox could not be served"));
+        return Err(MailboxStartFailure { error, stop });
     }
     Ok(())
 }
@@ -1186,6 +1203,38 @@ mod tests {
                 outcome
             },
         )
+        .map_err(Into::into)
+    }
+
+    #[test]
+    fn refused_mailbox_retains_the_original_stop_result() {
+        let dir = keys_dir();
+        let mut env = mvm_core::util::test_env::TestEnv::new();
+        env.isolate_mvm_home(dir.path());
+        let config = config_for(Some(grant(dir.path())));
+        let vm = VmId("vm-under-test".into());
+        let refuse = |backend: AnyBackend| {
+            serve_started_with(&backend, &vm, &config, None, |_, _, _, _| {
+                panic!("refused mailbox must never spawn")
+            })
+            .unwrap_err()
+        };
+
+        let confirmed = refuse(AnyBackend::Mock(mvm_runtime::MockBackend::new()));
+        assert!(confirmed.error.to_string().contains("no admitted posture"));
+        assert!(confirmed.stop_error().is_none());
+
+        let unresolved = refuse(AnyBackend::Mock(
+            mvm_runtime::MockBackend::new().with_failing_stop(),
+        ));
+        assert_eq!(unresolved.error.to_string(), confirmed.error.to_string());
+        assert!(
+            unresolved
+                .stop_error()
+                .expect("original stop failure")
+                .to_string()
+                .contains("forced stop failure")
+        );
     }
 
     /// The guest's token and the host process come from one plan: a granted

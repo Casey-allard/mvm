@@ -1,5 +1,37 @@
-//! Original signed launch lifecycle records and terminal session seals.
-use super::*;
+//! Closing a run's chain-signed audit session: the transient exit seal, the
+//! stopped persistent machine's seal, and the unsealed-end records a failure
+//! to close writes instead.
+//!
+//! Every record here is best-effort in the direction of the run itself: the
+//! workload already ran or the machine is already stopped, so a failure is
+//! reported on the audit log rather than failing the caller.
+
+use mvm_core::client::Result;
+use mvm_core::config::vm_state_dir;
+use mvm_core::plan::ExecutionPlan;
+use mvm_hostd::audit::emitter::{AuditEmitter, ExitRecord};
+
+use super::{TransientExitAudit, UnsealedEnd, UnsealedReason, record_unsealed_end};
+
+/// Best-effort chain-signed emitter under the host signer. Audit emission is
+/// tamper-evidence, not part of the admission decision: a construction
+/// failure warns and the boot proceeds unaudited-on-chain (CLI parity).
+pub(crate) fn build_audit_emitter() -> Option<AuditEmitter> {
+    let signer = match mvm_hostd::audit::host_keypair::load_or_init() {
+        Ok(signer) => signer,
+        Err(e) => {
+            tracing::warn!(error = %e, "host signer unavailable; skipping chain audit emission");
+            return None;
+        }
+    };
+    match AuditEmitter::new(signer.signing) {
+        Ok(emitter) => Some(emitter.with_receipts()),
+        Err(e) => {
+            tracing::warn!(error = %e, "audit emitter unavailable; skipping chain audit emission");
+            None
+        }
+    }
+}
 
 /// Record and seal a CLI-owned transient run before its state directory is
 /// removed. The signed envelope comes from the admitted launch configuration;
@@ -139,11 +171,11 @@ pub(crate) fn seal_transient_end(
 /// The records that close a waited-for run, written best-effort: the workload
 /// already ran, so a failure here is reported rather than failing the exit
 /// report.
-pub(super) struct ClosingRecords<'a> {
-    pub(super) plan: &'a ExecutionPlan,
-    pub(super) machine: &'a str,
-    pub(super) memory_limit_exceeded: Option<&'a mvm_core::spawn_scope::MemoryLimitExceeded>,
-    pub(super) exit: ExitRecord<'a>,
+pub(crate) struct ClosingRecords<'a> {
+    pub(crate) plan: &'a ExecutionPlan,
+    pub(crate) machine: &'a str,
+    pub(crate) memory_limit_exceeded: Option<&'a mvm_core::spawn_scope::MemoryLimitExceeded>,
+    pub(crate) exit: ExitRecord<'a>,
 }
 
 impl ClosingRecords<'_> {
@@ -154,7 +186,7 @@ impl ClosingRecords<'_> {
     /// on any of them before this returns, so syncing each on its own bought
     /// no ordering; it bought one serial fsync per record on a path the
     /// caller waits on.
-    pub(super) fn record(&self, emitter: &AuditEmitter) -> bool {
+    pub(crate) fn record(&self, emitter: &AuditEmitter) -> bool {
         let (plan, name) = (self.plan, self.machine);
         let closed = emitter.batched(|| {
             if let Some(exceeded) = self.memory_limit_exceeded {

@@ -292,6 +292,23 @@ pub fn reap_unowned_state_dir(state_dir: &Path, instance_dir: &Path) -> Result<b
     let Some(_lifecycle) = lock else {
         return Ok(false);
     };
+    reap_unowned_state_dir_locked(state_dir)
+}
+
+/// Caller retains the existing per-machine lifecycle lock for this directory.
+pub(crate) fn reap_unowned_state_dir_locked(state_dir: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(state_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if runtime_namespaces_absent(state_dir).map_err(|error| error.to_string())? {
+                return Ok(true);
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err("runtime state is not an original directory".into());
+        }
+        Ok(_) => {}
+    }
     if state_dir_has_live_process(state_dir) {
         return Ok(false);
     }
