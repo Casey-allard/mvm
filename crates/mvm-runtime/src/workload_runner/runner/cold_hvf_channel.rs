@@ -283,6 +283,8 @@ impl ColdHvfChannel {
             custody.phase == Phase::Prepared,
             "cold activation cannot be retried"
         );
+        let _activation_barrier =
+            mvm_core::host_interface::activation_barrier::ActivationBarrier::shared()?;
         custody.phase = Phase::Uncertain;
         let preparation = &mut custody.preparation;
         let config = preparation.launch.config();

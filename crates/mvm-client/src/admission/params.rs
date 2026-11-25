@@ -16,6 +16,9 @@ pub enum AssetSpec {
     },
     /// An internally selected signed pack; never accepted from `--asset`.
     RegistryPack(mvm_core::registry_pack::PackPin),
+    /// The resident owner's exact project-policy generation and closure.
+    /// Host admission revalidates it before signing; it is not a host file.
+    CommittedPolicy(mvm_core::plan::AssetIdentity),
 }
 
 pub struct AdmitPlanForBootParams<'a> {

@@ -566,6 +566,8 @@ impl<D: VmmDriver, S: NetworkEndpointSpawner, B: BrokerRegistrar> WorkloadRunner
         images: mvm_vmm::driver::prepared_disks::WritableVolumeImages,
         release: Option<&mvm_build::guest_runtime::evidence::VerifiedReleaseRuntime>,
     ) -> Result<VmId> {
+        let _activation_barrier =
+            mvm_core::host_interface::activation_barrier::ActivationBarrier::shared()?;
         #[cfg(unix)]
         if let Some(owner) = &config.host_lifetime {
             anyhow::ensure!(
@@ -821,6 +823,8 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
     }
 
     fn resume(&self, id: &VmId) -> Result<()> {
+        let _activation_barrier =
+            mvm_core::host_interface::activation_barrier::ActivationBarrier::shared()?;
         #[cfg(unix)]
         {
             if let Some(slot) = self.installed.find(id)? {
@@ -855,15 +859,19 @@ impl<D: VmmDriver + 'static, S: NetworkEndpointSpawner + 'static, B: BrokerRegis
             Err(e) => return Err(anyhow::anyhow!("read {}: {e}", root.display())),
         };
         let mut vms = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.with_context(|| format!("listing VM state in {}", root.display()))?;
             if !has_vm_marker(&entry.path()) {
                 continue;
             }
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 VM state entry in {}", root.display()))?;
             let id = VmId(name.clone());
-            let status = self.status(&id).unwrap_or(VmStatus::Stopped);
+            let status = self
+                .status(&id)
+                .with_context(|| format!("probing VM status for {name}"))?;
             vms.push(VmInfo {
                 id,
                 name,

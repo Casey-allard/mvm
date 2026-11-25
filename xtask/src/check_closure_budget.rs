@@ -39,6 +39,8 @@ const RELEASE_FEATURES: &str =
 // FlowMux/store, hashing, compression and CPU accounting, plus native macOS
 // directory custody. Its unconditional synthetic-WAN HttpClient also brings
 // ureq/ureq-proto/utf8-zero/webpki-roots; these are not MVM downloader inputs.
+// Committed generation admission adds the first-party mvm-policy package and
+// no third-party dependency to each measured CLI closure.
 // Exact measured ceilings leave no headroom; guest closures remain unchanged.
 const BUDGETS: &[ClosureBudget] = &[
     ClosureBudget {
@@ -57,19 +59,19 @@ const BUDGETS: &[ClosureBudget] = &[
         package: "mvmctl",
         target: "aarch64-apple-darwin",
         features: RELEASE_FEATURES,
-        max: 387,
+        max: 388,
     },
     ClosureBudget {
         package: "mvmctl",
         target: "x86_64-unknown-linux-gnu",
         features: RELEASE_FEATURES,
-        max: 385,
+        max: 386,
     },
     ClosureBudget {
         package: "mvmctl",
         target: "aarch64-unknown-linux-gnu",
         features: RELEASE_FEATURES,
-        max: 384,
+        max: 385,
     },
     ClosureBudget {
         package: "mvm-builder-guest",
@@ -94,12 +96,12 @@ const BUDGETS: &[ClosureBudget] = &[
 /// macOS omits the Linux-only confinement and networking dependencies.
 // Shared crypto, transfer/FlowMux/store and native directory ownership;
 // measured complete macOS closure with no headroom.
-const MACOS_CLOSURE_BUDGET: usize = 361;
+const MACOS_CLOSURE_BUDGET: usize = 362;
 
 /// Maximum distinct packages in the default Linux closure.
 // Shared crypto, transfer/FlowMux/store, exact hashing, compression and CPU
 // accounting; measured complete Linux closure with no headroom.
-pub(crate) const CLOSURE_BUDGET: usize = 365;
+pub(crate) const CLOSURE_BUDGET: usize = 366;
 
 pub(crate) fn run(workspace: &Path) -> Result<()> {
     for budget in BUDGETS {

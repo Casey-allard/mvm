@@ -744,6 +744,16 @@ fn admit_with_runtime_evidence(
                     verified.manifest_sha256().as_str(),
                 )?);
             }
+            AssetSpec::CommittedPolicy(identity) => {
+                anyhow::ensure!(
+                    identity.kind == mvm_core::plan::AssetKind::Policy
+                        && identity
+                            .name
+                            .starts_with(mvm_hostd::policy_generation::GENERATION_ASSET_PREFIX),
+                    "invalid committed project-policy asset"
+                );
+                caller_assets.push(identity.clone());
+            }
         }
     }
 

@@ -13,6 +13,7 @@ pub mod budget_charge;
 pub mod built_pack;
 pub mod bundle_runtime;
 pub mod canonical_linux;
+mod committed_policy;
 pub mod detached;
 pub mod grants_report;
 pub mod machine_start;
@@ -39,14 +40,14 @@ mod stopped_machine;
 #[cfg(test)]
 mod tests;
 mod transient;
-use stopped_machine::{
-    ensure_spec_bootable_in_process, reap_stopped_runtime_state, remove_dir_if_present,
-};
+use stopped_machine::{reap_stopped_runtime_state, remove_dir_if_present};
 mod unbooted;
 #[cfg(unix)]
 pub use host_lifetime_preflight::{HostLifetimeLaunchFailure, UnusedHostLifetimePreparation};
 
+use committed_policy::apply_committed_sdk_policy;
 use mvm_hostd::mailbox_process::original_journal::PairedBootReservation;
+use request::ensure_spec_bootable_in_process;
 use unbooted::DefinitionOrigin;
 
 struct PersistentStartGuards<'a> {
@@ -1074,10 +1075,35 @@ impl LocalBackend {
     /// requests boot immediately and are cleaned up on exit/TTL; persistent
     /// requests persist their definition first, then boot from it — both
     /// through the one canonical signed-admission seam.
-    pub async fn launch(&self, request: LaunchRequest) -> Result<LaunchOutcome> {
+    pub async fn launch(&self, mut request: LaunchRequest) -> Result<LaunchOutcome> {
         if request.mode == LifecycleMode::Persistent {
             persistent::journal::validate_slot(None, request.mailbox.as_ref())
                 .map_err(crate::local::backend_err)?;
+        }
+        let _barrier = mvm_core::host_interface::activation_barrier::ActivationBarrier::shared()
+            .map_err(crate::local::backend_err)?;
+        if cfg!(target_os = "linux")
+            && self.backend.kind() != mvm_core::vm_backend::BackendKind::Mock
+        {
+            crate::policy_profiles::coordinator::ensure_if_activated()
+                .map_err(crate::local::backend_err)?;
+        }
+        if let LaunchSource::Built { slot_hash } = &request.source {
+            let candidate =
+                crate::policy_profiles::coordinator::activated_for_slot(slot_hash, &_barrier)
+                    .map_err(crate::local::backend_err)?;
+            if let Some(candidate) = candidate {
+                let selected = self.launch_backend(request.backend.as_deref())?;
+                if selected.kind() != mvm_core::vm_backend::BackendKind::Firecracker {
+                    return Err(crate::local::backend_err(
+                        "committed project launch requires Firecracker",
+                    ));
+                }
+                apply_committed_sdk_policy(&mut request, &candidate)
+                    .map_err(crate::local::backend_err)?;
+                request.policy_generation =
+                    Some(candidate.plan_asset().map_err(crate::local::backend_err)?);
+            }
         }
         if let LaunchSource::PreparedImage { selection } = &request.source {
             if request.mode != LifecycleMode::Persistent {

@@ -1,56 +1,6 @@
 //! Stopped-machine restart/removal using the original lifecycle reservations.
 use super::*;
 
-/// Refusals for persisted-spec shapes a library start cannot honor (fail
-/// closed, never silently ignore a persisted field): the start path boots an
-/// image, a built manifest or a deployment, and its volumes arrive as typed
-/// attachments; the CLI-only shapes stay with `mvmctl machine start`.
-pub(super) fn ensure_spec_bootable_in_process(spec: &mp::MachineSpec) -> Result<()> {
-    spec.validate_prepared_source()
-        .map_err(|error| MvmError::InvalidSpec {
-            reason: error.to_string(),
-        })?;
-    let unsupported = |what: &str| MvmError::InvalidSpec {
-        reason: format!(
-            "machine {:?} declares {what}, which a library start cannot honor; use the CLI's \
-             `machine start`",
-            spec.name
-        ),
-    };
-    if spec.runtime_pack {
-        return Err(unsupported("a runtime-pack source"));
-    }
-    if !spec.volumes.is_empty() {
-        return Err(unsupported(
-            "CLI-grammar volume strings (use typed attachments)",
-        ));
-    }
-    if !spec.init.is_empty() {
-        return Err(unsupported("init commands"));
-    }
-    if spec.registry_pack_image.is_some() {
-        machine_start::validate_registry_pack_source(spec).map_err(|error| {
-            MvmError::InvalidSpec {
-                reason: format!("invalid registry pack source: {error:#}"),
-            }
-        })?;
-    }
-    if spec.image.is_none()
-        && spec.prepared_image.is_none()
-        && spec.manifest.is_none()
-        && spec.deployment.is_none()
-        && spec.registry_pack_image.is_none()
-    {
-        return Err(MvmError::InvalidSpec {
-            reason: format!(
-                "machine {:?} has no image, manifest or deployment source",
-                spec.name
-            ),
-        });
-    }
-    Ok(())
-}
-
 impl LocalBackend {
     /// Boot a stopped, previously defined machine under a one-start journal
     /// grant. The original helper is returned in the caller's owner slot.
@@ -103,11 +53,21 @@ impl LocalBackend {
     /// attachments re-resolved and leased, then the canonical admitted boot.
     /// Starting a machine that is already running returns its state.
     pub async fn start_persistent(&self, name: &str) -> Result<MachineState> {
+        let barrier = mvm_core::host_interface::activation_barrier::ActivationBarrier::shared()
+            .map_err(crate::local::backend_err)?;
+        if cfg!(target_os = "linux")
+            && self.backend.kind() != mvm_core::vm_backend::BackendKind::Mock
+        {
+            crate::policy_profiles::coordinator::ensure_if_activated()
+                .map_err(crate::local::backend_err)?;
+        }
         let lifecycle = crate::local::machine_lifecycle(name).await?;
         let reservation = reserve_named_lifecycle(name)?;
         let spec = mp::load_machine_spec(name).map_err(|e| MvmError::NotFound {
             id: format!("{name}: {e}"),
         })?;
+        crate::policy_profiles::coordinator::validate_machine_spec_generation(&spec, &barrier)
+            .map_err(crate::local::backend_err)?;
         if self.machine_running(name) {
             return Ok(MachineState {
                 id: MachineId(name.to_string()),

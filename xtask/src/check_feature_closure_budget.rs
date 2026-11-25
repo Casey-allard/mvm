@@ -38,8 +38,9 @@ const BUDGET_TARGET: &str = "x86_64-unknown-linux-gnu";
 /// feature enabled, excluding dev-dependencies.
 // Optional BDD counts the existing Cucumber closure alongside shared crypto,
 // transfer/FlowMux/store and their required transitive dependencies.
+// Committed generation admission adds only the first-party mvm-policy crate.
 // Measured complete all-features closure with no headroom.
-const FEATURE_CLOSURE_BUDGET: usize = 589;
+const FEATURE_CLOSURE_BUDGET: usize = 590;
 
 /// The two gates measure nested sets — everything in the default closure is
 /// reachable with all features on — so a feature budget at or below the default
