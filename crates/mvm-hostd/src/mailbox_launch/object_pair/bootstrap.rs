@@ -359,8 +359,9 @@ impl ObjectWorkerBootstrapV1 {
             ensure!(
                 crate::mailbox_process::load_admitted_plan(state)? == *plan
                     && MailboxReaderBootBinding::load(state)? == *boot
-                    && !ledger.entry(&plan.image.name).quarantined
-                    && ledger.entry(&plan.image.name).epoch.0 == boot.execution_epoch.get()
+                    && ledger
+                        .authorize(&plan.workload.0, boot.execution_epoch)
+                        .is_ok()
                     && incoming.grant.policy_epoch == template
                     && !revoked.contains(&incoming.grant.revocation_id),
                 "original installed plan/boot/epoch or direction changed"

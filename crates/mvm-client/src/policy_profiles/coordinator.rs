@@ -432,6 +432,7 @@ mod unix {
         time::{Duration, Instant},
     };
 
+    use mvm_hostd::policy_generation::coordinator::socket_path;
     use mvm_vmm::host::{
         aux_bin::AuxBin,
         broker_services_spawn::{resolve_subprocess_bin_to_spawn, spawn_detached_with_config},
@@ -515,7 +516,6 @@ mod unix {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use mvm_hostd::policy_generation::coordinator::socket_path;
     use super::*;
     use mvm_core::{
         manifest::{Manifest, PersistedManifest, Provenance, slot_dir, slot_revision_dir},
@@ -523,6 +523,7 @@ mod tests {
         template::{CURRENT_SCHEMA_VERSION, TemplateRevision},
         util::test_env::TestEnv,
     };
+    use mvm_hostd::policy_generation::coordinator::socket_path;
     use std::os::unix::fs::symlink;
 
     #[test]

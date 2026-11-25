@@ -177,10 +177,7 @@ mod unix {
         }
     }
 
-    fn read_frame<T: serde::de::DeserializeOwned>(
-        stream: &mut impl Read,
-        max: usize,
-    ) -> Result<T> {
+    fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut impl Read, max: usize) -> Result<T> {
         let mut length = [0u8; 4];
         stream.read_exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
@@ -412,24 +409,6 @@ mod unix {
         )
     }
 
-    /// A coordinator on a thread of this process, for tests that need a real
-    /// socket for the ledger's owner. It serves until the process exits.
-    #[cfg(test)]
-    pub(crate) fn serve_in_process(home: &Path) -> Result<PathBuf> {
-        let status = CoordinatorStatus::of_this_process(home, Lifetime::Detached);
-        let bound = bind(home)?;
-        std::thread::spawn(move || {
-            let _owner = bound.owner;
-            serve_on(
-                &bound.listener,
-                &bound.generations,
-                &bound.workloads,
-                &status,
-            )
-        });
-        Ok(socket_path(home))
-    }
-
     pub(in crate::policy_generation) fn bind(home: &Path) -> Result<Bound> {
         ensure!(
             home.is_absolute(),
@@ -595,7 +574,10 @@ mod unix {
 
             let socket = socket_path(&home);
             let stream = UnixStream::connect(&socket).unwrap();
-            assert_eq!(exchange_status(stream, Instant::now() + STATUS_TIMEOUT).unwrap(), status);
+            assert_eq!(
+                exchange_status(stream, Instant::now() + STATUS_TIMEOUT).unwrap(),
+                status
+            );
             assert!(matches!(
                 call(&socket, &Request::Ping).unwrap(),
                 Response::Ready
@@ -975,8 +957,6 @@ pub fn serve() -> Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) use unix::exchange_status;
-#[cfg(all(test, unix))]
-pub(crate) use unix::serve_in_process;
 /// Send a bounded request to the local coordinator.
 ///
 /// # Errors
